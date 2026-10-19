@@ -1,0 +1,65 @@
+# eph-broker config. Copy to config/broker.yaml (or point BROKER_CONFIG at it) and fill in your values.
+# Every section is optional. A section here replaces the config/<name>.json file of the same name; a
+# BROKER_CONFIG path ending in .json is read as JSON, so you don't need PyYAML for that.
+# An unknown section, a repeated key or a parse error stops the broker at startup.
+
+# Environment settings, the same keys as config/site.example.env. The real environment wins over these,
+# and these win over site.env. Values are strings, numbers or true/false (true becomes "1"). Quote anything
+# YAML might read as something else (on, off, 0755). Read at startup, so restart after changing them.
+# Never put secrets here, see docs/configuration.md#secrets.
+settings:
+  TICKET_URL_TEMPLATE: "https://tracker.example.com/tasks/{}"
+  GITLAB_WEB_URL: "https://gitlab.example.com"
+  BROKER_PUSH_HOSTS: "gitlab.example.com"
+  GENERAL_REPO_ALLOWLIST: "/srv/git/app:/srv/git/docs-site"
+  CODE_REPO_ALLOWLIST: "/srv/git/app:/srv/git/docs-site"
+  CONCURRENCY: 5
+
+# Your own agent types (docs/routes.md). Same rows as config/routes.json, as a list. Read at startup.
+# Each row's prompt must exist and be signed, or the broker refuses to start.
+# routes:
+#   - id: docs
+#     match: {label: "eph:docs"}
+#     prompt: docs/writer
+#     capability: code
+#     repo: /srv/git/docs-site
+#   - id: triage
+#     match: {assignee: triage-bot}
+#     prompt: triage/read-only
+#     capability: read
+#     repo: /srv/git/app
+#     model: sonnet
+
+# Your own capabilities (docs/routes.md#site-capabilities): a built-in base (read, code or general) plus extra
+# rules appended to its allow and deny lists. The base's deny list always wins. Read at startup.
+# capabilities:
+#   docs-writer:
+#     base: code
+#     allow: ["Bash(wc -w:*)"]
+#     deny: [WebFetch]
+
+# Turn caps and wall-clock limits (config/constraints.json). Read at startup.
+constraints:
+  max_turns: 50
+  max_turns_by_capability: {code: 100}
+  wall_clock_s: 1800
+  wall_clock_by_capability: {code: 3600}
+  max_forwards: 10
+  rotate_turns: 20
+  rotate_tokens: 120000
+
+# Burst and warm windows in seconds (config/windows.json). Re-read on SIGHUP.
+windows:
+  initial: {"vikunja:task": 3, alert: 2}
+  receive: {"vikunja:task": 45, alert: 60}
+
+# Who counts as an agent (config/provenance.json, all five keys required). Read at startup.
+# provenance:
+#   agent_basenames: [svc-account]
+#   handoff_doers: [svc-account]
+#   agent_pattern: '(-bot\b|@agents\.example\.com$)'
+#   untrusted_authors: [svc-account]
+#   handoff_parked_labels: [awaiting-input, blocked]
+
+# The other sections take the content of their json file as is: inbox-accounts, zulip-wake, cd-tier,
+# deploy-paths, pool-vikunja-ids.

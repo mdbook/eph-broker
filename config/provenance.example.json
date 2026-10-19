@@ -1,0 +1,19 @@
+{
+  "_comment": "Copy to config/provenance.json. agent_basenames: the usernames of your bots and service accounts, so the broker ignores their edits (each also matches -agent/-bot forms). For the GitLab quick start, put your GitLab bot user here. handoff_doers: exact usernames whose ticket create/update assigned to a dispatch row may spawn a worker. agent_pattern: regex for any other agent doer, added to the built-in -bot match (it must not match plain human names). untrusted_authors: exact usernames never trusted for write grants even when in handoff_doers (a shared service account that temporary workers also write as). handoff_parked_labels: label titles that stop a handoff from spawning a worker. All five keys are required (an empty list is allowed); agent / system are optional exact identities; any other key stops the broker. A missing file stops the broker unless BROKER_PROVENANCE_NEUTRAL=1 (then only the broker's own row identities, pool-NN and -bot names count as agents); a malformed file always stops it.",
+  "agent_basenames": [
+    "my-bot",
+    "my-service-account"
+  ],
+  "handoff_doers": [
+    "my-service-account"
+  ],
+  "agent_pattern": "(-bot\\b|@agents\\.example\\.com$)",
+  "untrusted_authors": [
+    "my-service-account"
+  ],
+  "handoff_parked_labels": [
+    "awaiting-input",
+    "deferred",
+    "blocked"
+  ]
+}

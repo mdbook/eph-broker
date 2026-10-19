@@ -1,0 +1,89 @@
+{
+  "name": "Vikunja to eph-broker tap",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "vikunja-tap",
+        "responseMode": "onReceived",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "name": "Vikunja webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "vikunja-tap"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Turn a Vikunja webhook into the broker's event shape and sign it (docs/n8n.md). Needs\n// NODE_FUNCTION_ALLOW_BUILTIN=crypto and N8N_BLOCK_ENV_ACCESS_IN_NODE=false for $env.\n// With VIKUNJA_WEBHOOK_SECRET set it also checks Vikunja's own X-Vikunja-Signature first.\nconst crypto = require('crypto');\nconst out = [];\nfor (let i = 0; i < $input.all().length; i++) {\n  const item = $input.all()[i];\n  const raw = await this.helpers.getBinaryDataBuffer(i, 'data');\n  if ($env.VIKUNJA_WEBHOOK_SECRET) {\n    const want = crypto.createHmac('sha256', $env.VIKUNJA_WEBHOOK_SECRET).update(raw).digest('hex');\n    const got = String(item.json.headers['x-vikunja-signature'] || '');\n    if (want.length !== got.length || !crypto.timingSafeEqual(Buffer.from(want), Buffer.from(got))) {\n      throw new Error('bad X-Vikunja-Signature');\n    }\n  }\n  const hook = JSON.parse(raw.toString('utf8'));\n  const data = hook.data || {};\n  const task = data.task || {};\n  const evt = {\n    source: 'vikunja',\n    event_name: hook.event_name,\n    task_id: task.id,\n    project_id: task.project_id,\n    done: task.done === true,\n    doer: (data.doer || {}).username || null,\n    labels: (task.labels || []).map(l => l.title),\n    assignees: (task.assignees || []).map(a => a.username),\n  };\n  if (data.comment) {\n    evt.comment = data.comment.comment || '';\n    evt.comment_id = data.comment.id;\n    const m = /broker-run:([A-Za-z0-9_-]+)/.exec(evt.comment);   // the broker's own comments carry this marker\n    if (m) evt.run_id = m[1];\n  }\n  const body = JSON.stringify(evt);\n  const sig = crypto.createHmac('sha256', $env.EPH_BROKER_HMAC_SECRET).update(body).digest('hex');\n  out.push({ json: { body, sig } });\n}\nreturn out;"
+      },
+      "name": "Shape and sign",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://broker.example.com/event",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Broker-HMAC",
+              "value": "={{ $json.sig }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.body }}",
+        "options": {
+          "timeout": 5000
+        }
+      },
+      "name": "POST eph-broker /event",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Vikunja webhook": {
+      "main": [
+        [
+          {
+            "node": "Shape and sign",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Shape and sign": {
+      "main": [
+        [
+          {
+            "node": "POST eph-broker /event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {}
+}

@@ -1,0 +1,20 @@
+{
+  "_comment": "The test inbox accounts (made-up, same schema as config/inbox-accounts.example.json). tests/*.py point BROKER_INBOX_ACCOUNTS here.",
+  "accounts": {
+    "owner": {
+      "email": "owner@example.test",
+      "ledger": "/var/lib/inbox/ledger-owner.jsonl",
+      "posture": "- Mail to the fleet@example.test alias is fleet mail, not the operator's own: forward it to admin-bot@chat.example.test as pending operator confirm and archive it. Never delete anything."
+    },
+    "work": {
+      "email": "work@example.test",
+      "ledger": "/var/lib/inbox/ledger-work.jsonl",
+      "posture": "- would-archive-only: log what you would archive, change nothing, until this account earns a track record."
+    },
+    "alt": {
+      "email": "alt@example.test",
+      "ledger": "/var/lib/inbox/ledger-alt.jsonl",
+      "posture": "- Backlog cap ~60 days: older unread mail is archived, never deleted."
+    }
+  }
+}

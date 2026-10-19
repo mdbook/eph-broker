@@ -1,0 +1,14 @@
+{
+  "_comment": "Constraint values (defaults, hot-reload-tunable). pinned_cli was removed: the CLI-version pin is no longer checked or enforced. max_turns_by_capability overrides max_turns per route capability (code=100; a code ticket hit the old limit of 40 with the work done, and it was originally 15). wall_clock_by_capability does the same for wall_clock_s (code=3600). The global defaults were raised from 15 to 50 turns and from 600 to 1800 s. The liveness progress_timeout_s backstop does not auto-extend: liveness.resolve_progress_timeout floors it at max(wall_clock_s, per-capability value) + 300s of headroom, so raising wall_clock_s can never leave it below the turn hard-kill.",
+  "max_turns": 50,
+  "max_turns_by_capability": {
+    "code": 100
+  },
+  "wall_clock_s": 1800,
+  "wall_clock_by_capability": {
+    "code": 3600
+  },
+  "max_forwards": 10,
+  "rotate_turns": 20,
+  "rotate_tokens": 120000
+}

@@ -1,0 +1,44 @@
+{
+  "name": "GitLab issue → eph-broker tap",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "gitlab-issue-tap",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "name": "GitLab issue webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://broker.example.com/webhooks/gitlab",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-Gitlab-Token", "value": "={{ $json.headers['x-gitlab-token'] || '' }}" },
+            { "name": "X-Gitlab-Event", "value": "={{ $json.headers['x-gitlab-event'] || '' }}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": { "timeout": 5000 }
+      },
+      "name": "POST eph-broker /webhooks/gitlab",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [260, 0]
+    }
+  ],
+  "connections": {
+    "GitLab issue webhook": {
+      "main": [[{ "node": "POST eph-broker /webhooks/gitlab", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {}
+}

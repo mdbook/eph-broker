@@ -1,0 +1,49 @@
+{
+  "_comment": "The test provenance roster (made-up names, same shape as config/provenance.json). tests/*.py point BROKER_PROVENANCE_PATH here.",
+  "agent_basenames": [
+    "svc-account",
+    "ansible",
+    "ops",
+    "infra",
+    "agent-a",
+    "agent-b",
+    "agent-c",
+    "cards",
+    "design",
+    "agent-e",
+    "agent-f",
+    "repo-c",
+    "repo-b",
+    "repo-a",
+    "inbox",
+    "mail",
+    "coder"
+  ],
+  "handoff_doers": [
+    "svc-account",
+    "ops",
+    "infra",
+    "ansible",
+    "cards",
+    "agent-e",
+    "dev",
+    "design",
+    "agent-a",
+    "agent-b",
+    "repo-c",
+    "repo-a-agent",
+    "repo-b-agent",
+    "agent-f",
+    "mail-agent",
+    "agent-c"
+  ],
+  "agent_pattern": "(-bot\\b|@chat(\\.|\\b))",
+  "untrusted_authors": [
+    "svc-account"
+  ],
+  "handoff_parked_labels": [
+    "awaiting-input",
+    "deferred",
+    "blocked"
+  ]
+}

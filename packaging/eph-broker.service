@@ -1,0 +1,24 @@
+[Unit]
+Description=eph-broker (ephemeral coding-agent worker broker, 127.0.0.1:8787)
+After=network-online.target remote-fs.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# The RPM creates this system user (home /var/lib/eph-broker). The workers run as it too, so its Claude Code
+# login, ~/.git-credentials and ~/.config/eph-broker live there. A drop-in can point User= elsewhere.
+User=eph-broker
+Group=eph-broker
+WorkingDirectory=/opt/eph-broker
+ExecStart=/usr/bin/python3 /opt/eph-broker/app.py
+Environment=PORT=8787 PYTHONDONTWRITEBYTECODE=1
+StateDirectory=eph-broker
+Environment=EVENTS_LOG=/var/lib/eph-broker/events.jsonl
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

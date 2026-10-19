@@ -1,0 +1,20 @@
+{
+  "_comment": "Copy to routes.json to add your own agent types. Each prompt must be rendered into prompts/<domain>/<class>.md and its sha256 signed in approved-prompts.json first. Restart the broker after editing; a bad file stops it from starting.",
+  "routes": [
+    {
+      "id": "docs",
+      "match": {"label": "eph:docs"},
+      "prompt": "docs/writer",
+      "capability": "code",
+      "repo": "/srv/git/docs-site"
+    },
+    {
+      "id": "triage",
+      "match": {"assignee": "triage-bot"},
+      "prompt": "triage/read-only",
+      "capability": "read",
+      "repo": "/srv/git/app",
+      "model": "sonnet"
+    }
+  ]
+}

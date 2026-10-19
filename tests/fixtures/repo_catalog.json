@@ -1,0 +1,232 @@
+{
+ "_doc": "Test catalog: a synthetic GitLab listing in the shape repo_catalog.get_catalog() caches (entries with local/remote/charter carry the local-checkout scan). Names are the ones the tests exercise; descriptions and hosts are made up.",
+ "entries": [
+  {
+   "path": "git-helper/git-mirror-sync",
+   "desc": "Mirrors upstream git repositories on a schedule, configured from YAML",
+   "default_branch": "main",
+   "http_url": "https://gitlab.example.test/git-helper/git-mirror-sync.git",
+   "archived": false
+  },
+  {
+   "path": "git-helper/mail-agent",
+   "desc": "Mail triage agent (example of a PII lane: denied by the test deny list)",
+   "default_branch": "main",
+   "http_url": "https://gitlab.example.test/git-helper/mail-agent.git",
+   "archived": false
+  },
+  {
+   "path": "owner/agents",
+   "desc": "Workflow graphs and shared tool wrappers",
+   "default_branch": "main",
+   "http_url": "https://gitlab.example.test/owner/agents.git",
+   "archived": false,
+   "local": "/srv/git/agents",
+   "remote": "https://gitlab.example.test/owner/agents.git",
+   "charter": false
+  },
+  {
+   "path": "owner/ansible",
+   "desc": "",
+   "default_branch": "master",
+   "http_url": "https://gitlab.example.test/owner/ansible.git",
+   "archived": false,
+   "local": "/srv/ansible",
+   "remote": "https://gitlab.example.test/owner/ansible.git",
+   "charter": null
+  },
+  {
+   "path": "owner/build",
+   "desc": "",
+   "default_branch": "master",
+   "http_url": "https://gitlab.example.test/owner/build.git",
+   "archived": false
+  },
+  {
+   "path": "owner/coder-agent",
+   "desc": "Standing code agent: charter and helper scripts",
+   "default_branch": "main",
+   "http_url": "https://gitlab.example.test/owner/coder-agent.git",
+   "archived": false,
+   "local": "/srv/git/coder-agent",
+   "remote": "https://gitlab.example.test/owner/coder-agent.git",
+   "charter": true
+  },
+  {
+   "path": "owner/docker",
+   "desc": "",
+   "default_branch": "master",
+   "http_url": "https://gitlab.example.test/owner/docker.git",
+   "archived": false,
+   "local": "/srv/infra",
+   "remote": "https://gitlab.example.test/owner/docker.git",
+   "charter": null
+  },
+  {
+   "path": "owner/eph-broker",
+   "desc": "Ephemeral-worker broker (phase 1) - coalescer core + harness adapter; systemd user unit",
+   "default_branch": "main",
+   "http_url": "https://gitlab.example.test/owner/eph-broker.git",
+   "archived": false,
+   "local": "/srv/git/eph-broker",
+   "remote": "https://gitlab.example.test/owner/eph-broker.git",
+   "charter": null
+  },
+  {
+   "path": "owner/fleet",
+   "desc": "Fleet-wide system prompt and shared bin",
+   "default_branch": "main",
+   "http_url": "https://gitlab.example.test/owner/fleet.git",
+   "archived": false,
+   "local": "/srv/git/site",
+   "remote": "https://gitlab.example.test/owner/fleet.git",
+   "charter": false
+  },
+  {
+   "path": "owner/home-dashboard",
+   "desc": "Wall-mounted family dashboard: clock, weather and chores",
+   "default_branch": "main",
+   "http_url": "https://gitlab.example.test/owner/home-dashboard.git",
+   "archived": false
+  },
+  {
+   "path": "owner/sysop-agent",
+   "desc": "Standing infra agent: charter and runbooks",
+   "default_branch": "main",
+   "http_url": "https://gitlab.example.test/owner/sysop-agent.git",
+   "archived": false,
+   "local": "/srv/git/sysop-agent",
+   "remote": "https://gitlab.example.test/owner/sysop-agent.git",
+   "charter": true
+  },
+  {
+   "path": "owner/invoice-tool",
+   "desc": "Turns time-tracking CSV exports into PDF invoices",
+   "default_branch": "master",
+   "http_url": "https://gitlab.example.test/owner/invoice-tool.git",
+   "archived": false
+  },
+  {
+   "path": "owner/repo-a-agent",
+   "desc": "Agent holding personal records (example of a PII lane: denied)",
+   "default_branch": "main",
+   "http_url": "https://gitlab.example.test/owner/repo-a-agent.git",
+   "archived": false,
+   "local": "/srv/git/repo-a-agent",
+   "remote": "https://gitlab.example.test/owner/repo-a-agent.git",
+   "charter": true
+  },
+  {
+   "path": "owner/widgets",
+   "desc": "",
+   "default_branch": "master",
+   "http_url": "https://gitlab.example.test/owner/widgets.git",
+   "archived": false
+  },
+  {
+   "path": "owner/gallery",
+   "desc": "Meme index - Flask gallery with an auth-gated upload form",
+   "default_branch": "main",
+   "http_url": "https://gitlab.example.test/owner/gallery.git",
+   "archived": false
+  },
+  {
+   "path": "owner/cards",
+   "desc": "",
+   "default_branch": "main",
+   "http_url": "https://gitlab.example.test/owner/cards.git",
+   "archived": false,
+   "local": "/srv/git/cards",
+   "remote": "https://gitlab.example.test/owner/cards.git",
+   "charter": true
+  },
+  {
+   "path": "owner/old-thing",
+   "desc": "archived experiment",
+   "default_branch": "main",
+   "http_url": "https://gitlab.example.test/owner/old-thing.git",
+   "archived": true,
+   "local": "",
+   "remote": "https://gitlab.example.test/owner/old-thing.git",
+   "charter": false
+  },
+  {
+   "path": "owner/ops",
+   "desc": "",
+   "default_branch": "main",
+   "http_url": "https://gitlab.example.test/owner/ops.git",
+   "archived": false,
+   "local": "/srv/git/ops",
+   "remote": "https://gitlab.example.test/owner/ops.git",
+   "charter": false
+  },
+  {
+   "path": "owner/speech-api",
+   "desc": "",
+   "default_branch": "main",
+   "http_url": "https://gitlab.example.test/owner/speech-api.git",
+   "archived": false,
+   "local": "",
+   "remote": "https://gitlab.example.test/owner/speech-api.git",
+   "charter": false
+  },
+  {
+   "path": "owner/recipe-box",
+   "desc": "Recipe collection with shopping-list export",
+   "default_branch": "main",
+   "http_url": "https://gitlab.example.test/owner/recipe-box.git",
+   "archived": false
+  },
+  {
+   "path": "owner/sample-app",
+   "desc": "Sync emulator save files between handhelds and a game server",
+   "default_branch": "main",
+   "http_url": "https://gitlab.example.test/owner/sample-app.git",
+   "archived": false,
+   "local": "/srv/git/sample-app",
+   "remote": "https://gitlab.example.test/owner/sample-app.git",
+   "charter": false
+  },
+  {
+   "path": "owner/scripts",
+   "desc": "",
+   "default_branch": "master",
+   "http_url": "https://gitlab.example.test/owner/scripts.git",
+   "archived": false
+  },
+  {
+   "path": "owner/music-mcp",
+   "desc": "MCP server for music playback and playlists",
+   "default_branch": "main",
+   "http_url": "https://gitlab.example.test/owner/music-mcp.git",
+   "archived": false,
+   "local": "",
+   "remote": "https://gitlab.example.test/owner/music-mcp.git",
+   "charter": false
+  },
+  {
+   "path": "owner/weather-station",
+   "desc": "Reads a backyard sensor over MQTT and charts temperature and humidity",
+   "default_branch": "main",
+   "http_url": "https://gitlab.example.test/owner/weather-station.git",
+   "archived": false
+  },
+  {
+   "path": "owner/wiki",
+   "desc": "Static-site personal wiki",
+   "default_branch": "main",
+   "http_url": "https://gitlab.example.test/owner/wiki.git",
+   "archived": false,
+   "local": "/srv/git/wiki",
+   "remote": "https://gitlab.example.test/owner/wiki.git",
+   "charter": false
+  },
+  {
+   "path": "mirrors/upstream-sdk",
+   "desc": "origin: https://example.test/upstream/sdk.git",
+   "default_branch": "main",
+   "http_url": "https://gitlab.example.test/mirrors/upstream-sdk.git",
+   "archived": false
+  }
+ ]
+}

@@ -1,0 +1,15 @@
+{
+  "_comment": "Worker-class manifest, renders prompts/code/change-proposer.md. Code change-proposer: an ephemeral worker that builds ONE ticket's bounded code change as a diff in a disposable worktree, runs the granted test runner to verify, commits, and exits. The broker pushes a feature branch and opens an MR (never the default branch, human-gated). Repo-agnostic and runner-agnostic: the per-ticket target repo, its test runner and the ticket body ride the runtime -p brief (like the inbox triage class's per-account posture), so this one signed prompt serves every code repo. sections = ordered module paths (no .md); vars fill {{slots}} at build time. Content is operator-gated: the rendered prompt's sha256 must be signed into approved-prompts.json by the operator before it runs.",
+  "domain": "code",
+  "class": "change-proposer",
+  "sections": [
+    "role/ephemeral-oneshot",
+    "scopes/code-change",
+    "capabilities/code-change",
+    "constraints/code-change",
+    "outputs/tickets/code"
+  ],
+  "vars": {
+    "worker_kind": "code change-proposer"
+  }
+}

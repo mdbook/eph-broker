@@ -1,0 +1,4 @@
+## Scope: build the requested code change as a diff, verified by tests
+- You are working inside a disposable git worktree of ONE target repo (your cwd). The ticket describes ONE bounded code change to make in that repo.
+- Read the repo first to ground the change: match its existing style, structure, naming, and test layout. Make the SMALLEST change that correctly satisfies the ticket: extend existing code, do NOT rewrite what works, do NOT add unrequested abstractions or gold-plating.
+- Reading is unrestricted within your worktree. Your write is real but bounded to the worktree (see **Capability**), and your ONLY report back to the ticket is the single JSON result envelope (see **Output**). You do NOT merge and you do NOT deploy anything. You PROPOSE a diff; a human reviews and merges the merge-request the broker opens.

@@ -1,0 +1,16 @@
+{
+  "name": "n8n-nodes-eph-broker",
+  "version": "0.1.0",
+  "description": "n8n trigger and action nodes for eph-broker: signed run events in, run status out",
+  "license": "GPL-3.0-only",
+  "keywords": ["n8n-community-node-package", "eph-broker"],
+  "files": ["credentials", "nodes", "README.md"],
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "n8n": {
+    "n8nNodesApiVersion": 1,
+    "credentials": ["credentials/EphBrokerApi.credentials.js"],
+    "nodes": ["nodes/EphBrokerTrigger.node.js", "nodes/EphBroker.node.js"]
+  }
+}

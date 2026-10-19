@@ -1,0 +1,24 @@
+{
+ "_doc": "Test aliases (synthetic): the config/repo-aliases.json shape, owned by the tests so they never depend on a site's live alias file.",
+ "owner/speech-api": {
+  "aliases": [
+   "speech",
+   "asr-api",
+   "asr"
+  ]
+ },
+ "owner/sample-app": {
+  "aliases": [
+   "game-sync"
+  ]
+ },
+ "owner/gallery": {
+  "aliases": [
+   "meme gallery",
+   "meme index"
+  ]
+ },
+ "owner/eph-broker": {
+  "card": "Vikunja ticket broker: spawns code workers, opens review MRs"
+ }
+}

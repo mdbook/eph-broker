@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+# runtime state, worktrees, the event log and the gate denial log are never committed
+events.jsonl
+worktrees/
+eph-gate-denials.jsonl

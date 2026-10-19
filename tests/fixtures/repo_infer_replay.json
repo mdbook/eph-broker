@@ -1,0 +1,45 @@
+{
+ "_doc": "Replay set: synthetic code tickets in the Vikunja blob shape, modelled on common ticket patterns (ns/path spelled out, bare name in the title, package path with an incidental tier-B name, no name at all). The repo: line is stripped; declared_repo is what the ticket would have declared.",
+ "tickets": [
+  {
+   "id": 9501,
+   "declared_repo": "owner/docker",
+   "ticket": "**id:** 9501\n**title:** change the landing page accent colour from green to blue\n**description:** <h3>Task</h3>\n<p>The landing page uses a green accent on its cards. Make it blue of the same weight.</p>\n<h3>Where it lives</h3>\n<p>web/index.html in the compose repo (GitLab: owner/docker).</p>\n<ul><li>Hue change only: keep layout, copy and contrast.</li><li>Check text contrast on the cards.</li></ul>\n**done:** false\n**assignees:** dev\n"
+  },
+  {
+   "id": 9502,
+   "declared_repo": "owner/eph-broker",
+   "ticket": "**id:** 9502\n**title:** eph-broker: remove dead --version branch in the fake-claude test fixture (reviewer nit)\n**description:** <p>Small cleanup from review: the fake binary used by the worker tests still handles <code>--version</code>, which nothing calls any more. Delete the branch; the suite must stay green.</p>\n**done:** false\n**assignees:** dev\n"
+  },
+  {
+   "id": 9503,
+   "declared_repo": "owner/sample-app",
+   "ticket": "**id:** 9503\n**title:** sample-app: add unit test for normalise_server_url\n**description:** <p>Add a test covering trailing slashes, missing scheme and an explicit port for <code>normalise_server_url</code>. No behaviour change.</p>\n**done:** false\n**assignees:** dev\n"
+  },
+  {
+   "id": 9504,
+   "declared_repo": "owner/coder-agent",
+   "ticket": "**id:** 9504\n**title:** coder-agent: add staging marker file\n**description:** <p>Add an empty <code>STAGING</code> marker at the repo root so the staging checks can find it. One file, one commit.</p>\n**done:** false\n**assignees:** dev\n"
+  },
+  {
+   "id": 9505,
+   "declared_repo": "owner/eph-broker",
+   "ticket": "**id:** 9505\n**title:** eph-broker: fix duplicate MR after restart\n**description:** <p>Follow-ups from the last end-to-end run.</p><ol><li>A restart while a worker is mid-run re-spawns it and opens a second merge request for the same ticket.</li><li>A comment from the service account must not trigger a handoff.</li></ol>\n**done:** false\n**assignees:** dev\n"
+  },
+  {
+   "id": 9506,
+   "declared_repo": "owner/sample-app",
+   "ticket": "**id:** 9506\n**title:** sample-app: unit tests for client._scrub_authorization (token-redaction path)\n**description:** <p><b>What:</b> <code>client._scrub_authorization</code> strips the bearer token from logged request headers. Add tests for upper/lower-case header names and a missing header.</p>\n**done:** false\n**assignees:** dev\n"
+  },
+  {
+   "id": 9507,
+   "declared_repo": "owner/sample-app",
+   "ticket": "**id:** 9507\n**title:** [e2e proof] docstring every function, one edit + full suite per function\n**description:** \n<p><b>Controlled test ticket for the code-worker loop.</b> Add a one-line docstring to every function in <code>src/sample_app/client.py</code>, running the full suite after each edit. The eph-broker test harness watches the run; do not touch it.</p>\n**done:** false\n**assignees:** dev\n"
+  },
+  {
+   "id": 9508,
+   "declared_repo": "owner/eph-broker",
+   "ticket": "**id:** 9508\n**title:** broker web UI: a readable session view\n**description:** <p>The session view streams raw monospace JSON. Render worker turns as readable cards (tool calls collapsed, text first) so a person can follow a code worker without reading the event log.</p>\n**done:** false\n**assignees:** dev\n"
+  }
+ ]
+}

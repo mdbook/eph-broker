@@ -1,0 +1,14 @@
+{
+  "_comment": "Worker-class manifest, renders prompts/mr-review/agent.md. MR-reviewer ephemeral capability: a pure-read, one-shot, adversarial reviewer of ONE merge request the broker just opened (code change-proposer or general worker). It reads the checked-out MR source branch (cwd) and the broker-injected `diff` in its runtime -p brief (Read/Grep/Glob only; no Edit/Write/Bash/git/network), and emits a {status,summary,wake} verdict. The broker posts that verdict as an MR note. The builder is never the acceptor and the reviewer has no merge power, by construction (fresh claude -p spawn, read-only grant). sections = ordered module paths (no .md); vars fill {{slots}} at build time. Content is operator-gated: the rendered prompt's sha256 must be signed into approved-prompts.json by the operator before it runs.",
+  "domain": "mr-review",
+  "class": "agent",
+  "sections": [
+    "role/ephemeral-oneshot",
+    "scopes/mr-review",
+    "constraints/mr-review",
+    "outputs/mr-review"
+  ],
+  "vars": {
+    "worker_kind": "MR reviewer"
+  }
+}

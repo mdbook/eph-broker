@@ -1,0 +1,28 @@
+{
+  "repo_patterns": {
+    "*/eph-broker": {
+      "engine": [
+        "adapters/*",
+        "app.py",
+        "routing.py",
+        "coalescer.py",
+        "echo_guard.py",
+        "envelope.py",
+        "provenance.py",
+        "cd.py",
+        "worktree.py",
+        "gitlab_mr.py",
+        "forge.py",
+        "stream.py",
+        "poster.py",
+        "notify.py",
+        "hooks/*",
+        "prompts/*",
+        "prompts.py",
+        "approved-prompts.json",
+        "packaging/*",
+        "workers/*"
+      ]
+    }
+  }
+}

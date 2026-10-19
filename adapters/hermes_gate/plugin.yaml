@@ -1,0 +1,3 @@
+name: eph-gate
+version: "1.0"
+description: "eph-broker: Claude Code allow/deny parity for hermes workers (pre_tool_call, fail-closed)."

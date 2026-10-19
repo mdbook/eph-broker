@@ -1,0 +1,15 @@
+{
+  "_comment": "Worker-class manifest, renders prompts/general/agent.md. General-purpose ephemeral ticket worker: an opus worker that takes ONE ARBITRARY Vikunja ticket (triggered by the eph:general label, routed LAST so narrow labels win) and works it end-to-end in a disposable worktree, then exits. Unlike the narrow classes it is broad in tools and general in tickets. Its guardrails are the auto-classifier (--permission-mode auto, no allow-list), the enforced deny floor (_GENERAL_DENIED), the user-level rules it loads via route.setting_sources='user', and a cred-free, broker-only feature-branch MR publish. Thin and stable by design: this signed prompt carries only the ephemeral-oneshot framing, scope, capability, hard floor and output envelope. It does not embed the user-level instructions file (its mode block is machine-rewritten); that rides setting-sources so a mode flip never breaks this sha256. sections = ordered module paths (no .md); vars fill {{slots}} at build time. Content is operator-gated: the rendered prompt's sha256 must be signed into approved-prompts.json by the operator before it runs.",
+  "domain": "general",
+  "class": "agent",
+  "sections": [
+    "role/ephemeral-oneshot",
+    "scopes/general",
+    "capabilities/general",
+    "constraints/general",
+    "outputs/tickets/general"
+  ],
+  "vars": {
+    "worker_kind": "general-purpose ticket"
+  }
+}

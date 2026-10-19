@@ -1,0 +1,16 @@
+{
+  "group/my-app": {
+    "repo": "group/my-app",
+    "kind": "ansible-rpm-pin",
+    "play": "my-app",
+    "pin_var": "my_app_version",
+    "target": "app-host",
+    "verify": "the play's health checks",
+    "ver_template": "{VERSION}-{pipeline_iid}"
+  },
+  "group/my-site": {
+    "repo": "group/my-site",
+    "kind": "nightly",
+    "expected_live": "after the next nightly deploy"
+  }
+}

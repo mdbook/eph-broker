@@ -1,0 +1,52 @@
+{
+  "name": "eph-broker run status",
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "jsonExample",
+        "jsonExample": "{\n  \"subject_key\": \"vikunja:task:42\"\n}"
+      },
+      "name": "Called with a subject key",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://broker.example.com/runs/{{ encodeURIComponent($json.subject_key) }}",
+        "options": {
+          "timeout": 5000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "name": "GET /runs",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        240,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Called with a subject key": {
+      "main": [
+        [
+          {
+            "node": "GET /runs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {}
+}

@@ -1,0 +1,5 @@
+{
+  "_comment": "Hot-reloadable per-subject-class windows (SIGHUP re-reads). Overrides coalescer defaults. Value-free.",
+  "initial": { "vikunja:task": 3, "alert": 2 },
+  "receive": { "vikunja:task": 45, "alert": 60 }
+}

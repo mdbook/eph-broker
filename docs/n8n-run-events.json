@@ -1,0 +1,240 @@
+{
+  "name": "eph-broker run events",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "eph-broker-events",
+        "responseMode": "onReceived",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "name": "eph-broker events",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "eph-broker-events"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Check X-Eph-Signature against the raw body (docs/events.md). Needs NODE_FUNCTION_ALLOW_BUILTIN=crypto and\n// N8N_BLOCK_ENV_ACCESS_IN_NODE=false for $env, or replace $env.EPH_EVENTS_SECRET with your own secret source.\nconst crypto = require('crypto');\nconst out = [];\nfor (let i = 0; i < $input.all().length; i++) {\n  const item = $input.all()[i];\n  const raw = await this.helpers.getBinaryDataBuffer(i, 'data');\n  const want = 'sha256=' + crypto.createHmac('sha256', $env.EPH_EVENTS_SECRET).update(raw).digest('hex');\n  const got = String(item.json.headers['x-eph-signature'] || '');\n  if (want.length !== got.length || !crypto.timingSafeEqual(Buffer.from(want), Buffer.from(got))) {\n    throw new Error('bad X-Eph-Signature');\n  }\n  const evt = JSON.parse(raw.toString('utf8'));\n  if (Math.abs(Date.now() / 1000 - evt.ts) > 300) {\n    throw new Error('stale event');   // older than 5 minutes: a replay, or a clock problem\n  }\n  out.push({ json: evt });\n}\nreturn out;"
+      },
+      "name": "Check signature",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.event }}",
+                    "rightValue": "run.started",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "run.started"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.event }}",
+                    "rightValue": "run.finished",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "run.finished"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.event }}",
+                    "rightValue": "run.escalated",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "run.escalated"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.event }}",
+                    "rightValue": "mr.opened",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "mr.opened"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "name": "By event",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        480,
+        0
+      ]
+    },
+    {
+      "parameters": {},
+      "name": "On run.started",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        760,
+        -240
+      ]
+    },
+    {
+      "parameters": {},
+      "name": "On run.finished",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        760,
+        -80
+      ]
+    },
+    {
+      "parameters": {},
+      "name": "On run.escalated",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        760,
+        80
+      ]
+    },
+    {
+      "parameters": {},
+      "name": "On mr.opened",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        760,
+        240
+      ]
+    }
+  ],
+  "connections": {
+    "eph-broker events": {
+      "main": [
+        [
+          {
+            "node": "Check signature",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check signature": {
+      "main": [
+        [
+          {
+            "node": "By event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "By event": {
+      "main": [
+        [
+          {
+            "node": "On run.started",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "On run.finished",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "On run.escalated",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "On mr.opened",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {}
+}

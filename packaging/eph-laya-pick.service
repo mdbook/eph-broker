@@ -1,0 +1,22 @@
+# EXAMPLE systemd --user unit for the Laya repo-pick daemon (tools/laya_pick_daemon.py).
+# NOT installed by the RPM and NOT enabled anywhere: whether to deploy it is up to the site operator.
+#   cp packaging/eph-laya-pick.service ~/.config/systemd/user/ && systemctl --user daemon-reload
+#   systemctl --user enable --now eph-laya-pick
+# ~2.4 GB resident, ~52 s cold load (the broker's client times out and asks the ticket author meanwhile), ~4.5 s/pick on CPU.
+# Socket: ~/.eph-broker/laya-pick.sock (0600, same uid). Must match the broker's LAYA_PICK_SOCK.
+[Unit]
+Description=eph-broker Laya repo-pick daemon
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/laya-venv/bin/python /opt/eph-broker/tools/laya_pick_daemon.py serve
+Environment=LAYA_PICK_SOCK=%h/.eph-broker/laya-pick.sock
+Environment=HF_HUB_OFFLINE=1
+Restart=on-failure
+RestartSec=30
+MemoryMax=4G
+Nice=5
+
+[Install]
+WantedBy=default.target

@@ -11,6 +11,7 @@ import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 
 @contextmanager
@@ -224,10 +225,163 @@ def test_quickstart_document_links_exist():
                 assert (page.parent / link.split("#", 1)[0]).exists(), (page, link)
 
 
+def test_screenshot_demo_is_synthetic_and_read_only():
+    with _preview_directory() as state:
+        probe = r'''
+import json, os, sys
+from pathlib import Path
+from unittest.mock import patch
+from scripts import screenshots
+
+state = Path(sys.argv[1])
+os.environ.update({"BROKER_CONFIG": "/nonexistent-live-config",
+                   "DASH_INSTANCE_NAME": "must not appear",
+                   "BROKER_ACTIONS_ENABLED": "1", "FLEET_STATUS_GEN": "/must-not-run"})
+real_import = __import__
+def isolated_import(name, *args, **kwargs):
+    if name == "app":
+        assert os.environ == screenshots.demo_environment(state)
+        app = real_import(name, *args, **kwargs)
+        class Server:
+            server_address = ("127.0.0.1", 12345)
+            def __init__(self, address, handler):
+                assert address == ("127.0.0.1", 0)
+                self.handler = handler
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+            def serve_forever(self):
+                first = app.dash.snapshot(app.BROKER, cap=5)
+                assert first == app.dash.snapshot(app.BROKER, cap=5)
+                assert first["now"] == screenshots.NOW
+                assert first["instance"] == "Synthetic demo"
+                assert len(first["workers"]) == 3 and len(first["live"]) == 4
+                assert len(first["pending"]) == 1 and len(first["queue"]) == 2
+                assert first["stream_enabled"] is False
+                assert len(first["fleet"]["agents"]) == 5
+                assert not first["fleet"]["stale"] and not first["fleet"].get("error")
+                for worker in first["workers"]:
+                    assert worker["title"].startswith("Demo: ")
+                    assert 9000 <= int(worker["key"].split(":")[-1]) <= 9999
+                for agent in first["fleet"]["agents"]:
+                    assert agent["name"].startswith("demo-")
+                    assert agent["context_state"] == "ok"
+                    assert agent["model_state"] == "running"
+                    assert agent["ledger_age"] == 90
+                assert sum(a["busy"] is True for a in first["fleet"]["agents"]) == 3
+                handler = object.__new__(self.handler)
+                replies = []
+                handler._reply = lambda *args: replies.append(args)
+                handler.do_POST()
+                assert replies[0][0] == 405
+                print("synthetic snapshot verified")
+        app.ThreadingHTTPServer = Server
+        return app
+    return real_import(name, *args, **kwargs)
+
+with patch("builtins.__import__", isolated_import), \
+     patch("threading.Thread.start", side_effect=AssertionError("no background workers")):
+    screenshots.serve_demo(state)
+assert (state / "ready.json").is_file()
+'''
+        result = subprocess.run([sys.executable, "-c", probe, str(state)], cwd=ROOT,
+                                capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        assert "synthetic snapshot verified" in result.stdout
+
+
+def test_screenshot_broker_cleanup_on_capture_failure():
+    from scripts import screenshots
+    from unittest.mock import patch
+
+    processes = []
+
+    class Process:
+        def __init__(self, args, **kwargs):
+            self.state = Path(args[-1])
+            assert kwargs["env"] == screenshots.demo_environment(self.state)
+            (self.state / "ready.json").write_text("12345")
+            self.terminated = self.killed = False
+            processes.append(self)
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout=None):
+            if timeout:
+                raise subprocess.TimeoutExpired("demo", timeout)
+            assert self.killed
+
+        def kill(self):
+            self.killed = True
+
+    with patch.object(screenshots.subprocess, "Popen", side_effect=Process) as start:
+        try:
+            with screenshots.demo_broker() as origin:
+                assert origin == "http://127.0.0.1:12345"
+                process = start.call_args
+                state = Path(process.args[0][-1])
+                raise ValueError("simulated capture failure")
+        except ValueError:
+            pass
+        assert processes[0].terminated and processes[0].killed
+        assert not state.exists()
+
+
+def test_screenshot_capture_views_and_browser_cleanup():
+    from scripts import screenshots
+    from types import ModuleType
+    from unittest.mock import MagicMock, patch
+
+    api = ModuleType("playwright.sync_api")
+    api.Error = RuntimeError
+    manager = MagicMock()
+    api.sync_playwright = lambda: manager
+    playwright = manager.start.return_value
+    browser = playwright.chromium.launch.return_value
+    context = browser.new_context.return_value
+    page = context.new_page.return_value
+    page.locator.return_value.is_visible.return_value = False
+    broker = MagicMock()
+    broker.__enter__.return_value = "http://127.0.0.1:12345"
+    with _preview_directory() as output, \
+         patch.dict(sys.modules, {"playwright.sync_api": api}), \
+         patch.object(screenshots, "demo_broker", return_value=broker):
+        screenshots.capture(output)
+        options = browser.new_context.call_args.kwargs
+        assert options["viewport"] == {"width": 1400, "height": 900}
+        assert options["timezone_id"] == "UTC" and options["locale"] == "en-US"
+        assert [call.args[0] for call in page.goto.call_args_list] == [
+            "http://127.0.0.1:12345/dash.html#" + view for view in ("runs", "fleet", "now")]
+        assert [Path(call.kwargs["path"]).name for call in page.screenshot.call_args_list] == [
+            "dashboard-workers.png", "dashboard-fleet.png", "dashboard-now.png"]
+        policy = context.route.call_args.args[1]
+        route = MagicMock()
+        route.request.url = "https://example.com/must-not-load"
+        policy(route)
+        route.abort.assert_called_once()
+        route.continue_.assert_not_called()
+        route.request.url = "http://127.0.0.1:12345/state"
+        policy(route)
+        route.continue_.assert_called_once()
+        page.locator.return_value.is_visible.return_value = True
+        try:
+            screenshots.capture(output)
+            assert False, "must reject a failed render"
+        except RuntimeError as exc:
+            assert "Dashboard render failed" in str(exc)
+        assert browser.close.call_count == playwright.stop.call_count == 2
+        assert broker.__exit__.call_count == 2
+
+
 if __name__ == "__main__":
     test_source_preview_starts_without_site_overlay()
     test_image_runtime_files_are_sufficient()
     test_docker_smoke_isolated_and_cleans_up()
     test_docker_smoke_failures_report_logs_and_clean_up()
     test_quickstart_document_links_exist()
+    test_screenshot_demo_is_synthetic_and_read_only()
+    test_screenshot_broker_cleanup_on_capture_failure()
+    test_screenshot_capture_views_and_browser_cleanup()
     print("quickstart preview checks passed")

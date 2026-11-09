@@ -22,6 +22,28 @@ sh tools/check.sh
 
 This is the test gate and needs no real agents or network. Run it before you open a pull request.
 
+## Refreshing screenshots
+
+With Python Playwright and its headless Chromium already available, run:
+
+```sh
+python3 scripts/screenshots.py
+```
+
+This writes 1400x900 PNGs to `docs/images/`: `dashboard-workers.png` (Runs),
+`dashboard-fleet.png` (Fleet), and `dashboard-now.png` (Now overview). Use
+`--output DIRECTORY` for a different destination. Playwright is optional developer
+tooling, not a broker dependency; the command reports missing tooling without
+installing anything.
+
+The script starts its own read-only broker with `config/demo/broker.example.json`
+on an automatically assigned loopback port. It ignores inherited broker settings,
+uses only synthetic demo workers, tickets and agents, fixes the clock and browser
+settings, and removes its temporary state and stops its broker and browser on exit.
+It never accepts a live broker URL or starts agent processes. Review the images
+before committing them. Use the same Playwright/Chromium version for pixel-level
+comparisons across refreshes.
+
 ## Pull requests
 
 - Keep each change small and focused, and add or update a test for new behavior.

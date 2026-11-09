@@ -4050,7 +4050,9 @@ def test_worker_prompt_file_access():
             _, rendered = rp.render(mf)
             renders.append((mf, rendered))
     for mf, rendered in renders:
-        assert guidance in rendered and rendered.count("## File access by harness") == 1, mf
+        expected = (root / "modules/capabilities/inbox-file-access.md").read_text(encoding="utf-8").rstrip("\n") \
+            if mf.parent.name == "inbox" else guidance
+        assert expected in rendered and rendered.count("## File access by harness") == 1, mf
         assert "1. `Read` / `Grep` / `Glob`" not in rendered, mf
         assert "You have Read/Grep/Glob and nothing else" not in rendered, mf
         assert "**Shell is `git`" not in rendered, mf
@@ -6206,7 +6208,8 @@ def test_phase2c_manifest_is_single_class_no_vars():
     assert mf["domain"] == "inbox" and mf["class"] == "triage", mf
     assert mf["sections"] == [
         "role/ephemeral-inbox",
-        "capabilities/file-access",
+        "capabilities/inbox-file-access",
+        "scopes/inbox-rules",
         "scopes/inbox-triage",
         "capabilities/inbox-triage",
         "constraints/inbox-triage",
@@ -6291,14 +6294,14 @@ def test_phase2c_rendered_prompt_is_account_agnostic_and_fail_closed():
 @_needs("workers/inbox/triage.json")
 def test_phase2c_fleet_mail_rule_now_lives_in_runtime_posture():
     """The owner's fleet@ bullet is now RUNTIME (inbox_accounts.py's owner
-    posture), not baked into the signed prompt; it must still route fleet mail to a standing agent
+    posture), not baked into the signed prompt; it must still route fleet mail to ops
     instead of surfacing it to the owner as their own. The signed prompt must stay clear of the stale
     'interim triage owner' framing (that check stays against the signed prompt; it's a framework-level
     invariant, not an account-specific fact)."""
     posture = inbox_fact_block("owner")
     assert "fleet@example.test" in posture
     assert "fleet" in posture.lower() and "not the operator" in posture.lower()
-    assert "admin-bot@chat.example.test" in posture and "pending operator confirm" in posture.lower()
+    assert "notify ops" in posture and "pending operator confirm" not in posture.lower()
     assert "never delete" in posture.lower()
 
     rendered = open(os.path.join(ROOT, "prompts", "inbox", "triage.md"), encoding="utf-8").read()

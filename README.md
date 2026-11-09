@@ -95,6 +95,8 @@ Settings are environment variables plus a few JSON files in `config/`. Start fro
 
 ![The dashboard's worker view](docs/images/dashboard-workers.png)
 
+See [Refreshing screenshots](CONTRIBUTING.md#refreshing-screenshots) for the repeatable capture command, including the Now overview.
+
 ## Security
 
 Run it isolated, with only the repos and credentials it needs, not your everyday login. **A container around the broker does not isolate workers from broker credentials**: workers run as the broker's OS user, and tool permissions are not a sandbox. The dashboard has no built-in login, so keep it on loopback and use an authenticating reverse proxy for remote access. Read the [security model](docs/security.md) before enabling webhooks.

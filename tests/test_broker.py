@@ -635,6 +635,76 @@ def test_spawn_failure_notes_mr_and_ticket():
     ok("spawn failure: an exec failure raises WorkerSpawnFailed and is noted on the MR + ticket, not just DMed")
 
 
+def test_model_denylist_at_launch():
+    """A mixed-case route pin cannot launch, retry, or fall back; the ticket gets the refusal reason."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+    comments, launches, removed = [], [], []
+
+    class _P:
+        returncode = 0
+        def __init__(self, argv, **kw): launches.append(argv)
+        def communicate(self, input=None, timeout=None): return _good_envelope(), ""
+
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        denied = replace(_route(), repo=d, model_pin="Claude-Mythos-5.2").with_model()
+        assert denied.model == "Claude-Mythos-5.2"
+        a = CCAdapter(router=SimpleNamespace(route=lambda *args: denied),
+                      worktree_mgr=SimpleNamespace(make=lambda *args, **kw: d, remove=removed.append),
+                      prompt_loader=SimpleNamespace(load=lambda *args: "SYS"),
+                      envelope_parser=EnvelopeParser(), alert_ops=lambda *args, **kw: None,
+                      ticket_fetcher=lambda tid: "**title:** guard test\n**done:** false\n")
+        a._tracker_comment = lambda ref, body, run_id: comments.append(body)
+        key = "vikunja:task:9377"
+        with patch.object(site_env, "CONFIG", {"model_denylist": ["mythos"]}), \
+                patch.object(cc.subprocess, "Popen", _P), \
+                patch.object(cc, "USAGE_CAP_FALLBACK_ENABLED", True), \
+                patch.object(a, "_usage_cap_chain", return_value=["", "fallback"]):
+            a._run_worker(key, {"task_id": 9377, "n_events": 1}, "deny-test")
+            assert launches == [], "a denied model must never reach Popen, even via fallback"
+            assert len(comments) == 1 and "model_denylist" in comments[0] and "Claude-Mythos-5.2" in comments[0]
+            assert removed == [key]
+            normal = replace(denied, model_pin="sonnet").with_model()
+            assert a._one_turn(Worker(key, "normal", d), normal, "SYS", "P", False)
+            assert len(launches) == 1 and "sonnet" in launches[0]
+            # Check the final backend recipe and env, not just the earlier Route.model value.
+            variants = [(normal, ("Claude-Mythos-5.2", {}, None)),
+                        (replace(normal, env={"ANTHROPIC_DEFAULT_SONNET_MODEL": "Claude-Mythos-5.2"}),
+                         (None, {}, None))]
+            for route, recipe in variants:
+                route = replace(route, backend="claude")
+                with patch.object(cc, "load_backend", return_value=recipe):
+                    try:
+                        a._one_turn(Worker(key, "override", d), route, "SYS", "P", False)
+                        raise AssertionError("final backend/env model must be denied")
+                    except site_env.ModelDenied:
+                        pass
+            assert len(launches) == 1
+            refs = []
+            a._tracker_comment = lambda ref, body, run_id: refs.append((ref, body))
+            a._note_spawn_failure("gitlab:group/app#9377", "deny-test", None,
+                                  site_env.ModelDenied("model_denylist refuses restricted model"))
+            assert len(refs) == 1 and refs[0][0] == "gitlab:group/app#9377" and "model_denylist" in refs[0][1]
+    ok("model_denylist: mixed-case pin rejected at launch with ticket comment and no fallback; normal model "
+       "launches; final backend/env overrides cannot bypass policy")
+
+
+def test_model_denylist_passed_to_tfa_launcher():
+    import app as A
+    for denylist in (["Restricted", "other-family"], []):
+        b = A.Broker()
+        with patch.object(site_env, "CONFIG", {"model_denylist": denylist}), \
+                patch.object(A, "_live_tfa_session", return_value=False), \
+                patch.object(b.adapter, "tracker", return_value=None), \
+                patch.object(A.threading, "Thread"), \
+                patch.object(A.subprocess, "Popen") as launch:
+            b._launch_tfa("vikunja:task:9377", {})
+            launch.assert_called_once()
+            assert launch.call_args.kwargs["env"]["BROKER_MODEL_DENYLIST"] == ",".join(denylist)
+        assert "vikunja:task:9377" in b._tfa_launched
+    ok("model_denylist: external TFA launch proceeds with comma-joined policy in its scrubbed env")
+
+
 def test_backend_resolution_and_argv():
     # A route may run its worker on a non-default inference backend (deepseek/glm) resolved from the shared
     # /etc/site/spawn-models.json. Hermetic: temp registry + temp env with a SENTINEL token, so the real secret

@@ -122,6 +122,30 @@ def test_yaml_and_json_read_the_same():
     ok("a .yaml and a .json config with the same content read the same")
 
 
+def test_model_denylist_config():
+    with tempfile.TemporaryDirectory() as d:
+        for invalid in ("family", {}, [1], [""], ["   "], None):
+            path = _write(d, "deny.json", json.dumps({"model_denylist": invalid}))
+            try:
+                site_env.read_config(path)
+                raise AssertionError(f"accepted invalid model_denylist: {invalid!r}")
+            except site_env.BrokerConfigError:
+                pass
+        for valid in ([], ["restricted-family", "other.model"]):
+            doc = {"model_denylist": valid}
+            assert site_env.read_config(_write(d, "deny.json", json.dumps(doc))) == doc
+    with patched_config({"model_denylist": ["other.model"]}):
+        site_env.require_model_allowed("OTHERxMODEL")  # literal substring, not a regex
+        try:
+            site_env.require_model_allowed("prefix-OTHER.MODEL-v2")
+            raise AssertionError("case-insensitive substring must refuse")
+        except site_env.ModelDenied:
+            pass
+    with patched_config({}):
+        site_env.require_model_allowed("any-model")
+    ok("model_denylist: validates lists, literal case-insensitive matching, unrestricted when omitted")
+
+
 def _uncomment(text, key):
     """The commented-out `# key:` block of the example, uncommented, as YAML text."""
     lines = text.splitlines()
@@ -140,6 +164,7 @@ def test_example_matches_the_shipped_json_defaults():
     import yaml
     path = os.path.join(ROOT, "config", "broker.example.yaml")
     ex = site_env.read_config(path)
+    assert ex["model_denylist"] == []
     for name in ("constraints", "windows"):
         with open(os.path.join(ROOT, "config", f"{name}.json")) as f:
             want = {k: v for k, v in json.load(f).items() if not k.startswith("_")}

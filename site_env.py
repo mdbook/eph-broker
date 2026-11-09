@@ -14,13 +14,17 @@ SITE_ENV = os.getenv("BROKER_SITE_ENV") or os.path.join(_HERE, "config", "site.e
 BROKER_CONFIG = os.getenv("BROKER_CONFIG") or os.path.join(_HERE, "config", "broker.yaml")
 # Top-level keys of broker.yaml. `settings` feeds the environment; every other key is the content of the
 # config/<key>.json file it replaces (routes: the rows list), except `capabilities` (routing.load_site_capabilities),
-# which has no file. Anything else is a typo and stops the broker.
+# which has no file, and `model_denylist` (the launch policy). Anything else is a typo and stops the broker.
 SECTIONS = frozenset({"settings", "routes", "capabilities", "constraints", "windows", "provenance", "inbox-accounts",
-                      "zulip-wake", "cd-tier", "deploy-paths", "pool-vikunja-ids"})
+                      "zulip-wake", "cd-tier", "deploy-paths", "pool-vikunja-ids", "model_denylist"})
 
 
 class BrokerConfigError(ValueError):
     """broker.yaml is present but invalid. Raised at import, so the broker refuses to start."""
+
+
+class ModelDenied(ValueError):
+    """The final launch model is forbidden by site policy. Never retry on another model."""
 
 
 def _yaml_load(text):
@@ -94,6 +98,9 @@ def read_config(path=None):
     empty = sorted(k for k, v in doc.items() if v is None)
     if empty:   # `constraints:` with nothing under it would otherwise fall back to the json file silently
         raise BrokerConfigError(f"{path}: section(s) {empty} are empty; remove them or fill them in")
+    denylist = doc.get("model_denylist", [])
+    if not isinstance(denylist, list) or any(not isinstance(s, str) or not s.strip() for s in denylist):
+        raise BrokerConfigError(f"{path}: model_denylist must be a list of non-empty strings")
     try:        # plain data only, so every later copy (section()) can't fail: YAML reads 2026-10-18 as a date
         return json.loads(json.dumps(doc))
     except (TypeError, ValueError) as e:
@@ -135,6 +142,24 @@ def section(name, config=None):
         raise KeyError(name)
     doc = CONFIG if config is None else config
     return json.loads(json.dumps(doc[name])) if name in doc else None
+
+
+def require_model_allowed(model, env=None):
+    """Last-launch guard for every harness: case-insensitive literal substrings, empty = no restriction.
+    CC can remap aliases and auxiliary calls through its final environment, so check those model ids too.
+    Read the startup config, like routes; changing the policy requires a broker restart.
+    """
+    denylist = CONFIG.get("model_denylist", [])
+    candidates = [("model", model)]
+    for key, value in (env or {}).items():
+        if key in ("ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL") or (
+                key.startswith("ANTHROPIC_DEFAULT_") and key.endswith("_MODEL")):
+            candidates.append((key, value))
+    for source, value in candidates:
+        for denied in denylist:
+            if value and denied.casefold() in str(value).casefold():
+                raise ModelDenied(f"model_denylist refuses {source} {value!r} (matches {denied!r}); "
+                                  "no worker launched, no model fallback (fail-closed)")
 
 
 def load(path=SITE_ENV):

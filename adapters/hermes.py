@@ -858,6 +858,7 @@ class HermesHarness:
             self._check_interpreter(env, worker.worktree)
         worker.turn_wall_clock = wall_clock_s
         worker.kill_group = True                           # teardown kills the process group, not just the pid
+        _cc.site_env.require_model_allowed(model)
         _cc.record_launch(worker, model, backend, "hermes")   # dash Worker view: the model this process gets
         worker.in_turn = True
         worker.turn_started = time.time()

@@ -48,6 +48,7 @@ import repo_catalog  # Repo catalog (GitLab listing + clones) behind REPO_INFER_
 import repo_infer    # Repo inference ladder (name match, then Laya, then 4B, then ask)
 import write_grant   # Deterministic infra live-write grants (mcp-rw.sh) + their journal audit lines
 import repo_companions
+import site_env
 from prompts import PromptNotApproved   # mr-review quick-tier prompt soft-fallback (see the load() try/except)
 
 log = logging.getLogger("eph-broker.cc")
@@ -2749,7 +2750,7 @@ class CCAdapter(Adapter):
                 log.warning("mr tier-skip ticket comment failed task_id=%s run_id=%s: %s", task_id, run_id, e)
 
     def _note_spawn_failure(self, key, run_id, mr, err):
-        """The worker binary could not be exec'd (WorkerSpawnFailed): no worker ran, so no verdict / envelope
+        """The worker could not start (exec failure or model policy): no worker ran, so no verdict / envelope
         will ever be posted. Say so on the MR (mr-review) and on the source ticket, on top of the alert DM
         _run_worker already sends. Neutral wording: NOT a PASS or a BLOCK. Never raises."""
         why = html.escape(str(err))
@@ -2771,9 +2772,15 @@ class CCAdapter(Adapter):
                 except Exception as e:                     # never let a poster failure wedge the worker
                     log.warning("spawn-failed ticket comment failed task_id=%s run_id=%s: %s", task_id, run_id, e)
             return
-        self._post_ticket_note(key, (
-            f"<p><b>Worker failed to start:</b> <code>{why}</code>. No worker ran, so there is no result; "
-            "ops has been notified and must re-trigger once fixed.</p>"), run_id)
+        # Model-policy refusals belong on any source tracker, not just the operator's Vikunja ticket.
+        ref = tickets.ref_from_key(key) if isinstance(err, site_env.ModelDenied) else _ops_ref(key)
+        if ref is not None:
+            try:
+                self._tracker_comment(ref, (
+                    f"<p><b>Worker failed to start:</b> <code>{why}</code>. No worker ran, so there is no result; "
+                    "ops has been notified and must re-trigger once fixed.</p>"), run_id)
+            except Exception as e:
+                log.warning("spawn-failed ticket comment failed ref=%s run_id=%s: %s", ref, run_id, e)
 
     # ---- MR-reviewer: post the review verdict as an MR note (the reviewer posts nothing itself) ----
     def _post_mr_verdict(self, mr, run_id, env, harness="cc"):
@@ -4083,7 +4090,7 @@ class CCAdapter(Adapter):
         except Exception as e:                           # a worker failure must never wedge the broker
             log.exception("worker key=%s run_id=%s failed: %s", key, run_id, e)
             self._alert_ops(f"worker {key} run_id={run_id} failed: {e}", subject=f"worker:{key}")
-            if isinstance(e, WorkerSpawnFailed):         # the worker never ran: say so where the author looks
+            if isinstance(e, (WorkerSpawnFailed, site_env.ModelDenied)):  # no worker ran: tell the author
                 if mr_review is not None:
                     review_skipped = True                # no review ran -> re-armable, like a diff-unavailable skip
                 self._note_spawn_failure(key, run_id, mr_review, e)
@@ -4674,6 +4681,7 @@ class CCAdapter(Adapter):
         log.info("spawn key=%s capability=%s backend=%s local=%s effective wall-clock=%ss",
                  worker.key, capability, _backend or "claude", local_turn, wall_clock_s)
         worker.turn_wall_clock = wall_clock_s            # the liveness backstop scales with it (turn_deadline_extra)
+        site_env.require_model_allowed(eff_model, env)
         record_launch(worker, eff_model, _backend, "cc")  # dash Worker view: the model this process gets
         worker.in_turn = True                            # turn-completion signal (liveness consumer)
         worker.turn_started = time.time()                # force-close timing (turn_age)

@@ -1006,6 +1006,27 @@ def test_codex_infra_general_ssh_config():
     _check_codex_ssh_config(R._INFRA_GENERAL_ROW)
 
 
+def test_codex_model_denylist_at_launch():
+    with tempfile.TemporaryDirectory() as d, _Codex(d):
+        wt = _git_repo(os.path.join(d, "wt"))
+        a = _adapter(d)
+        w = Worker("vikunja:task:9377", "deny-test", wt)
+        policy, roots = X.gate_policy("code", wt, "pytest"), X.git_writable_roots(wt)
+        # Route.model is not Codex's final model: the registry / CODEX_BACKEND resolves it.
+        with patch.object(CC.site_env, "CONFIG", {"model_denylist": ["GPT-TEST"]}), \
+                patch.object(X, "gate_policy", return_value=policy), \
+                patch.object(X, "git_writable_roots", return_value=roots), \
+                patch.object(a.codex, "_install_gate"), patch.object(X.subprocess, "Popen") as launch:
+            try:
+                a._one_turn(w, _route(), "SYS", "P", resume=False)
+                raise AssertionError("Codex final model must be denied")
+            except CC.site_env.ModelDenied:
+                pass
+            launch.assert_not_called()
+        assert not w.in_turn and w.model is None
+    ok("codex: denylist checks final registry model immediately before worker launch")
+
+
 def test_codex_happy_path_and_resume():
     with tempfile.TemporaryDirectory() as d, _Codex(d) as c:
         wt = _git_repo(os.path.join(d, "wt"))

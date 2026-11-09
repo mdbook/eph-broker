@@ -1111,6 +1111,7 @@ class CodexHarness:
         argv = build_argv(self.codex_bin, model, sandbox, resume_session)
         worker.turn_wall_clock = wall_clock_s
         worker.kill_group = True
+        _cc.site_env.require_model_allowed(model)
         _cc.record_launch(worker, model, backend, "codex")   # dash Worker view: the model this process gets
         worker.in_turn = True
         worker.turn_started = time.time()

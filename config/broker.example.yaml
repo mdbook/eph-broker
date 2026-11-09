@@ -3,6 +3,10 @@
 # BROKER_CONFIG path ending in .json is read as JSON, so you don't need PyYAML for that.
 # An unknown section, a repeated key or a parse error stops the broker at startup.
 
+# Case-insensitive literal substrings forbidden in final worker model ids. Empty = unrestricted.
+# Checked at launch for every harness, including backend/env model remapping. Restart after changes.
+model_denylist: []
+
 # Environment settings, the same keys as config/site.example.env. The real environment wins over these,
 # and these win over site.env. Values are strings, numbers or true/false (true becomes "1"). Quote anything
 # YAML might read as something else (on, off, 0755). Read at startup, so restart after changing them.

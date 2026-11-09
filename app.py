@@ -1499,6 +1499,8 @@ class Broker:
                                for k in ("SPAWN_MODELS_JSON", "VLLM_ENV", "SPAWN_SH")
                                if k in os.environ}
             tfa_env = scrub_worker_env(os.environ, route_env=tfa_passthrough)
+            # The external launcher must enforce this policy on its own final resolved model.
+            tfa_env["BROKER_MODEL_DENYLIST"] = ",".join(site_env.section("model_denylist") or [])
             # detached: spawn.sh backgrounds a tmux session and returns; don't block the ingest thread.
             # stdout is PIPEd so _tfa_self_assign can read the leased pool handle off it.
             proc = subprocess.Popen([SPAWN_SH, *([f"--{backend}"] if backend else []), cwd, kickoff], env=tfa_env,
@@ -1510,6 +1512,9 @@ class Broker:
             log.info("TFA LAUNCH key=%s backend=%s cwd=%s task=%s", key, backend, cwd, task_id)
         except Exception as e:
             log.exception("TFA launch failed key=%s: %s", key, e)
+            if isinstance(e, site_env.ModelDenied):
+                self._tfa_launched.pop(key, None)
+                self.adapter._note_spawn_failure(key, f"tfa-{task_id}", None, e)
             if self.state:
                 self._tfa_launched.pop(key, None)
                 raise StateError("TFA launch failed; intake retained for reconciliation") from e

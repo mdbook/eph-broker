@@ -76,6 +76,16 @@ The [first merge request checklist](docs/first-merge-request.md) walks through e
 
 Settings are environment variables plus a few JSON files in `config/`. Start from the examples (`config/site.example.env`, `config/provenance.example.json`) and keep secrets out of `site.env` and git.
 
+Set top-level `model_denylist: ["restricted-family"]` in `broker.yaml` (see
+[`config/broker.example.yaml`](config/broker.example.yaml)) to forbid model ids containing any listed
+case-insensitive literal substring. The default is `[]`. Restart after changing it. Every worker harness
+checks the final resolved model immediately before launch, after route pins, mode/backend selection and
+environment remapping. A match refuses the launch and comments the ticket with the reason, without
+silently falling back to another model. External TFA launchers receive the comma-joined list in
+`BROKER_MODEL_DENYLIST` (empty when unrestricted). They must enforce the same case-insensitive literal
+substring policy on their final resolved model and refuse matching launches without silently falling
+back to another model. Invalid lists stop broker startup.
+
 | What | Where |
 |---|---|
 | Every environment variable and its default | [docs/settings.md](docs/settings.md) |

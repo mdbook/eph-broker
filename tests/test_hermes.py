@@ -269,6 +269,26 @@ def test_unknown_adapter_fails_closed():
     ok("hermes: unknown adapter fails closed at load (Route) and at spawn (_one_turn)")
 
 
+def test_hermes_model_denylist_at_launch():
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as d, _Registry(d):
+        a = _adapter(d, envelope_parser=EnvelopeParser())
+        w = Worker("vikunja:task:9377", "deny-test", d)
+        policy = H.gate_policy("mr-review", d)
+        with patch.object(CC.site_env, "CONFIG", {"model_denylist": ["FAKE-MODEL"]}), \
+                patch.object(H, "gate_policy", return_value=policy), \
+                patch.object(a.hermes, "_install_gate", return_value="probe"), \
+                patch.object(H.subprocess, "Popen") as launch:
+            try:
+                a._one_turn(w, _route(), "SYS", "P", resume=False)
+                raise AssertionError("Hermes final model must be denied")
+            except CC.site_env.ModelDenied:
+                pass
+            launch.assert_not_called()
+        assert not w.in_turn and w.model is None
+    ok("hermes: denylist checks final backend model immediately before worker launch")
+
+
 def test_hermes_big_prompt_rides_stdin_no_e2big():
     """A >200 KiB brief (an mr-review diff) goes through the REAL hermes argv builder and a REAL exec on
     stdin; no argv string nears MAX_ARG_STRLEN (128 KiB), so the spawn cannot die with E2BIG."""

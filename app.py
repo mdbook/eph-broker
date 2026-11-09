@@ -1782,6 +1782,8 @@ class Handler(BaseHTTPRequestHandler):
             return actions.whoami(self)
         if path == "/actions/settings":
             return actions.settings_view(self)
+        if path.startswith("/actions/rerun/"):
+            return actions.rerun_view(self, BROKER, path[len("/actions/rerun/"):])
         if path == "/dash.html":
             b = dash.module_page([dict(name=n, label=m.config["label"], child=bool(m.config["cmd"]))
                                   for n, m in host.modules.items() if modhost.allowed(self.headers, m)[0]]

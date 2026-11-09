@@ -757,6 +757,16 @@ PAGE = r"""<!DOCTYPE html>
             font-size:14px;padding:0 8px;max-width:100%}
   .pick-sel.num{width:84px}
   .pick-sel.set{border-color:var(--brand)}
+  .control-label{display:block;font-size:12px;color:var(--t2);margin-bottom:4px}
+  .rerun{flex-basis:100%;min-width:0}
+  .rerun-controls{display:flex;align-items:flex-end;gap:8px}
+  .rerun-controls label{flex:1 1 auto;min-width:0}
+  .rerun-controls select{width:100%;min-width:0;text-overflow:ellipsis}
+  .rerun-controls .btn{flex:none}
+  .rerun .sub{margin-top:6px}
+  .run-search{margin-left:auto}
+  .msg label{flex:1;min-width:0}
+  .msg textarea{width:100%}
   .toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:50;max-width:min(520px,90vw);padding:10px 16px;border-radius:10px;
          background:var(--t1);color:var(--s1);font-size:14px;font-weight:600;box-shadow:var(--shadow)}
   .toast.bad{background:var(--red);color:#fff}
@@ -1080,12 +1090,11 @@ PAGE = r"""<!DOCTYPE html>
     .set-tbl tr{grid-template-columns:1fr 1fr;gap:6px 12px}
     .set-tbl td:first-child{grid-column:1 / -1}
     .set-tbl .pick-sel:not(.num){width:100%}
-    .set-tbl td[data-l]::before{content:attr(data-l);display:block;font-size:12px;color:var(--t3);margin-bottom:2px}
     .ag .meter{width:100%}
     .ag .role{max-width:none}
     .qhead,.qrow,.qmore,.side{padding-left:16px;padding-right:16px}
     .bars > div{padding:10px 16px;grid-template-columns:90px minmax(0,1fr) 32px}
-    .bar .search{width:100%;margin-left:0}
+    .run-search,.bar .search{width:100%;margin-left:0}
     .conv-h{padding:10px 12px}
     .tl{padding:12px 12px 20px}
     .err-banner{margin:12px 12px 0}
@@ -1102,7 +1111,7 @@ PAGE = r"""<!DOCTYPE html>
   </nav>
   <div class="top-r">
     <a class="chip wait pause" id="paused" href="#queue" hidden>New runs paused</a>
-    <button class="btn sq" id="theme" title="Theme: auto" aria-label="Theme: auto">◐</button>
+    <button class="btn" id="theme" title="Theme: auto" aria-label="Theme: auto">Theme: auto</button>
   </div>
 </div></header>
 
@@ -1128,7 +1137,8 @@ PAGE = r"""<!DOCTYPE html>
 <section id="v-runs" hidden>
   <div class="ph"><h1>Runs</h1><span class="upd"></span></div>
   <div class="bar"><div class="seg" id="r-seg" role="group" aria-label="Filter runs"></div>
-    <input class="search" id="r-q" type="search" placeholder="Search tickets or titles" aria-label="Search runs"></div>
+    <label class="run-search"><span class="control-label">Search runs</span>
+      <input class="search" id="r-q" type="search" placeholder="Search tickets or titles" aria-label="Search runs"></label></div>
   <div class="cols">
     <div class="card"><table class="tbl" id="r-tbl"><thead><tr><th>Run</th><th>Status</th><th>Model</th><th>Started</th><th>Time</th><th class="r">Tokens</th></tr></thead>
       <tbody id="r-rows"></tbody></table><div class="tfoot" id="r-foot"></div></div>
@@ -1164,7 +1174,7 @@ PAGE = r"""<!DOCTYPE html>
       <tbody id="f-rows"></tbody></table>
       <div class="legend">Context bar: the tick is the agent's clear floor. Blue under it, amber past it, red past the ceiling.</div></div>
   </div>
-  <div class="sec" id="s-w" hidden><h2>Worker settings</h2>
+  <div class="sec" id="s-w" hidden><h2 id="settings">Worker settings</h2>
     <p class="sub" id="s-sub">Applies to new runs. Running work keeps the model it started with. Blue outline = changed here; Default puts it back.</p>
     <div class="card"><table class="tbl set-tbl"><thead><tr><th>Row</th><th class="m-hide">Harness</th><th>Backend</th><th>Model</th></tr></thead>
       <tbody id="s-rows"></tbody></table></div>
@@ -1183,8 +1193,9 @@ PAGE = r"""<!DOCTYPE html>
         <div class="seg" role="group" aria-label="Transcript detail"><button id="cv" aria-pressed="true">Conversation</button><button id="hr" aria-pressed="false"
           title="Also show behind-the-scenes steps and technical run details">Everything<b id="hr-n">0</b></button></div></div>
       <div class="tl" id="sv-log"></div>
-      <form class="msg" id="d-msg" hidden><textarea id="d-msg-t" rows="1" maxlength="4000" aria-label="Message this run"
-        placeholder="Message this run. Enter to send, Shift+Enter for newline."></textarea><button class="btn pri">Send</button></form>
+      <form class="msg" id="d-msg" hidden><label><span class="control-label">Message this run</span>
+        <textarea id="d-msg-t" rows="1" maxlength="4000" aria-label="Message this run"
+        placeholder="Message this run. Enter to send, Shift+Enter for newline."></textarea></label><button class="btn pri">Send</button></form>
     </div>
     <aside>
       <div class="card side" id="d-stats"></div>
@@ -1234,7 +1245,7 @@ function applyTheme(t){
   if(t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
   else delete document.documentElement.dataset.theme;
   const [ic, lb] = t === 'light' ? ['☀', 'Light'] : t === 'dark' ? ['☾', 'Dark'] : ['◐', 'Auto'];
-  $('theme').textContent = ic;
+  $('theme').textContent = ic + ' Theme: ' + lb;
   $('theme').title = 'Theme: ' + lb;
   $('theme').setAttribute('aria-label', 'Theme: ' + lb + '. Click to change.');
 }
@@ -1673,12 +1684,14 @@ function runCard(r, inView){
     .concat(showHarness ? [['Backend', w.backend], ['Steps', w.items], ['Session', r.past || w.session]] : [])
     .filter(p => p[1] !== null && p[1] !== undefined && p[1] !== '');
   const open = !inView && r.grp !== 'waiting'
-    ? '<button class="btn pri" data-key="' + esc(r.key) + '"' + (r.past ? ' data-past="' + esc(r.past) + '"' : '') + '>'
+    ? '<button class="btn' + (r.past ? '' : ' pri') + '" data-key="' + esc(r.key) + '"' + (r.past ? ' data-past="' + esc(r.past) + '"' : '') + '>'
       + (r.past ? 'Open transcript' : 'Watch live') + '</button>' : '';
   const ctl = !can ? '' : r.live ? actBtn('Cancel run', 'cancel', {subject_key: r.key}, {bad: true, done: 'Cancelled ' + nm.ref,
       confirm: 'Cancel ' + nm.ref + '? The worker stops now and the ticket will not start again on its own.'})
     : r.grp === 'finished' && tid(r.key) && !(lastState && lastState.live.some(l => l.key === r.key))
-      ? modelPick(r.key) + actBtn('Run again', 'rerun', {task_id: Number(tid(r.key))}, {done: 'Queued ' + nm.ref + ' to run again', pickFor: r.key}) : '';
+      ? '<div class="rerun"><div class="rerun-controls">' + modelPick(r.key)
+        + actBtn('Run again', 'rerun', {task_id: Number(tid(r.key))}, {done: 'Queued ' + nm.ref + ' to run again', pickFor: r.key})
+        + '</div>' + rerunHint(r.key) + '</div>' : '';
   return (inView ? '<h3>Run</h3>' : '<div class="ref">' + esc(nm.ref) + '</div><h3>' + esc(nm.title || nm.ref) + '</h3>')
     + '<dl class="kv">' + kv.map(([k, v]) => '<dt>' + esc(k) + '</dt><dd>' + esc(v) + '</dd>').join('') + '</dl>'
     + (open || url || ctl ? '<div class="acts">' + open + (url ? '<a class="btn" href="' + esc(url) + '" target="_blank" rel="noopener">Open ticket</a>' : '') + ctl + '</div>' : '');
@@ -2906,6 +2919,7 @@ async function explainClose(key, past){
 // ---- actions: POST /actions/<verb> (actions.py). Drawn only when GET /actions says this viewer may act.
 let can = false, settings = null;
 const rerunModel = {};       // subject key -> model picked for "Run again" (survives the 5-second repaint)
+const rerunOptions = new Map(); // current ticket row, not the row/model of a historical session
 async function loadCan(){
   try{ const r = await fetch('/actions', {cache:'no-store'}); can = r.ok && (await r.json()).allowed === true; }catch(e){ can = false; }
   if(can) await loadSettings();
@@ -2924,11 +2938,41 @@ function picking(id){
   const a = document.activeElement;
   return !!(a && a.matches('[data-rr]') && $(id).contains(a));
 }
+function rerunBlocked(key){
+  const o = rerunOptions.get(key), pick = rerunModel[key];
+  return !!(pick && (!o || o.loading || o.error || o.pinned || !settings || !settings.models.includes(pick)));
+}
 function modelPick(key){
   if(!settings) return '';
-  return '<select class="pick-sel' + (rerunModel[key] ? ' set' : '') + '" data-rr="' + esc(key) + '" aria-label="Model for this one run">'
-    + '<option value="">Usual model</option>' + settings.models.map(m => '<option' + (m === rerunModel[key] ? ' selected' : '') + '>'
-    + esc(m) + '</option>').join('') + '</select>';
+  let o = rerunOptions.get(key);
+  if(!o || (!o.loading && Date.now() - o.at > 15000)){
+    o = {loading: true, at: Date.now()}; rerunOptions.set(key, o);
+    loadRerunOptions(key, o);
+  }
+  const ready = !o.loading && !o.error, disabled = !ready || o.pinned;
+  return '<label><span class="control-label">Run again on:</span><select class="pick-sel' + (rerunModel[key] ? ' set' : '')
+    + '" data-rr="' + esc(key) + '" aria-label="Run again on"' + (disabled ? ' disabled' : '') + '>'
+    + '<option value="">' + esc(ready ? 'Row default (' + o.model + ')' : o.loading ? 'Loading current row…' : 'Model unavailable') + '</option>'
+    + (rerunBlocked(key) ? '<option selected>' + esc(rerunModel[key]) + '</option>' : '')
+    + (ready && !o.pinned ? settings.models.map(m => '<option' + (m === rerunModel[key] ? ' selected' : '') + '>'
+      + esc(m) + '</option>').join('') : '') + '</select></label>';
+}
+async function loadRerunOptions(key, o){
+  try{
+    const r = await fetch('/actions/rerun/' + encodeURIComponent(tid(key)), {cache:'no-store'});
+    const j = await r.json();
+    Object.assign(o, r.ok ? j : {error: j.error || 'Could not read the current row.'});
+  }catch(e){ o.error = 'Could not read the current row.'; }
+  o.loading = false; o.at = Date.now();
+  if(lastState) paint(lastState);
+}
+function rerunHint(key){
+  const o = rerunOptions.get(key);
+  return '<p class="sub">' + (!o || o.loading ? 'Checking the current row before offering a model override.'
+    : o.error ? esc(o.error) : o.pinned ? esc('This row (' + o.row + ') is pinned to ' + o.model + '; change it in ')
+      + '<a href="#fleet" data-settings>Settings</a>.' : 'One-run override only. Row default follows current routing and ticket labels.')
+    + (rerunBlocked(key) ? ' Selected override ' + esc(rerunModel[key]) + ' cannot be used until validated. '
+      + '<button class="lnk" data-rerun-default="' + esc(key) + '">Use row default</button>' : '') + '</p>';
 }
 function paintSettings(){
   const s = settings;
@@ -2940,28 +2984,30 @@ function paintSettings(){
     : s.rejected ? 'The routing overrides file on disk is invalid, so the broker is using its last good copy. Fix the file by hand before editing here.'
     : 'Applies to new runs. Running work keeps the model it started with. Blue outline = changed here; Default puts it back.';
   $('s-rows').innerHTML = s.rows.map(r => {
-    const sel = (f, list, dflt) => '<select class="pick-sel' + (r.overridden.includes(f) ? ' set' : '') + '"' + off
+    const sel = (f, list, dflt) => '<label><span class="control-label">' + (f === 'backend' ? 'Backend' : 'Model')
+      + '</span><select class="pick-sel' + (r.overridden.includes(f) ? ' set' : '') + '"' + off
       + ' data-set-row="' + esc(r.row) + '" data-field="' + f + '" aria-label="' + esc(r.row + ' ' + (f === 'backend' ? 'backend' : 'model')) + '">'
-      + opts(list, r.overridden.includes(f) ? r[f] : null, dflt) + '</select>';
+      + opts(list, r.overridden.includes(f) ? r[f] : null, dflt) + '</select></label>';
     return '<tr><td><div class="t">' + esc(r.row) + '</div></td><td class="m-hide">' + esc(HARNESS[r.adapter] || r.adapter) + '</td>'
       + '<td data-l="Backend">' + sel('backend', backends, r.default_backend || 'by fleet mode') + '</td>'
       + '<td data-l="Model">' + sel('model_pin', s.models, r.default_model_pin || 'by fleet mode') + '</td></tr>';
   }).join('');
   $('s-caps').innerHTML = s.groups.map(g => '<tr><td><div class="t">' + esc(g.group) + '</div></td><td>'
-    + '<input class="pick-sel num' + (g.overridden ? ' set' : '') + '" type="number" min="0" step="1" inputmode="numeric"' + off
-    + ' data-cap="' + esc(g.group) + '" value="' + esc(g.cap ?? '') + '" placeholder="No cap" aria-label="' + esc('Max at once for ' + g.group) + '">'
+    + '<label><span class="control-label">Max at once</span><input class="pick-sel num' + (g.overridden ? ' set' : '') + '" type="number" min="0" step="1" inputmode="numeric"' + off
+    + ' data-cap="' + esc(g.group) + '" value="' + esc(g.cap ?? '') + '" placeholder="No cap" aria-label="' + esc('Max at once for ' + g.group) + '"></label>'
     + (g.overridden ? ' <button class="lnk" data-cap-reset="' + esc(g.group) + '">Default</button>' : '') + '</td></tr>').join('');
 }
 async function saveSetting(body, done){
   const r = await fetch('/actions/settings', {method: 'POST', cache: 'no-store', body: JSON.stringify(body),
     headers: {'Content-Type': 'application/json', 'X-Broker-Action': '1'}}).catch(e => null);
   const j = r ? await r.json().catch(() => ({})) : {};
-  if(r && r.ok && j.settings){ settings = j.settings; toast(done); }
+  if(r && r.ok && j.settings){ settings = j.settings; rerunOptions.clear(); toast(done); }
   else {
     if(r && (r.status === 403 || r.status === 404)) can = false;
     toast(j.error || 'Failed: ' + (r ? 'HTTP ' + r.status : 'network error'), true);
   }
   paintSettings();
+  if(lastState) paint(lastState);
 }
 $('s-rows').addEventListener('change', e => {
   const t = e.target.closest('[data-set-row]');
@@ -2997,8 +3043,9 @@ function actAttrs(verb, body, done){
   return ' data-act="' + verb + '" data-body="' + esc(JSON.stringify(body)) + '" data-done="' + esc(done) + '"';
 }
 function actBtn(label, verb, body, o){
-  return '<button class="btn' + (o.bad ? ' bad' : '') + '"' + actAttrs(verb, body, o.done)
+  return '<button class="btn' + (o.bad ? ' bad' : '') + (o.pickFor ? ' pri' : '') + '"' + actAttrs(verb, body, o.done)
     + (o.confirm ? ' data-confirm="' + esc(o.confirm) + '"' : '') + (o.pickFor ? ' data-model-key="' + esc(o.pickFor) + '"' : '')
+    + (o.pickFor && rerunBlocked(o.pickFor) ? ' disabled' : '')
     + '>' + esc(label) + '</button>';
 }
 async function act(verb, body, done){
@@ -3032,14 +3079,26 @@ $('d-msg-t').addEventListener('keydown', e => {
 document.addEventListener('click', e => {
   const a = e.target.closest('[data-act]');
   if(a){
+    const mk = a.dataset.modelKey;
+    // Guard stale controls as well as disabling the rendered button. Never drop an explicit override.
+    if(a.disabled || (mk && rerunBlocked(mk))) return;
     if(!a.dataset.confirm || confirm(a.dataset.confirm)){
       a.disabled = true;
-      const body = JSON.parse(a.dataset.body), mk = a.dataset.modelKey, pick = mk && rerunModel[mk];
+      const body = JSON.parse(a.dataset.body), pick = mk && rerunModel[mk];
       if(pick) body.model = pick;
       act(a.dataset.act, body, pick ? a.dataset.done + ' on ' + pick : a.dataset.done).then(ok => { if(ok && mk) delete rerunModel[mk]; })
-        .finally(() => { a.disabled = false; });
+        .finally(() => { a.disabled = !!(mk && rerunBlocked(mk)); });
     }
     return;
+  }
+  const reset = e.target.closest('[data-rerun-default]');
+  if(reset){
+    delete rerunModel[reset.dataset.rerunDefault];
+    if(lastState) paint(lastState);
+    return;
+  }
+  if(e.target.closest('[data-settings]')){
+    setTimeout(() => $('settings').scrollIntoView({block: 'start'}), 0);
   }
   const s = e.target.closest('[data-seg]');
   if(s){

@@ -42,6 +42,8 @@ import hmac, json, logging, os, re, threading, time
 import events
 import notify
 import stream
+import routing
+import tickets
 from routing_overrides import OVERRIDES
 
 log = logging.getLogger("eph-broker.actions")
@@ -237,11 +239,42 @@ def whoami(handler):
     return handler._reply(200, {"enabled": True, "allowed": bool(allowed)})
 
 
-def settings_view(handler):
-    """GET /actions/settings: the Settings card's data (routing_overrides.view). Same checks as GET /actions;
-    a viewer who may not act gets 403, so backend names never reach a read-only viewer."""
+def _view_refusal(handler):
+    """Shared gate for action-only read views; never expose backend names before auth."""
     if not enabled():
-        return handler._reply(404, {"error": "not found"})
+        return 404, {"error": "not found"}
     if _duplicated(handler.headers) or not (_proxy_ok(handler.headers) and stream.authorized(handler.headers, group_var="BROKER_ACTIONS_GROUP")[0]):
-        return handler._reply(403, {"error": "not authorised"})
-    return handler._reply(200, OVERRIDES.view())
+        return 403, {"error": "not authorised"}
+    return None
+
+
+def settings_view(handler):
+    """GET /actions/settings: the Settings card's data (routing_overrides.view)."""
+    refusal = _view_refusal(handler)
+    return handler._reply(*refusal) if refusal else handler._reply(200, OVERRIDES.view())
+
+
+def rerun_view(handler, broker, task_id):
+    """GET /actions/rerun/<task_id>: the current row's default and whether a one-run pick is allowed."""
+    refusal = _view_refusal(handler)
+    if refusal:
+        return handler._reply(*refusal)
+    # Finished runs have no route stamp. Re-read the ticket, just as ops_rerun does, rather
+    # than guessing a row from its old model or harness (or exposing ticket content in /state).
+    if not re.fullmatch(r"[0-9]{1,20}", task_id):
+        return handler._reply(400, {"error": "bad task id"})
+    key = tickets.vikunja_ref(int(task_id))
+    try:
+        ticket = broker._ticket(tickets.ref_from_key(key))
+        row = (broker.adapter.repo_parked(key) or
+               routing.comment_respawn_domain(ticket.assignees, ticket.labels)) if ticket else None
+        from routing_overrides import templates
+        template = templates().get(row)
+        route = template.with_model() if template else None
+    except Exception:
+        log.warning("could not read rerun options")
+        return handler._reply(503, {"error": "Rerun model unavailable; could not read the current row."})
+    if route is None:
+        return handler._reply(404, {"error": "Rerun model unavailable; no current row."})
+    return handler._reply(200, {"row": row, "pinned": route.backend_pinned,
+                                "model": route.backend if route.backend and route.backend != "claude" else route.model})

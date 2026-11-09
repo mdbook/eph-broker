@@ -13098,6 +13098,156 @@ def test_dash_fleet_tab_ui():
     ok("dash.PAGE has a Fleet tab (mode chip, summary strip, per-agent rows, generated age) with escaped strings")
 
 
+def test_dash_rerun_options_use_current_ticket_row():
+    import actions
+    import routing as R
+    import routing_overrides as RO
+    from types import SimpleNamespace
+    replies = []
+    h = SimpleNamespace(_reply=lambda code, body: replies.append((code, body)))
+    ticket = SimpleNamespace(assignees=['dev'], labels=[])
+    b = SimpleNamespace(_ticket=lambda ref: ticket, adapter=SimpleNamespace(repo_parked=lambda key: None))
+    template = Route(domain='code', repo='/sample', prompt_class='change', agent='code', backend_from_mode=True)
+    with patch.object(actions, '_view_refusal', return_value=None), \
+            patch.object(RO, 'templates', return_value={'code': template, 'general': template}), \
+            patch.object(R, 'comment_respawn_domain', return_value='code') as classify, \
+            patch.object(RO.OVERRIDES, 'apply', side_effect=lambda t: t), \
+            patch.object(R, 'resolve_model', return_value='gpt-example'):
+        actions.rerun_view(h, b, '9610')
+        assert replies.pop() == (200, {'row': 'code', 'pinned': False, 'model': 'gpt-example'})
+        classify.assert_called_with(ticket.assignees, ticket.labels)
+        from dataclasses import replace
+        for fields, expected in (({'backend': 'sol'}, 'sol'), ({'model_pin': 'opus'}, 'opus'),
+                                 ({'backend': 'claude', 'model_pin': 'haiku'}, 'haiku')):
+            with patch.object(RO.OVERRIDES, 'apply', side_effect=lambda t: replace(t, **fields)):
+                actions.rerun_view(h, b, '9610')
+                assert replies.pop() == (200, {'row': 'code', 'pinned': True, 'model': expected})
+        b.adapter.repo_parked = lambda key: 'general'
+        actions.rerun_view(h, b, '9610')
+        assert replies.pop()[1]['row'] == 'general', 'parked row takes precedence, as in ops_rerun'
+        actions.rerun_view(h, b, 'nope')
+        assert replies.pop()[0] == 400
+        b._ticket = lambda ref: None
+        actions.rerun_view(h, b, '9610')
+        assert replies.pop()[0] == 404
+        with patch.object(b, '_ticket', side_effect=RuntimeError('private detail')):
+            actions.rerun_view(h, b, '9610')
+            code, body = replies.pop()
+            assert code == 503 and 'private detail' not in json.dumps(body)
+    # The endpoint is action-authorized BEFORE ticket/routing I/O.
+    with patch.object(actions, '_view_refusal', return_value=(403, {'error': 'not authorised'})), patch.object(b, '_ticket') as fetch:
+        actions.rerun_view(h, b, '9610')
+        fetch.assert_not_called()
+        assert replies.pop()[0] == 403
+    assert 'return actions.rerun_view(self, BROKER,' in pathlib.Path(ROOT, 'app.py').read_text()
+    ok('rerun options use current ticket/parked row, current mode and effective pins; failures reveal no content')
+
+
+def test_dash_rerun_model_controls():
+    page = dash.PAGE
+    for text in ('Run again on:', 'This row (', 'data-settings', 'class="rerun-controls"',
+                 '<span class="control-label">Search runs</span>', '<span class="control-label">Message this run</span>',
+                 '<span class="control-label">Max at once</span>'):
+        assert text in page, text
+    controls = re.search(r'\.rerun-controls\{([^}]+)\}', page).group(1)
+    assert 'display:flex' in controls and 'flex-wrap' not in controls
+    for rule in ('.rerun-controls label{flex:1 1 auto;min-width:0}',
+                 '.rerun-controls select{width:100%;min-width:0;text-overflow:ellipsis}',
+                 '.rerun-controls .btn{flex:none}'):
+        assert rule in page, rule  # Keep model + action together even at phone/panel widths.
+    node = shutil.which('node')
+    if not node:
+        SKIPPED.append('dash_rerun_model_controls: node unavailable')
+        return
+    def section(start, end):
+        return start + page.split(start, 1)[1].split(end, 1)[0]
+    js = """
+const assert = require('node:assert/strict');
+const esc = s => String(s).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('"', '&quot;');
+let settings = {models: ['sonnet', 'sol', 'opus']}, lastState = null, can = true, showHarness = false;
+const rerunModel = {}, rerunOptions = new Map(), key = 'vikunja:task:42';
+const tid = () => '42', runName = () => ({ref: 'run-a'}), ticketUrl = () => '', stamp = s => s;
+const agoT = s => s, dur = s => s, HARNESS = {};
+let paints = 0;
+const paint = () => paints++;
+"""
+    js += section('function rerunBlocked(key)', 'function paintSettings()')
+    js += section('function actAttrs(', 'async function act(')
+    js += section('function runCard(r, inView)', 'function drainHead(')
+    js += """
+let click, sent;
+const document = {addEventListener: (name, f) => {click = f;}};
+const act = (verb, body) => {sent = body; return Promise.resolve(false);};
+"""
+    js += section("document.addEventListener('click', e => {", "$('r-q').addEventListener")
+    js += """
+(async () => {
+  const current = o => rerunOptions.set(key, {at: Date.now(), ...o});
+  current({model: 'sol', pinned: true, row: 'code'});
+  let html = modelPick(key);
+  assert(html.includes('Run again on:') && html.includes(' disabled'));
+  assert(html.includes('Row default (sol)') && !html.includes('>sonnet</option>'));
+  assert(rerunHint(key).includes('pinned to sol') && rerunHint(key).includes('Settings'));
+  html = runCard({key, grp: 'finished', model: 'gpt-example'}, true);
+  assert(html.includes('rerun-controls') && html.includes('Run again</button>'));
+  assert(html.includes('class="btn pri" data-act="rerun"'), 'rerun is the primary action');
+  assert(!runCard({key, grp: 'waiting'}, true).includes('data-rr'));
+  current({model: 'gpt-example', pinned: false, row: 'code'});
+  html = modelPick(key);
+  assert(html.includes('Row default (gpt-example)') && !html.includes(' disabled'));
+  assert(!html.includes(' selected'), 'no hardcoded model override selected');
+  rerunModel[key] = 'opus';
+  assert(modelPick(key).includes('<option selected>opus</option>'));
+  current({loading: true});
+  assert(modelPick(key).includes(' disabled') && rerunModel[key] === 'opus', 'refresh preserves the pick');
+  current({model: 'gpt-example', pinned: false, row: 'code'});
+  assert(modelPick(key).includes('<option selected>opus</option>'));
+  current({error: '<unavailable>'});
+  assert(modelPick(key).includes(' disabled'));
+  assert(rerunHint(key).includes('&lt;unavailable>'));
+  assert.equal(rerunModel[key], 'opus', 'failure preserves the explicit choice');
+  for(const o of [null, {pinned: true}, {loading: true}, {error: 'offline'}, {pinned: false}]){
+    sent = null;
+    current(o); rerunModel[key] = 'opus';
+    if(!o) rerunOptions.delete(key);
+    const blocked = !o || o.pinned || o.loading || !!o.error;
+    assert.equal(rerunBlocked(key), !!blocked);
+    assert.equal(actBtn('Run again', 'rerun', {}, {pickFor: key}).includes(' disabled'), !!blocked);
+    const a = {dataset: {body: '{"task_id":42}', modelKey: key, act: 'rerun', done: 'Queued'}};
+    click({target: {closest: s => s === '[data-act]' ? a : null}});
+    if(blocked){
+      assert.equal(sent, null, 'unvalidated explicit choice must not submit ANY rerun, including the default');
+      assert.equal(rerunModel[key], 'opus');
+      assert(rerunHint(key).includes('Use row default'), 'falling back requires an explicit user action');
+    }else assert.equal(sent.model, 'opus');
+    await Promise.resolve(); await Promise.resolve();
+  }
+  current({error: 'offline'});
+  click({target: {closest: s => s === '[data-rerun-default]' ? {dataset: {rerunDefault: key}} : null}});
+  assert(!rerunModel[key] && !rerunBlocked(key), 'only an explicit reset enables the row default');
+  const a = {dataset: {body: '{"task_id":42}', modelKey: key, act: 'rerun', done: 'Queued'}};
+  click({target: {closest: s => s === '[data-act]' ? a : null}});
+  assert.deepEqual(sent, {task_id: 42});
+  settings = null;
+  assert.equal(modelPick(key), '');
+  settings = {models: ['sonnet', 'sol', 'opus']};
+  let url;
+  global.fetch = async u => {url = u; return {ok: true, json: async () => ({model: 'sol', pinned: true, row: 'code'})};};
+  const o = {loading: true}; rerunOptions.set(key, o);
+  await loadRerunOptions(key, o);
+  assert.equal(url, '/actions/rerun/42');
+  assert.equal(o.loading, false);
+  assert(modelPick(key).includes('Row default (sol)'));
+  global.fetch = async () => {throw Error('offline');};
+  await loadRerunOptions(key, o);
+  assert(modelPick(key).includes(' disabled'));
+})().catch(e => {console.error(e); process.exitCode = 1;});
+"""
+    r = subprocess.run([node, '-e', js], capture_output=True, text=True, timeout=10)
+    assert r.returncode == 0, r.stderr
+    ok('rerun controls stay grouped, use current defaults and preserve/block unvalidated explicit choices without a silent downgrade')
+
+
 def test_dash_mobile_layout():
     """<=720px is a phone app: bottom tab bar for the four views, the summary strip becomes a list, tables stack
     into rows (title line + one muted detail line) and row buttons fold into the tappable row."""

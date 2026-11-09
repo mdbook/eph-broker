@@ -29,6 +29,7 @@ import provenance
 import site_env  # noqa: F401  (loads config/site.env before the env reads below)
 import ticket_fetch
 from echo_guard import is_fleet_bot
+from broker_state import StateError
 
 log = logging.getLogger("eph-broker.mention_handoff")
 
@@ -123,15 +124,21 @@ def wants_handoff(evt, user=None):
 
 
 class MentionHandoff:
-    """Per-broker dedup (a tap retry / double delivery assigns once) + the off-ingest-thread assign call."""
+    """Mention dedup and assignment; durable callers wait under a committed dispatch intent."""
 
-    def __init__(self, assign):
+    def __init__(self, assign, state_store=None):
         self._assign = assign                         # (task_id, user_id) -> bool   (poster.assign_user)
-        self._seen = {}
+        self.state_store = state_store
+        self._seen = ({int(t): ts for t, ts in state_store.get("mention_seen", [])
+                       if time.time() - ts < DEDUP_S} if state_store else {})
         self._lock = threading.Lock()
 
-    def maybe(self, key, evt):
-        """Returns the started Thread when a handoff fires, else None. Never raises."""
+    def maybe(self, key, evt, synchronous=False):
+        """Return the thread (legacy) or True after durable assignment, else None.
+
+        Synchronous callers retain a committed dispatch intent until this returns.
+        An unknown assignment outcome raises so that intent stays held.
+        """
         try:
             tid = wants_handoff(evt)
             if tid is None:
@@ -145,14 +152,21 @@ class MentionHandoff:
                 self._seen[tid] = now
             log.info("mention handoff: %s @%s on task=%s (key=%s) -> assigning user %s",
                      evt.get("doer"), MENTION_USER, tid, key, MENTION_UID)
+            if synchronous:
+                self._run(tid, strict=True)
+                if self.state_store:
+                    self.state_store.put("mention_seen", list(self._seen.items()))
+                return True
             t = threading.Thread(target=self._run, args=(tid,), name=f"mention-handoff-{tid}", daemon=True)
             t.start()
             return t
         except Exception as e:
+            if synchronous:
+                raise StateError("mention assignment outcome unknown; retain dispatch intent") from e
             log.warning("mention handoff failed key=%s: %s", key, e)
             return None
 
-    def _run(self, tid):
+    def _run(self, tid, strict=False):
         try:
             ok = self._assign(tid, MENTION_UID)
         except Exception as e:
@@ -162,3 +176,5 @@ class MentionHandoff:
         if not ok:                                    # let a later mention retry
             with self._lock:
                 self._seen.pop(tid, None)
+            if strict:
+                raise RuntimeError("mention assignment outcome unknown; retain dispatch intent")

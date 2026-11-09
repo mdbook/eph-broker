@@ -6,7 +6,9 @@ ticket writes nothing.
 
 stdlib assert only, same runner shape as test_tickets.py.
 """
-import json, os, stat, sys, tempfile
+import json, os, stat, subprocess, sys, tempfile
+from functools import partial
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -16,8 +18,8 @@ os.environ["BROKER_CONFIG"] = os.path.join(HERE, "fixtures", "broker.test.json")
 os.environ["BROKER_PROVENANCE_PATH"] = os.path.join(HERE, "fixtures", "provenance.test.json")
 os.environ["ROUTES_PATH"] = "/nonexistent/eph-test/routes.json"
 
-# A stub mcp.sh: appends its argv to a log and answers like the bridge. Set BEFORE site_env loads (setdefault)
-# and before poster / ticket_fetch bind their mcp_sh default, so the real defaults exec the stub.
+# A stub mcp.sh: appends its argv to a log and answers like the bridge. The parity test injects it
+# explicitly: poster / ticket_fetch may already have bound their defaults in another suite's import.
 _TMP = tempfile.TemporaryDirectory()
 STUB, STUB_LOG = os.path.join(_TMP.name, "mcp.sh"), os.path.join(_TMP.name, "argv.log")
 with open(STUB, "w") as f:
@@ -36,7 +38,6 @@ if call["name"] == "vikunja_task_crud":
 print(json.dumps({{"result": {{"content": [{{"type": "text", "text": text}}] if text else []}}}}))
 """)
 os.chmod(STUB, os.stat(STUB).st_mode | stat.S_IXUSR)
-os.environ["BROKER_MCP_SH"] = STUB
 import site_env  # noqa: F401,E402
 
 import poster, ticket_fetch, tickets  # noqa: E402
@@ -98,6 +99,10 @@ def test_registry_routes_by_tracker():
     ok("Registry.get routes vikunja refs to the Vikunja tracker; gitlab/github/non-ticket keys get None")
 
 
+@patch.object(poster, "post_comment", partial(poster.post_comment, mcp_sh=STUB))
+@patch.object(poster, "apply_label", partial(poster.apply_label, mcp_sh=STUB))
+@patch.object(poster, "assign_user", partial(poster.assign_user, mcp_sh=STUB))
+@patch.object(ticket_fetch, "fetch_ticket", partial(ticket_fetch.fetch_ticket, mcp_sh=STUB))
 def test_vikunja_argv_parity():
     _argv()
     assert poster.post_comment(42, "<p>hi</p>", "run-1") is True
@@ -130,6 +135,25 @@ def test_vikunja_argv_parity():
     assert poster.post_comment("42", "<p>hi</p>", "run-1") is True and _argv() == direct[:1]
     ok("VikunjaTracker comment/label/assign/fetch exec argv IDENTICAL to poster / ticket_fetch with the int id "
        "(stub mcp.sh), directly and through CCAdapter's registry")
+
+
+def test_vikunja_argv_parity_is_import_order_independent():
+    for preload in ("", "import poster, ticket_fetch\n"):
+        probe = ("import os, sys\n"
+                 f"sys.path.insert(0, {HERE!r})\n" + preload +
+                 "import test_trackers as T\n"
+                 "before = (T.poster.post_comment, T.poster.apply_label, T.poster.assign_user, "
+                 "T.ticket_fetch.fetch_ticket)\n"
+                 "T.test_vikunja_argv_parity()\n"
+                 "assert before == (T.poster.post_comment, T.poster.apply_label, T.poster.assign_user, "
+                 "T.ticket_fetch.fetch_ticket)\n"
+                 "assert os.environ['BROKER_MCP_SH'] == '/nonexistent/eph-test/mcp.sh'\n")
+        env = {**os.environ, "BROKER_MCP_SH": "/nonexistent/eph-test/mcp.sh"}
+        # Other suites exercise process-wide umasks; own the child fixture permissions as well.
+        result = subprocess.run([sys.executable, "-c", probe], cwd=ROOT, env=env, umask=0o077,
+                                capture_output=True, text=True, timeout=60)
+        assert result.returncode == 0, (preload, result.stdout, result.stderr)
+    ok("Vikunja argv parity uses only its stub regardless of import order and restores the real sinks/env")
 
 
 def test_ticket_done_matches_old_predicate():
@@ -319,8 +343,10 @@ def test_gitlab_issue_ops_notices_and_reject_over_api():
 
 def test_gitlab_issue_mr_description():
     from adapters.cc import _mr_description
-    assert _mr_description("vikunja:task:4", "b", "main", "<p>x</p>") is None, "other subjects keep the default"
-    assert _mr_description("github:o/r#4", "b", "main", "<p>x</p>") is None
+    for key in ("vikunja:task:9991", "github:o/r#9991"):
+        description = _mr_description(key, "b", "main", "<p>x</p>")
+        assert description.endswith("> x"), description
+        assert "\n\nCloses " not in description, description
     d = _mr_description("gitlab:grp/app#7", "eph/issue-x", "main",
                         "<p>Fixed the parser.</p><p>Closes #3, fixes grp/other#4 and "
                         "https://gitlab.example.test/grp/app/-/issues/9, /-/work_items/10 and "
@@ -335,7 +361,7 @@ def test_gitlab_issue_mr_description():
     assert _re.findall(r"#[0-9]+", d) == ["#7", "#7"], "only the broker's own reference survives"
     assert _mr_description("gitlab:g/a#1", "b", "main", None).endswith("> (no summary)")
     ok("GitLab-issue MR description: default text + Closes <project>#<iid> + the worker summary quoted with its "
-       "issue references broken; other subjects keep open_mr's default")
+       "issue references broken; other subjects retain the summary without a Closes reference")
 
 
 if __name__ == "__main__":

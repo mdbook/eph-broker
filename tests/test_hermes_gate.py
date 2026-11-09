@@ -16,6 +16,15 @@ sys.path.insert(0, ROOT)
 os.environ["BROKER_SITE_ENV"] = os.path.join(HERE, "fixtures", "site.test.env")
 os.environ["BROKER_CONFIG"] = os.path.join(HERE, "fixtures", "broker.test.json")
 os.environ["BROKER_PROVENANCE_PATH"] = os.path.join(HERE, "fixtures", "provenance.test.json")
+# default HERMES_HOME, for the WHOLE suite, to a throwaway tempdir.
+# adapters/hermes_gate.record_denial() (called from make_hook()'s pre_tool_call on every DENY) writes
+# eph-gate-denials.jsonl under HERMES_HOME whenever no explicit `home=` kwarg is passed, every
+# hook(...)/make_hook(...) call site below does exactly that. Several tests here only point HERMES_HOME at
+# their OWN tempdir around a narrower PLUGIN.register() call and restore it to whatever it was before
+# (usually unset) BEFORE calling the hook itself, which wrote that file straight into the repo cwd. A
+# permanent tempdir default means that restore now lands HERMES_HOME back on a safe tempdir instead of "",
+# no matter how a given test scopes its own override.
+os.environ.setdefault("HERMES_HOME", tempfile.mkdtemp(prefix="eph-test-hermes-home-"))
 import site_env  # noqa: F401
 # Gate calls with no HERMES_HOME record denials relative to the cwd: run from a scratch dir, not the checkout
 _CWD = tempfile.mkdtemp(prefix="eph-gate-test-")
@@ -25,10 +34,18 @@ atexit.register(shutil.rmtree, _CWD, ignore_errors=True)
 import adapters.cc as CC
 from adapters.cc import CCAdapter, Worker
 from adapters import hermes as H
-# Tests must NEVER reach the live policy judge (real wrapper and its gate dir: its decisions.jsonl,
-# allow-once, the operator ask DM). Point the judge at a path that cannot exist; a test that needs a judge builds a fake.
-H.GENERAL_JUDGE.update(wrapper="/nonexistent/eph-test/gate-wrapper.sh", gate_dir="/nonexistent/eph-test/gate",
-                       project_dir="/nonexistent/eph-test/gate")
+_GATE_TERMS = "gate-home"
+# Tests must NEVER reach a live exec gate (its decision log, allow-once dir, operator DMs). Force the
+# portcullis provider onto paths that cannot exist, whatever the real env says; a test that needs a judge builds a fake.
+# These are the deployment's own key shapes (config/site.env), so the identity test below pins the real wiring.
+EXEC_GATE_TEST_ENV = dict(EXEC_GATE="portcullis", EXEC_GATE_PORTCULLIS_WRAPPER="/nonexistent/eph-test/gate-wrapper.sh",
+                          EXEC_GATE_PORTCULLIS_HOOK="/nonexistent/eph-test/gate-hook.py",
+                          EXEC_GATE_PORTCULLIS_PYTHON="/nonexistent/eph-test/python",
+                          EXEC_GATE_PORTCULLIS_DIR="/nonexistent/eph-test/gate", EXEC_GATE_TIMEOUT="5.0",
+                          EXEC_GATE_INHERIT_ENV="ZBUS_ENV,TMPDIR,LANG,TZ", EXEC_GATE_PROTECTED_TERMS=_GATE_TERMS)
+os.environ.update(EXEC_GATE_TEST_ENV)
+os.environ.pop("EXEC_GATE_PORTCULLIS_PROJECT_DIR", None)
+os.environ.pop("EXEC_GATE_COMMAND", None)
 from adapters import hermes_gate as PLUGIN
 from adapters.hermes_gate import gate as G
 from envelope import EnvelopeParser
@@ -67,6 +84,9 @@ class Fixture:
         self.write = G.Policy(H.gate_policy("write", self.wt, nonce="N-W"))
         self.code = G.Policy(H.gate_policy("code", self.wt, test_runner="pytest", nonce="N-C"))
         self.code_bashn = G.Policy(H.gate_policy("code", self.wt, test_runner="bash-n"))
+        self.code_repo = G.Policy(H.gate_policy("code", self.wt, test_runner="repo-test"))
+        self.code_check = G.Policy(dict(H.gate_policy("code", self.wt),
+                                       allow=["Bash(tools/check.sh:*)"], test_allow=["Bash(tools/check.sh:*)"]))
         self.wiki = G.Policy(H.gate_policy("write", os.path.join(self.wt, "content")))
         # mr-review: cc's pure-read grant (Read/Grep/Glob, no acceptEdits, Bash denied), read tools only
         self.mr = G.Policy(H.gate_policy("mr-review", self.wt, nonce="N-R"))
@@ -99,6 +119,59 @@ def T(cmd, **kw):
     return dict(command=cmd, **kw)
 
 
+def test_search_file_glob_floor():
+    with tempfile.TemporaryDirectory() as wt:
+        os.makedirs(os.path.join(wt, "nested"))
+        for name in (".env", "nested/.db-env", "run.sh"):
+            open(os.path.join(wt, name), "w").write("SYNTHETIC=1\n")
+        for capability in ("code", "mr-review"):
+            p = G.Policy(H.gate_policy(capability, wt))
+            args = dict(pattern="SYNTHETIC", path=wt)
+            assert not G.decide("search_files", args, p).allowed
+            assert G.decide("search_files", dict(args, file_glob="*.sh"), p).allowed
+            for glob in ("*.env", "!.*-env", "*", "*.{sh,env}"):
+                v = G.decide("search_files", dict(args, file_glob=glob), p)
+                assert not v.allowed, (capability, glob, v)
+            # With just the nested floor file, a negative glob excludes it without naming a file.
+            nested = dict(args, path=os.path.join(wt, "nested"), file_glob="!.*-env")
+            assert G.decide("search_files", nested, p).allowed
+        # A nested link is not read, but an explicitly named root is still checked.
+        os.symlink(os.path.join(wt, "..", "outside"), os.path.join(wt, "outside.txt"))
+        assert G.decide("search_files", dict(args, file_glob="*.sh"), p).allowed
+        assert not G.decide("search_files", dict(args, path=os.path.join(wt, "outside.txt")), p).allowed
+    ok("eph-gate: content file_glob allows proven exclusions only; unknown globs, uncovered floors and "
+       "explicit escaping roots remain denied")
+
+
+def test_search_nested_symlinks_follow_policy():
+    with tempfile.TemporaryDirectory() as d:
+        wt = os.path.join(d, "wt")
+        os.makedirs(os.path.join(wt, "clean"))
+        os.makedirs(os.path.join(d, "outside"))
+        open(os.path.join(d, "outside", "plain.txt"), "w").write("hello\n")
+        open(os.path.join(wt, "plain.txt"), "w").write("hello\n")
+        open(os.path.join(wt, ".env"), "w").write("SYNTHETIC=1\n")
+        links = (("file", os.path.join(d, "outside", "plain.txt")),
+                 ("directory", os.path.join(d, "outside")),
+                 ("dangling", os.path.join(d, "missing")),
+                 ("secret_alias", os.path.join(wt, ".env")),
+                 (".db-env", os.path.join(wt, "plain.txt")))
+        for capability in ("code", "mr-review"):
+            p = G.Policy(H.gate_policy(capability, wt))
+            for name, target in links:
+                link = os.path.join(wt, "clean", name)
+                os.symlink(target, link)
+                try:
+                    assert G._walk_clean(p, os.path.dirname(link)) is None, name
+                    assert G._walk_clean(p, os.path.dirname(link), followlinks=True), name
+                    assert G.decide("search_files", dict(pattern="hello", path=os.path.dirname(link)), p).allowed
+                    assert not G.decide("search_files", dict(pattern="hello", path=link), p).allowed, name
+                finally:
+                    os.unlink(link)
+    ok("eph-gate: nested file/directory/dangling/secret symlinks are skipped without following; "
+       "followed links and explicit roots retain confinement and secret checks")
+
+
 # (tool, args, policy-name) that MUST be allowed / denied. Shared with the mutation check below.
 def allow_table(f):
     return [
@@ -107,6 +180,23 @@ def allow_table(f):
         ("terminal", T("git add f.txt && git commit -m t"), "write"),
         ("terminal", T("git status --short; git log --oneline -5 HEAD~1..HEAD"), "write"),
         ("terminal", T("git diff; git diff --cached --stat; git diff HEAD"), "write"),
+        ("terminal", T("git diff --check"), "write"),
+        ("terminal", T("git diff --no-index f.txt src/pkg/m.py"), "write"),
+        ("terminal", T("git diff --no-index -- f.txt lnk_ok"), "code"),
+        ("terminal", T("git diff --no-index src src/pkg"), "write"),
+        ("terminal", T("git diff --no-index content src"), "code"),  # nested directory links are not followed
+        ("terminal", T("git log -L1,20:src/pkg/m.py"), "write"),
+        ("terminal", T("git log -L 1,+20:f.txt HEAD"), "code"),
+        ("terminal", T("git log -L :my_func:src/pkg/m.py"), "code"),
+        ("terminal", T("git log -L '/^def /,+20:src/pkg/m.py'"), "code"),
+        ("terminal", T("git log -L ':^my_.*:src/pkg/m.py'"), "code"),
+        ("terminal", T("git log -p -- src/pkg/m.py f.txt"), "write"),
+        ("terminal", T("sed -n '1,200p' f.txt"), "write"),
+        ("terminal", T("sed -n '2,$p' '--' src/pkg/m.py"), "code"),
+        ("terminal", T("sed -n '1,+20p' f.txt lnk_ok"), "code"),
+        ("terminal", T("NO_COLOR=1 CI=1 ./run-tests.sh --verbose"), "code_repo"),
+        ("terminal", T("NO_COLOR='some value' tools/check.sh"), "code_check"),
+        ("terminal", T("CI=1 python -m pytest -q"), "code"),
         ("terminal", T("python -m pytest -q"), "code"),
         ("terminal", T("pytest tests/test_x.py::test_a -k 'a and not b'"), "code"),
         ("terminal", T("bash -n t.sh"), "code_bashn"),
@@ -116,6 +206,7 @@ def allow_table(f):
         ("read_file", {"path": "lnk_ok"}, "write"),
         ("read_file", {"path": "../quartz.config.ts"}, "wiki"),          # read_root = the repo, not the cwd
         ("search_files", {"pattern": "a..b", "path": "src"}, "code"),
+        ("search_files", {"pattern": "x", "path": "content"}, "write"),  # nested links are not followed
         ("search_files", {"pattern": "*.py", "target": "files"}, "code"),
         ("write_file", {"path": "new.py", "content": "x"}, "code"),
         ("write_file", {"path": os.path.join(f.wt, "src/pkg/m.py"), "content": "y"}, "code"),
@@ -144,7 +235,7 @@ BROAD_DENY = (
     "git add --pathspec-from-file=/abs/x", "git commit -m x --pathspec-fr=/abs/x", "git add --paths=x",
     "git add --pathspec-file-nul", "git commit -aF x", "git commit -nF /etc/passwd", "git commit --fil x",
     "git commit --file=x", "git commit -t tmpl", "git commit -S", "git commit --gpg-sign",
-    "git diff --no-index a b", "git diff --no-i a b", "git diff --output=o", "git log --out=o",
+    "git diff --no-index a", "git diff --no-i a b", "git diff --output=o", "git log --out=o",
     "git diff -O/etc/passwd", "git diff --ext-diff", "git log -L1,2:/x/abc", "git diff /dev/null /abs",
     "git diff lnk_out", "git add ../../x.env", "git add sec/.db-env", "git diff -- ../../x.env",
     "git log --work-tree=/x", "git commit --template=x", "git commit --reuse-message=HEAD --file x",
@@ -200,7 +291,40 @@ def deny_table(f):
         ("terminal", T("git commit --file=x"), "write"),
         ("terminal", T("git commit -t tmpl"), "write"),
         ("terminal", T("git commit -S -m t"), "write"),
-        ("terminal", T("git diff --no-index a b"), "write"),
+        ("terminal", T("git diff --no-index f.txt /etc/passwd"), "write"),
+        ("terminal", T("git diff --no-index f.txt lnk_out"), "code"),
+        ("terminal", T("git diff --no-index f.txt lnk_secret"), "code"),
+        ("terminal", T("git diff --no-index sec src"), "code"),
+        ("terminal", T("git diff --no-index --output=o f.txt lnk_ok"), "code"),
+        ("terminal", T("git diff --no-index f.txt lnk_ok --output=o"), "code"),
+        ("terminal", T("git diff --no-index - f.txt"), "code"),
+        ("terminal", T("git diff --check --output=o"), "code"),
+        ("terminal", T("git log -L 1,2:lnk_secret"), "code"),
+        ("terminal", T("git log -L1,2:lnk_out"), "code"),
+        ("terminal", T("git log -L1,2:sec/.db-env"), "code"),
+        ("terminal", T("git log -L1,2:../outside/secret.txt"), "code"),
+        ("terminal", T("git log -L 1,2:f.txt --output=o"), "code"),
+        ("terminal", T("git log -L"), "code"),
+        ("terminal", T("git log -L '/foo:bar/,20:f.txt'"), "code"),
+        ("terminal", T("git log -L --output=/etc/out:f.txt"), "code"),
+        ("terminal", T("git log -p -- lnk_secret"), "code"),
+        ("terminal", T("sed -i '1,2p' f.txt"), "code"),
+        ("terminal", T("sed -n 'w /x' f.txt"), "code"),
+        ("terminal", T("sed -n '1,2p;w out' f.txt"), "code"),
+        ("terminal", T("sed -n '1e id' f.txt"), "code"),
+        ("terminal", T("sed -n '1,2p' f.txt -i"), "code"),
+        ("terminal", T("sed -n -f f.txt"), "code"),
+        ("terminal", T("sed -n '1p' lnk_secret"), "code"),
+        ("terminal", T("sed -n '1p' lnk_out"), "code"),
+        ("terminal", T("sed -n '1p' /etc/passwd"), "code"),
+        ("terminal", T("sed -n '1p' -"), "code"),
+        ("terminal", T("CI=1 ./run-tests.sh"), "code"),  # wrong runner for this turn
+        ("terminal", T("CI=1 tools/check.sh"), "code_repo"),
+        ("terminal", T("CI=1 git push"), "code_repo"),
+        ("terminal", T("CI=1"), "code_repo"),
+        ("terminal", T("CI=1 ./run-tests.sh; rm f.txt"), "code_repo"),
+        ("terminal", T("CI=sec/.db-env ./run-tests.sh"), "code_repo"),
+        ("terminal", T("CI=1 python -m pytest --basetemp=tmp"), "code"),
         ("terminal", T("git diff --output=/tmp/o"), "write"),
         ("terminal", T("git diff --out=o"), "write"),
         ("terminal", T("git diff -O/etc/passwd"), "write"),
@@ -264,7 +388,7 @@ def deny_table(f):
         ("write_file", {"path": ".new-env", "content": "x"}, "code"),
         ("patch", {"mode": "patch", "patch": "*** Begin Patch\n*** Update File: /etc/x\n"}, "write"),
         ("search_files", {"pattern": "TOKEN"}, "write"),               # tree holds sec/.db-env + symlinks out
-        ("search_files", {"pattern": "x", "path": "content"}, "write"),   # content/dirlink_out leaves the tree
+        ("search_files", {"pattern": "x", "path": "content/dirlink_out"}, "write"),  # explicit escaping root
         ("search_files", {"pattern": "x", "path": "/etc"}, "write"),
         ("search_files", {"pattern": "../../*", "target": "files"}, "write"),
         ("search_files", {"pattern": "x", "target": "bogus"}, "write"),
@@ -295,12 +419,18 @@ def deny_table(f):
         ("write_file", {"path": "f.txt", "content": "x"}, "mr_widened"),
         ("patch", {"path": "f.txt", "old_string": "x", "new_string": "y"}, "mr_widened"),
         ("terminal", T("git status"), "mr_widened"),
-    ] + [("terminal", T(c), "broad") for c in BROAD_DENY]
+    ] + [("terminal", T(c), "broad") for c in BROAD_DENY] + [
+        ("terminal", T(name + "=local ./run-tests.sh"), "code_repo") for name in
+        ("PATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "GIT_CONFIG_COUNT", "GIT_SSH",
+         "BASH_ENV", "ENV", "IFS", "HOME", "PYTHONPATH", "PYTHONWARNINGS", "PYTEST_ADDOPTS", "NODE_OPTIONS",
+         "path", "GCONV_PATH", "JAVA_TOOL_OPTIONS", "GLIBC_TUNABLES", "TCLLIBPATH",
+         "LUA_INIT", "MAKEFILES", "PERL5OPT", "PYTHONSTARTUP", "UNKNOWN_TEST_FLAG")]
 
 
 def run_tables(f):
     """Raise AssertionError on the first row whose verdict is wrong (the mutation check relies on this)."""
-    pol = {"write": f.write, "code": f.code, "code_bashn": f.code_bashn, "wiki": f.wiki, "broad": f.broad,
+    pol = {"write": f.write, "code": f.code, "code_bashn": f.code_bashn,
+           "code_repo": f.code_repo, "code_check": f.code_check, "wiki": f.wiki, "broad": f.broad,
            "mr": f.mr, "mr_widened": f.mr_widened}
     old = os.getcwd()
     os.chdir(f.d)                    # relative paths must resolve against the POLICY cwd, not the process cwd
@@ -320,8 +450,82 @@ def run_tables(f):
 def test_decision_table():
     f = fx()
     na, nd = run_tables(f)
+    # Env-prefix names are allow-listed, not a deny-list of known runtime knobs. Exercise both runner
+    # forms, including payloads the old deny-list missed; these are gate decisions, never executed.
+    with _env(EPH_GATE_TEST_ENV_ALLOW=None):
+        repo = H.gate_policy("code", f.wt, test_runner="repo-test")
+        check = dict(repo, allow=["Bash(tools/check.sh:*)"], test_allow=["Bash(tools/check.sh:*)"])
+        for raw, runner in ((repo, "./run-tests.sh"), (check, "tools/check.sh")):
+            pol = G.Policy(json.loads(json.dumps(raw)))
+            for assignment in ("PORTCULLIS_PYTHON=tools/python", "PYTHONDONTWRITEBYTECODE=1", "NO_COLOR=1",
+                               "CI=1", "CI=", "TERM=xterm", "LANG=C.UTF-8", "LC_ALL=C.UTF-8",
+                               "LC_MESSAGES=C", "NO_COLOR=1 CI=1"):
+                v = G.decide("terminal", T(assignment + " " + runner), pol)
+                assert v.allowed, (assignment, runner, v)
+            for assignment in ("LUA_INIT='os.execute(\"id\")'", "MAKEFILES=payload.mk", "BASH_ENV=local",
+                               "ENV=local", "PERL5OPT=local", "PYTHONSTARTUP=local", "NODE_OPTIONS=local",
+                               "LD_PRELOAD=local", "UNKNOWN_TEST_FLAG=1", "CI=1 UNKNOWN_TEST_FLAG=1",
+                               "ci=1", "LC_=C", "CI=/etc/passwd", "CI=sec/.db-env",
+                               "PORTCULLIS_PYTHON=lnk_out"):
+                v = G.decide("terminal", T(assignment + " " + runner), pol)
+                assert not v.allowed, (assignment, runner, v)
+        for bad in ("SITE_TEST_MODE", None, ["SITE_*"], ["bad-name"], [1]):
+            try:
+                G.Policy(dict(repo, test_env_allow=bad))
+                raise AssertionError(("invalid test_env_allow accepted", bad))
+            except ValueError:
+                pass
+    with _env(EPH_GATE_TEST_ENV_ALLOW=" SITE_TEST_MODE, SITE_TEST_SHARD "):
+        pol = G.Policy(json.loads(json.dumps(H.gate_policy("code", f.wt, test_runner="repo-test"))))
+        for assignment in ("SITE_TEST_MODE='some value'", "SITE_TEST_SHARD=2", "CI=1 SITE_TEST_MODE=fast"):
+            assert G.decide("terminal", T(assignment + " ./run-tests.sh"), pol).allowed, assignment
+        for assignment in ("SITE_TEST_MODE_OTHER=1", "site_test_mode=1", "SITE_TEST_MODE=/etc/passwd",
+                           "SITE_TEST_MODE=sec/.db-env", "UNKNOWN_TEST_FLAG=1"):
+            assert not G.decide("terminal", T(assignment + " ./run-tests.sh"), pol).allowed, assignment
+    with _env(EPH_GATE_TEST_ENV_ALLOW=None):
+        pol = G.Policy(H.gate_policy("code", f.wt, test_runner="repo-test"))
+        assert not G.decide("terminal", T("SITE_TEST_MODE=1 ./run-tests.sh"), pol).allowed
+    with _env(EPH_GATE_TEST_ENV_ALLOW="SITE_*"):
+        try:
+            H.gate_policy("code", f.wt, test_runner="repo-test")
+            raise AssertionError("wildcard env config must refuse the turn")
+        except H.HermesRefused as e:
+            assert "test_env_allow" in str(e), e
     ok(f"eph-gate: decision table - {na} allow rows + {nd} deny rows over write/code/code(bash-n)/wiki/"
        "mr-review policies built from cc.capability_tool_grant + a broad no-imported-rules policy")
+
+
+def test_patch_edit_rule_matches_gate():
+    """The edit rule a hermes editing worker is told (gate.PATCH_EDIT_RULE, appended by
+    hermes.worker_system_prompt) must agree with what decide() actually lets through for `patch`."""
+    f = fx()
+    rule = G.PATCH_EDIT_RULE
+    for word in ("plain replace mode", "`path`", "`old_string`", "`new_string`", "`replace_all`",
+                 '"replace"', "V4A", '`mode: "patch"`', "DENIED", "`write_file`"):
+        assert word in rule, (word, rule)
+    old = os.getcwd()
+    os.chdir(f.d)
+    try:
+        for pol in (f.write, f.code):
+            # what the rule tells the worker to do: allowed
+            for args in ({"path": "f.txt", "old_string": "x", "new_string": "y"},
+                         {"path": "f.txt", "old_string": "x", "new_string": "y", "mode": G.PATCH_MODE},
+                         {"path": "f.txt", "old_string": "x", "new_string": "y", "replace_all": True}):
+                v = G.decide("patch", args, pol)
+                assert v.allowed, ("rule says ALLOW", args, v)
+            # what the rule tells the worker not to do (a single-file V4A patch inside the worktree): denied
+            v = G.decide("patch", {"mode": "patch", "patch": "*** Begin Patch\n*** Update File: f.txt\n"
+                                   "@@\n-x\n+y\n*** End Patch\n"}, pol)
+            assert not v.allowed and "plain replace mode" in v.reason, v
+            v = G.decide("write_file", {"path": "brand_new.txt", "content": "x"}, pol)
+            assert v.allowed, v
+    finally:
+        os.chdir(old)
+    for cap in ("write", "code", "general"):
+        assert H.worker_system_prompt("SIGNED", cap) == "SIGNED" + G.PATCH_EDIT_RULE, cap
+    assert H.worker_system_prompt("SIGNED", "mr-review") == "SIGNED"   # read-only: every writer is denied anyway
+    ok("eph-gate: the hermes worker edit rule (plain replace only, no V4A) agrees with decide() and is "
+       "appended for write/code/general, not for read-only mr-review")
 
 
 def test_hard_git_denies_without_imported_rules():
@@ -761,18 +965,21 @@ def test_adapter_gated_write_turn():
         cfg = r["config"]
         assert cfg["plugins"]["enabled"] == ["eph-gate"] and cfg["tools"]["tool_search"]["enabled"] == "off", cfg
         assert cfg["plugins"]["load_timeout_seconds"] == 0, cfg["plugins"]      # B2: inline load, no deadline
+        assert cfg["agent"]["system_prompt"] == "SYS" + G.PATCH_EDIT_RULE, cfg["agent"]   # hermes edit rule
         assert cfg["lsp"]["enabled"] is False, cfg.get("lsp")                    # B1: no language servers
         assert cfg["security"] == {"tirith_enabled": False, "allow_lazy_installs": False}, cfg.get("security")
         # No tirith exec, and no lazy-install uv/pip reading a worktree uv.toml
         assert not {"file", "terminal"} & set(cfg["agent"]["disabled_toolsets"]), cfg["agent"]
         assert {"code_execution", "delegation", "browser", "web", "memory"} <= set(cfg["agent"]["disabled_toolsets"])
         assert cfg["terminal"] == {"backend": "local", "cwd": os.path.realpath(wt), "auto_source_bashrc": False,
-                                   "shell_init_files": []}, cfg.get("terminal")
+                                   "shell_init_files": [os.path.join(w.hermes_home, H.TERMINAL_ENV_FILE)]}, cfg.get("terminal")
         assert r["terminal_cwd"] == os.path.realpath(wt) and r["cwd"] == os.path.realpath(wt), r
         pol = r["policy"]
         grant = CC.capability_tool_grant("write")
-        assert pol["allow"] == G.split_rules(grant[grant.index("--allowedTools") + 1]), pol["allow"]
-        assert pol["deny"] == G.split_rules(grant[grant.index("--disallowedTools") + 1]), pol["deny"]
+        assert pol["allow"] == G.split_rules(grant[grant.index("--allowedTools") + 1]) + [
+            "Bash(git diff --check)", "Bash(git diff --no-index:*)", "Bash(sed:*)"], pol["allow"]
+        assert pol["deny"] == [r for r in G.split_rules(grant[grant.index("--disallowedTools") + 1]) if r not in
+                               ("Bash(git diff --no-index*)", "Bash(git * --no-index*)")], pol["deny"]
         assert pol["secret_globs"] == list(CC._SECRET_FILE_GLOBS) and pol["edits"] is True, pol
         assert pol["cwd"] == pol["write_root"] == pol["read_root"] == os.path.realpath(wt), pol
         assert "__init__.py" in r["plugin_files"] and "gate.py" in r["plugin_files"], r["plugin_files"]
@@ -970,11 +1177,13 @@ def test_adapter_venv_pythonpath_terminal_only():
                              env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PYTHONPATH": "/keep"},
                              capture_output=True, text=True).stdout
         assert got == os.path.join(os.path.realpath(wt), "src") + ":/keep", got
-        # no venv runner (or no src/): no init file, empty shell_init_files
+        # No venv runner: the init file pins PATH only, with no worktree PYTHONPATH.
         w2 = Worker("k2", "r2", wt); w2.test_runner = "pytest"
         assert a._one_turn(w2, _r("code", FAKE_RECORD=rec), "SYS", "P", resume=False)
         r2 = _recs(rec)[-1]
-        assert r2["config"]["terminal"]["shell_init_files"] == [] and H.TERMINAL_ENV_FILE not in r2["home_ls"], r2
+        init2 = os.path.join(w2.hermes_home, H.TERMINAL_ENV_FILE)
+        assert r2["config"]["terminal"]["shell_init_files"] == [init2], r2
+        assert "PYTHONPATH" not in open(init2).read()
     ok("eph-gate: N-N3 venv runner - worktree src/ on PYTHONPATH via the terminal's shell init file only; "
        "the hermes process and the probe get none")
 
@@ -1189,7 +1398,8 @@ def test_adapter_mr_review_gated_read_only():
         open(os.path.join(d, "outside.txt"), "w").write("CANARY\n")
         rec, prec = os.path.join(d, "rec.jsonl"), os.path.join(d, "probe.jsonl")
         with _stdin_pipe(), _env(HERMES_SAFE_MODE="1", TIRITH_ENABLED="1"):
-            assert a._one_turn(Worker("gitlab:mr:1", "r", wt),
+            w = Worker("gitlab:mr:1", "r", wt)
+            assert a._one_turn(w,
                                _r("mr-review", FAKE_RECORD=rec, FAKE_PROBE_RECORD=prec, FAKE_STATUS="pass"),
                                "SYS", "P", resume=False)
         (r,) = _recs(rec)
@@ -1198,7 +1408,8 @@ def test_adapter_mr_review_gated_read_only():
         assert cfg["plugins"] == {"enabled": ["eph-gate"], "load_timeout_seconds": 0}, cfg["plugins"]
         assert cfg["tools"]["tool_search"]["enabled"] == "off" and cfg["lsp"]["enabled"] is False, cfg
         assert "terminal" in cfg["agent"]["disabled_toolsets"] and "file" not in cfg["agent"]["disabled_toolsets"]
-        assert cfg["terminal"]["cwd"] == os.path.realpath(wt) and cfg["terminal"]["shell_init_files"] == [], cfg
+        assert cfg["terminal"]["cwd"] == os.path.realpath(wt), cfg
+        assert cfg["terminal"]["shell_init_files"] == [os.path.join(w.hermes_home, H.TERMINAL_ENV_FILE)], cfg
         assert r["terminal_cwd"] == os.path.realpath(wt) and r["cwd"] == os.path.realpath(wt), r
         assert r["hermes_env"] == ["HERMES_HOME"] and not r["tirith_env"], r
         pol = r["policy"]
@@ -1323,6 +1534,63 @@ def test_terminal_env_file_race_refuses():
             H.HermesHarness._sweep_home = orig
         assert not os.path.exists(rec)
     ok("eph-gate: a re-planted eph-terminal-env.sh after the sweep -> HermesRefused, no launch")
+
+
+def test_terminal_env_file_after_probe_race_refuses():
+    """Startup validation precedes init-file creation, but a clean probe cannot excuse a re-plant.
+    Files, directories and symlinks must remain untouched and must never reach the real run."""
+    old_umask = os.umask(0o077)   # isolate a failed socket test's process-wide umask (aggregate pytest)
+    try:
+        for cap in ("write", "code", "mr-review", "general"):
+            for kind in ("file", "directory", "symlink", "dangling-symlink"):
+                with tempfile.TemporaryDirectory() as d, _Registry(d), _env(CODE_NONCLAUDE_OK="1"):
+                    a, wt, alerts = _setup(d)
+                    rec, prec = os.path.join(d, "rec.jsonl"), os.path.join(d, "probe.jsonl")
+                    target = os.path.join(d, "target")
+                    body = "export PATH=/evil\n"
+                    if kind == "symlink":
+                        open(target, "w").write(body)
+                    orig = a.hermes._install_gate
+
+                    def racy(home, *args):
+                        init = os.path.join(home, H.TERMINAL_ENV_FILE)
+                        assert not os.path.lexists(init), "the init file must be created AFTER startup validation"
+                        nonce = orig(home, *args)
+                        if kind == "directory":
+                            os.makedirs(init)
+                        elif kind in ("symlink", "dangling-symlink"):
+                            os.symlink(target, init)
+                        else:
+                            open(init, "w").write(body)
+                        return nonce
+
+                    a.hermes._install_gate = racy
+                    try:
+                        w = Worker("k", "r", wt); w.test_runner = "pytest"
+                        try:
+                            a._one_turn(w, _r(cap, FAKE_RECORD=rec, FAKE_PROBE_RECORD=prec), "SYS", "P",
+                                        resume=False)
+                            raise AssertionError((cap, kind, "a re-planted terminal env file must refuse"))
+                        except H.HermesRefused as e:
+                            assert H.TERMINAL_ENV_FILE in str(e) and "FileExistsError" in str(e), (cap, kind, e)
+                    finally:
+                        a.hermes._install_gate = orig
+                    assert len(_recs(prec)) == 1 and not os.path.exists(rec), (cap, kind)
+                    init = os.path.join(w.hermes_home, H.TERMINAL_ENV_FILE)
+                    if kind == "directory":
+                        assert os.path.isdir(init) and not os.listdir(init)
+                    elif kind in ("symlink", "dangling-symlink"):
+                        assert os.path.islink(init) and os.readlink(init) == target
+                        if kind == "symlink":
+                            assert open(target).read() == body
+                        else:
+                            assert not os.path.exists(target)
+                    else:
+                        assert open(init).read() == body
+    finally:
+        os.umask(old_umask)
+    ok("eph-gate: startup probe precedes terminal init creation; a file/directory/symlink re-planted after "
+       "a clean probe still refuses without overwriting it or launching any honoured capability")
 
 
 def test_check_interpreter_silent_nonzero_exit_refuses():
@@ -1530,7 +1798,8 @@ def test_item3_judge_never_sees_worktree_as_project_dir():
     neutral project_dir, never the worktree, and a project_dir overlapping the write root fails closed. (a) belt:
     AUTHORIZED.md / .claude settings writes and terminal commands naming them / the gate dir are HARD floor denies
     (kind floor, no sha = not mintable) that never reach the judge."""
-    assert H.GENERAL_JUDGE["project_dir"] == H.GENERAL_JUDGE["gate_dir"]
+    j = H.gate_policy("general", fx().wt, nonce="N-G")["judge"]
+    assert j["project_dir"] == j["gate_dir"], "project_dir defaults to the gate dir"
     with _judge_policy("allow") as (p, gd):
         assert G.decide("terminal", {"command": "ls -la > out.txt"}, p).allowed
         c = _calls(gd)

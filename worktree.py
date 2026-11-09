@@ -4,10 +4,11 @@
 The worker's cwd must carry no charter (CLAUDE.md / AGENTS.md / *-AGENT.md),
 so a stripped-charter worker (`--system-prompt` REPLACE + `--setting-sources ''`) doesn't
 silently re-inherit one from the working directory. This is belt and suspenders with the flags.
+Root charters remain readable as git-excluded, read-only .txt copies under .eph/repo-rules/.
 
 Value-free: git plumbing only, no secrets.
 """
-import os, re, shutil, subprocess, logging, time
+import os, re, shutil, subprocess, logging, time, hashlib
 
 log = logging.getLogger("eph-broker.worktree")
 
@@ -38,6 +39,7 @@ def _fetch_branch_sha(repo, remote, ref, *pre, env=None):
 
 _CHARTER_NAMES = ("CLAUDE.md", "AGENTS.md")
 _CHARTER_SUFFIX = "-AGENT.md"          # e.g. CODER-AGENT.md
+_REPO_RULES_DIR = ".eph/repo-rules"
 
 
 def _safe(key):
@@ -136,6 +138,16 @@ def _push_url_rewritten(path, url):
 # can still plant with exec, e.g. config.worktree filter.*.clean): docs/security-residual-same-uid.md.
 _NO_REPO_CODE = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false")
 _NO_EXT_DIFF = ("--no-ext-diff", "--no-textconv")        # a planted diff.external / textconv never runs
+# Fix round 6 (M2): a committed .gitmodules `ignore = all` for a submodule (or a repo-local
+# `diff.ignoreSubmodules=all`) makes plain `git diff` drop that path's ENTIRE diff entry - not just its
+# `Subproject commit` hunk body, the whole `diff --git ...`/index/mode header too - so a worker-authored
+# gitlink bump under such a path would be completely invisible to mr_diff, and so to EVERY review tier
+# (routing.select_mr_review_tier never even sees the path, let alone its mode). `--ignore-submodules=none`
+# overrides any such config for this one `git diff` invocation, command-line beating repo config the same
+# way `_NO_REPO_CODE` does above; `--submodule=short` pins the body format to the `Subproject commit ...`
+# shape routing._MODE_OR_LINK_RE matches (a config-set `diff.submodule=log` would otherwise swap it for a
+# commit-log body the regex doesn't recognize).
+_SUBMODULE_VISIBLE = ("--ignore-submodules=none", "--submodule=short")
 
 
 class WorktreeTampered(RuntimeError):
@@ -164,6 +176,21 @@ def _wt_env(path):
     return env
 
 
+def _update_global_safe_directory(path, *, remove=False):
+    """Best-effort registration, unless global config is explicitly disabled with /dev/null.
+
+    Git config writes via lock/rename, not by writing to the device. As root (e.g. in CI),
+    updating GIT_CONFIG_GLOBAL=/dev/null replaces it with a regular file, breaking DEVNULL
+    stdin for later subprocesses. Resolve aliases too, but leave ordinary config updates intact.
+    """
+    config = os.environ.get("GIT_CONFIG_GLOBAL")
+    if config and os.path.realpath(config) == os.path.realpath(os.devnull):
+        return
+    action = ["--unset", "--fixed-value"] if remove else ["--add"]
+    subprocess.run(["git", "config", "--global", *action, "safe.directory", path],
+                   check=False, capture_output=True, text=True)
+
+
 def _wt_cred_args(repo):
     """Credential `-c` args for a credentialed push run under _wt_env: the broad-token helper when
     it applies (unchanged), else _store_cred_args()."""
@@ -183,9 +210,13 @@ def _store_cred_args():
     return ["-c", "credential.helper=", "-c", f"credential.helper={helper}", "-c", "credential.useHttpPath=true"]
 
 
-def _wt_identity_args():
-    """`-c user.name/-c user.email` for the broker's WIP commit under _wt_env. Read from the broker's
-    GLOBAL config only (`git config --global`, no repo, so no worker repo config is loaded); fixed fallback."""
+def _wt_identity_args(env=None):
+    """Fallback identity for broker commits/rebases when the row did not supply an env identity.
+    Read GLOBAL config only (`git config --global`, no worker repo config); fixed fallback.
+    """
+    if env and all(env.get(k) for k in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+                                        "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL")):
+        return []                       # the row's explicit environment already supplies both identities
     out = {}
     for k, dflt in (("user.name", "eph-broker"), ("user.email", "eph-broker@localhost")):
         r = subprocess.run(["git", "config", "--global", "--get", k], capture_output=True, text=True,
@@ -221,6 +252,43 @@ def _git(repo, *args, check=True, env=None):
     return r.stdout.strip()
 
 
+def _copy_repo_rules(path):
+    """Keep cut-commit root charters readable without a harness auto-loading them.
+
+    The reserved directory is ignored by git and copies are read-only, non-charter names.
+    Never follow a repo-supplied symlink or overwrite an existing rules directory.
+    """
+    names = [name for name in os.listdir(path)
+             if (name in _CHARTER_NAMES or name.endswith(_CHARTER_SUFFIX))
+             and not os.path.islink(os.path.join(path, name))
+             and os.path.isfile(os.path.join(path, name))]
+    if not names:
+        return
+    parent = os.path.join(path, ".eph")
+    if os.path.islink(parent):
+        raise ValueError("repo rules directory must not follow a .eph symlink")
+    os.makedirs(parent, exist_ok=True)
+    rules = os.path.join(path, _REPO_RULES_DIR)
+    os.mkdir(rules)                       # fail closed on a tracked dir/file/symlink collision
+    exclude = _git(path, "rev-parse", "--git-path", "info/exclude")
+    if not os.path.isabs(exclude):
+        exclude = os.path.join(path, exclude)
+    os.makedirs(os.path.dirname(exclude), exist_ok=True)  # git init may use an empty template dir
+    pattern = f"/{_REPO_RULES_DIR}/"
+    with open(exclude, "a+") as f:
+        f.seek(0)
+        if pattern not in f.read().splitlines():
+            f.write(f"\n{pattern}\n")
+    for name in names:
+        # Read the git blob, not the live checkout, a checkout filter, or a symlink target.
+        blob = subprocess.run(_wt_argv(path, "show", f"HEAD:{name}"), check=True,
+                              capture_output=True, env=_wt_env(path)).stdout
+        copy = os.path.join(rules, name + ".txt")
+        with open(copy, "xb") as f:
+            f.write(blob)
+        os.chmod(copy, 0o444)
+
+
 def strip_charter(path):
     """Remove any charter files from the worktree root so cwd is charter-free."""
     removed = []
@@ -250,13 +318,23 @@ class WorktreeManager:
         self._made = {}
         # key -> the worktree's `.git` gitdir pointer as make() created it (see _checked()).
         self._gitdirs = {}
+        self._git_identities = {}        # key -> row identity for broker WIP commits and wiki rebases
 
     def path_for(self, key, worktrees_root=None):
-        return os.path.join(worktrees_root or self.worktrees_root, _safe(key))
+        # Long issue/repository subjects must not consume the AF_UNIX socket path budget.
+        name = _safe(key) if len(_safe(key)) <= 24 else "w-" + hashlib.sha256(key.encode()).hexdigest()[:20]
+        return os.path.join(worktrees_root or self.worktrees_root, name)
 
     def make(self, key, *, base_repo=None, worktrees_root=None, publish_ref=None, suppress_hooks=False,
-             expect_sha=None, sleep=None):
+             expect_sha=None, sleep=None, also_fetch=(), git_identity=None):
         """Create a worktree for `key` (see _make_once), return the path.
+
+        git_identity = the row's GIT_AUTHOR_*/GIT_COMMITTER_* environment, retained for WIP commits
+        and wiki rebase retries. Empty/unset preserves the legacy global identity fallback.
+
+        also_fetch = extra branch names whose origin/<branch> tracking refs are refreshed (explicit refspec,
+        best-effort: a failure only logs) before the cut, so a worker cut from a `base:` branch can
+        `git merge origin/<default>` against a current ref. Nothing is fetched into the worktree's own branch.
 
         expect_sha (a full SHA or a >=7-hex prefix, e.g. the MR head): the cut SHA MUST match it. On a
         mismatch the worktree is removed, the branch refetched and the cut retried (CUT_SHA_RETRY_S); if it is still
@@ -265,10 +343,18 @@ class WorktreeManager:
         An expect_sha that is not 7-40 hex chars can never be verified, so CutShaMismatch is raised at once (fail
         closed, nothing cut). A git error during a cut attempt (e.g. the fetch) is retried like a mismatch, and if
         it keeps failing, CutShaMismatch is raised, so the caller takes its neutral skip path, not a generic failure."""
+        for extra in (also_fetch or ()) if (base_repo or self.base_repo) else ():   # never `git -C ""`
+            if not extra or extra == publish_ref:
+                continue
+            try:
+                _fetch_branch_sha(base_repo or self.base_repo, "origin", extra)
+            except (subprocess.CalledProcessError, OSError) as e:
+                log.warning("worktree make key=%s: refresh of origin/%s failed (%s), continuing", key, extra,
+                            (getattr(e, "stderr", "") or "").strip() or e)
         want = (expect_sha or "").strip().lower()
         if not want:
             return self._make_once(key, base_repo=base_repo, worktrees_root=worktrees_root,
-                                   publish_ref=publish_ref, suppress_hooks=suppress_hooks)
+                                   publish_ref=publish_ref, suppress_hooks=suppress_hooks, git_identity=git_identity)
         if not _SHA_RE.match(want):
             raise CutShaMismatch(f"worktree {key}: expected head {want!r} is not a 7-40 hex sha")
         sleep = sleep or time.sleep
@@ -278,7 +364,7 @@ class WorktreeManager:
                 sleep(delay)
             try:
                 path = self._make_once(key, base_repo=base_repo, worktrees_root=worktrees_root,
-                                       publish_ref=publish_ref, suppress_hooks=suppress_hooks)
+                                       publish_ref=publish_ref, suppress_hooks=suppress_hooks, git_identity=git_identity)
             except subprocess.CalledProcessError as e:
                 got = f"<git error: {(e.stderr or '').strip() or e}>"
                 log.warning("worktree make key=%s: cut failed (attempt %d/%d): %s -> retry",
@@ -294,7 +380,8 @@ class WorktreeManager:
         raise CutShaMismatch(f"worktree {key}: cut at {got}, expected head {want} after "
                              f"{len(CUT_SHA_RETRY_S) + 1} attempts")
 
-    def _make_once(self, key, *, base_repo=None, worktrees_root=None, publish_ref=None, suppress_hooks=False):
+    def _make_once(self, key, *, base_repo=None, worktrees_root=None, publish_ref=None, suppress_hooks=False,
+                   git_identity=None):
         """Create a worktree for `key`, strip its charter, return the path.
 
         Default (read domain): a detached worktree off self.base_repo @ current HEAD, in
@@ -329,6 +416,7 @@ class WorktreeManager:
             shutil.rmtree(path, ignore_errors=True)
         self._made.pop(key, None)                # drop any stale in-process tracking for this key
         self._gitdirs.pop(key, None)
+        self._git_identities.pop(key, None)
         if publish_ref:
             # freshen the upstream tip before the cut; cut from the SHA THIS fetch stored (explicit
             # refspec), never the shared, raceable FETCH_HEAD
@@ -364,8 +452,7 @@ class WorktreeManager:
         # producing nothing (the broker's cut succeeded and the worker still made no
         # commit). Registering the path once, here, is what makes the worktree usable end to end.
         # SCOPED to this exact path, never a wildcard, never another repo.
-        subprocess.run(["git", "config", "--global", "--add", "safe.directory", path],
-                       check=False, capture_output=True, text=True)
+        _update_global_safe_directory(path)
         if suppress_hooks:
             # WORKTREE-LOCAL only: `git config core.hooksPath` without --worktree writes the SHARED repo
             # config, which would disable hooks for the base repo AND every standing bridge worktree (the
@@ -373,16 +460,21 @@ class WorktreeManager:
             # scopes --worktree writes to THIS ephemeral worktree, leaving the bridges' hooks intact.
             _git(repo, "config", "extensions.worktreeConfig", "true")
             _git(path, "config", "--worktree", "core.hooksPath", "/dev/null")
+        _copy_repo_rules(path)             # readable inside the harness's worktree read_root
         strip_charter(path)                # charter-free cwd
         cut_sha = _git(path, "rev-parse", "HEAD")
         self._gitdirs[key] = _gitdir_pointer(path)   # recorded BEFORE the worker ever runs in `path`
         self._made[key] = (repo, path, cut_sha)
+        self._git_identities[key] = dict(git_identity or {})
         log.info("worktree cut key=%s base=%s sha=%s path=%s", key, _cut_desc, cut_sha, path)
         return path
 
     def remove(self, key):
         repo, path, _ = self._made.pop(key, (self.base_repo, self.path_for(key), None))
         self._gitdirs.pop(key, None)
+        self._git_identities.pop(key, None)
+        import repo_companions
+        repo_companions.prepare_remove(path)
         # `--force` because we stripped tracked charter files (dirty worktree).
         subprocess.run(["git", "-C", repo, "worktree", "remove", "--force", path],
                        capture_output=True, text=True)
@@ -396,8 +488,7 @@ class WorktreeManager:
         # erroring. Best-effort + idempotent: check=False so a not-present entry / an ancient git lacking
         # --fixed-value is a harmless no-op that never raises into the remove path. SCOPED to this one path,
         # never a wildcard, never --unset-all of unrelated entries.
-        subprocess.run(["git", "config", "--global", "--unset", "--fixed-value", "safe.directory", path],
-                       check=False, capture_output=True, text=True)
+        _update_global_safe_directory(path, remove=True)
 
     def _checked(self, key):
         """(repo, path, cut_sha) for `key`, but only after verifying the worktree's `.git` pointer is
@@ -424,6 +515,7 @@ class WorktreeManager:
         PushTargetRefused (nothing pushed) unless `remote`'s push URL is https://<BROKER_PUSH_HOSTS>/."""
         repo, path, cut_sha = self._checked(key)        # fail closed on a repointed .git
         env = _wt_env(path)                              # no global/system config in the worker worktree
+        env.update(self._git_identities.get(key, {}))
         if _git(path, "rev-parse", "HEAD", env=env) == cut_sha:
             log.info("publish key=%s: worker made no commit -> no-op", key)
             return False
@@ -439,7 +531,7 @@ class WorktreeManager:
                 return True
             log.warning("publish key=%s: push rejected (attempt %d): %s", key, attempt, r.stderr.strip())
             _git(path, *cred, "fetch", remote, publish_ref, env=env)
-            rb = subprocess.run(_wt_argv(path, *_wt_identity_args(), "-c", "commit.gpgSign=false",
+            rb = subprocess.run(_wt_argv(path, *_wt_identity_args(env), "-c", "commit.gpgSign=false",
                                          "rebase", f"{remote}/{publish_ref}"),
                                 capture_output=True, text=True, env=env)
             if rb.returncode != 0:
@@ -447,22 +539,63 @@ class WorktreeManager:
                 raise RuntimeError(f"wiki publish rebase conflict key={key}: {rb.stderr.strip()}")
         raise RuntimeError(f"wiki publish key={key}: push still rejected after {retries} rebase-retries")
 
-    def publish_mr(self, key, *, branch_prefix="eph/code-change", mr_target_ref="main", remote="origin"):
+    def publish_iteration(self, key, branch):
+        """Fast-forward an EXISTING broker MR branch. Never create, overwrite, rebase or open an MR."""
+        import routing
+        refusal = routing.mr_iteration_refusal(branch)
+        if refusal:
+            raise ValueError(refusal)                    # even a no-op onto main must raise
+        repo, path, cut_sha = self._checked(key)
+        env = _wt_env(path)
+        head = _git(path, "rev-parse", "HEAD", env=env)
+        if head == cut_sha:
+            return None
+        push_url = _gitlab_push_url(path, "origin")
+        cred = _wt_cred_args(repo)
+        # An explicit fetch must succeed: a missing branch is NOT a new-branch publish. Check ancestry
+        # broker-side too; a worker that replaced HEAD must never turn a forced update into an iteration.
+        _git(path, *cred, "fetch", push_url, f"refs/heads/{branch}", env=env)
+        fetched = _git(path, "rev-parse", "--verify", "FETCH_HEAD^{commit}", env=env)
+        _git(path, "merge-base", "--is-ancestor", fetched, "HEAD", env=env)
+        # Bind the update to the exact fetched tip, not a mutable remote-tracking ref. An ordinary
+        # push could recreate a branch deleted after fetch, or overwrite a concurrent rewind. The
+        # lease rejects BOTH; the ancestry check above still forbids non-fast-forward updates.
+        r = subprocess.run(_wt_argv(path, *cred, "push", *_ci_skip_opts(),
+                                    f"--force-with-lease=refs/heads/{branch}:{fetched}", push_url,
+                                    f"HEAD:refs/heads/{branch}"), capture_output=True, text=True, env=env)
+        if r.returncode != 0:
+            raise RuntimeError(f"MR iteration push failed: {r.stderr.strip()}")
+        return branch
+
+    def publish_mr(self, key, *, branch_prefix="eph/code-change", mr_target_ref="main", remote="origin",
+                   continue_branch=None):
         """Publish a code change-proposer's committed HEAD as a FEATURE BRANCH for an
         MR, NEVER a push to `mr_target_ref` (main). This is the human-gated code contract: the worker's diff
         lands on a fresh eph branch on the remote; opening the actual MR (GitLab API, token side) is
         a separate step. Returns the pushed branch name, or None on a no-op (worker made no commit).
 
+        continue_branch (a `continue-mr:` fix round, worktree cut FROM that branch) -> push HEAD back
+        onto that EXISTING branch instead of a fresh one, so its open MR updates in place. Plain push, never
+        forced: a branch that moved since the cut is rejected (non-fast-forward) and raises. The branch is
+        re-checked against routing.continue_mr_refusal here too (only broker-created branches; never the target).
+
         SECURITY INVARIANT: the ONLY ref this method ever pushes to is a fresh
-        `<branch_prefix>/...` feature branch. It must NEVER push to mr_target_ref, since that would auto-deploy
-        unreviewed code. The assert below makes that invariant executable."""
+        `<branch_prefix>/...` feature branch (or an eligible continue_branch). It must NEVER push to
+        mr_target_ref, since that would auto-deploy unreviewed code. The assert below makes that invariant executable."""
         repo, path, cut_sha = self._checked(key)        # fail closed on a repointed .git
         env = _wt_env(path)                              # no global/system config in the worker worktree
         if _git(path, "rev-parse", "HEAD", env=env) == cut_sha:
             log.info("publish_mr key=%s: worker made no commit -> no-op", key)
             return None
         head = _git(path, "rev-parse", "HEAD", env=env)
-        branch = f"{branch_prefix}/{_safe(key)}-{head[:8]}"
+        if continue_branch:
+            import routing
+            refusal = routing.continue_mr_refusal(continue_branch, mr_target_ref)
+            if refusal:
+                raise ValueError(f"code publish_mr key={key}: {refusal}")
+            branch = continue_branch
+        else:
+            branch = f"{branch_prefix}/{_safe(key)}-{head[:8]}"
         assert branch != mr_target_ref and not mr_target_ref.endswith(f"/{branch}"), \
             f"refusing to publish onto the MR target ref {mr_target_ref!r} (code MRs push a feature branch only)"
         push_url = _gitlab_push_url(path, remote)        # fail closed unless https://<BROKER_PUSH_HOSTS>/
@@ -476,22 +609,48 @@ class WorktreeManager:
                  key, remote, branch, mr_target_ref)
         return branch
 
+    def capped_commit_ready(self, key):
+        """True iff a turn-capped code worker left a CLEAN commit ahead of the cut: HEAD moved past the
+        cut sha AND the tree has no uncommitted/untracked change (the stripped charter files are ignored, as
+        in save_wip). That commit is the worker's finished deliverable (it capped after committing, before
+        its envelope), so the broker may publish it as an MR instead of a WIP branch. Read-only, never raises:
+        any git failure -> False (the caller falls back to save_wip)."""
+        try:
+            repo, path, cut_sha = self._checked(key)
+            env = _wt_env(path)
+            if _git(path, "rev-parse", "HEAD", env=env) == cut_sha:
+                return False
+            st = subprocess.run(_wt_argv(path, "status", "--porcelain", "--", ".", ":(top,exclude)CLAUDE.md",
+                                         ":(top,exclude)AGENTS.md", f":(top,exclude,glob)*{_CHARTER_SUFFIX}"),
+                                capture_output=True, text=True, env=env)
+            return st.returncode == 0 and st.stdout.strip() == ""
+        except Exception as e:
+            log.warning("capped_commit_ready key=%s: %s -> False", key, e)
+            return False
+
     def save_wip(self, key, remote="origin"):
         """A turn-capped code worker's work-in-progress must survive teardown. Commit any
         uncommitted edits as a WIP commit, then push HEAD (incl. any unpushed worker commits) to a fresh
         `eph/<key>-wip-<sha8>` branch. Branch ONLY; the caller opens NO MR (incomplete work is never put up
         for review/merge). The stripped charter files (strip_charter) are excluded so the WIP commit never
         records their deletion. Returns the pushed branch, or None when there is nothing to save (clean tree
-        AND HEAD == the cut sha). Raises on a git/push failure; the caller logs it and continues teardown."""
+        AND HEAD == the cut sha). Raises on a git/push failure; the caller logs it and continues teardown.
+
+        `git add -u` (update), NOT `-A` (all): `-u` stages tracked-file changes (edits + deletions) only;
+        a brand-new UNTRACKED file (worker scratch the turn cap caught mid-edit, never `git add`ed by the
+        worker itself) is left exactly as untracked and is never swept into the WIP commit. A file the
+        worker DID `git add` is already staged by that point and is unaffected either way (`-u` touches
+        the working-tree-vs-index diff for tracked paths; it never un-stages an already-staged new file)."""
         repo, path, cut_sha = self._checked(key)        # fail closed on a repointed .git
         env = _wt_env(path)                              # no global/system config in the worker worktree
-        _git(path, "add", "-A", "--", ".", ":(top,exclude)CLAUDE.md", ":(top,exclude)AGENTS.md",
+        env.update(self._git_identities.get(key, {}))
+        _git(path, "add", "-u", "--", ".", ":(top,exclude)CLAUDE.md", ":(top,exclude)AGENTS.md",
              f":(top,exclude,glob)*{_CHARTER_SUFFIX}", env=env)
         staged = subprocess.run(_wt_argv(path, "diff", "--cached", "--quiet", *_NO_EXT_DIFF),
                                 capture_output=True, text=True, env=env)
         if staged.returncode == 1:                       # 1 = staged changes present (0 = none)
             # Identity passed explicitly (_wt_env drops ~/.gitconfig); never run a planted gpg.program
-            _git(path, *_wt_identity_args(), "-c", "commit.gpgSign=false",
+            _git(path, *_wt_identity_args(env), "-c", "commit.gpgSign=false",
                  "commit", "-q", "--no-verify", "-m", f"WIP: turn-cap save ({key})", env=env)
         head = _git(path, "rev-parse", "HEAD", env=env)
         if head == cut_sha:
@@ -592,18 +751,25 @@ class WorktreeManager:
 
     def _mr_diff_once(self, key, repo, path, target_ref, remote):
         """One mr_diff attempt: the worktree fetch + three-dot diff, then (if that failed or came back
-        empty) the base-repo fetch + `<target sha>...HEAD` diff. Never raises; '' when both are empty/fail."""
+        empty) the base-repo fetch + `<target sha>...HEAD` diff. Never raises; '' when both are empty/fail.
+
+        `-c core.quotepath=false`: without it, git C-quotes (octal-escapes) any non-ASCII byte in a
+        `diff --git a/X b/X` path header, which breaks routing._diff_paths' plain-text parse of changed
+        paths (the tiered MR review's `select_mr_review_tier` reads those headers to pick quick/full).
+        Forcing it off means the header always carries the literal path, same as `--name-only -z` would."""
         env = _wt_env(path)
         try:
             _git(path, *_store_cred_args(), "fetch", remote, target_ref, env=env)
-            diff = _git(path, "diff", *_NO_EXT_DIFF, "FETCH_HEAD...HEAD", env=env)
+            diff = _git(path, "-c", "core.quotepath=false", "diff", *_NO_EXT_DIFF, *_SUBMODULE_VISIBLE,
+                        "FETCH_HEAD...HEAD", env=env)
             if diff.strip():
                 return diff
         except Exception as e:
             log.warning("mr_diff key=%s worktree fetch/diff failed: %s", key, e)
         try:                                             # local fallback: base repo shares the object db
             base = _fetch_branch_sha(repo, remote, target_ref)   # not the shared FETCH_HEAD
-            return _git(path, "diff", *_NO_EXT_DIFF, f"{base}...HEAD", env=env)
+            return _git(path, "-c", "core.quotepath=false", "diff", *_NO_EXT_DIFF, *_SUBMODULE_VISIBLE,
+                        f"{base}...HEAD", env=env)
         except Exception as e:
             log.warning("mr_diff key=%s base-repo fallback failed: %s", key, e)
             return ""

@@ -11,12 +11,13 @@ is `{status, summary, wake:[agents]}` (plus session_id and token usage, which we
 `gate_denials` (hermes gated turns only; added by adapters/hermes.one_turn AFTER parsing, from the eph-gate
 plugin's own record, never from worker text): list of {kind, tool, reason, sha?, subject?, path?}.
   kind     "floor" (an eph-gate rule) | "unmapped-tool" (no tool-table row: the table may be too narrow) |
-           "judge" (the judge model said no)
-  sha      ONLY on a judge deny the hook would honour an allow-once for. It is gate-hook.py's own value, copied
-           BYTE-EXACT from its decisions.jsonl final row (subject_sha): sha256 of the EXACT subject bytes
-           (the full command including any heredoc body and every newline/trailing space), which is the token
-           filename in the judge's allow-once directory. NEVER recompute it from `subject` or a re-typed
-           command: a retry only passes when the worker re-issues the identical bytes. Only the operator mints one.
+           "judge" (the exec gate said no)
+  sha      ONLY on a judge deny the gate offers an override for (the provider's token). Portcullis: gate-hook.py's
+           own value, copied BYTE-EXACT from its decisions.jsonl final row (subject_sha): sha256 of the EXACT
+           subject bytes (the full command including any heredoc body and every newline/trailing space), which is
+           the token filename in the judge's allow-once directory. NEVER recompute it from `subject` or a
+           re-typed command: a retry only passes when the worker re-issues the identical bytes. Only the operator
+           mints one.
   subject  the exact terminal command (<= 4000 chars, else omitted and only the sha is reported), so the
            operator can check sha256(subject) == sha before minting. Worker-chosen text: always rendered
            escaped/fenced.

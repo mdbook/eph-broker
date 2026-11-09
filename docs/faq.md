@@ -47,8 +47,9 @@ listed repo's worker MRs once the pipeline is green, with no reviewer (meant for
 ## What happens when the agent gets stuck?
 
 It's told to return `blocked` with an explanation rather than guess. The broker posts that on the ticket and
-adds `PARKED_LABEL_ID` if you set one. A worker that hits its turn cap has its partial work pushed to a WIP
-branch with no MR. One that runs past its time limit is killed. In every case the worktree is cleaned up.
+adds `PARKED_LABEL_ID` if you set one. A worker that hits its turn cap after a clean commit has that commit
+published as an MR (`TURN_CAP_PUBLISH_CLEAN_COMMIT`); otherwise its partial work is pushed to a WIP branch with
+no MR. One that runs past its time limit is killed. In every case the worktree is cleaned up.
 
 ## What does it cost to run?
 

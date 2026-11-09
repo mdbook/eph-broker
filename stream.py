@@ -3,6 +3,9 @@
 
 `GET /stream/<url-quoted subject_key>` tails the live Claude Code transcript of a CURRENT live worker
 (~/.claude/projects/<cwd-slug>/<session uuid>.jsonl) as `text/event-stream`, one jsonl line per event.
+Codex workers use the same lookup/SSE/history path with broker-written, redacted records in
+PROJECTS_DIR/eph-codex/<thread uuid>.jsonl (message and thought text, command lines with the tail of their output,
+per-edit diffs of worktree files, plan items; never MCP arguments or results).
 
 DEFAULT OFF. Env (names + defaults; values live in eph-broker.env or the site overlay config/site.env):
   BROKER_STREAM_ENABLED  unset  -> off: /stream/* 404s AND the CC adapter passes no --session-id (inert).
@@ -42,6 +45,8 @@ from a uuid the broker recorded for that exact key; the request never names a fi
 """
 import collections, glob, json, logging, os, re, socket, threading, time, urllib.parse
 
+import steer
+
 log = logging.getLogger("eph-broker.stream")
 
 PROJECTS_DIR = os.path.expanduser("~/.claude/projects")   # module attr so tests can repoint it
@@ -64,7 +69,7 @@ _CLIENT_GONE = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError,
 
 _slots_lock = threading.Lock()
 _active = 0
-_warned_no_group = False
+_warned_no_group = set()
 _warned_unsafe = set()
 _CLIENT_HEADERS = {"host", "cookie", "user-agent", "referer", "origin", "authorization", "forwarded", "x-real-ip"}
 
@@ -109,18 +114,19 @@ def _identity_header(var):
     return name
 
 
-def authorized(headers):
-    """(allowed, username). Fail-closed on a missing group config, a missing username, or no exact match."""
-    global _warned_no_group
+def authorized(headers, group_var="BROKER_STREAM_GROUP"):
+    """(allowed, username). Fail-closed on a missing group config, a missing username, or no exact match.
+    `group_var` names the env var holding the allowed group (actions.py passes BROKER_ACTIONS_GROUP; the
+    identity headers are the same proxy's either way)."""
     user_h = _identity_header("BROKER_STREAM_USER_HEADER")
     groups_h = _identity_header("BROKER_STREAM_GROUPS_HEADER")
     user = (headers.get(user_h) or "").strip() if user_h else ""
-    group = (os.getenv("BROKER_STREAM_GROUP") or "").strip()
+    group = (os.getenv(group_var) or "").strip()
     if not (group and user_h and groups_h):
-        if not _warned_no_group:
-            _warned_no_group = True
-            log.error("stream: BROKER_STREAM_ENABLED but BROKER_STREAM_GROUP / BROKER_STREAM_USER_HEADER / "
-                      "BROKER_STREAM_GROUPS_HEADER unset -> every /stream 403 (fail-closed)")
+        if group_var not in _warned_no_group:
+            _warned_no_group.add(group_var)
+            log.error("%s / BROKER_STREAM_USER_HEADER / BROKER_STREAM_GROUPS_HEADER unset -> every request "
+                      "it guards 403s (fail-closed)", group_var)
         return False, user
     if not user:
         return False, user
@@ -169,7 +175,7 @@ def active():
 # ---------------------------------------------------------------- previous-session history
 
 _hist_lock = threading.Lock()
-_hist = None                # deque of {"key","sid","ts"}, lazily loaded from HISTORY_PATH
+_hist = None                # deque of {"key","sid","ts","title"} (+ finish() fields), lazily loaded from HISTORY_PATH
 _hist_appends = 0           # appends since the file was last compacted
 
 
@@ -192,45 +198,98 @@ def _load():
                         except ValueError:
                             continue
                         if _valid_rec(r):
-                            _hist.append({"key": r["key"], "sid": r["sid"], "ts": r["ts"]})
+                            _hist.append({"key": r["key"], "sid": r["sid"], "ts": r["ts"], "title": _title(r.get("title")),
+                                          **_end_fields(r)})
+                        elif isinstance(r, dict) and "ts" not in r:   # a finish() line: fold into its start
+                            _merge_end(_hist, r)
             except OSError:
                 pass
     return _hist
 
 
-def remember(key, sid, now=None):
+def _title(t):
+    """A run's ticket title for the history list: a short single-line string, else None."""
+    return " ".join(t.split())[:200] or None if isinstance(t, str) else None
+
+
+def _end_fields(r):
+    """The end-of-run fields finish() adds (model, harness, tokens, ended), validated; absent ones are omitted."""
+    out = {}
+    for k, cap in (("model", 80), ("harness", 20)):
+        if isinstance(r.get(k), str) and r[k].strip():
+            out[k] = r[k].strip()[:cap]
+    if isinstance(r.get("tokens"), int) and not isinstance(r["tokens"], bool) and r["tokens"] >= 0:
+        out["tokens"] = r["tokens"]
+    if isinstance(r.get("ended"), (int, float)) and not isinstance(r["ended"], bool):
+        out["ended"] = r["ended"]
+    return out
+
+
+def _merge_end(h, r):
+    """Fold a finish() record into the newest start record with the same key + session. True if one matched."""
+    for rec in reversed(h):
+        if rec["key"] == r.get("key") and rec["sid"] == r.get("sid"):
+            rec.update(_end_fields(r))
+            return True
+    return False
+
+
+def remember(key, sid, now=None, title=None):
     """Record a fresh stream session for `key` (called by the CC adapter right after it pins the uuid).
+    `title` (the ticket title, optional) lets the dashboard name an ended run instead of showing a bare id.
     Best-effort: a write failure is logged, never raised into the worker spawn path."""
-    global _hist_appends
-    rec = {"key": key, "sid": sid, "ts": round(now if now is not None else time.time(), 1)}
+    rec = {"key": key, "sid": sid, "ts": round(now if now is not None else time.time(), 1), "title": _title(title)}
     if not _valid_rec(rec):
         return
     with _hist_lock:
         h = _load()
         h.append(rec)
-        if not HISTORY_PATH:
-            return
-        try:
-            os.makedirs(os.path.dirname(HISTORY_PATH) or ".", exist_ok=True)
-            _hist_appends += 1
-            if _hist_appends >= HISTORY_MAX:            # compact: the file never grows past ~2x HISTORY_MAX
-                tmp = HISTORY_PATH + ".tmp"
-                with open(tmp, "w") as f:
-                    f.write("".join(json.dumps(r) + "\n" for r in h))
-                os.replace(tmp, HISTORY_PATH)
-                _hist_appends = 0
-            else:
-                with open(HISTORY_PATH, "a") as f:
-                    f.write(json.dumps(rec) + "\n")
-        except OSError as e:
-            log.warning("stream history write failed (%s): %s", HISTORY_PATH, e)
+        _persist(h, rec)
+
+
+def finish(key, sid, model=None, harness=None, tokens=None, now=None):
+    """Record how a stream session ended (called by the adapter's teardown): the model and harness it ran on and
+    the worker's token total, so an ended run is not a bare id on the dashboard. Appended as its own line and
+    folded into the matching start record on load. No matching start record = nothing written. Never raises."""
+    if not (isinstance(key, str) and valid_uuid(sid)):
+        return
+    rec = {"key": key, "sid": sid, **_end_fields({"model": model, "harness": harness, "tokens": tokens,
+                                                   "ended": round(now if now is not None else time.time(), 1)})}
+    with _hist_lock:
+        h = _load()
+        if _merge_end(h, rec):
+            _persist(h, rec)
+
+
+def _persist(h, rec):
+    """Append `rec` to HISTORY_PATH, or compact the file to `h` every HISTORY_MAX appends. Caller holds _hist_lock.
+    Best-effort: a write failure is logged, never raised into the worker path."""
+    global _hist_appends
+    if not HISTORY_PATH:
+        return
+    try:
+        os.makedirs(os.path.dirname(HISTORY_PATH) or ".", exist_ok=True)
+        _hist_appends += 1
+        if _hist_appends >= HISTORY_MAX:            # compact: the file never grows past ~2x HISTORY_MAX
+            tmp = HISTORY_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                f.write("".join(json.dumps(r) + "\n" for r in h))
+            os.replace(tmp, HISTORY_PATH)
+            _hist_appends = 0
+        else:
+            with open(HISTORY_PATH, "a") as f:
+                f.write(json.dumps(rec) + "\n")
+    except OSError as e:
+        log.warning("stream history write failed (%s): %s", HISTORY_PATH, e)
 
 
 def history():
-    """Newest-first view for /state: key + 8-char session prefix + start time. Never the full uuid."""
+    """Newest-first view for /state: key + 8-char session prefix + start time + title, plus model, harness, tokens
+    and end time once the session has ended. Never the full uuid."""
     with _hist_lock:
         recs = list(_load())
-    return [{"key": r["key"], "session": r["sid"][:8], "ts": r["ts"]} for r in reversed(recs)]
+    return [{"key": r["key"], "session": r["sid"][:8], "ts": r["ts"], "title": r.get("title"), **_end_fields(r)}
+            for r in reversed(recs)]
 
 
 def past_lookup(key, sid8):
@@ -274,6 +333,41 @@ def _backfill(path, max_lines=None, max_bytes=None):
     if start > 0 and lines:
         lines = lines[1:]                        # first line was cut by the byte window
     return list(collections.deque(lines, maxlen=max_lines or TAIL_LINES)), offset
+
+
+def _window(key, sid):
+    """(start, end) epoch of the recorded session `sid` of `key` (end None while it runs), else (None, None)."""
+    with _hist_lock:
+        recs = list(_load())
+    for r in reversed(recs):
+        if r["key"] == key and r["sid"] == sid:
+            return r["ts"], r.get("ended")
+    return None, None
+
+
+def _messages(key, sid, offset=0):
+    """(dashboard-message records of this session, new offset): steer.py's per-subject log, filtered to the
+    session's time window so another run's messages never show. Never raises."""
+    start, end = _window(key, sid)
+    path = steer.log_path(key)
+    if os.path.islink(path):                    # a planted symlink never turns the dash into a file reader
+        return [], offset
+    try:
+        if offset > os.path.getsize(path):      # steer.py trimmed the log: read it again from the top
+            offset = 0
+        lines, offset = _read_complete(path, offset)
+    except OSError:
+        return [], offset
+    out = []
+    for ln in lines:
+        try:
+            ts = json.loads(ln).get("ts")
+        except (ValueError, AttributeError):
+            continue
+        if (isinstance(ts, (int, float)) and (start is None or ts >= start - 5)
+                and (end is None or ts <= end + 5)):
+            out.append(ln)
+    return out, offset
 
 
 def _event(line):
@@ -364,6 +458,7 @@ def serve_past(handler, raw):
         handler.send_header("X-Accel-Buffering", "no")
         handler.end_headers()
         lines, _ = _backfill(path, PAST_LINES, PAST_BYTES)
+        lines += _messages(key, sid)[0]
         handler.wfile.write(b"".join(_event(ln) for ln in lines) + b"event: end\ndata: past-session\n\n")
         handler.wfile.flush()
     except _CLIENT_GONE:
@@ -380,7 +475,7 @@ def pump(wfile, broker, key, sid):
     rotation (worker got a fresh uuid) by switching files. Client disconnects raise out of wfile.write."""
     start = time.monotonic()
     deadline, last_ping = start + max_s(), start
-    path, offset = None, 0
+    path, offset, moff = None, 0, 0
     while True:
         now = time.monotonic()
         if now >= deadline:
@@ -391,7 +486,7 @@ def pump(wfile, broker, key, sid):
             wfile.flush()
             return "worker-ended"
         if cur != sid:                           # session rotation: follow the new transcript
-            sid, path, offset = cur, None, 0
+            sid, path, offset, moff = cur, None, 0, 0
         if path is None:
             path = find_transcript(sid)          # file may not exist yet (worker still starting): keep waiting
             lines = []
@@ -402,6 +497,9 @@ def pump(wfile, broker, key, sid):
                 lines, offset = _read_complete(path, offset)
             except OSError:
                 lines, path, offset = [], None, 0
+        if path:                                 # dashboard messages (steer.py) ride after the transcript lines
+            msgs, moff = _messages(key, sid, moff)
+            lines = lines + msgs
         out = b"".join(_event(ln) for ln in lines)
         if now - last_ping >= PING_S:
             out += b": ping\n\n"

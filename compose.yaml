@@ -1,0 +1,24 @@
+# Local dashboard preview, not a worker-enabled production image. See docs/docker.md.
+services:
+  broker:
+    build: .
+    # The broker deliberately binds only to loopback. Host networking requires Linux.
+    network_mode: host
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:mode=1777
+    volumes:
+      - broker-state:/var/lib/eph-broker
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/health', timeout=3).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  broker-state:

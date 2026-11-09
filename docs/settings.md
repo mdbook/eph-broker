@@ -24,11 +24,15 @@ Flags count as on for `1`, `true`, `yes` or `on`, unless the row says otherwise.
 | `BROKER_PROVENANCE_PATH` | `CONFIG_DIR/provenance.json` | Which accounts are agents ([configuration.md](configuration.md#who-counts-as-an-agent)). |
 | `BROKER_PROVENANCE_NEUTRAL` | unset | `1` lets the broker start without a provenance file, with only built-in agent names. |
 | `ROUTES_PATH` | `CONFIG_DIR/routes.json` | Your own agent types ([routes.md](routes.md)). |
+| `REPO_COMPANIONS_FILE` | `config/repo-companions.json` beside the broker | Optional per-code-repo read-only source checkouts. Re-read on each cut; an explicit missing file refuses the run. See [configuration.md](configuration.md#companion-source-repositories). |
 | `EVENTS_LOG` | `$TMPDIR/eph-broker/events.jsonl` | Every accepted event, one JSON line each. Its directory also holds the state files below. |
 | `COMPLETED_PATH` | `completed.json` next to `EVENTS_LOG` | Tickets that finished a run. In memory only when `EVENTS_LOG` isn't set. |
+| `BROKER_STATE_PATH` | `broker-state.sqlite3` beside an explicit `COMPLETED_PATH` | Private local journal for durable drain, FIFO intake and scheduler state. Without either path drain control returns 503. See [drain.md](drain.md). |
+| `BROKER_DRAIN_ON_NEW_JOURNAL` | off | Startup-only bootstrap for a logically uninitialized journal. Commits initial drain with its schema before scheduling/listeners. Accepts `1/true/yes/on` or `0/false/no/off`, case-insensitive with surrounding whitespace ignored; unset is off, any other value (including empty) refuses startup. Enabled without durable storage also refuses startup. Existing journals retain their drain state, including implicit false when absent. See [drain.md](drain.md#starting-with-a-new-journal). |
 | `MAX_COMPLETED` | `2000` | How many finished subjects are remembered. |
-| `PENDING_MAX_AGE` | `3600` | Seconds. A saved, not yet started worker older than this is dropped at startup. |
+| `PENDING_MAX_AGE` | `3600` | Seconds. Legacy JSON pending entries older than this are dropped during import. Journaled pending work has no age expiry. |
 | `WORKTREES_ROOT` | `$TMPDIR/eph-broker-worktrees` | Where worktrees for rows without their own base go. |
+| `WORKER_ENV_PASSTHROUGH` | unset | Comma list of extra environment variable names a worker keeps from the broker env, on top of the fixed allowlist. Names containing `TOKEN`, `SECRET`, `KEY` or `PASSWORD` are refused. Read at import. |
 | `TURN_CAPTURE_DIR` | `turn-captures/` next to `EVENTS_LOG` | Size-capped stdout and stderr of failed turns, for debugging. Off when `EVENTS_LOG` isn't set. |
 | `TURN_CAPTURE_KEEP` | `200` | Captures kept. |
 | `TURN_CAPTURE_MAX_AGE_S` | 7 days | Captures older than this are removed. |
@@ -45,6 +49,8 @@ Turn caps and time limits per capability are in `config/constraints.json`, not h
 | `INITIAL_WINDOWS`, `RECEIVE_WINDOWS` | `{}` | JSON maps of subject type to seconds (for example `{"vikunja:task": 5}`), on top of the defaults. |
 | `TICK` | `1` | Seconds between scheduler passes. |
 | `ROW_CONCURRENCY` | unset | Per-row caps, `<row>=<n>,...`. A worker over its row's cap waits in the queue. |
+| `DISPATCH_PRIORITY` | `reviews-first` | Pending MR reviews (including reruns) and valid `continue-mr:` fix rounds precede new tickets on the same repo. Repos are served fairly; a capped/debouncing repo does not hold unrelated repos. `fifo` restores strict durable FIFO and FIFO checkout-lock admission. Other values refuse startup. See [configuration.md](configuration.md#dispatch-priority). |
+| `DISPATCH_METADATA_WAIT` | `5` | Seconds of grace from lookup start before ordinary admission falls back to unknown-target ordering while eligible same-row metadata is still resolving. Shared row-cap groups share the grace; known follow-ups and other rows can dispatch. `0` disables the grace. Only applies to `reviews-first`. |
 | `MAX_SPAWNS_PER_HOUR` | `60` | Warning only: past it, each start logs `BREAKER-WOULD-TRIP`. Nothing is stopped. |
 | `API_OVERLOAD_RETRY_DELAYS_S` | `120,300,600` | Back-off in seconds when the model API answers 429 or 529. |
 | `HARDKILL_REPROMPT_CAP_S` | `60` | Time limit for the one re-prompt after a worker was killed for running too long. |
@@ -56,7 +62,9 @@ Turn caps and time limits per capability are in `config/constraints.json`, not h
 |---|---|---|
 | `BROKER_MCP_SH` | unset | The tracker script ([tracker-script.md](tracker-script.md)). Unset: no tracker ticket can start a worker. |
 | `TICKET_URL_TEMPLATE` | unset | Ticket link, `{}` is the id. Unset: plain `#<id>`. |
+| `DASH_INSTANCE_NAME` | unset | Label shown next to the logo on the dashboard. |
 | `PARKED_LABEL_ID` | unset | Tracker label id added when a worker returns `blocked`. Its title also belongs in `handoff_parked_labels`. |
+| `MR_ROUTINE_OPS_DM` | `0` | `0`: no ops DM for "MR opened" or a quick-tier review PASS when the ticket comment posted (the comment is the record). FAIL/BLOCK, Full-tier PASS, review-skipped, worker errors, ticket-less MRs and a failed comment post still DM. `1`: rollback, DM every MR-opened and verdict. |
 | `COMMENT_RESPAWN_ENABLED` | on | A human comment can restart a ticket whose worker exited ([agent-refire.md](agent-refire.md)). `0` turns it off. |
 | `RERUN_CALLER` | `operator` | The name `/rerun` calls are logged and commented as. |
 | `MODEL_LABEL_TRUSTED_CREATORS` | unset | Ticket creators whose `model:` or `hermes` label is honoured. |
@@ -81,6 +89,7 @@ The secrets themselves are in [configuration.md](configuration.md#secrets). Thes
 | `GITLAB_ISSUE_TOKEN_ENV` | `GITLAB_ISSUE_TOKEN` | Name of the variable holding the GitLab issue-comment token (optional). |
 | `GITLAB_MERGE_TOKEN_ENV` | `GITLAB_MERGE_TOKEN` | Name of the variable holding the merge token (CD and auto-merge). |
 | `GITLAB_PUSH_TOKEN_ENV` | `GITLAB_PUSH_TOKEN` | Name of the variable holding the namespace push token ([repo-push-cred.md](repo-push-cred.md)). |
+| `CATALOG_REFRESH_TOKEN_ENV` | `BROKER_CATALOG_REFRESH_TOKEN` | Name of the variable holding the `/catalog/refresh` token. |
 | `EVENTS_WEBHOOK_SECRET_ENV` | `EVENTS_WEBHOOK_SECRET` | Name of the variable holding the run event signing secret. |
 | `NOTIFY_WEBHOOK_SECRET_ENV` | `NOTIFY_WEBHOOK_SECRET` | Name of the variable holding the notification webhook secret. |
 | `NOTIFY_SMTP_PASSWORD_ENV` | `NOTIFY_SMTP_PASSWORD` | Name of the variable holding the SMTP password. |
@@ -95,18 +104,41 @@ The secrets themselves are in [configuration.md](configuration.md#secrets). Thes
 | `BROKER_PUSH_HOSTS` | unset | Comma list of bare host names a worker branch may be pushed to, over https. Unset: no pushes. |
 | `REPO_CRED_FILE` | `~/.git-credentials` | The credential store the broker pushes with ([repo-push-cred.md](repo-push-cred.md)). |
 
+### Worker commit identity
+
+Workers use bot metadata for both Git author and committer on every harness, including resumed turns.
+Broker WIP commits and wiki rebase retries retain the same row identity. This does not change the push
+credential, remote, branch permissions or URL checks, and it does not rewrite existing commits.
+
+Replace `<ROW>` below with the routing row key, uppercased with punctuation replaced by underscores:
+`code` becomes `CODE`, `infra/general` becomes `INFRA_GENERAL`, and a config row `docs-writer` becomes
+`DOCS_WRITER`. The default bot slug is the lowercase row key with punctuation replaced by dashes.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `<ROW>_GIT_NAME` | `eph-<row-slug>` | Both `GIT_AUTHOR_NAME` and `GIT_COMMITTER_NAME`. |
+| `<ROW>_GIT_EMAIL` | `eph-<row-slug>@noreply.invalid` | Both `GIT_AUTHOR_EMAIL` and `GIT_COMMITTER_EMAIL`. Use a server-approved bot address if push rules require one. |
+| `<ROW>_GIT_IDENTITY_ENABLED` | on | Explicit per-row compatibility opt-out. Set off only if the existing push credential/server rules cannot accept bot metadata. Off preserves the previous identity behavior, including host Git config. Invalid boolean/identity values refuse the run, rather than silently using the operator. |
+
+These settings are operator configuration, not ticket fields. They override ambient, route and backend
+identity environment variables. They are read at worker launch; restart after changing a settings file.
+For example, `CODE_GIT_NAME=eph-code` and `CODE_GIT_EMAIL=eph-code@example.com` customize the code row.
+Git metadata is not authenticated provenance: author names alone must not be used to trust a diff.
+After rollout, check `git log -1 --format='%an <%ae> / %cn <%ce>'` and a broker-published feature branch
+on your server; a local transport test cannot check server-specific author/email push rules.
+
 ## Issue intake
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `ISSUE_REPO_MAP` | unset | `<source>:<project>=<local path>,...`. Unset: every issue is refused. |
-| `ISSUE_AUTHOR_ALLOWLIST` | unset | Users whose new issues may start a worker. Unset: nobody. |
+| `ISSUE_AUTHOR_ALLOWLIST` | unset | Users whose new issues may start a worker. Unset: nobody. `GET /health` reports the list the running process uses as `issue_author_allowlist` (sorted, lowercased, `[]` when unset), so a check can confirm an account is not admitted without reading config files that the environment may override. |
 | `ISSUE_TRIGGERING_EVENTS` | `issues.opened,issue.opened,issue.open` | Issue events that start work. |
 | `GITLAB_ISSUE_SOURCE`, `GITHUB_ISSUE_SOURCE` | `gitlab`, `github` | The event `source` of each issue row. Empty turns the row off. |
 | `ISSUE_CODE_TEST_RUNNER` | unset | Test runner for issue workers when `CODE_REPO_RUNNER_SEEDS` has none for the repo. Unset: no test command. |
 | `ISSUE_CODE_MR_TARGET_REF` | `main` | Fallback MR target; the repo's own default branch is used when known. |
 | `ISSUE_CODE_BRANCH_PREFIX` | `eph/issue` | Branch name prefix. |
-| `ISSUE_CODE_WORKTREE_BASE` | `~/.cache/eph-issue-worktrees` | Where issue worktrees go. |
+| `ISSUE_CODE_WORKTREE_BASE` | `~/.cache/ew/i` | Short root for issue worktrees; keep overrides short. Nested paths such as pytest `tmp_path` can still exceed AF_UNIX limits. |
 | `ISSUE_CODE_BACKEND` | unset | Pins a registry backend for issue workers. Unset: `FLEET_MODEL_SH` decides. |
 | `ISSUE_CODE_REPO`, `ISSUE_CODE_REPO_PATH` | unset | Not used: each issue's repo comes from `ISSUE_REPO_MAP`. |
 | `ISSUE_CODE_ZBUS_ENV` | unset | Chat identity file handed to the worker (zbus only). |
@@ -117,12 +149,16 @@ The secrets themselves are in [configuration.md](configuration.md#secrets). Thes
 |---|---|---|
 | `CODE_ROW_LABEL`, `DEV_ASSIGNEE` | `eph:code-change`, `eph-code` | The label and assignee that start it. Empty turns that trigger off. |
 | `CODE_REPO_ALLOWLIST` | unset | Colon list of repo paths it may work in. Unset: none. |
-| `CODE_REPO_RUNNER_SEEDS` | unset | Test runner per repo, `<path>=<runner>,...`. |
+| `CODE_REPO_RUNNER_SEEDS` | unset | Test runner per repo, `<path>=<runner>,...` (`repo-test` runs the repo's own `./run-tests.sh`). The key must be the repo's real absolute path: a key on a path that does not exist as a directory never applies (the broker warns at startup and the repo falls through to the route default `CODE_TEST_RUNNER`). |
+| `CONTINUE_MR_PREFIXES` | `eph/` | Colon list of branch prefixes a `continue-mr:` line may name. Each must end in `/`. Empty: nothing can be continued. |
+| `TURN_CAP_PUBLISH_CLEAN_COMMIT` | `1` | A worker that hits its turn cap with a clean commit ahead of the base gets that commit published as an MR. `0`: WIP branch only. |
 | `CODE_REPO_RUNNERS` | unset | Same format; overrides the seeds per path. |
 | `CODE_TEST_RUNNER` | `pytest` | Runner for a repo that's in neither map. |
+| `EPH_GATE_TEST_ENV_ALLOW` | unset | Comma list of extra reviewed, exact environment names allowed before a code worker's granted test runner on hermes/Codex, on top of the benign defaults ([hermes.md](hermes.md#test-runner-environment-assignments-hermes-and-codex)). No wildcard patterns. Values remain confined. |
+| `CODE_TEST_DEPS_CONFIG` | unset | Operator-owned JSON map of absolute repo paths to Python package requirements. Mapped repos use the `venv` runner; the broker provisions `<repo>/.venv` before starting them. Setup failures are verification gaps, not pre-start refusals. |
 | `CODE_MR_TARGET_REF` | `main` | Fallback MR target; the repo's own default branch is used when known. |
 | `CODE_BRANCH_PREFIX` | `eph/code-change` | Branch name prefix. |
-| `CODE_WORKTREE_BASE` | `~/.cache/eph-code-worktrees` | Where its worktrees go. |
+| `CODE_WORKTREE_BASE` | `~/.cache/ew/c` | Short root for code worktrees. Each code worker gets a private writable sibling `TMPDIR`, cleaned up at exit. Keep overrides short; nested paths such as pytest `tmp_path` can still exceed AF_UNIX limits. |
 | `CODE_AGENT` | `code-worker` | Agent name passed to `FLEET_MODEL_SH`. |
 | `CODE_CHANGE_BACKEND` | unset | Pins a registry backend. Unset: `FLEET_MODEL_SH` decides. |
 | `CODE_NONCLAUDE_OK` | off | Lets a code worker run on a non-Anthropic backend or on hermes. |
@@ -145,6 +181,30 @@ The secrets themselves are in [configuration.md](configuration.md#secrets). Thes
 | `GENERAL_BACKEND` | unset | Pins a registry backend. Keep it unset ([security-residual-same-uid.md](security-residual-same-uid.md)). |
 | `GENERAL_ZBUS_ENV` | unset | Chat identity file handed to the worker (zbus only). |
 
+## MR comment iteration
+
+Enable GitLab **Comments** events on the same authenticated `/webhooks/gitlab` hook used for issues.
+An accepted note starts the existing code worker on the MR source branch. Notes arriving while it is live
+are forwarded to that worker. The broker pushes follow-up commits onto the same branch, posts a marked
+summary note, and requests a new review at the pushed SHA. It opens no new MR and never merges.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MR_NOTE_AUTHOR_ALLOWLIST` | empty (off) | Comma-separated GitLab usernames allowed to request follow-ups, case-insensitive. Separate from `ISSUE_AUTHOR_ALLOWLIST`. |
+| `MR_ITERATION_MAX` | `3` | Maximum distinct accepted notes per project/MR, including warm forwards. The fourth note is ignored by default. Zero, negative or invalid values disable intake. Delivery retries of the same note ID do not consume another slot. Receipts survive restart with `BROKER_STATE_PATH`; without a journal they are in memory only. |
+| `CD_WORKER_BRANCH_PREFIX` | `eph/` | Reused branch filter. Only valid `eph/*` branches under this prefix qualify; the MR target ref never qualifies. No dependency on `CD_ENABLED`. |
+
+The project must have a local repo in `ISSUE_REPO_MAP` (`gitlab:group/project`), just like GitLab issues.
+Notes cannot select a local path, branch, runner or tool grant. System notes, issue/commit notes, edited
+notes, closed MRs, fork MRs, broker-marked notes and non-allowlisted authors are acknowledged with 200 and
+ignored. A stale head pin, missing branch or non-fast-forward push fails closed. A re-review waits for any
+older reviewer to close, using the existing durable re-review queue; the latest queued head wins.
+
+The broker records the originating ticket ID by project/MR when publishing a code worker's `mr.opened`
+event. That binding survives restart with `BROKER_STATE_PATH` (process-local without a journal). Iteration
+and re-review workers use it to fetch the current ticket text; editable notes and MR descriptions cannot
+change the binding. Notes also carry the MR title and description as context, including ticket-less MRs.
+
 ## MR reviewer
 
 | Variable | Default | Meaning |
@@ -153,7 +213,15 @@ The secrets themselves are in [configuration.md](configuration.md#secrets). Thes
 | `MR_REVIEW_REPO` | unset | Default repo; the MR's own repo wins. |
 | `MR_REVIEW_WORKTREE_BASE` | `~/.cache/eph-mr-worktrees` | Where review checkouts go. |
 | `MR_REVIEW_AGENT` | `mr-reviewer` | Agent name passed to `FLEET_MODEL_SH`. |
-| `MR_REVIEWER_MODEL`, `MR_REVIEWER_BACKEND`, `MR_REVIEW_ADAPTER` | unset, unset, `cc` | The reviewer's model, backend and harness ([configuration.md](configuration.md#choosing-the-reviewers-model)). |
+| `MR_REVIEWER_MODEL`, `MR_REVIEWER_BACKEND`, `MR_REVIEW_ADAPTER` | unset, unset, `cc` | The reviewer's model, backend and harness (`cc`, `hermes` or `codex`; [configuration.md](configuration.md#choosing-the-reviewers-model)). Set, either one overrides every review tier below. |
+| `MR_REVIEW_QUICK_MODEL`, `MR_REVIEW_QUICK_MODEL_CODEX` | `haiku`, unset | Quick-tier reviewer model; the codex one is used instead on the Codex harness. |
+| `MR_REVIEW_STANDARD_MODEL` | unset | Standard-tier reviewer model; unset keeps the row's existing resolution. |
+| `MR_REVIEW_FULL_MODEL` | `opus` | Full-tier reviewer model. |
+| `MR_REVIEW_QUICK_PATHS` | `*.md,*.rst,*.txt` | Comma globs; a quick-tier diff's changed paths must ALL match one (narrow prose-extension allowlist; add-only). |
+| `MR_REVIEW_QUICK_EXCLUDE_PATHS` | `tests/*,*/tests/*,.*/*,*/.*/*,CMakeLists.txt,*/CMakeLists.txt,*copilot-instructions*,charters/*,agents/*,*/agents/*,modules/*,*/modules/*,scopes/*,*/scopes/*,skills/*,*/skills/*` | Comma globs; a path matching one of these is excluded from the quick allowlist above even if it also matches a quick extension (add-only, site may widen, never narrow). |
+| `MR_REVIEW_QUICK_MAX_DIFF_LINES` | `20` | Changed-line ceiling for the quick tier. |
+| `MR_REVIEW_FULL_PATHS` | `CLAUDE*.md,AGENTS*.md,FLEET.md,GEMINI.md,.claude/*,*/.claude/*,.codex/*,*/.codex/*,prompts/*,*/prompts/*,SKILL.md,commands/*.md,*/commands/*.md`, plus cd.py's own Full-path glob categories (generic sensitive/deploy categories and any repo-specific one for the MR's own repo), read fresh per review | Comma globs; any changed path matching one forces the full tier (add-only; a site may widen, never narrow). |
+| `MR_REVIEW_FULL_DIFF_LINES` | `400` | Changed-line floor above which the diff forces the full tier. |
 
 ## Models and backends
 
@@ -175,6 +243,27 @@ The secrets themselves are in [configuration.md](configuration.md#secrets). Thes
 | `HERMES_BIN` | `~/.local/share/eph-hermes/venv/bin/hermes` | The broker's own hermes install ([hermes.md](hermes.md)). |
 | `HERMES_HOME_ROOT` | `~/.cache/eph-hermes-homes` | Where each hermes worker's private config home is created. |
 | `CD_ACCEPT_HERMES` | off | Lets a hermes reviewer's PASS auto-merge under CD. |
+| `EXEC_GATE` | `deny` | Who judges a general worker's shell and write calls: `deny`, `none`, `exec` or `portcullis` ([hermes.md](hermes.md#plugging-in-your-own-exec-gate-general-worker-only)). |
+| `EXEC_GATE_COMMAND` | unset | With `exec`: the program that gets each request as JSON on stdin. |
+| `EXEC_GATE_PORTCULLIS_WRAPPER`, `_HOOK`, `_PYTHON`, `_DIR`, `_PROJECT_DIR` | unset | With `portcullis`: the hook-mode wrapper, hook script, its interpreter and its state directory (`_PROJECT_DIR` defaults to `_DIR`). |
+| `EXEC_GATE_TIMEOUT` | `5.0` | Seconds per gate decision. |
+| `EXEC_GATE_INHERIT_ENV` | `TMPDIR,LANG,TZ` | Comma list of env names the gate process may inherit. |
+| `EXEC_GATE_PROTECTED_TERMS` | unset | Extra literal names a general terminal command may never mention. |
+
+## Codex harness
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `<ROW>_ADAPTER` | `cc` | A built-in row's harness: `cc`, `hermes` or `codex` ([configuration.md](configuration.md#choosing-a-rows-harness)). |
+| `CODEX_AUTH_FILE` | unset | Absolute path of the Codex login file, symlinked into each worker's home, never read. Unset refuses every Codex worker ([configuration.md](configuration.md#the-codex-harness)). |
+| `CODEX_BACKEND` | unset | Registry backend whose `codex` block gives the model when the row's backend has none. |
+| `CODEX_BIN` | `codex` | The Codex CLI. |
+| `CODEX_HOME_ROOT` | `~/.cache/eph-codex-homes` | Where each Codex worker's private `CODEX_HOME` is created. |
+| `CODEX_REASONING_SUMMARY` | empty | Codex `model_reasoning_summary` for every turn: `auto`, `concise`, `detailed` or `none`. Codex only reports a thought when the model returns a summary, so set this to put thoughts in the live transcript. Empty leaves the key out (Codex's default); any other value refuses every Codex turn with an error naming the knob. Check your model accepts it with one turn before rolling it out. |
+| `CODEX_SANDBOX_NETWORK` | off | Network inside Codex's workspace-write sandbox. |
+
+A Codex reviewer's PASS never auto-merges under CD: only `cc` verdicts (and hermes ones with `CD_ACCEPT_HERMES`)
+do.
 
 ## Notifications
 
@@ -186,6 +275,7 @@ The secrets themselves are in [configuration.md](configuration.md#secrets). Thes
 | `NOTIFY_SMTP_HOST`, `NOTIFY_SMTP_PORT`, `NOTIFY_SMTP_USER`, `NOTIFY_SMTP_STARTTLS`, `NOTIFY_EMAIL_FROM` | unset, `587`, unset, on, unset | The `email` channel. |
 | `NOTIFY_ZBUS`, `NOTIFY_ZBUS_ENV` | unset | The `zbus` chat CLI and its credentials file path. |
 | `CD_ANSIBLE_HANDLE`, `INFRA_MR_NOTIFY_HANDLE` | unset | Recipients of the CD deploy hand-off line and of infra-row MR links. |
+| `MR_REVIEWER_OF_RECORD` | `the reviewer of record` | Name used in the MR-opened DM to a row's `mr_notify_handle` (e.g. the infra deployer): who the MR is waiting on for review + merge. That DM never tells the handle to merge it themselves; deploy is theirs only after it merges. |
 
 ## Run events
 
@@ -210,13 +300,20 @@ The secrets themselves are in [configuration.md](configuration.md#secrets). Thes
 | Variable | Default | Meaning |
 |---|---|---|
 | `BROKER_STREAM_ENABLED` | off (`1` or `true` only) | Live worker transcripts on the dashboard ([configuration.md](configuration.md#live-transcripts)). |
+| `CC_SHOW_THINKING_SUMMARIES` | off | Request Claude Code API-side thinking summaries in worker transcripts (`1`, `true`, `yes`, `on`). See [configuration.md](configuration.md#thinking-summaries). |
 | `BROKER_STREAM_GROUP` | unset | The group allowed to watch. Required when streaming is on. |
 | `BROKER_STREAM_USER_HEADER`, `BROKER_STREAM_GROUPS_HEADER` | unset | Headers your auth proxy sets. Required when streaming is on. |
 | `BROKER_STREAM_GROUPS_SEP` | `\|` | Separator in the groups header. |
 | `BROKER_STREAM_MAX_S` | `600` | Longest a single stream connection stays open, in seconds. |
 | `BROKER_STREAM_MAX` | `CONCURRENCY` | Most streams open at once. |
-| `BROKER_STREAM_HISTORY` | `stream-history.jsonl` next to `EVENTS_LOG` | Past sessions you can replay. |
-| `FLEET_STATUS_PATH`, `FLEET_MD_PATH`, `SUPERVISOR_STATUS_PATH` | unset | Sources for the optional Fleet tab ([configuration.md](configuration.md#the-dashboard)). |
+| `BROKER_STREAM_HISTORY` | `stream-history.jsonl` next to `EVENTS_LOG` | Past sessions you can replay, with each one's ticket title and, once it ends, its model, harness, token total and end time. |
+| `BROKER_ACTIONS_ENABLED` | off (`1` or `true` only) | Buttons on the dashboard that act on runs ([configuration.md](configuration.md#dashboard-actions)). |
+| `BROKER_ACTIONS_GROUP` | unset | The group allowed to act. Required when actions are on. |
+| `BROKER_ACTIONS_PROXY_SECRET_ENV` | `BROKER_ACTIONS_PROXY_SECRET` | Name of the variable holding the secret your proxy adds. Required when actions are on. |
+| `BROKER_ACTIONS_PROXY_HEADER` | `X-Broker-Proxy-Secret` | Header that carries the proxy secret. |
+| `BROKER_ACTIONS_AUDIT_HANDLE` | unset | Where each action is also sent as a message. |
+| `FLEET_STATUS_PATH`, `FLEET_MD_PATH`, `SUPERVISOR_STATUS_PATH` | unset | Sources for the optional Fleet view ([configuration.md](configuration.md#the-dashboard)). |
+| `FLEET_STATUS_GEN` | unset | Executable the broker runs (background, at most once/60s, 30s timeout) as `FLEET_STATUS_GEN <FLEET_STATUS_PATH>` to refresh `FLEET_STATUS_PATH`; it must write argv[1], not its own default. Unset (either knob): nothing refreshes it for you. |
 
 ## Other built-in rows
 

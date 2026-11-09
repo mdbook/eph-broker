@@ -51,13 +51,13 @@ hermes unchanged, plus hard denies of its own (worktree confinement, git file-re
                   at call time; default refuse), the same gate the CC path applies to a non-Claude code turn.
                   venv runner: <worktree>/src reaches PYTHONPATH of the terminal shell only (an init file in
                   terminal.shell_init_files), never the hermes process (see TERMINAL_ENV_FILE).
-    general    -> `-t file,terminal` under eph-gate + the policy judge. CC's general has no
+    general    -> `-t file,terminal` under eph-gate + the configured exec gate. CC's general has no
                   allow-list (auto classifier + deny floor), and a prefix deny-floor alone is not enforceable, so
                   eph-gate runs its floors FIRST (secret floor, worktree-confined edits, no .git writes, imported
                   _GENERAL_DENIED on any segment the lexer can split) and then every terminal / write_file / patch
-                  needs an allow from gate-wrapper.sh, which calls gate-hook.py (armed: no decision = BLOCK). No web toolset
-                  (backend 403s); unmapped tools deny as `unmapped-tool: <name>`. A refused call is recorded and
-                  reported in the result (`gate_denials`, with the hook's allow-once sha): deny-and-report, never
+                  needs an allow from the exec gate EXEC_GATE selects (hermes_gate/providers/; unset = deny). No web
+                  toolset (backend 403s); unmapped tools deny as `unmapped-tool: <name>`. A refused call is recorded
+                  and reported in the result (`gate_denials`, with the gate's override token): deny-and-report, never
                   ask. Reachable only via the per-ticket `hermes` label, which ships with an EMPTY allow-set.
     read / inbox / inbox-chat / anything else -> REFUSED (inbox needs the Gmail MCP; read was refused as
                   tool-less and is not re-opened here).
@@ -131,7 +131,7 @@ import json, logging, os, re, secrets, shlex, shutil, signal, subprocess, tempfi
 from . import cc as _cc
 from .cc import _NO_OVERRIDE, load_backend, scrub_worker_env, SPAWN_MODELS_JSON
 from .cc import _is_local_backend, LOCAL_WALL_CLOCK_MULT   # local-backend wall-clock scaling, shared with cc
-from .hermes_gate import DENIALS_FILE, POLICY_FILE, SENTINEL_FILE, gate as _gate
+from .hermes_gate import DENIALS_FILE, POLICY_FILE, SENTINEL_FILE, gate as _gate, providers as _providers
 
 log = logging.getLogger("eph-broker.hermes")
 
@@ -150,6 +150,9 @@ _SESSION_ID_RE = re.compile(r"[\w.-]+", re.ASCII)       # used with fullmatch()
 # from terminal-tool child env; other hermes configs use the same name for the same reason).
 KEY_ENV = "AUXILIARY_VLLM_API_KEY"
 PROVIDER = "eph"
+# lower hermes' large-output spill thresholds (defaults 50_000) so long tool output spills to a file much
+# sooner, like Claude Code, heavy 4B/deepseek workers otherwise eat ~12k tokens of inline tool output per call.
+HERMES_SPILL_CHARS = 20000
 
 # capability -> hermes toolsets. ABSENT == refused. Capabilities in GATED_CAPABILITIES run ONLY under the
 # eph-gate plugin. Every honoured capability is gated now (mr-review too: `file` = read_file + write_file + patch
@@ -158,27 +161,12 @@ PROVIDER = "eph"
 HERMES_GRANTS = {"mr-review": ("file",), "write": ("file", "terminal"), "code": ("file", "terminal"),
                  "general": ("file", "terminal")}
 GATED_CAPABILITIES = frozenset({"mr-review", "write", "code", "general"})
-# general = file + terminal under eph-gate + the policy judge (gate.judge). NO web: the
-# broker hermes' web backend is keyless firecrawl and 403s (checked 2026-10-16), so web_* stay unmapped-tool
-# denies and a worker fetches with curl under the judge's egress rules. The judge is the SAME entry every standing
-# agent's PreToolUse hook uses (gate-wrapper.sh, deployed into the judge's bin dir), armed
-# (mode=enforce + full=on in the switch dir, set at deploy time) so a hook timeout / garbage / no decision is a BLOCK.
-# Ceiling: agent name and gate dir are fixed here, so there's ONE shared switch dir and ONE concurrent general-on-hermes
-# worker (the hook's ask-dm-sent / clearance-pending / m4b-pin state and decisions.jsonl are per-dir). Scaling past
-# the canary needs a gate dir per worker, read from config. Not built. Also known (non-blocking): the worker
-# can READ its gate dir's decisions.jsonl (it can't mint: allow-once writes are hard-denied by tier0 + the
-# GENERAL_TERMINAL_FLOOR belt now refuses any command naming the dir; a computed path still reads).
-GENERAL_JUDGE = {
-    "wrapper": os.path.expanduser("~/.eph-judge/bin/gate-wrapper.sh"),
-    "hook": os.path.expanduser("~/.eph-judge/bin/gate-hook.py"),
-    "python": os.path.expanduser("~/.eph-judge/venv/bin/python"),
-    "gate_dir": os.path.expanduser("~/.eph-judge/eph-general"),
-    # The judge's CLAUDE_PROJECT_DIR. NEUTRAL and worker-unwritable (the judge's tier0 rules hard-deny writes
-    # to its own dir; eph-gate's write_root is the worktree). NEVER the worktree: gate-hook reads <proj>/AUTHORIZED.md and
-    # .claude/settings*.json as the agent's own policy. judge() refuses any project_dir overlapping the write root.
-    "project_dir": os.path.expanduser("~/.eph-judge/eph-general"),
-    "timeout": "5.0",
-}
+# general = file + terminal under eph-gate + an exec-gate judge (gate.judge). NO web: the broker
+# hermes' web backend is keyless firecrawl and 403s (checked 2026-10-16), so web_* stay unmapped-tool denies and a
+# worker fetches with curl under the gate's own egress rules. WHICH gate judges is config, not code:
+# EXEC_GATE (+ its EXEC_GATE_* keys) picks a provider in hermes_gate/providers/ (deny when unset, none, exec,
+# portcullis); gate_policy writes its config into the per-turn policy and refuses the turn on a misconfig. The
+# gate's own floors (policy files, state-dir names) ride in policy["floor"] for every capability.
 GATE_PLUGIN = "eph-gate"
 _GATE_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hermes_gate")
 PROBE_TIMEOUT_S = 90
@@ -213,7 +201,7 @@ _HOME_KEEP_PREFIX = "state.db"
 # (never on the hermes process: a worker-written src/json.py would run inside hermes before the gate). The
 # local terminal backend sources terminal.shell_init_files into its login-shell env snapshot
 # (tools/environments/local.py _resolve_shell_init_files / _run_bash(login=True)), which every later command
-# inherits; this file is that one init file.
+# inherits; this file also restores the shared worker PATH after login profiles (managed SSH launcher).
 TERMINAL_ENV_FILE = "eph-terminal-env.sh"
 # belt: subtracted LAST by hermes even if a composite re-adds them (model_tools._select_tool_names).
 _DISABLED_TOOLSETS = ["terminal", "file", "code_execution", "delegation", "browser", "computer_use", "web",
@@ -240,6 +228,16 @@ def hermes_toolsets(capability):
         raise HermesRefused("hermes adapter refuses capability 'code': a hermes turn is non-Claude and "
                             "CODE_NONCLAUDE_OK=1 is not set (fail-closed)")
     return list(grant)
+
+
+def worker_system_prompt(system_prompt, capability):
+    """The system prompt hermes gets. hermes PREPENDS its own tool guidance, which tells the model to edit
+    existing files with V4A patches; eph-gate denies those (plain replace only). A gated capability that may edit
+    gets gate.PATCH_EDIT_RULE appended so the worker's instructions match the gate; read-only capabilities (every
+    writer is hard-denied) and ungated ones get the signed prompt unchanged."""
+    if capability in GATED_CAPABILITIES and capability not in _gate.READ_ONLY_CAPABILITIES:
+        return system_prompt + _gate.PATCH_EDIT_RULE
+    return system_prompt
 
 
 def read_denials(home, cap=50):
@@ -337,6 +335,11 @@ def hermes_config(system_prompt, provider, model, toolsets=(), gated=False, cwd=
         # pre_tool_call. enabled False makes LSPService.is_active() False and get_service() None, so no server.
         "lsp": {"enabled": False, "install_strategy": "manual"},
         "tools": {"tool_search": {"enabled": "off"}},     # no tool_call bridge; eph-gate denies it too
+        # Spill long tool output to a file (preview + path) much sooner than hermes' 50_000-char defaults;
+        # max_lines / max_line_length and the generic default_result_size are left alone (not config-exposed;
+        # context-window scaling already handles those).
+        "tool_output": {"max_bytes": HERMES_SPILL_CHARS},
+        "tool_budget": {"mcp_result_size_chars": HERMES_SPILL_CHARS},
         "auth": {"adopt_external_logins": False},   # never borrow the user's Claude Code / Codex OAuth
         "updates": {"check": False},
         # no tirith: hermes would exec $HERMES_HOME/bin/tirith (or download "latest", unpinned) on every terminal
@@ -364,7 +367,7 @@ _READ_ONLY_FORBIDDEN_RULES = frozenset({"Edit", "Write", "MultiEdit", "NotebookE
 
 
 def gate_policy(capability, cwd, test_runner=None, test_repo=None, nonce=None):
-    """The per-turn eph-gate policy, derived from the CC grant for the SAME capability (never a copied list)."""
+    """The CC grant for the SAME capability, plus read extensions requiring eph-gate's parsed path checks."""
     grant = _cc.capability_tool_grant(capability, test_runner=test_runner, test_repo=test_repo)
     if capability in _gate.READ_ONLY_CAPABILITIES and ("--permission-mode" in grant or any(
             r.split("(", 1)[0] in _READ_ONLY_FORBIDDEN_RULES for r in _gate.split_rules(
@@ -391,13 +394,30 @@ def gate_policy(capability, cwd, test_runner=None, test_repo=None, nonce=None):
            "allow": _gate.split_rules(_val("--allowedTools")),
            "deny": _gate.split_rules(_val("--disallowedTools")),
            "secret_globs": list(_cc._SECRET_FILE_GLOBS)}
+    if capability in ("write", "code"):
+        # CC's string patterns cannot confine no-index operands or validate sed programs. Only the
+        # parsed eph-gate path (shared by hermes and codex) can safely grant these read-only forms.
+        pol["allow"] += ["Bash(git diff --check)", "Bash(git diff --no-index:*)", "Bash(sed:*)"]
+        pol["deny"] = [r for r in pol["deny"] if r not in
+                       ("Bash(git diff --no-index*)", "Bash(git * --no-index*)")]
+    if capability == "code":
+        # Separate from arbitrary Bash grants: an env prefix may only wrap this turn's reviewed runner.
+        pol["test_allow"] = _cc._code_test_bash(test_runner, test_repo)
+    try:
+        if capability == "code":
+            extra = [n.strip() for n in os.getenv("EPH_GATE_TEST_ENV_ALLOW", "").split(",") if n.strip()]
+            pol["test_env_allow"] = sorted(_gate.test_env_names(extra))
+        pol["floor"] = _providers.floor()
+        judge = _providers.judge_config() if general else None
+    except ValueError as e:
+        raise HermesRefused(f"hermes adapter: gate misconfigured ({e}), refusing the turn (fail-closed)")
     if general:
         # CC's general grant is `--permission-mode auto` plus a deny list and NO allow list (the
         # classifier decides). Here: reads/searches are the gate's own (repo-confined + secret floor + the imported
         # Read denies), edits stay inside the worktree, and every terminal / write_file / patch ALSO needs a
-        # judge allow (policy.judge). read_root stays the repo: CC general reads outside it (14/29 reads in
+        # exec-gate allow (policy.judge). read_root stays the repo: CC general reads outside it (14/29 reads in
         # the 10-16 inventory) are a known narrowing, widened only on evidence.
-        pol.update(edits=True, allow=["Read", "Grep", "Glob"], judge=dict(GENERAL_JUDGE))
+        pol.update(edits=True, allow=["Read", "Grep", "Glob"], judge=judge)
     return pol
 
 
@@ -603,11 +623,14 @@ def parse_stream(out):
 
 
 def _kill_group(proc):
-    if proc.poll() is not None:               # already reaped: its pid (== pgid) may be reused, so never signal it
-        return
+    # start_new_session=True makes pgid == pid. Reaping the CLI (e.g. live_pid_count's poll) does
+    # NOT mean its group is gone: tool descendants may still be alive and holding its pipes open.
+    # Call only while owning this turn's group, not for a stale proc left over from a finished turn.
     try:
-        os.killpg(proc.pid, signal.SIGKILL)   # start_new_session=True makes pgid == pid, so this kills tool children too
-    except (ProcessLookupError, PermissionError, OSError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
         try:
             proc.kill()
         except OSError:
@@ -791,27 +814,29 @@ class HermesHarness:
         home = self._home(worker)
         self._sweep_home(home)                             # N-N1: allowlist sweep (also covers B2's .env/.op.env)
         cwd = os.path.realpath(worker.worktree) if gated else None
+        # Build the shared env before the terminal init file: login snapshots must use this PATH too.
+        env = _cc.worker_env(os.environ, route, backend_env={KEY_ENV: token}, worker=worker)
+        env.update(_cc.repo_companions.environment(worker))
+        _cc.test_environment.apply_tmpdir(env, worker, capability)
         init_files = []
         if gated:
             test_runner = getattr(worker, "test_runner", None) or getattr(route, "test_runner", "") or None
             test_repo = getattr(worker, "repo", None) if test_runner == "venv" else None
             _wt_src = os.path.join(cwd, "src")             # G2 parity with the CC path (src-layout venv repos)
+            shell_init = f'export PATH={shlex.quote(env["PATH"])}\n'
+            for name, value in _cc.routing.worker_git_identity(route).items():
+                shell_init += f'export {name}={shlex.quote(value)}\n'
+            shell_init += "".join(f"export {k}={shlex.quote(v)}\n"
+                                  for k, v in _cc.repo_companions.environment(worker).items())
             if test_runner == "venv" and os.path.isdir(_wt_src):
                 # N-N3: on the terminal shell only (its login snapshot), NOT the hermes process env
-                init_files = [os.path.join(home, TERMINAL_ENV_FILE)]
-                try:
-                    fd = os.open(init_files[0], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                except OSError as e:           # re-planted by a same-uid racer after the sweep (N2-4)
-                    raise HermesRefused(f"hermes adapter: cannot create {TERMINAL_ENV_FILE} in the private home "
-                                        f"({type(e).__name__}) - refusing (fail-closed)")
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.write(f'export PYTHONPATH={shlex.quote(_wt_src)}"${{PYTHONPATH:+:$PYTHONPATH}}"\n')
+                shell_init += f'export PYTHONPATH={shlex.quote(_wt_src)}"${{PYTHONPATH:+:$PYTHONPATH}}"\n'
+            init_files = [os.path.join(home, TERMINAL_ENV_FILE)]
         with open(os.path.join(home, "config.yaml"), "w", encoding="utf-8") as f:
-            f.write(yaml_safe_json(hermes_config(system_prompt, provider, model, toolsets, gated=gated, cwd=cwd,
+            f.write(yaml_safe_json(hermes_config(worker_system_prompt(system_prompt, capability), provider, model,
+                                                 toolsets, gated=gated, cwd=cwd,
                                                  shell_init_files=init_files, overrides=overrides)))
         argv = build_argv(self.hermes_bin, model, toolsets, max_turns, wall_clock_s, resume_session)
-        # same allowlist scrub as a CC worker; the token rides ONLY as KEY_ENV (no ANTHROPIC_* passed through)
-        env = scrub_worker_env(os.environ, route_env=route.env, backend_env={KEY_ENV: token})
         for k in [k for k in env if k.startswith(_POPPED_ENV_PREFIXES)]:  # N-N2: no HERMES_* but ours; no TIRITH_*
             del env[k]
         env["HERMES_HOME"] = home
@@ -819,17 +844,31 @@ class HermesHarness:
         if gated:
             env["TERMINAL_CWD"] = cwd                      # hermes' terminal/file base dir == the gate's cwd
             nonce = self._install_gate(home, gate_policy(capability, cwd, test_runner, test_repo), env, cwd, argv)
+            # The probe checks startup + hook dispatch, never starts a terminal or sources shell_init_files.
+            # Let its security refusal win over a stale init file if the home sweep regresses (B2). Still create
+            # exclusively BEFORE the real run: any re-plant after the sweep, even during the probe, refuses.
+            try:
+                fd = os.open(init_files[0], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except OSError as e:               # re-planted by a same-uid racer after the sweep (N2-4)
+                raise HermesRefused(f"hermes adapter: cannot create {TERMINAL_ENV_FILE} in the private home "
+                                    f"({type(e).__name__}) - refusing (fail-closed)")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(shell_init)
         else:                                              # no probe: the minimal interpreter-path gate
             self._check_interpreter(env, worker.worktree)
         worker.turn_wall_clock = wall_clock_s
         worker.kill_group = True                           # teardown kills the process group, not just the pid
+        _cc.record_launch(worker, model, backend, "hermes")   # dash Worker view: the model this process gets
         worker.in_turn = True
         worker.turn_started = time.time()
         worker.hard_killed = False                          # reset before this turn; set True only below
         try:                                               # Popen inside: an exec failure still clears in_turn
-            proc = subprocess.Popen(argv, cwd=worker.worktree, env=env, stdin=subprocess.PIPE,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                    start_new_session=True)
+            try:
+                proc = subprocess.Popen(argv, cwd=worker.worktree, env=env, stdin=subprocess.PIPE,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                        start_new_session=True)
+            except OSError as e:                           # the worker never ran: _run_worker notes it on the MR/ticket
+                raise _cc.WorkerSpawnFailed(f"could not start {os.path.basename(argv[0])}: {e}") from e
             worker.proc = proc
             if getattr(worker, "done", False):         # teardown landed between the check above and Popen
                 _kill_group(proc)
@@ -878,6 +917,8 @@ class HermesHarness:
             _capture("parse miss")
         if result is not None:
             worker.tokens += int(result.get("tokens", 0) or 0)
+            # hermes reports only the turn's summed token usage, no last-request input size: worker.context_tokens
+            # stays None, so token-based session rotation is off for this harness (the turn limit still applies).
             if gated:
                 denials = read_denials(home)
                 if denials:

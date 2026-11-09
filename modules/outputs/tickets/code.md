@@ -5,8 +5,8 @@ Emit exactly this shape (and nothing after it):
 
     {"status": "done", "summary": "<HTML: what you changed, why, and the test result>", "wake": []}
 
-- `status`: `"done"` when you committed a change whose tests pass; `"blocked"` if the task needs a decision, a credential, a missing dependency, or is outside your bounds (say exactly what, in `summary`). Commit nothing meaningful in that case.
-- `summary`: self-contained, human-readable, HTML. **Lead with a one-line description of the change**, then give: the files touched, the approach, and the **test outcome** (which runner, pass/fail counts). This is what the reviewer reads alongside your MR. Never a pointer like "see the diff"; describe it.
+- `status`: `"done"` for a committed change accepted by edited-tree verification and any required targeted base checks (new/changed tests pass, no NEW failures), or when only an environment gap prevents verification and your summary names it with your reasoning. `"blocked"` for a needed decision/credential or out-of-bounds task; verification is blocked only if the suite cannot execute at all AND no alternative verification is possible. Still preserve useful work in a commit so the broker pushes a reviewable branch. Never delete work because of missing dependencies.
+- `summary`: self-contained, human-readable HTML. Lead with the change, then files, approach, and verification: commands, after pass/fail counts, and new/changed test results. Only when there were failures, include failing test IDs, the targeted untouched-base command/results/counts, and each failure's classification as new, pre-existing, or unclassified (explicitly say no NEW failures when none). Include exact environment gaps and alternative verification; with no runner say "untested locally, CI verifies" plus your reasoning. This summary becomes the ticket comment and MR description.
 - `needs_operator`: optional. Set `true` ONLY on a `"blocked"` result that is waiting on something only the operator can supply (a decision, a credential, a physical action); otherwise omit it. A missing dependency, a failing test, or running out of turns is NOT an operator wait.
 - `wake`: leave `[]`.
 

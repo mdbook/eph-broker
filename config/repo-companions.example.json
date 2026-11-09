@@ -1,0 +1,5 @@
+{
+  "example/widget-site": [
+    {"repo": "example/widget-core", "ref": "main", "as": "core"}
+  ]
+}

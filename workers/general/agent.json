@@ -4,6 +4,7 @@
   "class": "agent",
   "sections": [
     "role/ephemeral-oneshot",
+    "capabilities/file-access",
     "scopes/general",
     "capabilities/general",
     "constraints/general",

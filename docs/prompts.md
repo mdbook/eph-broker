@@ -81,6 +81,21 @@ conditionals or loops. If two workers need different wording, they use different
 Per-ticket details (the ticket text, the target repo, the granted test runner) never go into the prompt. The
 broker sends them as the worker's first message, so one signed prompt serves every ticket and every repo.
 
+### Charter-free worktrees
+
+The broker removes root `CLAUDE.md`, `AGENTS.md` and `*-AGENT.md` files from worker worktrees
+to prevent harness auto-loading (constraint #5). Their pre-existing deletions in `git status`
+are expected, not missing setup or changes for the worker to restore or commit.
+
+Every worktree worker's runtime brief includes a `repo_rules` notice explaining the strip and
+pointing to the existing read-only, git-excluded `.eph/repo-rules/<original-name>.txt` copies.
+Workers read those copies as repository data for conventions using their harness's granted
+file-reading tools, within the existing scope. The notice does not grant access to the live
+base checkout. Repositories without regular root charters have no copies directory.
+The notice survives fresh-session forwards with the seed brief. Neither the originals nor
+their copies are inserted into the system prompt. Signed prompts and `approved-prompts.json`
+are unchanged; any future change to their approved behavior still needs operator re-signing.
+
 ## Site overrides
 
 The modules in `modules/` are generic on purpose. To use your own wording for one section, create
@@ -120,6 +135,22 @@ The renderer always writes into this repo's `prompts/`. The broker reads from `P
 `APPROVED_PROMPTS`, which default to `prompts/` and `approved-prompts.json` next to `app.py`.
 
 ## Signing
+
+The code worker contract uses baseline differences: run tests before editing and again afterwards;
+new/changed tests pass and no new failing test IDs appear. The worker summary carries baseline and
+after counts, added/resolved failing IDs, and any environment gaps into the MR description. Missing
+dependencies or a missing runner never justify deleting useful work. Only a baseline that cannot
+execute at all with no alternative verification warrants a verification-blocked result, and the
+worker still commits its work for the broker to push. These rules live in the code capability,
+constraints and output modules, including site overrides. Re-rendering them requires operator re-signing.
+
+Dependency setup uses an explicit per-repo list rather than executing installation hooks discovered
+in arbitrary repos. Copy `config/code-test-deps.example.json` outside the worker's writable tree, edit
+the paths and packages, and point `CODE_TEST_DEPS_CONFIG` at it. Package names, version constraints and
+extras are accepted; URLs, paths and pip options are rejected. The broker uses a scrubbed environment
+without its service credentials or pip config. Successful lists are cached in
+`<repo>/.venv/.eph-test-deps.json`; changing a list re-runs installation. Existing environments are
+extended, not pruned; remove a stale environment out of band when dependency removal matters.
 
 Signing means reading the rendered prompt and recording its hash.
 

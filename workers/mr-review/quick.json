@@ -1,0 +1,15 @@
+{
+  "_comment": "Worker-class manifest, renders prompts/mr-review/quick.md. The QUICK review tier (tiered MR review): the broker-side tier selector (routing.select_mr_review_tier) picks this prompt_class instead of mr-review/agent when the MR's diff is low-risk (small, and an allowlist-only match: plain prose docs by extension or tests-only, nothing executable/prompt-shaped, no sensitive-path hit). Same read-only grant, same {status,summary,wake} PASS/BLOCK output contract (constraints/mr-review + outputs/mr-review, unchanged) as the full reviewer; only the scope module is lighter: a 'does this break anything?' sanity check instead of a full adversarial audit, sized for a cheap model (default haiku). Content is operator-gated: the rendered prompt's sha256 must be signed into approved-prompts.json by the operator before it runs.",
+  "domain": "mr-review",
+  "class": "quick",
+  "sections": [
+    "role/ephemeral-oneshot",
+    "capabilities/file-access",
+    "scopes/mr-review-quick",
+    "constraints/mr-review",
+    "outputs/mr-review"
+  ],
+  "vars": {
+    "worker_kind": "quick MR reviewer"
+  }
+}

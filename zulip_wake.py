@@ -64,7 +64,11 @@ UV_BIN = os.getenv("ZULIP_UV_BIN") or shutil.which("uv") or os.path.expanduser("
 # into the shell). The CHILD sources $ZBUS_ENV; the broker never reads it.
 _CHILD_SH = 'set -a; . "$ZBUS_ENV"; set +a; exec "$0" run "$1" --channel'
 WAKE_ROWS = {"inbox-chat"}   # row names a wake-map entry may name
-ACCOUNT_ROWS = {"inbox-chat"}       # rows whose worker acts on a mailbox: the entry MUST name its account
+ACCOUNT_ROWS = {"inbox-chat"}       # rows whose worker acts on a mailbox: the entry MUST name its account.
+# The inbox-chat worker has mailbox access to EVERY account in inbox_accounts.ACCOUNTS, not just the one named
+# here. This field stays required and validated (fail closed: an unmapped bot, or an account not in ACCOUNTS,
+# still refuses the spawn, see cc.py's inbox-chat gate); it just doesn't cap WHICH accounts the admitted
+# worker can see.
 # Rows that exist only behind a routing flag; a map entry naming one is ignored while the flag is off (no
 # listener, no wake), so a mapped-but-disabled bot can never fall through to the generic zulip (inbox) row.
 _ROW_ENABLED = {}
@@ -424,7 +428,8 @@ class ZulipWake:
         self._ctr_lock = threading.Lock()
         self.listeners = {}                                   # bot -> _Listener
         self.counters = {"events": 0, "not_1to1": 0, "bot_sender": 0, "dup": 0, "stale": 0,
-                         "not_allowlisted": 0, "woken": 0, "rate_limited": 0, "autoreplied": 0, "unmapped": 0}
+                         "not_allowlisted": 0, "woken": 0, "rate_limited": 0, "autoreplied": 0, "unmapped": 0,
+                         "ingest_failed": 0}
         self._thread = None
 
     # ---- config ----
@@ -525,6 +530,27 @@ class ZulipWake:
             return []
         return [r for r in rows if r["msg_id"] < before][-n:]
 
+    # ---- broker-prefetched on-demand thread lookback (replaces 's live per-turn zbus lookback,
+    # which handed a chat worker's own Bash a send-capable bot identity, review finding). ----
+    def thread_lookback(self, bot, sender_id, before_msg_id, skip=1, n=100):
+        """up to the last `n` messages (both sides, oldest first, strictly OLDER than before_msg_id,
+        same exclusion as history()) of the 1:1 thread, fetched ONCE broker-side on a COLD chat start and
+        written to a file the worker Read/Greps (adapters.cc._write_thread_file); the worker itself never
+        runs zbus, and gets no bus identity. Independent of the bot map's "history" (in-brief) N, its own
+        fixed cap. Only while wake_admits(bot, sender). Fail-soft: [] on any fetch/parse/timeout error (one
+        log line, no crash), history is context, not a control."""
+        sid = str(sender_id or "")
+        try:
+            before = int(before_msg_id)
+            if not self.wake_admits(bot, sid):
+                return []
+            rows = parse_dm_read(self.history_runner(sid, n + max(int(skip), 1), self.registry.retired().get(bot)))
+        except Exception as e:
+            log.warning("zulip-wake: thread lookback fetch failed bot=%s sender=%s n=%s (%s: %s) -> no file",
+                        bot, sid or "-", n, type(e).__name__, e)
+            return []
+        return [r for r in rows if r["msg_id"] < before][-n:]
+
     def desired(self):
         """{bot: (bot_env, mode)} this broker should be listening on right now."""
         retired, wmap = self.registry.retired(), self.wake_map()
@@ -605,11 +631,17 @@ class ZulipWake:
                 return self._drop("unmapped", bot, sid, mid)
             if sid not in wake_senders() and not bot_ok:
                 return self._drop("not_allowlisted", bot, sid, mid)
-            self._count("woken")
             log.info("zulip-wake: WAKE bot=%s sender=%s msg=%s -> ingest", bot, sid, mid)
-            self.ingest({"source": "zulip", "event_name": "zulip.dm", "bot": bot, "sender_id": sid,
-                         "sender": email, "msg_id": mid, "content": params.get("content") or "",
-                         "doer": f"zulip:{sid}"})   # doer: a human id the echo-guard lets through
+            try:
+                self.ingest({"source": "zulip", "event_name": "zulip.dm", "bot": bot, "sender_id": sid,
+                             "sender": email, "msg_id": mid, "content": params.get("content") or "",
+                             "doer": f"zulip:{sid}"})   # doer: a human id the echo-guard lets through
+            except Exception:
+                with self._lock:
+                    self._seen.pop(mid, None)  # failed durable acceptance must not become a dedup receipt
+                self._count("ingest_failed")
+                raise
+            self._count("woken")
             return "woken"
         if mode == "autoreply":
             if not autoreply_enabled() or bot in self.wake_map() or bot in autoreply_exclude():

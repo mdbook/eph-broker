@@ -4,6 +4,7 @@
   "class": "change-proposer",
   "sections": [
     "role/ephemeral-oneshot",
+    "capabilities/file-access",
     "scopes/code-change",
     "capabilities/code-change",
     "constraints/code-change",

@@ -27,7 +27,7 @@ import site_env  # noqa: F401  (loads config/site.env before the reads below)
 
 log = logging.getLogger("eph-broker.events")
 
-KINDS = ("run.started", "run.finished", "run.escalated", "mr.opened")
+KINDS = ("run.started", "run.finished", "run.escalated", "mr.opened", "action.taken")
 EVENTS_WEBHOOK_URL = os.getenv("EVENTS_WEBHOOK_URL", "").strip()
 EVENTS_WEBHOOK_SECRET_ENV = os.getenv("EVENTS_WEBHOOK_SECRET_ENV", "EVENTS_WEBHOOK_SECRET")   # NAME only
 # Comma list of the events to send (default all). An unknown name stops the import: a typo must not silently mute one.

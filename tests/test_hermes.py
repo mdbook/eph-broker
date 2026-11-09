@@ -4,7 +4,7 @@
 hermes is FAKED: a small script stands in for the `hermes` CLI (like test_broker's fake claude), records its
 argv / stdin / env-key names / HERMES_HOME config, and prints stream-json. No real hermes, model or endpoint.
 """
-import gc, hashlib, json, os, stat, subprocess, sys, tempfile, time
+import gc, hashlib, json, os, pathlib, stat, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -21,10 +21,15 @@ from coalescer import Coalescer
 import adapters.cc as CC
 from adapters.cc import CCAdapter, Worker
 from adapters import hermes as H
-# Tests must NEVER reach the live policy judge (real wrapper and its gate dir: its decisions.jsonl,
-# allow-once, the operator ask DM). Point the judge at a path that cannot exist; a test that needs a judge builds a fake.
-H.GENERAL_JUDGE.update(wrapper="/nonexistent/eph-test/gate-wrapper.sh", gate_dir="/nonexistent/eph-test/gate",
-                       project_dir="/nonexistent/eph-test/gate")
+_GATE_TERMS = "gate-home"
+# Tests must NEVER reach a live exec gate (its decision log, allow-once dir, operator DMs). Force the
+# portcullis provider onto paths that cannot exist, whatever the real env says; a test that needs a judge builds a fake.
+os.environ.update(EXEC_GATE="portcullis", EXEC_GATE_PORTCULLIS_WRAPPER="/nonexistent/eph-test/gate-wrapper.sh",
+                  EXEC_GATE_PORTCULLIS_HOOK="/nonexistent/eph-test/gate-hook.py",
+                  EXEC_GATE_PORTCULLIS_PYTHON="/nonexistent/eph-test/python",
+                  EXEC_GATE_PORTCULLIS_DIR="/nonexistent/eph-test/gate", EXEC_GATE_TIMEOUT="5.0",
+                  EXEC_GATE_INHERIT_ENV="ZBUS_ENV,TMPDIR,LANG,TZ", EXEC_GATE_PROTECTED_TERMS=_GATE_TERMS)
+os.environ.pop("EXEC_GATE_PORTCULLIS_PROJECT_DIR", None)
 from envelope import EnvelopeParser
 from prompts import PromptLoader
 from routing import Route, Router, ADAPTERS
@@ -64,7 +69,7 @@ def _directive(hooks, tool, args):
 
 # ---- fake hermes CLI: records the call, optionally sleeps / forks a grandchild, prints stream-json ----
 FAKE_HERMES = r'''#!/usr/bin/env python3
-import json, os, subprocess, sys, time
+import json, os, shutil, subprocess, sys, time
 ''' + _LOAD_GATE + r'''
 prompt = sys.stdin.read()
 rec = os.environ.get("FAKE_RECORD")
@@ -78,6 +83,9 @@ if rec:
         f.write(json.dumps({"argv": sys.argv[1:], "prompt": prompt, "env_keys": sorted(os.environ),
                             "key": os.environ.get("AUXILIARY_VLLM_API_KEY"), "home": home, "config": cfg,
                             "cwd": os.getcwd(), "policy": policy, "terminal_cwd": os.environ.get("TERMINAL_CWD"),
+                            "path": os.environ["PATH"], "ssh": shutil.which("ssh"),
+                            "git_identity": {k: v for k, v in os.environ.items()
+                                             if k.startswith(("GIT_AUTHOR_", "GIT_COMMITTER_"))},
                             "verdicts": {t: _directive(hooks, t, a)[0] for t, a in (
                                 ("write_file", {"path": "x.txt", "content": "x"}),
                                 ("patch", {"path": "x.txt", "old_string": "a", "new_string": "b"}),
@@ -221,7 +229,7 @@ def _gone(pid):
 
 # =====================================================================================
 def test_selector_default_cc_unchanged():
-    assert ADAPTERS == ("cc", "hermes")
+    assert ADAPTERS == ("cc", "hermes", "codex")
     r = Route(domain="ansible", repo="/srv/ansible", prompt_class="read-report", agent="ansible")
     assert r.adapter == "cc"
     rows = Router().rows
@@ -261,6 +269,72 @@ def test_unknown_adapter_fails_closed():
     ok("hermes: unknown adapter fails closed at load (Route) and at spawn (_one_turn)")
 
 
+def test_hermes_big_prompt_rides_stdin_no_e2big():
+    """A >200 KiB brief (an mr-review diff) goes through the REAL hermes argv builder and a REAL exec on
+    stdin; no argv string nears MAX_ARG_STRLEN (128 KiB), so the spawn cannot die with E2BIG."""
+    big = json.dumps({"diff": "+" + "x" * (256 * 1024)})
+    with tempfile.TemporaryDirectory() as d, _Registry(d):
+        argv = H.build_argv("/bin/hermes", "m", "file", 7, 60)
+        assert big not in argv and max(len(t.encode()) for t in argv) < 128 * 1024, argv
+        rec = os.path.join(d, "rec.jsonl")
+        a = _adapter(d, envelope_parser=EnvelopeParser(), wall_clock_s=60)
+        w = Worker("gitlab:mr:1", "run-big", d)
+        env = a._one_turn(w, _route(FAKE_RECORD=rec), "SYS", big, resume=False)
+        assert env and env["status"] == "pass", env
+        (r1,) = _records(rec)
+        assert r1["prompt"] == big and max(len(t.encode()) for t in r1["argv"]) < 128 * 1024
+    ok("hermes: a 256 KiB prompt rides stdin through the real argv builder + exec (no E2BIG)")
+
+
+def _check_hermes_ssh_config(row):
+    from dataclasses import replace
+    from unittest.mock import patch
+    import routing
+    from ssh_fixture import ssh_home, assert_ssh_config
+    old_umask = os.umask(0o077)
+    try:
+        with tempfile.TemporaryDirectory(dir=ROOT) as d, _Registry(d):
+            home = ssh_home(d)
+            rec = os.path.join(d, "rec.jsonl")
+            a = _adapter(d, envelope_parser=EnvelopeParser(), wall_clock_s=60)
+            w = Worker("vikunja:task:9268", "ssh-config", d)
+            route = replace(row, adapter="hermes", backend="fakebe",
+                            env={"PATH": os.defpath, "FAKE_RECORD": rec,
+                                 "FAKE_TEXT": json.dumps({"status": "done", "summary": "ok", "wake": []})})
+            with patch.dict(os.environ, {"HOME": home, "PATH": os.defpath, "CODE_NONCLAUDE_OK": "1"}):
+                for resume in (False, True):
+                    assert a._one_turn(w, route, "SYS", "P", resume=resume)
+            for r in _records(rec):
+                assert r["ssh"] == os.path.join(w.ssh_tmpdir, "ssh"), r
+                assert r["git_identity"] == routing.worker_git_identity(route)
+                assert_ssh_config(env={"PATH": r["path"]})
+                (init,) = json.loads(r["config"])["terminal"]["shell_init_files"]
+                for name, value in r["git_identity"].items():
+                    assert f"export {name}={value}\n" in pathlib.Path(init).read_text()
+                # Model the login snapshot clobbering PATH: the shared SSH selection must be restored.
+                assert_ssh_config(["/bin/sh", "-c",
+                                   'PATH=/usr/bin:/bin; . "$1"; shift; exec ssh "$@"', "sh", init])
+    finally:
+        os.umask(old_umask)
+    ok("Hermes shared SSH config: " + row.row_key + ", parent/login snapshot, seed and resume")
+
+
+def test_hermes_spawn_preserves_ssh_shim():
+    _check_hermes_ssh_config(CC.routing._CODE_ROW)
+
+
+def test_hermes_general_ssh_config():
+    _check_hermes_ssh_config(CC.routing._GENERAL_ROW)
+
+
+def test_hermes_infra_ssh_config():
+    _check_hermes_ssh_config(CC.routing._INFRA_ROW)
+
+
+def test_hermes_infra_general_ssh_config():
+    _check_hermes_ssh_config(CC.routing._INFRA_GENERAL_ROW)
+
+
 def test_hermes_happy_path_parses_envelope():
     with tempfile.TemporaryDirectory() as d, _Registry(d):
         rec = os.path.join(d, "rec.jsonl")
@@ -293,6 +367,9 @@ def test_hermes_happy_path_parses_envelope():
         # the run loaded hard-denies write_file / patch / terminal
         assert "terminal" in cfg["agent"]["disabled_toolsets"] and "file" not in cfg["agent"]["disabled_toolsets"]
         assert cfg["plugins"]["enabled"] == ["eph-gate"], cfg["plugins"]
+        # hermes' large-output spill thresholds lowered from its 50_000-char defaults
+        assert cfg["tool_output"]["max_bytes"] == H.HERMES_SPILL_CHARS == 20000, cfg.get("tool_output")
+        assert cfg["tool_budget"]["mcp_result_size_chars"] == H.HERMES_SPILL_CHARS, cfg.get("tool_budget")
         assert r1["policy"]["capability"] == "mr-review" and r1["policy"]["edits"] is False, r1["policy"]
         assert r1["policy"]["allow"] == ["Read", "Grep", "Glob"], r1["policy"]["allow"]
         assert r1["terminal_cwd"] == os.path.realpath(d), r1["terminal_cwd"]

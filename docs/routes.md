@@ -30,8 +30,13 @@ which of the built-in capabilities it gets. Start from `config/routes.example.js
 | `repo` | yes | Absolute path to the repo the worker gets a throwaway worktree of. It has to be in `CODE_REPO_ALLOWLIST` or `GENERAL_REPO_ALLOWLIST` (see below). |
 | `agent` | no | Name passed to `FLEET_MODEL_SH` to pick a model. Defaults to the built-in worker of the same capability (`CODE_AGENT`, `GENERAL_AGENT`, or the ansible row's agent for `read`). |
 | `model` | no | Pin a model for this row (for example `opus`), skipping `FLEET_MODEL_SH`. |
+| `repo_lock_scope` | no | `phases` (default): same-repo workers edit/test in parallel, while cut, publish and removal are mutually exclusive. `run`: serialize the whole worker run for that repo. Applies to publishing routes. |
 
 Keys starting with `_` are ignored, so you can leave `_comment` notes.
+
+Each row gets its own bot Git author and committer, even when it shares another row's prompt domain.
+Configure them with the row's `<ROW>_GIT_NAME`, `<ROW>_GIT_EMAIL` and, only for incompatible push rules,
+`<ROW>_GIT_IDENTITY_ENABLED` settings ([worker commit identity](settings.md#worker-commit-identity)).
 
 ## Capabilities
 

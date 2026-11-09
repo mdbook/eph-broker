@@ -12,7 +12,7 @@ It's off until you set `EVENTS_WEBHOOK_URL`. [n8n.md](n8n.md#reacting-to-runs) h
 |---|---|---|
 | `EVENTS_WEBHOOK_URL` | Where events go. Has to be `https`, or `http` to localhost. | Off |
 | `EVENTS_WEBHOOK_SECRET` (`EVENTS_WEBHOOK_SECRET_ENV`) | The signing secret. Required: with it unset nothing is sent. | None |
-| `EVENTS_WEBHOOK_KINDS` | Comma list of the events you want. An unknown name stops the broker. | All four |
+| `EVENTS_WEBHOOK_KINDS` | Comma list of the events you want. An unknown name stops the broker. | All five |
 
 Put the secret in the unit's environment file like the other secrets ([configuration.md](configuration.md#secrets)),
 not in `site.env`.
@@ -36,6 +36,7 @@ the run is about, like `vikunja:task:42` or `github:owner/repo#45`). The rest de
 | `run.finished` | The subject's worker is gone | `outcome`, `events`, `forwards` (follow-ups sent to the live worker) |
 | `run.escalated` | An escalation went to the operator | `text`. Here `subject_key` is the escalation's own key: usually the subject's key, sometimes `escalate:<ticket id>`, or `auto:<hash>` when the caller had none |
 | `mr.opened` | A code worker's branch got its merge request | `run_id`, `web_url`, `iid`, `project`, `branch`, `target` |
+| `action.taken` | Someone used a [dashboard action](configuration.md#dashboard-actions) | `user`, `verb`, `result` (`ok`, `refused-<http code>`, `bad-json`, `error-<exception>`, or `rejected-<reason>` for a refused login, at most one a minute). `subject_key` is empty for pause, resume and settings; a settings change adds `change`, such as `code.model_pin:opus,cap.code:1` |
 
 `outcome` on `run.finished` is one of:
 

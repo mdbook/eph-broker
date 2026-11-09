@@ -14,6 +14,15 @@ settings:
   GENERAL_REPO_ALLOWLIST: "/srv/git/app:/srv/git/docs-site"
   CODE_REPO_ALLOWLIST: "/srv/git/app:/srv/git/docs-site"
   CONCURRENCY: 5
+  # Per-row commit metadata (push credentials are unchanged). Default: eph-<row>@noreply.invalid.
+  CODE_GIT_NAME: "eph-code"
+  CODE_GIT_EMAIL: "eph-code@example.com"
+  # CODE_GIT_IDENTITY_ENABLED: false  # only if existing server/credential rules reject bot metadata
+  # Private local storage for durable maintenance drain and queued intake (docs/drain.md).
+  BROKER_STATE_PATH: "/var/lib/eph-broker/broker-state.sqlite3"
+  # Opt in before the FIRST journal initialization to start already drained.
+  # Existing persisted drain values, including false, remain authoritative.
+  BROKER_DRAIN_ON_NEW_JOURNAL: false
 
 # Your own agent types (docs/routes.md). Same rows as config/routes.json, as a list. Read at startup.
 # Each row's prompt must exist and be signed, or the broker refuses to start.

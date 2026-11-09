@@ -1,0 +1,16 @@
+{
+  "settings": {
+    "CONFIG_DIR": "config/demo",
+    "EVENTS_LOG": "demo-state/events.jsonl",
+    "BROKER_PUSH_HOSTS": "",
+    "ISSUE_AUTHOR_ALLOWLIST": ""
+  },
+  "provenance": {
+    "agent_basenames": [],
+    "handoff_doers": [],
+    "agent_pattern": "(-bot\\b)",
+    "untrusted_authors": [],
+    "handoff_parked_labels": []
+  },
+  "routes": []
+}

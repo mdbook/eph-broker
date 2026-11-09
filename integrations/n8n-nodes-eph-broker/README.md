@@ -3,7 +3,7 @@
 Two n8n nodes for [eph-broker](../../README.md), for self-hosted n8n:
 
 - **eph-broker Trigger** starts a workflow on a signed run event (`run.started`, `run.finished`, `run.escalated`,
-  `mr.opened`). It checks `X-Eph-Signature` against the raw body, refuses events older than five minutes, can
+  `mr.opened`, `action.taken`). It checks `X-Eph-Signature` against the raw body, refuses events older than five minutes, can
   filter by event, and fires once per delivery id even when the broker retries.
 - **eph-broker** looks things up: Get Run Status (`GET /runs/<subject_key>`) and Get Health (`GET /health`). It's
   read-only. There's no "start a worker" action, on purpose: give the broker work through your tracker.

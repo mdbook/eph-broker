@@ -2,7 +2,7 @@
 
 const crypto = require('crypto');
 
-const EVENTS = ['run.started', 'run.finished', 'run.escalated', 'mr.opened'];
+const EVENTS = ['run.started', 'run.finished', 'run.escalated', 'mr.opened', 'action.taken'];
 const MAX_AGE_DEFAULT = 300; // seconds
 const SEEN_MAX = 500; // delivery ids remembered per trigger; the broker's retries come within 12 seconds
 // Kept in memory, not in workflow static data: n8n 2.x loses static data a webhook writes once the workflow already

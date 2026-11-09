@@ -37,8 +37,13 @@ instead of starting another worker. When the window passes quietly, the worker e
 
 Both windows are set per subject type in `config/windows.json`. For tracker tickets they're 3 and 45 seconds.
 A warm worker accepts up to `max_forwards` follow-ups (10), and its harness session is restarted fresh
-after 20 turns or 120k tokens (`rotate_turns`, `rotate_tokens` in `config/constraints.json`). At most
-`CONCURRENCY` workers (5) run at once.
+after 20 turns or when its context reaches 120k tokens (`rotate_turns`, `rotate_tokens` in `config/constraints.json`).
+Context is the last model request's input size (Claude Code: the session transcript; Codex: the rollout's `token_count`
+event), not the summed usage of a turn. Hermes reports no such figure, so it rotates on turns only. A follow-up that
+lands on a fresh session (rotation, usage-cap fallback, or a forward with no learned session id) gets the original
+task brief again, including comments accumulated across earlier forwards, merged with non-None values from the new
+events, plus a short notice. Plain resumed forwards stay deltas. Envelope-only re-prompts never re-seed or rotate
+and do not count toward the rotation turn limit. At most `CONCURRENCY` workers (5) run at once.
 
 Once a ticket has finished a run, later events from agents are dropped. Only a human edit or reassignment
 re-arms it. [agent-refire.md](agent-refire.md) has the exact rules, including how a human comment can
@@ -68,7 +73,7 @@ Three classes ship with signed prompts.
 | Class | Capability | Typical trigger | Publishes |
 |---|---|---|---|
 | `code/change-proposer` | `code`: edit and commit inside the worktree, run one named test runner; push and network commands denied | label `eph:code-change`, assignee `eph-code`, a new GitLab issue | comment and MR |
-| `general/agent` | `general`: most tools over a fixed deny list, each action judged by the harness's own check (Claude Code's auto permission mode on native Claude, or hermes' policy judge; see [security.md](security.md)) | assignee `eph`, label `eph:general` | comment, and an MR if it committed |
+| `general/agent` | `general`: most tools over a fixed deny list, each action judged by the harness's own check (Claude Code's auto permission mode on native Claude, or hermes' exec gate; see [security.md](security.md)) | assignee `eph`, label `eph:general` | comment, and an MR if it committed |
 | `mr-review/agent` | `mr-review`: Read, Grep and Glob only | the broker opened an MR | verdict note on the MR |
 
 Rows from `config/routes.json` ([routes.md](routes.md)) go after every built-in narrow row and before the
@@ -94,7 +99,7 @@ Each class picks its repo differently.
   experimental; see [repo-push-cred.md](repo-push-cred.md#repo-inference-experimental).
 
 The code worker's test runner is picked per repo from `CODE_REPO_RUNNER_SEEDS` (`pytest`, `npm`, `go`,
-`venv`, `bash-n`, `ansible-syntax`, `none`). It gets permission for that runner's commands and no other shell
+`venv`, `bash-n`, `bash-n+unittest`, `ansible-syntax`, `repo-test`, `none`). It gets permission for that runner's commands and no other shell
 access.
 
 ## The worker run
@@ -132,8 +137,9 @@ or general worker finishes.
   `eph/code-change/vikunja_task_42-1a2b3c4d`, then opens an MR to the repo's default branch with
   `GITLAB_MR_TOKEN`. The push URL has to be `https://` on a host in `BROKER_PUSH_HOSTS`, or nothing is pushed.
 - A `blocked` result adds the `PARKED_LABEL_ID` label to a tracker ticket.
-- A worker that ran out of turns gets its work pushed to an `eph/...-wip-<sha>` branch with no MR, since it
-  isn't finished.
+- A worker that ran out of turns after committing cleanly (nothing uncommitted or untracked) gets that commit
+  published as a normal MR, as if it had returned its result (`TURN_CAP_PUBLISH_CLEAN_COMMIT`, on by default). Any
+  other turn-capped worker gets its work pushed to an `eph/...-wip-<sha>` branch with no MR, since it isn't finished.
 - Edits left uncommitted are saved as a patch file outside the worktree, and the worktree is removed.
 
 ## Review

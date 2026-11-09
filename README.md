@@ -1,225 +1,124 @@
-# eph-broker
+<h1 align="center">eph-broker</h1>
 
-eph-broker is a standard-library Python service that takes a ticket you assign to a bot, has a short-lived coding agent
-make the change in a throwaway git worktree, and hands you back a GitLab merge request that a second, read-only
-agent has already reviewed. The agent runs on a harness, an agent CLI the broker drives: Claude Code by default,
-hermes-agent as an option, and others can be added ([docs/adapters.md](docs/adapters.md)).
+<p align="center">
+  <b>Turn a ticket into a merge request you can review.</b><br>
+  A short-lived coding agent makes a commit, the broker opens the merge request, and a second agent reviews it. You decide whether to merge.
+</p>
 
-You can add your own kinds of worker without touching code. A row is one entry in the broker's routing table:
-a trigger plus the worker it starts. One row in `config/routes.json` says which label or assignee starts it, which signed prompt it runs and which built-in tool grant it gets. Prompts are put
-together from small Markdown modules, so a new worker is usually a short manifest and a module or two, not a
-whole prompt written from scratch.
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#features">Features</a> ·
+  <a href="docs/install.md">Install guide</a> ·
+  <a href="#configuration">Configuration</a> ·
+  <a href="#docs">Docs</a>
+</p>
 
-## What you need
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue" alt="License: GPL-3.0-or-later"></a>
+  <img src="https://img.shields.io/badge/python-3.9%2B-blue" alt="Python 3.9+">
+  <img src="https://img.shields.io/badge/docker-compose-blue" alt="Runs with Docker Compose">
+</p>
 
-- A ticket source that can send webhooks. GitLab issues in, merge request out, with no extra glue; the
-  worker's summary comes back as a comment on the issue. A tracker needs a small tap that reshapes its webhooks into the broker's event
-  format, plus a script you write that reads tickets and posts comments (contract in
-  [docs/tracker-script.md](docs/tracker-script.md)). Both are shaped for [Vikunja](https://vikunja.io) today.
-- GitLab, a bot token that can open merge requests, and a push credential for each repo the bot may touch.
-- A harness CLI on the broker host. Every built-in row uses the
-  [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI by default (tested with Claude Code 2.1),
-  logged in as the user the broker runs as. Workers use that stored login: API keys and tokens in the
-  environment (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`) are deliberately not passed to them.
-  [hermes-agent](https://github.com/NousResearch/hermes-agent) is an optional second harness.
-- A Linux host with Python 3.9+ and git (tmux only for the interactive-agent row). There are no Python dependencies.
-- Your own settings in `config/site.env` (hosts, repos, links) and signed worker prompts. You render each
-  prompt, read it and record its hash before any worker will start. Turn and time limits live in
-  `config/constraints.json`, and its defaults are fine to begin with.
-
-```mermaid
-%%{init: {"flowchart": {"padding": 12, "nodeSpacing": 30, "rankSpacing": 55}}}%%
-flowchart LR
-    T["Ticket tracker"] -->|webhook| B
-    G["GitLab issue"] -->|webhook| B
-    B["eph-broker<br/>batch, route"] -->|spawn| W["Worker agent<br/>throwaway<br/>worktree"]
-    W -->|commit| P["Broker pushes<br/>a branch, opens<br/>the MR"]
-    P -->|spawn| R["Reviewer<br/>agent<br/>read-only"]
-    R -->|verdict| H(["You review<br/>and merge"])
+```text
+ ticket or GitLab issue                         you
+          |                                      ^
+          v   webhook                            | merge, or ask for changes
+  +----------------+  batch, route   +----------------------+
+  |   eph-broker   | --------------> |  worker (throwaway   |
+  | (one process,  |                 |  git worktree, one   |
+  |  stdlib only)  | <-------------- |  agent CLI session)  |
+  +----------------+   local commit  +----------------------+
+          |
+          | pushes a fresh branch, opens the MR
+          v
+     GitLab merge request  --->  second agent reviews it
 ```
 
-![The dashboard's worker view, showing a running worker's live transcript](docs/images/dashboard-workers.png)
+It is for people who already file work as tickets and want an agent to take a first pass at the small ones. It runs on one Linux host, uses only the Python standard library, and keeps you in charge of every merge. Workers never push; only the broker does, and only to a fresh branch.
 
-## A first merge request
+**Real code changes need a paid or otherwise funded agent account.** The default agent is [Claude Code](https://www.anthropic.com/claude-code), installed and logged in as the broker's OS user. [hermes-agent](docs/hermes.md) is also supported. The preview below needs no account, repo or token.
 
-The shortest path uses a GitLab issue as the ticket, so you don't need tracker glue yet. Clone the target repo
-on the broker host with an https `origin`, then set up the broker.
+## Quick start
+
+You need Linux, git, and either Python 3.9+ or [Docker Engine](https://docs.docker.com/engine/install/) with the [Compose plugin](https://docs.docker.com/compose/install/linux/). Allow about 10 minutes.
 
 ```sh
-git clone https://github.com/mdbook/eph-broker && cd eph-broker
-cp config/provenance.example.json config/provenance.json
-cp config/site.example.env config/site.env
+git clone https://github.com/mdbook/eph-broker
+cd eph-broker
+docker compose up --build -d
 ```
 
-`provenance.json` lists your bot and service accounts, so the broker ignores the edits they make. For this
-quick start, put your GitLab bot user in it ([docs/configuration.md](docs/configuration.md#who-counts-as-an-agent)).
+Open [the dashboard](http://127.0.0.1:8787/dash.html). [Health](http://127.0.0.1:8787/health) should show `"ok": true` and no live workers. If `docker compose ps` is not healthy, check `docker compose logs broker`. Port 8787 must be free. Stop with `docker compose down`; add `-v` to delete the preview state.
 
-These go in `config/site.env`, with your own values in place of the examples.
+No Docker? From the same checkout, no packages needed:
 
 ```sh
-GITLAB_WEB_URL=https://gitlab.example.com
-BROKER_PUSH_HOSTS=gitlab.example.com
-ISSUE_REPO_MAP=gitlab:group/app=/srv/git/app
-# who may start work by opening an issue; nobody can until you list them
-ISSUE_AUTHOR_ALLOWLIST=your-gitlab-username
-# optional: lets the worker run this repo's tests (pytest, npm, go, ...)
-CODE_REPO_RUNNER_SEEDS=/srv/git/app=pytest
+BROKER_SITE_ENV=/dev/null BROKER_CONFIG=config/demo/broker.example.json python3 app.py
 ```
 
-Two secrets go in the broker's environment rather than `site.env`. `GITLAB_MR_TOKEN` (scope `api`, Developer
-on the project) opens MRs and posts notes, and `GITLAB_WEBHOOK_TOKEN` is the value GitLab must send as
-`X-Gitlab-Token`. A third, `BROKER_HMAC_SECRET`, only matters once a tracker tap sends `POST /event`: the broker
-refuses unsigned events, so it has to be set and the tap has to sign.
+Use the same links, Ctrl-C to stop. State goes in `demo-state/`. Run it from a clean shell without broker tokens, because real environment variables override the example.
 
-Then set up the user the broker runs as:
+**This previews the service, not a first merge request.** It uses the shipped [demo config](config/demo/broker.example.json) with no secrets, no repo access and no agent CLI. Webhooks are refused while their tokens are unset, and nothing is sent to an AI provider. There is no published image yet, so Compose builds locally. More in the [Docker guide](docs/docker.md).
 
-- a push credential for the repo: one line for exactly that repo's path in `~/.git-credentials`, like
-  `https://<user>:<token>@gitlab.example.com/group/app.git`
-  ([docs/repo-push-cred.md](docs/repo-push-cred.md) has the details);
-- a git identity for the worker's commits (`git config --global user.name` and `user.email`);
-- write access to the checkout's `.git`, because each worker gets a `git worktree` of it.
+### Going further: real code changes
 
-Read the three shipped prompts in `prompts/` and either accept their hashes in `approved-prompts.json` or sign
-your own ([docs/prompts.md](docs/prompts.md)). Start the broker with the secrets in its environment
-(`set -a; . /etc/eph-broker/eph-broker.env; set +a; python3 app.py`), put a reverse proxy in front of
-`127.0.0.1:8787`, and add a GitLab project webhook for issue events pointing at `/webhooks/gitlab` with the same
-secret token. Open an issue. A few seconds later a worker starts; when it finishes you get an `eph/issue/...`
-branch, an MR that closes the issue when you merge it, a review note on the MR, and the worker's summary as a
-comment on the issue. If no MR shows up, the comment says why; `/runs/<key>`, the dashboard and the broker's
-log have the rest ([docs/operations.md](docs/operations.md#finding-the-result-of-a-gitlab-issue)).
+The shortest supported path uses GitLab issues. It needs more than a service start:
 
-[docs/install.md](docs/install.md) covers the RPM, systemd and the tracker path.
+- Claude Code logged in for a dedicated broker user, on an account that can pay for workers.
+- A GitLab project and a bot with Developer access and an `api` token.
+- A local checkout of that project with an HTTPS origin, a push credential and a git identity.
+- Your allowed issue authors, bot account names and approved worker prompts.
+- A reverse proxy and a GitLab issue webhook.
 
-## Try it without anything attached
+The [first merge request checklist](docs/first-merge-request.md) walks through every step and check. Allow 30 to 60 minutes once the accounts are ready, plus agent run time. I don't promise a ten-minute first MR. Vikunja users also need the bridge and an n8n workflow, covered in the same guide.
 
-After the two `cp` commands above, this runs the broker and its dashboard with no tracker, GitLab or agent.
+## Configuration
 
-```sh
-EVENTS_LOG=$PWD/events.jsonl python3 app.py
-```
+Settings are environment variables plus a few JSON files in `config/`. Start from the examples (`config/site.example.env`, `config/provenance.example.json`) and keep secrets out of `site.env` and git.
 
-Then run these in another terminal.
+| What | Where |
+|---|---|
+| Every environment variable and its default | [docs/settings.md](docs/settings.md) |
+| The files you touch, secrets, limits, models | [docs/configuration.md](docs/configuration.md) |
+| Your own worker types | [docs/routes.md](docs/routes.md) |
+| Which prompts workers may run | [docs/prompts.md](docs/prompts.md) |
 
-```sh
-curl -s 127.0.0.1:8787/health          # {"ok": true, ...}
-xdg-open http://127.0.0.1:8787/dash.html
-sh tools/check.sh                      # the test suite; no network or real agents needed
-```
+## Features
 
-## How it works
+- **Ticket to MR.** A webhook starts a worker in its own git worktree. It commits locally, and the broker pushes a fresh branch and opens the merge request.
+- **Built-in review.** A second agent session reviews each MR. Merging stays manual unless you turn on the optional [auto-merge path](docs/cd-deploy-paths.md).
+- **Burst batching.** Saving a ticket fires several webhooks. The broker waits a few seconds so they become one worker with one brief, and follow-up comments reach the same worker.
+- **Pluggable agents.** Claude Code by default, [hermes-agent](docs/hermes.md) and other CLIs through [adapters](docs/adapters.md), with [custom worker types](docs/routes.md).
+- **Your tracker.** GitLab issues work natively. [Vikunja](https://vikunja.io) and others plug in through a [small script](docs/tracker-script.md) and [n8n](https://n8n.io) workflows ([ready-made](docs/n8n.md)).
+- **Dashboard and events.** A live view of workers and queues, plus [signed run events](docs/events.md) for your own automation.
+- **Optional UI modules.** [Add a tab](docs/modules.md#try-it-in-ten-minutes) without embedding another app in the broker.
 
-A webhook arrives, either `POST /event` from your tracker's tap or `POST /webhooks/gitlab` from GitLab. The broker
-drops events its own comments caused, then waits a few seconds so a burst of edits on one ticket turns into
-one worker. If that ticket already has a worker running, the event is handed to it instead.
+![The dashboard's worker view](docs/images/dashboard-workers.png)
 
-Routing goes by assignee or label to a worker class. Three classes ship with signed prompts.
+## Security
 
-| Class | Starts when | What it may do | Result |
-|---|---|---|---|
-| `code/change-proposer` | label `eph:code-change`, assignee `eph-code`, or a new GitLab issue | edit files, commit, run one named test runner; no push | comment and MR |
-| `general/agent` | assignee `eph`, or label `eph:general` | most tools, minus a deny list for secrets, pushes and destructive commands | comment, optional MR |
-| `mr-review/agent` | the broker just opened an MR | read files only | verdict note on the MR |
+Run it isolated, with only the repos and credentials it needs, not your everyday login. **A container around the broker does not isolate workers from broker credentials**: workers run as the broker's OS user, and tool permissions are not a sandbox. The dashboard has no built-in login, so keep it on loopback and use an authenticating reverse proxy for remote access. Read the [security model](docs/security.md) before enabling webhooks.
 
-Your own classes go in `config/routes.json` ([docs/routes.md](docs/routes.md)). They pick up tickets the
-built-in rows don't claim, ahead of the general catch-all.
+## Limits
 
-The worker gets a fresh worktree, a turn cap, a time limit and its signed system prompt. It ends with a small
-JSON result (`done` or `blocked`, plus a summary). The broker posts the summary as a comment on the ticket or
-GitLab issue. Then it pushes the worker's commit to a new branch, opens the MR and starts the reviewer. Merging stays with you.
+- Merge requests and native issue webhooks are GitLab only.
+- One host runs the broker. Durable maintenance queues use local SQLite; other state is memory and JSON files.
 
-```mermaid
-sequenceDiagram
-    actor You
-    participant T as Tracker
-    participant B as eph-broker
-    participant W as Worker agent
-    participant G as GitLab
-    participant R as Reviewer agent
-    You->>T: assign ticket to the bot
-    T->>B: webhook
-    Note over B: batch, route,<br/>check prompt hash
-    B->>W: start in a fresh worktree
-    Note over W: read, edit,<br/>test, commit
-    W-->>B: result {status, summary}
-    B->>T: comment with the summary
-    B->>G: push branch, open MR
-    B->>R: start review
-    R-->>B: verdict
-    B->>G: verdict note on the MR
-    You->>G: review and merge
-```
+## Docs
 
-A ticket has at most one worker at a time. The worker stays warm for a short window so follow-up comments
-reuse it, then exits.
+The full index is [docs/README.md](docs/README.md). Highlights:
 
-```mermaid
-stateDiagram-v2
-    [*] --> Batching: first event
-    Batching --> Running: window closes
-    Running --> Idle: turn done
-    Idle --> Running: new event
-    Idle --> Closed: receive window ends
-    Closed --> [*]
-```
+- [Concepts](docs/concepts.md): follow one ticket from webhook to merge request.
+- [Install guide](docs/install.md): from source, RPM and systemd, and wiring webhooks.
+- [Operations](docs/operations.md): logs, `/health`, reloads, re-running a ticket, upgrading.
+- [Agent CLIs](docs/adapters.md) and [prompt architecture](docs/prompts.md).
+- [Maintenance drain](docs/drain.md), [live routing overrides](docs/routing-overrides.md), [test runners and worktrees](docs/worker-runtime.md).
+- [FAQ and costs](docs/faq.md).
 
-[docs/concepts.md](docs/concepts.md) walks through events, batching, routing and publishing in more detail.
+## Contributing
 
-## Prompt architecture
-
-Worker prompts are built from small Markdown modules rather than written as one file per worker. This is
-what ships.
-
-- `modules/` holds 12 fragments grouped by job: `role/`, `scopes/`, `capabilities/`, `constraints/` and
-  `outputs/`.
-- `workers/<domain>/<class>.json` is a manifest per class (three ship). It lists modules in order and fills
-  `{{var}}` slots by plain string replacement.
-- `tools/render-prompts.py` renders each manifest to `prompts/<domain>/<class>.md`. With `--check` it exits 1
-  when a committed prompt no longer matches its manifest, and `tools/check.sh` runs it.
-- `modules/site/<section>.md`, if you create it, replaces `modules/<section>.md` at render time. That's where
-  your own wording goes, so pulling a new release never overwrites it.
-- `approved-prompts.json` maps each `<domain>/<class>` to the sha256 of its rendered prompt. `prompts.py`
-  refuses to start a worker whose prompt file doesn't hash to that value.
-
-The hashes in this repo cover the generic prompts as shipped. Read them before you trust them, and re-sign
-after any change. [docs/prompts.md](docs/prompts.md) covers inline sources, the render check and adding a
-new agent type, which takes a prompt and one row in `config/routes.json`.
-
-## Security model
-
-Workers have no tokens and only commit locally; the broker is the only thing that pushes, comments or opens
-MRs. For the shipped classes it pushes only to a fresh branch, and only to a host listed in
-`BROKER_PUSH_HOSTS`. Each class gets its own tool allowlist plus a fixed deny list (secret files, `.git`
-writes, pushes, destructive shell), enforced by the harness: Claude Code's permission flags, or hermes'
-`eph-gate` plugin. Secrets are scrubbed from the worker's environment, and repo instruction files
-(`CLAUDE.md`, `AGENTS.md`) are removed from the worktree. On Claude Code the signed prompt replaces the CLI's
-default one; hermes adds some text of its own around it. The general worker also loads the service user's
-user-level Claude Code settings and `~/.claude/CLAUDE.md`, so keep those deliberate. The broker listens on 127.0.0.1
-only, and the GitLab and re-run endpoints refuse every request until their token is set.
-
-The big caveat is that workers run as the broker's OS user. Tool grants are not a sandbox, so a worker with
-shell access can read whatever the broker can. [docs/security.md](docs/security.md) explains the model and
-[docs/security-residual-same-uid.md](docs/security-residual-same-uid.md) the parts code can't fix.
-
-## Limitations
-
-- Merge requests and issue webhooks are GitLab only.
-- Tracker reads, comments and labels go through a script you write (`BROKER_MCP_SH`), shaped for Vikunja
-  ([docs/tracker-script.md](docs/tracker-script.md)). GitLab issues only get comments: no labels or
-  assignees.
-- Three worker classes have prompts. `routing.py` has rows for other kinds of worker; they stay inert until
-  you write and sign prompts for them.
-- One host. State lives in memory plus a few JSON files next to the event log.
-- Merging is manual. Two optional paths, both off by default, can merge for you: the CD module (`cd.py`)
-  merges reviewed MRs in repos you allowlist, and `AUTO_MERGE_REPOS` merges a listed repo's MRs on a green
-  pipeline with no reviewer.
-
-## Documentation
-
-Everything else is under [docs/](docs/README.md), starting from the index there. To run workers on another
-agent CLI, see [docs/adapters.md](docs/adapters.md). To hook it up to n8n (taps in, run events out), see
-[docs/n8n.md](docs/n8n.md); self-hosted n8n can also use the nodes in
-[integrations/n8n-nodes-eph-broker](integrations/n8n-nodes-eph-broker/README.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md). Short version: `sh tools/check.sh` runs the full test gate without real agents.
 
 ## License
 
-GPL-3.0-only. See [LICENSE](LICENSE).
+GPL-3.0-or-later. See [LICENSE](LICENSE).

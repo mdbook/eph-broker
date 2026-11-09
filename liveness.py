@@ -153,9 +153,24 @@ class LivenessDriver:
         # be empty; guard anyway so no buffered work is ever silently dropped.
         # rearm_pending drops (and logs) forward-only comments; only re-armed events are alerted.
         if popped and popped.get("fwd_buffer"):
-            n = self.coalescer.rearm_pending(key, popped["fwd_buffer"], now)
+            n = (popped["rearmed"] if "rearmed" in popped else
+                 self.coalescer.rearm_pending(key, popped["fwd_buffer"], now, row=popped.get("row")))
             if n:
                 self.alert_ops(f"close key={key}: {n} late buffered event(s) re-armed as a fresh spawn")
+
+    # ---- operator cancel (web action): same closing -> teardown -> finish_close path as a normal close ----
+    def cancel(self, key, reason):
+        """Stop a live worker now. Returns the dropped-buffer count, None when there is no open worker, or
+        "starting" while the adapter is still setting the run up (nothing changed; try again once it runs).
+        The teardown runs in its own thread (it joins the worker), so the caller never blocks on it.
+        finish_close marks the subject completed, so later ticket noise does not re-spawn it; /rerun can."""
+        dropped = self.coalescer.begin_cancel(key, ready=self.adapter.cancellable)
+        if dropped is None or dropped == "starting":
+            return dropped
+        self._dispatch_close(key, time.time())
+        # alert_ops can shell out to the bus; keep it off the request thread
+        threading.Thread(target=self.alert_ops, args=(f"CANCEL key={key}: {reason}",), daemon=True).start()
+        return dropped
 
     # ---- force close (also re-arms a non-empty buffer) ----
     def _force_close(self, key, now, reason):
@@ -168,7 +183,8 @@ class LivenessDriver:
         if popped and popped.get("fwd_buffer"):
             # Orphaned buffered events must be logged, alerted and re-armed (never lost).
             # Forward-only comments are dropped (and logged) by rearm_pending, not re-armed.
-            n = self.coalescer.rearm_pending(key, popped["fwd_buffer"], now)
+            n = (popped["rearmed"] if "rearmed" in popped else
+                 self.coalescer.rearm_pending(key, popped["fwd_buffer"], now, row=popped.get("row")))
             if n:
                 log.warning("FORCE-CLOSE key=%s ORPHANED %d buffered event(s) -> re-armed a fresh spawn", key, n)
                 self.alert_ops(f"FORCE-CLOSE key={key}: {n} ORPHANED buffered event(s) re-armed as a fresh spawn")

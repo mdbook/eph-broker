@@ -1,9 +1,9 @@
 # Adding a harness
 
 A harness is the agent CLI that runs a worker's turns. It takes the signed prompt and the brief, calls a model,
-uses tools inside the worktree and prints a result. Two ship: Claude Code (`cc`, the default) and hermes-agent
-(`hermes`, see [hermes.md](hermes.md)). This page explains the seam a third one plugs into, with Codex as a
-worked example.
+uses tools inside the worktree and prints a result. Three ship: Claude Code (`cc`, the default), hermes-agent
+(`hermes`, see [hermes.md](hermes.md)) and the Codex CLI (`codex`, see [The Codex harness](#the-codex-harness)).
+This page explains the seam they plug into.
 
 This is not the same thing as the tracker adapters in [trackers.md](trackers.md), which are about where tickets
 come from.
@@ -19,7 +19,7 @@ The code has two layers, and it helps to keep them apart.
 - The **harness** runs one turn. `CCAdapter` does everything around the turn (worktree, ticket brief, prompt
   check, concurrency cap, session rotation, the envelope re-prompt, publishing, escalations) and hands the turn
   itself to the harness the route names. For `cc` that's its own `claude -p` code. For `hermes` it calls
-  `HermesHarness.one_turn` in `adapters/hermes.py`.
+  `HermesHarness.one_turn` in `adapters/hermes.py`, and for `codex` `CodexHarness.one_turn` in `adapters/codex.py`.
 
 So `CCAdapter` covers more than Claude Code: it's the lifecycle every harness shares. A new harness belongs at
 the turn layer, the way hermes does it. A new `Adapter` subclass would have to rebuild the worktree cut, the
@@ -27,7 +27,7 @@ prompt gate, the caps, the retry, publishing and every escalation path, and `app
 
 ## The Adapter interface
 
-`adapters/base.py` defines four required methods and three optional ones. `key` is the subject key, such as
+`adapters/base.py` defines four required methods and three optional ones; the coalescer also calls `steerable` if an adapter has it. `key` is the subject key, such as
 `vikunja:task:42` or `gitlab:group/app#7`.
 
 | Method | Called by, and when | What it must do |
@@ -39,6 +39,7 @@ prompt gate, the caps, the retry, publishing and every escalation path, and `app
 | `turn_age(key)` | The liveness driver, on every sweep of a running worker. | Seconds the current turn has run, or `None` when idle or gone. Default `None`. |
 | `worker_alive(key)` | The same sweep, when `turn_age` is `None`. | Whether the worker's own thread is still running. Default `False`, so a running worker with no turn age gets force-closed. |
 | `set_coalescer(c)` | The coalescer's constructor. | Keep the reference, so the worker can report turn start and end through the coalescer's lock. Default does nothing. |
+| `steerable(key)` | `coalescer.forward_message` when a dashboard message arrives mid-turn. | True if this worker's turns carry the `steer.py` `PostToolUse` hook, so the message can land after its next tool call. Default (missing) False: it waits for the turn boundary. |
 
 `CCAdapter` also has `turn_deadline_extra(key)`. The driver reads it if it exists, so a capability with a longer
 time limit than the global one keeps the same headroom before a force-close.
@@ -48,8 +49,9 @@ binary is logged, reported to the escalation handle and leaves nothing running.
 
 ## The turn seam
 
-`CCAdapter._one_turn` reads `route.adapter`. For `cc` it builds the `claude` command line itself. For `hermes` it
-builds `HermesHarness` on first use (so a broker that never routes to hermes never imports it) and calls:
+`CCAdapter._one_turn` reads `route.adapter`. For `cc` it builds the `claude` command line itself. For `hermes`
+and `codex` it builds `HermesHarness` / `CodexHarness` on first use (so a broker that never routes to one never
+imports it) and calls:
 
 ```python
 def one_turn(self, adapter, worker, route, system_prompt, prompt_text, resume_session,
@@ -81,10 +83,17 @@ The turn has to keep the `Worker` fields that the liveness layer and teardown re
   untrusted).
 - Set `worker.session_id` whenever the output names one, even on a failed turn, so the re-prompt can resume it.
 - If the process runs in its own process group, set `worker.kill_group = True` so teardown kills the whole group.
-  Teardown currently uses hermes' `_kill_group` for that.
+  Teardown uses hermes' `_kill_group` for that (Codex reuses it).
 
 It returns the parsed envelope, or `None` for a parse miss. A miss gets one warm re-prompt (a resumed turn asking
 for a clean envelope), then an escalation.
+
+Before dispatch, `CCAdapter` re-seeds a forwarded turn that starts fresh: on rotation, a usage-cap fallback,
+or a forward with no learned session id. It merges the enriched seed brief and accumulated earlier forwarded
+comments with the current delta; only non-None delta values override seed fields. Plain resumed forwards stay
+deltas. Envelope-only re-prompts never re-seed or rotate, even without a session id, and the adapter excludes
+their harness invocation from the rotation turn count. Every fresh start clears the previous context-size
+reading, so a missing reading cannot carry a prior session's size into the new session.
 
 ## The envelope contract
 
@@ -112,89 +121,196 @@ adds after parsing, like hermes' `gate_denials`, has to come from its own record
 
 - `Route.adapter` in `routing.py`, `cc` by default. The allowed names are `routing.ADAPTERS`. `Route` refuses any
   other value when the table loads, and `_one_turn` refuses it again at turn time.
-- Built-in rows set it in code. The MR reviewer row reads `MR_REVIEW_ADAPTER`
-  ([configuration.md](configuration.md#choosing-the-reviewers-model)).
-- Rows in `config/routes.json` have no harness field and run on `cc`, unless the label below moves a ticket.
-- A `hermes` label moves one ticket's worker onto hermes (`routing.apply_adapter_label`). It only counts from
-  creators in `MODEL_LABEL_TRUSTED_CREATORS`, never on a row with a pinned backend, and only for capabilities in
-  `HERMES_LABEL_CAPABILITIES` (`general`). The ticket also needs a non-Anthropic backend, normally from a
-  `model:` label. A label on the wrong capability or with an Anthropic backend refuses the spawn; it never falls
-  back to `cc`.
+- Each built-in worker row reads its own `<ROW>_ADAPTER` setting (`routing._row_adapter`, default `cc`), for
+  example `CODE_CHANGE_ADAPTER` or the reviewer's `MR_REVIEW_ADAPTER`
+  ([configuration.md](configuration.md#choosing-a-rows-harness)).
+- Rows in `config/routes.json` have no harness field and run on `cc`, unless a label below moves a ticket.
+- A `hermes` or `codex` label moves one ticket's worker onto that harness (`routing.apply_adapter_label`). It only
+  counts from creators in `MODEL_LABEL_TRUSTED_CREATORS`, never on a row with a pinned backend, and only for the
+  label's capabilities (`HERMES_LABEL_CAPABILITIES` / `CODEX_LABEL_CAPABILITIES`, both `general` and `code`).
+  Both labels on one ticket refuse. A hermes ticket also needs a non-Anthropic backend, normally from a `model:`
+  label; a Codex ticket takes its model from `CODEX_BACKEND` unless its backend has a `codex` block. A label on
+  the wrong capability or with an Anthropic backend (hermes) refuses the spawn; it never falls back to `cc`.
 
-## What the two harnesses do differently
+## What the three harnesses do differently
 
-| | Claude Code (`cc`) | hermes-agent (`hermes`) |
-|---|---|---|
-| Launch, per turn | `claude -p <brief>` | `hermes chat --query-file - --format stream-json ...`, brief on stdin |
-| Signed prompt | `--system-prompt`, which replaces the CLI's own prompt | `agent.system_prompt` in a private config; hermes adds its own identity and tool text before it and a runtime block after it |
-| Repo and user instructions | `--setting-sources ''` (the general row loads `user`) | `--ignore-rules` (skips `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, `SOUL.md`, memory) |
-| Tool limits | `--allowedTools`, `--disallowedTools` and `--permission-mode` from `capability_tool_grant()` | toolsets (`-t file` or `-t file,terminal`) plus the `eph-gate` plugin, which checks every call against the same lists |
-| General worker | `auto` permission mode on native Claude, `--dangerously-skip-permissions` on other backends, deny list on top | eph-gate floors first, then an external policy judge; no judge configured means deny |
-| Resuming | `--resume <session_id>` | `--resume=<session>` inside a private `HERMES_HOME` that lives as long as the worker |
-| Result | the `--output-format json` wrapper | the stream-json `result` record, repacked into the same wrapper |
-| Turn cap | `--max-turns` | `--max-turns`, plus `--run-budget` asking it to wrap up early |
-| Time limit | the process is killed | the whole process group is killed |
-| Backends | native Claude or a registry backend | non-Anthropic registry backends only |
-| Capabilities | all | `mr-review`, `write`, `code` (only with `CODE_NONCLAUDE_OK=1`), `general` (label only); the rest are refused |
-| Live transcript | yes, with `BROKER_STREAM_ENABLED` | no |
-| Checks before each turn | prompt present; MCP config present for general and inbox | prompt and binary present, private home swept, gate probe passes, interpreter has no editable or relative path entries |
+| | Claude Code (`cc`) | hermes-agent (`hermes`) | Codex CLI (`codex`) |
+|---|---|---|---|
+| Launch, per turn | `claude -p <brief>` | `hermes chat --query-file - --format stream-json ...`, brief on stdin | `codex exec --json -s <sandbox> -m <model> -`, brief on stdin |
+| Signed prompt | `--system-prompt`, which replaces the CLI's own prompt | `agent.system_prompt` in a private config; hermes adds its own identity and tool text before it and a runtime block after it | `model_instructions_file` in a private config, which replaces Codex's built-in instructions |
+| Repo and user instructions | `--setting-sources ''` (the general row loads `user`) | `--ignore-rules` (skips `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, `SOUL.md`, memory) | `project_doc_max_bytes = 0`, a swept private `CODEX_HOME`, and an untrusted project (its `.codex/` never loads) |
+| Tool limits | `--allowedTools`, `--disallowedTools` and `--permission-mode` from `capability_tool_grant()` | toolsets (`-t file` or `-t file,terminal`) plus the `eph-gate` plugin, which checks every call against the same lists | Codex's OS sandbox (read-only or workspace-write) plus eph-gate as a `PreToolUse` hook, checking every call against the same lists |
+| General worker | `auto` permission mode on native Claude, `--dangerously-skip-permissions` on other backends, deny list on top | eph-gate floors first, then your exec gate ([hermes.md](hermes.md#plugging-in-your-own-exec-gate-general-worker-only)); none configured means deny | same as hermes |
+| Resuming | `--resume <session_id>` | `--resume=<session>` inside a private `HERMES_HOME` that lives as long as the worker | `resume <thread id>` inside a private `CODEX_HOME` that lives as long as the worker |
+| Result | the `--output-format json` wrapper | the stream-json `result` record, repacked into the same wrapper | the `--json` events (final agent message, thread id, usage), repacked into the same wrapper |
+| Turn cap | `--max-turns` | `--max-turns`, plus `--run-budget` asking it to wrap up early | none; the time limit is the only hard cap |
+| Time limit | the process is killed | the whole process group is killed | the whole process group is killed |
+| Backends | native Claude or a registry backend | non-Anthropic registry backends only | its own ChatGPT login; the model comes from a registry `codex` block |
+| Capabilities | all | `mr-review`, `write`, `code` (only with `CODE_NONCLAUDE_OK=1`), `general`; the rest are refused | same as hermes |
+| Live transcript | yes, with `BROKER_STREAM_ENABLED` | no | yes, with `BROKER_STREAM_ENABLED`: a broker-written, redacted record of messages, reasoning summaries, command lines with the last 3000 characters of their output, per-edit diffs of worktree files, plan items and tool names, never MCP arguments or results |
+| Checks before each turn | prompt present; MCP config present for general and inbox | prompt and binary present, private home swept, gate probe passes, interpreter has no editable or relative path entries | prompt, binary and login file present, private home swept, Codex reports the gate hook loaded, enabled and trusted, gate probe passes |
 
-## Worked example: Codex
+## The Codex harness
 
-Codex is not a supported harness. This section sketches what adding one would take, to show the shape of the
-work. The Codex CLI flags named here are illustrative; check each one against the version you install.
+`adapters/codex.py` (`CodexHarness`) runs a turn on the Codex CLI with its own ChatGPT login.
+`adapters/codex_gate.py` is the per-call gate it installs. Settings are in
+[configuration.md](configuration.md#the-codex-harness); `tests/test_codex.py` fakes the `codex` binary. The flags
+and config keys were checked against the CLI version named in `CODEX_VERIFIED`; re-check them when you upgrade.
+`CodexHarness` refuses to build at all (`CodexRefused`, fail-closed) unless `codex --version` matches
+`CODEX_VERIFIED_VERSION` exactly (a prerelease suffix such as `-rc1` is never an exact match, whatever its
+release numbers say, unless `CODEX_ALLOW_PRERELEASE=1`), and unless the `codex-linux-sandbox` helper every turn
+execs to actually sandbox a command resolves on `PATH` - bump `CODEX_VERIFIED_VERSION` deliberately, after
+re-checking `CODEX_VERIFIED`'s claims, never as a reflex to a refusal. The version is re-checked before every
+spawn too (cheaply: only a `stat()` unless the binary file itself changed since the last check), so an in-place
+`codex` upgrade under a running broker is caught on the next turn rather than only at the next broker restart.
+Codex finds its sandbox helper next to its own executable (arg0); the adapter does not configure it.
+`tests/test_codex_canary.py` checks the installed binary: with no login it loads the broker's `config.toml` under
+`--strict-config` and confirms every disabled feature is off, `code_mode_host` is on and `unified_exec_tty` is
+off; with `CODEX_CANARY=1` (plus `CODEX_AUTH_FILE` and `CODEX_CANARY_MODEL`) it runs one real turn behind a
+deny-all hook and requires `apply_patch`, web search and a shell command to be denied or absent (and, for a
+code_mode_only model, a nested call's `tool_use_id` to start `exec-`). It prints a report: the tool names and
+shell argument keys the hook saw, error events, and whether a login refresh rewrote the auth file through the
+symlink. Run it before you set any row to codex and after every Codex upgrade.
+`tests/test_codex_probe.py` (the workdir-bypass fix) also needs the real binary, but no login at all: it drives it
+against a throwaway localhost mock of the OpenAI Responses API, proving the offline probe's findings
+stay true - every nested call hooked and isolated, the
+nested `tools` surface within `codex_gate.EXPECTED_NESTED_TOOLS`, `tty`/`write_stdin` inert, the workdir bypass
+fixed, a namespaced `spawn_agent` denied as unmapped-tool. Both are skipped (and pass) with no `codex` binary on
+`PATH` / `CODEX_BIN`.
 
-### The pieces to add
+**Launching non-interactively.** One headless `codex exec --json --strict-config -s <sandbox> -m <model> -` per
+turn (`--strict-config`: a config key this Codex doesn't know stops the run rather than being ignored), brief on
+stdin, cwd the worktree, environment from `scrub_worker_env` with every `CODEX_*` and `OPENAI_*` name dropped
+(no API-key billing, no second home, no sandbox override) and `CODEX_HOME` set. Each worker gets a private
+`CODEX_HOME` under `CODEX_HOME_ROOT`, created on the first turn and removed with the worktree. Before every turn
+it is swept down to what Codex wrote and resume needs (`sessions/`, `archived_sessions/`, `log/`, `*.sqlite*`),
+so a planted `AGENTS.md`, `rules/`, `skills/` or config never survives into a turn. The model and effort always go
+in explicitly, from the backend's `codex` registry block (or `CODEX_BACKEND`'s).
 
-1. `adapters/codex.py` with a `CodexHarness` class and a `one_turn` method with the signature and contract
-   above.
-2. `"codex"` in `routing.ADAPTERS`.
-3. A branch in `CCAdapter._one_turn` next to the hermes one, importing the module lazily.
-4. Process-group teardown, if the harness starts its own session (today teardown reaches for hermes'
-   `_kill_group`).
-5. Tests with a fake `codex` binary, the way `tests/test_hermes.py` fakes hermes, and a line in
-   `tools/check.sh` if they live in a new file.
-6. A page like [hermes.md](hermes.md) for its install and its quirks.
+**Auth.** `<home>/auth.json` is a symlink to `CODEX_AUTH_FILE`. The broker only checks that the file exists; it
+never opens, reads or copies it (a copy would fork the refresh token). Removing the home removes only the link.
+The config pins `cli_auth_credentials_store = "file"` and `forced_login_method = "chatgpt"`, so Codex uses that
+file and never a keyring copy. Concurrent codex workers share one login, so a refresh in one rewrites the file for
+all of them; the canary reports whether a refresh wrote through the link.
 
-### What `one_turn` has to map
+**Passing the signed prompt.** The signed prompt is written to `<home>/eph-instructions.md` and named by
+`model_instructions_file`, which replaces Codex's built-in instructions. `project_doc_max_bytes = 0` keeps any
+`AGENTS.md` out (`worktree.py` removes them too), and the project is never marked trusted, so a repo's `.codex/`
+config and hooks don't load.
 
-**Launching non-interactively.** Run Codex's non-interactive mode (`codex exec`) once per turn with the brief
-on stdin, the worktree as its working directory and the environment from `scrub_worker_env`. Give each worker a
-private config home (`CODEX_HOME`), created on the first turn and removed with the worktree, so it never reads
-the broker user's own config, credentials or session history. Always pass an explicit model. Resolve the
-route's backend through the same registry `load_backend` reads, and refuse one that doesn't resolve.
+**Resuming a session for forwarded events.** The thread id from `thread.started` is stored on
+`worker.session_id`, even when the turn fails. A resumed turn runs `codex exec ... resume <thread id> -`; the id
+must be a UUID before it reaches the command line. Session rotation needs nothing here.
 
-**Passing the signed prompt.** The signed prompt has to be the instructions Codex runs under. Find the setting
-that replaces Codex's base instructions, not one that appends to them. If the CLI can only add to its own
-prompt, say so on the harness page, the way hermes.md does, because then the signed prompt isn't the whole
-system prompt. `worktree.py` already removes `AGENTS.md` and `CLAUDE.md` from the worktree, and the private home
-keeps user-level instruction files out.
+**Sandbox and approvals.** `approval_policy = "never"` always, since nobody can answer an ask.
 
-**Resuming a session for forwarded events.** Read the session id from Codex's output and store it on
-`worker.session_id`, even when the turn fails. When `resume_session` is set, continue that session
-(`codex exec resume <id>`) instead of starting a new one. Validate the id against a strict pattern before it goes
-on the command line, as hermes does. Session rotation needs nothing here: `_one_turn` passes `None` when it's
-time for a fresh session.
+- `mr-review`: `read-only` sandbox.
+- `write`, `code`, `general`: `workspace-write`, writable roots the worktree plus Codex's defaults, `/tmp` and
+  `$TMPDIR` (left writable so test runners can use temp dirs; the gate still decides every command and edit, and
+  `apply_patch` is confined to the worktree). Network off unless `CODEX_SANDBOX_NETWORK=1`. `code` also needs
+  `CODE_NONCLAUDE_OK=1`.
+- Anything else, unknown values included: refused.
 
-**Tool and write limits.** Map each capability to what Codex can enforce, and refuse the rest.
+Commands Codex runs don't inherit `CODEX_HOME` (`shell_environment_policy.exclude`).
 
-- `mr-review`: a read-only sandbox, no network, approvals off (`--sandbox read-only`, and an approval policy
-  that never asks, since nobody can answer).
-- `code` and `write`: writes confined to the worktree, network off so a `git push` can't reach anything. The
-  `code` test runner allow-list and the deny lists in `adapters/cc.py` (secret files, `.git` writes, destructive
-  shell) still have to hold. If Codex can't express them, the harness needs a per-call gate like hermes'
-  `eph-gate`, or it refuses that capability.
-- `general` and `inbox`: refuse until there's a per-call gate. Reading the broker's secret files is the main
-  risk, and a sandbox that allows reads everywhere doesn't stop it.
-- Anything else, unknown values included: refuse.
+**Tools the hook never sees are switched off.** Hosted tools (web search, image generation) run on OpenAI's side,
+and Codex skips `PreToolUse` for MCP tools, so the gate can't stop either. The config sets `web_search =
+"disabled"` and turns off every feature in `DISABLED_FEATURES` (`apps`, `plugins`, `multi_agent`,
+`image_generation`, `view_image`, browser and computer use, and others). The worker keeps the shell,
+`apply_patch` and `update_plan`.
 
-Codex's sandbox is an OS-level one, which the shipped harnesses don't have. It still runs as the broker's user,
-so the same-user reads in [security-residual-same-uid.md](security-residual-same-uid.md) apply unless the
-sandbox blocks them. Check before you claim more.
+**code_mode_host is explicitly ON** (not merely left off `DISABLED_FEATURES`), because every model the ChatGPT
+login offers on 0.164.0 is code_mode_only: without it, such a model can call no tool at all (`hooked_tools=[]`;
+safe but useless). ALWAYS written together with **`unified_exec_tty = false`** (the workdir-bypass fix): without it, an
+`exec_command(tty: true)` session keeps stdin open and `write_stdin` actually feeds it - and `write_stdin` never
+reaches `PreToolUse` at all, so the gate could never stop that. With `unified_exec_tty = false`, Codex itself
+rejects `tty: true` and closes every session's stdin, so `write_stdin` fails "stdin is closed" regardless of the
+gate - stronger than any gate-side heuristic. `goals` and `sleep_tool` are off too, narrowing the nested surface
+further (`create_goal`/`get_goal`/`update_goal`, `clock.sleep`); the gate would default-deny them anyway.
+Enabled, code mode's nested `tools.*` calls reach `PreToolUse` with the SAME event shape as a classic tool call,
+so the hook maps the shell one (`exec_command`) through the identical rules as `Bash` - including the workdir
+fix below - and `apply_patch` under code mode is already the same tool name. `write_stdin` is also denied
+outright by the gate as a second belt (the real floor is `unified_exec_tty = false` above); `Bash` / `exec_command`
+additionally refuse to ever start a bare stdin-reading interpreter (a shell or script interpreter given no script
+file and no inline-code flag, e.g. plain `bash` or `python3`), in every capability, as a third belt. What this
+cannot prove is whether the code-mode JS runtime itself has any reach to the filesystem / network / processes /
+env outside `tools.*` - only the real binary can show that (`tests/test_codex_canary.py`,
+`tests/test_codex_probe.py`); see `CODEX_VERIFIED`.
 
-**Caps.** Use the per-capability turn cap if Codex has one; if not, the time limit is the only hard cap, and the
-harness page has to say so. Start the process in its own session and kill the whole group on the time limit.
+**The workdir bypass fix (HIGH, pre-existing on `main` whatever code_mode_host is).** An offline real-binary
+probe (no login, a local mock of the OpenAI Responses API) found that Codex 0.164.0 strips `workdir` (also `tty`,
+`shell`, `login`, `sandbox_permissions`) from the `tool_input` this hook sees on every `Bash` / `exec_command`
+call - the event's `tool_input` is just `{"command": cmd}` - but still runs the command in that workdir; the
+event's own `cwd` is always the session cwd, never the real one. `exec_command({cmd:"cat hostname",
+workdir:"/etc"})` passed the gate and printed `/etc/hostname`: a relative path was checked against the worktree
+while the command actually ran somewhere else, so the check proved nothing. The fix does not try to recover
+`workdir` (a call carrying one is denied outright, whatever it names); instead it confines the command in its
+own TEXT: every `Bash` / `exec_command` command must start with the EXACT literal `cd <abs worktree> || exit 1; `
+and contain no OTHER `cd`. Whatever hidden directory Codex actually starts the shell in, an absolute `cd` into
+the worktree moves it there before anything else runs, and with no second `cd` available to leave again, every
+relative path really is relative to the worktree from then on. The prefix ends in `|| exit 1; ` (a statement
+terminator), not `&& ` (H1, eph-broker !185 review): `cd WT && A & B` backgrounds `(cd WT && A)` into a forked
+subshell, so the `cd` never reaches the parent shell and `B` runs in whatever hidden workdir Codex actually
+started the shell in instead; `cd WT || exit 1; ...` always runs the `cd` to completion in the parent shell
+first, whatever follows. When the part after the prefix does not even parse (e.g. a bare `&`), the gate denies
+outright rather than skipping the second-cd / bare-interpreter checks. The worker's signed prompt is told the
+exact required prefix (`codex_gate.worker_system_prompt`, appended the same way `hermes.worker_system_prompt`
+appends `gate.PATCH_EDIT_RULE`) for EVERY capability, `mr-review` included (M1, eph-broker !185 review): it
+still reads through the shell and needs the prefix on its reads too, even though it is otherwise read-only.
 
-**Parsing the result.** Read Codex's machine-readable output (`--json`), take the final agent message, the
-session id and the token usage, and repack them into `{"result", "session_id", "usage"}`. Then call
-`adapter.envelope_parser.try_parse`. A non-zero exit or an error event returns `None`, whatever the text says.
+Codex's sandbox runs as the broker's user, so the same-user reads in
+[security-residual-same-uid.md](security-residual-same-uid.md) are covered by the gate below, not by the sandbox.
+
+**The per-call gate (eph-gate on Codex hooks).** The private home's `hooks.json` has one `PreToolUse` hook,
+matcher `*`, that runs `codex_gate.py` under the broker's own Python (`-I`, so nothing in the worktree can be
+imported) with this turn's policy file. The policy is `hermes.gate_policy()`, built from the same
+`capability_tool_grant()` lists and secret floor a `cc` worker gets, so all three harnesses enforce one rule set.
+The hook maps Codex's tools onto eph-gate:
+
+- `Bash` or `exec_command` (the code_mode_only nested shell call, the code-mode gating fix - same rules either
+  way): the command must start with the exact literal `cd <abs worktree> || exit 1; ` and carry no `workdir` /
+  `cwd` argument and no other `cd` (the workdir-bypass fix, see above) - denied outright otherwise, as is a rest
+  that does not even parse (H1, see above). Past that prefix,
+  where every segment is a plain read
+  (`cat`, `head`, `tail`, `wc`, `nl`, `ls`, `grep`, `rg`, by bare name): checked as Claude Code's `Read` / `Grep`
+  / `Glob` (the capability must grant them, every path stays in the repo and off the secret floor, `rg`'s
+  program-running options are denied, a content search walks its tree for secret files). Codex reads through the
+  shell, so this is what keeps `mr-review` and `code` workers able to read.
+- Any other `Bash` / `exec_command` (past the required prefix): eph-gate's terminal check (the `Bash(...)` allow
+  and deny lists, the command lexer, the general worker's exec gate). `mr-review` gets no other shell. Either
+  name is denied outright, in every capability, when the command would start a bare stdin-reading interpreter (no
+  script file, no inline code) - see code_mode_host above.
+- `apply_patch`: every file it adds, updates, deletes or moves to must pass the edit check (edits granted, inside
+  the worker cwd, no `.git`, no secret).
+- `update_plan` is allowed; `write_stdin` is denied outright; every other tool - MCP tools, `create_goal` /
+  `get_goal` / `update_goal`, `list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource`,
+  `clockcurr_time`, a namespaced `collaboration*` call such as `spawn_agent` (REAL even with `multi_agent =
+  false` - the gate's default-deny is the only thing stopping an un-hooked sub-agent, not the feature flag)
+  included - is denied as unmapped-tool.
+
+A deny is exit 2 with the reason on stderr; an allow is silence. Denials are reported in the result, as on hermes.
+Codex lets a call through when a hook runs past its timeout (`HOOK_TIMEOUT_S`, 30 s), so the hook sets its own
+alarm 5 s before that and denies the call if the alarm fires first.
+Codex silently skips an untrusted hook and lets a call through when a hook never answers, so before every turn
+the harness writes the policy and `hooks.json`, records trust for exactly that hook (`hooks.state.<key>`), asks
+`codex app-server` (`hooks/list`) to confirm Codex resolved it as an enabled, trusted `preToolUse` hook with
+matcher `*` and the exact command (and no other non-managed trusted hook; stdin stays open until the answer comes
+back, because Codex 0.164 exits on end of input without answering a request still in flight), then runs the hook once to see the
+probe answer with the turn's nonce and a `git push` denied. Any failure refuses the turn before `codex exec` runs.
+The config never sets `bypass_hook_trust`, and a `[features] hooks = false` anywhere would fail the check.
+
+**Caps.** Codex has no per-turn tool-call cap, so the capability's time limit is the only hard cap. The process
+runs in its own session and the whole group is killed on the time limit or teardown.
+
+**Parsing the result.** From the `--json` events: `thread.started` (thread id), the last `agent_message`,
+`turn.completed` (usage, which Codex reports cumulatively per thread, so the per-turn difference is only a usage stat;
+rotation reads the context size from the thread's rollout `token_count` event instead), `turn.failed` / `error`. They are repacked into `{"result", "session_id", "usage"}` for
+`adapter.envelope_parser.try_parse`. A non-zero exit, an error event or a missing `turn.completed` returns `None`,
+whatever the text says. The one exception is an `error` event starting `Reconnecting`, which Codex emits for each
+stream retry before the turn continues. A turn that really fails still ends with `turn.failed` or without
+`turn.completed`. Failed-turn captures, and `last_output` when no events parsed, keep only thread, turn and error
+records, never tool output.
+
+**Not covered.** A Codex reviewer's verdict never auto-merges under CD (only `cc`, and hermes with
+`CD_ACCEPT_HERMES`). A Codex row never takes the Anthropic usage-cap fallback chain. The inbox capabilities and
+site capabilities stay on `cc`.

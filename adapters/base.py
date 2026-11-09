@@ -51,6 +51,11 @@ class Adapter(abc.ABC):
         """-> bool: is the worker's own loop thread still alive?"""
         return False
 
+    def cancellable(self, key):
+        """-> bool: can teardown(key) stop this subject's run right now? False while a run is still being set
+        up outside the adapter's reach (teardown would miss it and the setup would go on to run)."""
+        return True
+
     def set_coalescer(self, coalescer):
         """Receive a back-ref to the coalescer so the worker can advertise turn transitions."""
         pass

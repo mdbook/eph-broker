@@ -23,6 +23,31 @@ import events
 
 log = logging.getLogger("eph-broker.notify")
 
+# ------------------------------------------------------------------------------------------------
+# Delivery outcomes for an escalation DM. wake_ops used to return a bare bool that conflated a rate-limit
+# SUPPRESSION (no DM sent at all) with a real delivery: True meant only "no transport error", so a caller
+# that must ACKNOWLEDGE a delivery - the CD-retry settlement (app._cd_retry_dm_ops) - read a throttled call as
+# one that had gone out and could drop an obligation no DM ever satisfied. wake_ops now returns True ONLY for
+# a real delivery and False for a transport failure, plus this distinct FALSY sentinel when the throttler
+# suppressed the send, so "delivered" is the single outcome a caller acknowledges on (notify.delivered).
+class _SuppressedOutcome:
+    """The SINGLETON outcome of a rate-limit suppression: no DM left the process. Falsy (so `not`/`bool`
+    treat a suppressed send as a non-delivery, the safe default for acknowledgement) yet NOT `False`
+    (identity distinguishes it from a transport failure)."""
+    __slots__ = ()
+    def __bool__(self):
+        return False
+    def __repr__(self):
+        return "notify.SUPPRESSED"
+
+SUPPRESSED = _SuppressedOutcome()
+
+
+def delivered(outcome):
+    """True iff `outcome` is a confirmed DELIVERY - never a suppression and never a failure. The
+    acknowledgement test for a caller that must not drop an obligation when a notification did not go out."""
+    return outcome is True
+
 # The zbus binary and default bot-env PATH come from site.env. Unset NOTIFY_ZBUS means the exec fails (logged, False).
 ZBUS = os.getenv("NOTIFY_ZBUS", "")
 # The escalation target (site.env). Unset means escalations are logged only, never DMed anywhere.
@@ -207,19 +232,21 @@ def build_env(zbus_env=None):
 
 
 def wake_ops(text, subject=None, zbus=ZBUS):
-    """Exec wrapper: DM the escalation handle with `[eph-broker escalation] <text>` (NOTIFY_BACKEND channel). Returns
-    True on apparent success, False on ANY failure (logged, never raised); zbus owns auth, no secrets
-    touched here.
+    """Exec wrapper: DM the escalation handle with `[eph-broker escalation] <text>` (NOTIFY_BACKEND channel).
+    Returns True ONLY on a real delivery, False on ANY failure (logged, never raised), and the falsy
+    SUPPRESSED sentinel when the rate limiter throttled the send out entirely (see _admit). A caller that must
+    acknowledge a DELIVERY - the CD-retry settlement (app._cd_retry_dm_ops) - keys on `delivered(outcome)`, so
+    a throttled (or failed) DM never counts as one that went out. zbus owns auth, no secrets touched here.
 
     `subject` (optional) keys the rate limiter (see _admit): callers with a stable subject (the
     ticket/worker key) should pass it so a flapping subject dedupes cleanly; omitted -> a normalized hash
     of the text. An over-cap call is SUPPRESSED (logged, counted, summarised on the next admitted DM) and
-    returns True (intentionally throttled, not a failure)."""
+    returns SUPPRESSED (falsy, never a failure)."""
     subj = subject if subject is not None else _subject_key(text)
     send, summary = _admit(subj)
     if not send:
         log.warning("notify: SUPPRESSED escalation (rate-limit) subject=%s: %s", subj, str(text)[:200])
-        return True                                   # throttled by policy, not an error
+        return SUPPRESSED                              # throttled by policy: NOT a delivery, NOT a failure
     body = f"{MSG_PREFIX}{summary}\n{text}" if summary else f"{MSG_PREFIX}{text}"
     events.emit("run.escalated", subj, text=str(text)[:2000])   # same throttle as the DM; no-op when off
     if not OPS_HANDLE:                                # no site handle: journal only, no zbus exec

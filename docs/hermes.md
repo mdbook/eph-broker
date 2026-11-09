@@ -3,7 +3,7 @@
 By default every worker runs on the Claude Code harness (`cc`, `adapters/cc.py`). A built-in row (in code) or
 the reviewer, through `MR_REVIEW_ADAPTER`, can switch to the
 [hermes-agent](https://github.com/NousResearch/hermes-agent) harness instead by setting its adapter to `hermes`
-(`adapters/hermes.py`), and a trusted `hermes` ticket label can do the same for one general ticket. Rows in
+(`adapters/hermes.py`), and a trusted `hermes` ticket label can do the same for one general or code ticket. Rows in
 `config/routes.json` can't switch. Hermes is only allowed with a non-Claude backend, so you also need a
 [backend registry](configuration.md#models-and-backends) entry for it to run on. Its tool calls go through the `eph-gate` plugin
 (`adapters/hermes_gate/`), which applies the same allow and deny rules as the Claude Code grant.
@@ -26,17 +26,65 @@ pin the checkout to a commit you've tested and upgrade it on purpose. `HERMES_BI
 `~/.local/share/eph-hermes/venv/bin/hermes`) points the broker at the binary, and `HERMES_HOME_ROOT` (default
 `~/.cache/eph-hermes-homes`) is where each worker gets a private config home.
 
-## The policy judge (general worker only)
+## Test-runner environment assignments (hermes and Codex)
 
-Claude Code's general worker has the auto permission mode judging each action. On hermes, the `eph-gate`
-plugin asks an external policy judge instead, for every shell command and file write the general worker makes.
-No judge ships with the broker. The paths are fixed in `adapters/hermes.py` (`GENERAL_JUDGE`):
-`~/.eph-judge/bin/gate-wrapper.sh`, run with the judge's own Python and directory under `~/.eph-judge/`. The
-wrapper gets a Claude Code `PreToolUse` hook event on stdin and must answer like a Claude Code hook
-(`hookSpecificOutput.permissionDecision` of `allow`) within 5 seconds. Anything else is a deny.
+For code workers, eph-gate allows environment assignments only before the granted test runner.
+The default name allow-list is `PORTCULLIS_PYTHON`, `PYTHONDONTWRITEBYTECODE`, `NO_COLOR`, `CI`, `TERM`,
+`LANG` and `LC_*` locale variables. Every other name is denied, including unknown runtime configuration
+knobs. Values still undergo the existing read-root and secret-file checks; the runner and its arguments
+still undergo all normal checks.
 
-Without a judge, every general worker action on hermes is denied, so treat the general worker on hermes as
-unsupported outside the original setup. The code worker and the reviewer don't use the judge.
+Set `EPH_GATE_TEST_ENV_ALLOW=SITE_TEST_MODE,SITE_TEST_SHARD` in the broker's site settings to add reviewed,
+exact, case-sensitive names (no wildcard patterns). These ride in the per-turn policy's `test_env_allow`
+list, not the worker's environment. Only add benign test flags: adding a runtime/loader configuration name
+would explicitly trust that variable to change how tests execute. Invalid names refuse the code turn.
+
+## Plugging in your own exec gate (general worker only)
+
+Claude Code's general worker has the auto permission mode judging each action. On hermes the general worker has no
+allow-list, so after eph-gate's own floors (the capability grant, the secret floor, worktree-confined writes, the
+general deny list) every `terminal`, `write_file` and `patch` call also needs a yes from an **exec gate**. The broker
+doesn't care which one. You pick it with `EXEC_GATE` in your site config:
+
+| `EXEC_GATE` | what judges | you set |
+|---|---|---|
+| unset or `deny` | nothing: every judged call is denied. The safe default | nothing |
+| `none` | nothing: eph-gate's floors only. You have to ask for this explicitly | nothing |
+| `exec` | your program, in any language | `EXEC_GATE_COMMAND` |
+| `portcullis` | Portcullis, the reference gate, through its hook-mode wrapper | `EXEC_GATE_PORTCULLIS_WRAPPER`, `_HOOK`, `_PYTHON`, `_DIR`, optionally `_PROJECT_DIR` |
+
+Shared knobs: `EXEC_GATE_TIMEOUT` (seconds per decision, default 5.0), `EXEC_GATE_INHERIT_ENV` (env names the gate may
+inherit, default `TMPDIR,LANG,TZ`) and `EXEC_GATE_PROTECTED_TERMS` (extra literal names a general terminal command
+may never mention; `portcullis` already protects its own home dir without it). `config/site.example.env` has a
+commented block for all of them.
+
+**The `exec` contract.** The broker runs `EXEC_GATE_COMMAND` once per judged call, with the call's cwd and a minimal
+env (`PATH=/usr/bin:/bin`, `HOME`, plus `EXEC_GATE_INHERIT_ENV`). It writes one JSON object to stdin:
+
+```json
+{"tool": "Bash", "tool_input": {"command": "make test"}, "cwd": "/path/to/worktree",
+ "session_id": "eph-<nonce>", "capability": "general", "write_root": "/path/to/worktree"}
+```
+
+`tool` is Claude Code shaped (`Bash`, `Write`, `Edit`) so a gate written for Claude Code hooks reads it as-is.
+Print `{"decision": "allow", "reason": "..."}` and exit 0 to allow. Anything else is a deny: `"deny"`, a non-zero
+exit, a timeout, no output, output that isn't a JSON object.
+
+**Writing a provider module** (when `exec` isn't enough, say you want an override token like Portcullis'
+allow-once). Add a stdlib-only module to `adapters/hermes_gate/providers/` and register it in that package's
+`PROVIDERS`. The package docstring is the full interface: `NAME`, `LABEL`, `FLOOR_FILES`, `FLOOR_TERMS`,
+`config(env)` (broker side, raise `ValueError` on a bad config) and `judge(request, cfg)` (runs inside the worker's
+harness, returns `{"decision", "reason", "token"}`), plus the optional `floor_terms(cfg)` (names your gate's own
+state, so the floor protects it with no extra site key) and `override_hint(cfg)`. `providers/portcullis.py` is the
+worked example.
+
+**It fails closed, every way.** An unknown `EXEC_GATE` refuses every hermes turn. A judged turn with missing or
+relative paths is refused before it starts. A provider that crashes, hangs or returns garbage is a deny. A gate
+going missing never turns into an open door. The code worker and the reviewer don't use the exec gate.
+
+Claude Code workers aren't routed through this: they run under Claude Code's own permission modes plus whatever
+`PreToolUse` hooks your Claude settings load, so a gate that speaks Claude Code hooks (Portcullis does) plugs in
+there directly.
 
 ## The hermes venv must be a non-editable install
 

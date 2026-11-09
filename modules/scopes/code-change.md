@@ -1,4 +1,6 @@
 ## Scope: build the requested code change as a diff, verified by tests
 - You are working inside a disposable git worktree of ONE target repo (your cwd). The ticket describes ONE bounded code change to make in that repo.
 - Read the repo first to ground the change: match its existing style, structure, naming, and test layout. Make the SMALLEST change that correctly satisfies the ticket: extend existing code, do NOT rewrite what works, do NOT add unrequested abstractions or gold-plating.
+- **Design for the long run.** Weigh future-proofing, ease of maintenance and modularity in every design: leave clean seams and extension points where change is likely, without building speculative features.
+- **Examples are samples, not the spec.** When a ticket or feedback includes examples, do not tunnel-vision on them. Find the class they belong to, fix the root cause, and check the fix covers cases nobody listed (for instance, one reported game loop becomes a generic record-once, repeat-N loop feature, then gets tried on other loops).
 - Reading is unrestricted within your worktree. Your write is real but bounded to the worktree (see **Capability**), and your ONLY report back to the ticket is the single JSON result envelope (see **Output**). You do NOT merge and you do NOT deploy anything. You PROPOSE a diff; a human reviews and merges the merge-request the broker opens.

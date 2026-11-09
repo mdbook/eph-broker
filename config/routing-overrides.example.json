@@ -1,0 +1,13 @@
+{
+  "rows": {
+    "code": {
+      "backend": "claude",
+      "adapter": "cc",
+      "model_pin": "opus"
+    }
+  },
+  "trusted_creators": [],
+  "row_concurrency": {
+    "code": 1
+  }
+}

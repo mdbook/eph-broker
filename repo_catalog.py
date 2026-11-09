@@ -353,8 +353,14 @@ def refresh():
 
 
 _LOCK = threading.Lock()
-_MEM = {"cat": None, "at": 0.0}
+_MEM = {"cat": None, "at": 0.0, "stale": False}
 _OVERRIDE = None   # tests: set_catalog(Catalog) pins the catalog (no network, no cache file)
+# A plain bool, written by invalidate() WITHOUT _LOCK so it is safe to call from
+# the SIGHUP handler (always the main thread) even while a worker thread holds _LOCK across a GitLab refresh's
+# network I/O, taking _LOCK in the handler would let that in-flight request block the main thread. get_catalog()
+# folds it into _MEM["stale"] under its own _LOCK the next time it runs. Bool assignment is a single bytecode
+# store -> atomic under the GIL, so no lock is needed on either side for this flag.
+_PENDING_INVALIDATE = False
 
 
 def set_catalog(cat):
@@ -362,14 +368,27 @@ def set_catalog(cat):
     _OVERRIDE = cat
 
 
+def invalidate():
+    """force the NEXT get_catalog() call to re-list from GitLab rather than serve the memo or a
+    still-fresh file cache. Lock-free (see _PENDING_INVALIDATE above), callable from the SIGHUP handler
+    without risking a main-thread block on _LOCK."""
+    global _PENDING_INVALIDATE
+    _PENDING_INVALIDATE = True
+
+
 def get_catalog():
     """The live catalog (memo -> fresh cache -> GitLab refresh -> stale cache). Raises CatalogUnavailable."""
     if _OVERRIDE is not None:
         return _OVERRIDE
+    global _PENDING_INVALIDATE
     with _LOCK:
-        if _MEM["cat"] is not None and time.time() - _MEM["at"] < CACHE_TTL_S:
+        if _PENDING_INVALIDATE:            # fold in invalidate()'s lock-free flag now that we hold _LOCK
+            _MEM["stale"], _PENDING_INVALIDATE = True, False
+        if _MEM["cat"] is not None and not _MEM["stale"] and time.time() - _MEM["at"] < CACHE_TTL_S:
             return _MEM["cat"]
-        entries = _read_cache(CACHE_TTL_S)
+        # invalidate() marks the file cache stale too: skip straight to a real GitLab refresh instead of
+        # just re-parsing the same still-fresh-by-TTL file (which wouldn't see a just-added repo either).
+        entries = None if _MEM["stale"] else _read_cache(CACHE_TTL_S)
         if entries is None:
             try:
                 entries = refresh()
@@ -378,8 +397,38 @@ def get_catalog():
                 entries = _read_cache()
         if not entries:
             raise CatalogUnavailable("no GitLab listing and no cached catalog")
-        _MEM["cat"], _MEM["at"] = build(entries), time.time()
+        _MEM["cat"], _MEM["at"], _MEM["stale"] = build(entries), time.time(), False
         return _MEM["cat"]
+
+
+def refresh_now():
+    """POST /catalog/refresh backing: a synchronous, real GitLab re-list, bypassing BOTH the memo
+    and the stale-cache fallback get_catalog() uses for ordinary routing (ops wants to know whether the
+    refresh itself actually worked, not silently get yesterday's listing back with ok=True).
+
+    This calls refresh() directly instead of going
+    through get_catalog(), get_catalog()'s stale-cache fallback would otherwise make a GitLab outage look
+    like success (ok=True, the older cached entries quietly swapped into _MEM and pinned for a full TTL).
+    _MEM is built and committed ONLY after refresh() returns real entries; on ANY failure (refresh() raises
+    CatalogUnavailable for a config/token problem, or any other exception from the GitLab listing itself,
+    e.g. a network error, or returns no entries) _MEM is left completely untouched (same object, same
+    "at") and (False, {"ok": False, "error": ...}) is returned so the route answers non-200. The previous
+    catalog keeps serving ordinary routing until a later refresh succeeds."""
+    with _LOCK:
+        prev_cat = _MEM["cat"]
+    prev_paths = set(prev_cat.by_path) if prev_cat is not None else set()
+    try:
+        entries = refresh()
+    except Exception as e:                                    # never raise the token/url; message only
+        return False, {"ok": False, "error": str(e)}
+    if not entries:
+        return False, {"ok": False, "error": "no GitLab listing"}
+    cat = build(entries)
+    with _LOCK:
+        _MEM["cat"], _MEM["at"], _MEM["stale"] = cat, time.time(), False
+    new_paths = set(cat.by_path)
+    return True, {"ok": True, "repos": len(cat.repos),
+                  "added": sorted(new_paths - prev_paths), "removed": sorted(prev_paths - new_paths)}
 
 
 def path_allowed(path):

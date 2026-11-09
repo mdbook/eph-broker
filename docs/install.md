@@ -1,5 +1,9 @@
 # Installing eph-broker
 
+For a no-account preview, start with the [README](../README.md#quick-start) or
+[Docker guide](docker.md). For real workers, use the [first-MR checklist](first-merge-request.md).
+That setup needs a funded Claude Code login, GitLab credentials and a webhook; it is not a ten-minute promise.
+
 ## Requirements
 
 | Need | Why |
@@ -9,7 +13,7 @@
 | `tmux` | A `Recommends` of the RPM; only the interactive-agent row and its duplicate check use it. |
 | The `claude` CLI | The default harness for every built-in row. On the broker's `PATH`, already logged in for the user the broker runs as. Workers use that stored login (`~/.claude`); `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` in the broker's environment are deliberately not passed to them. Tested with Claude Code 2.1. The broker passes `-p`, `--system-prompt`, `--model`, `--max-turns`, `--output-format json`, `--setting-sources`, `--permission-mode` (`acceptEdits`, `auto`), `--allowedTools`, `--disallowedTools`, `--mcp-config` with `--strict-mcp-config`, `--settings`, `--resume`, `--session-id`, and in some setups `--effort`, `--add-dir`, `--plugin-dir` or `--dangerously-skip-permissions`, so an older CLI that lacks one of these won't work. |
 | GitLab and a token that can open MRs | `gitlab_mr.py`. |
-| A tracker script | Only for tracker tickets. The broker runs `$BROKER_MCP_SH vikunja-bridge tools/call ...` to read tickets and post comments and labels. No script ships, and without one no tracker ticket can start a worker. The contract is in [tracker-script.md](tracker-script.md). |
+| A tracker script | Only for tracker tickets. The broker runs `$BROKER_MCP_SH vikunja-bridge tools/call ...` to read tickets and post comments and labels. `tools/mcp.sh` is a ready-made one for Vikunja (set `BROKER_MCP_SH=/abs/path/to/eph-broker/tools/mcp.sh`; needs `VIKUNJA_URL` and `VIKUNJA_TOKEN` in the broker's environment); without a script no tracker ticket can start a worker. The contract is in [tracker-script.md](tracker-script.md). |
 | `hermes` (optional) | Only if you switch a row's harness to hermes, see [hermes.md](hermes.md). Other harnesses: [adapters.md](adapters.md). |
 
 ## From source

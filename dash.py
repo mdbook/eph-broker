@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""dash.py: read-only dash for the ephemeral-worker broker.
+"""dash.py: the dash for the ephemeral-worker broker.
 
-Scope: INSIGHT ONLY. What is running and its current state. No writes, no control verbs (those need in-app
-auth, which is described in the note at the bottom of PAGE, and are a separate lane).
+Scope: INSIGHT. What is running and its current state; this module never writes. The page's buttons call
+actions.py (POST /actions/<verb>), which owns the auth and the writes, and only appear when GET /actions
+says the viewer may act.
 
 Why a separate module: `snapshot()` takes the broker as an argument rather than being a Broker method,
 so it can be exercised against a fake without standing up a real broker (which would spawn real
@@ -17,19 +18,27 @@ SAFETY: what this deliberately does NOT expose:
 
 import datetime
 import json
+import logging
+import math
 import os
 import re
+import subprocess
 import threading
 import time
 
+import coalescer
 import site_env  # noqa: F401  config/site.env carries the FLEET_*/SUPERVISOR_STATUS_PATH values
 import stream
+import tickets
+
+log = logging.getLogger("eph-broker.dash")
 
 # ---------------------------------------------------------------- fleet
-# READ-ONLY view of the fleet: fleet-status.json (a status generator rewrites it every 60s) + the
-# FLEET_MODE line of the mode file (FLEET_MD_PATH). Fail-soft by contract: a missing,
-# unreadable, garbage or stale source yields {"error": ...} / stale=True, NEVER an exception (so /state
-# can't 500 over it). Cached ~15s so the 5s /state poll doesn't re-read the files on every hit.
+# READ-ONLY view of the fleet: fleet-status.json (a generator rewrites it periodically; either the
+# deployment's own job, or FLEET_STATUS_GEN below, run BY THE BROKER) + the FLEET_MODE line of the mode
+# file (FLEET_MD_PATH). Fail-soft by contract: a missing, unreadable, garbage or stale source yields
+# {"error": ...} / stale=True, NEVER an exception (so /state can't 500 over it). Cached ~15s so the 5s
+# /state poll doesn't re-read the files on every hit.
 
 # FLEET_STATUS_PATH / FLEET_MD_PATH come from site.env; unset means the fleet view reports "not configured".
 FLEET_STATUS_DEFAULT = ""
@@ -42,13 +51,18 @@ SILENT_S = 3 * 3600   # Tower: busy this long with no STATE.md/TASKS.md edit = "
 FLEET_STALE_S = 300
 FLEET_CACHE_S = 15
 FLEET_MAX_AGENTS = 200
-# context_pct is the Claude Code pane's "Context N% (Xk/1.0M)", converted to tokens and shown against the fleet
-# ceiling (FLEET_CTX_CEILING).
-# Limitation: assumes every pane's window is 1.0M; if that stops holding, have the status generator emit the
-# token count and read it here instead.
-FLEET_CTX_WINDOW = 1_000_000
-FLEET_CTX_CEILING = 200_000
-FLEET_CTX_SOFT = 150_000
+# FLEET_STATUS_GEN (site.env): an executable that (re)writes FLEET_STATUS_PATH. Unset = feature off (the
+# fleet view just reads whatever last wrote the file, same as before this existed). When set, the broker
+# runs it itself, at most once per FLEET_GEN_PERIOD_S, fire-and-forget on a daemon thread, so a slow or hung
+# generator never blocks an HTTP request; no external timer/cron is needed to keep the file fresh. No
+# shell: the path is exec'd directly, argv-only, no injection surface.
+# Contract: the generator is invoked as `FLEET_STATUS_GEN <FLEET_STATUS_PATH>`: it must write its output to
+# argv[1], NOT to some default/cwd-relative path of its own (a generator whose own default output path is
+# relative resolves it against the broker's cwd, not FLEET_STATUS_PATH). If FLEET_STATUS_PATH is unset,
+# the generator is never run, even when FLEET_STATUS_GEN is set (there's no path to tell it to write).
+FLEET_STATUS_GEN_DEFAULT = ""
+FLEET_GEN_PERIOD_S = 60
+FLEET_GEN_TIMEOUT_S = 30
 _MODE_RE = re.compile(r"^FLEET_MODE: (high|normal|lean|min|zero)$", re.M)
 _MODEL_RE = re.compile(r"^(?:claude-)?(opus|sonnet|haiku|fable)-(\d+)(?:-(\d+))?(?:-\d{8})?$")
 _fleet_lock = threading.Lock()
@@ -108,8 +122,33 @@ def model_label(m):
     return m[:24]
 
 
-def ctx_tokens(v):
-    """Context in tokens from a percent of FLEET_CTX_WINDOW (37, 37.5, '37%'); None if not a percent."""
+def model_state(runtime_model, runtime_at, configured, now, file_stale=False):
+    """Which model reading a row may HONESTLY claim, given what evidence exists. The distinction is the
+    whole point of the model display: `model` in fleet-status.json is the mode-resolved CONFIGURED model
+    (fleet-model.sh's answer), never proof of what a process is running.
+
+      "running"    observed runtime evidence (`runtime_model`), fresh enough to call current
+      "stale"      runtime evidence exists but is too old to call current (or the whole source file is)
+      "configured" no runtime evidence; only the configured/mode-resolved model is known
+      "unknown"    neither
+
+    Freshness: FLEET_STALE_S, the same window the context sample uses. An absent `runtime_model_at` is NOT
+    read as stale: a producer that supplies only the model is trusted exactly as far as the status file
+    itself is (that file's own age is `file_stale`). A timestamp >30s in the future is a clock skew, not
+    evidence, and reads stale like a too-old one."""
+    if runtime_model:
+        if file_stale:
+            return "stale"
+        if runtime_at is not None:
+            age = now - runtime_at
+            if age > FLEET_STALE_S or age < -30:
+                return "stale"
+        return "running"
+    return "configured" if configured else "unknown"
+
+
+def context_percent(v):
+    """Legacy percentage is display-only; it cannot establish an absolute token count."""
     if isinstance(v, bool):
         return None
     if isinstance(v, str):
@@ -120,7 +159,14 @@ def ctx_tokens(v):
             return None
     if not isinstance(v, (int, float)) or not 0 <= v <= 100:
         return None
-    return int(round(v * FLEET_CTX_WINDOW / 100.0))
+    return v
+
+
+def context_count(v, minimum=0):
+    """Token metadata must be a finite integer, not a boolean or an untrusted label."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+        return None
+    return int(v) if v >= minimum and int(v) == v else None
 
 
 def ledger_excerpt(s):
@@ -149,6 +195,13 @@ def _ledger_age(cwd, now):
 
 
 def _agent_row(name, a, now):
+    """Accept additive context_tokens/window/ceiling/floor and context_sampled_at (epoch or ISO).
+    Legacy context/context_pct/ctx remain display-only. No window or threshold is inferred from runtime.
+
+    Model: `model` (fleet-status.json) is the CONFIGURED, mode-resolved model. Additive
+    `runtime_model` (+ optional `runtime_model_at`, epoch or ISO) is OBSERVED runtime evidence and wins the
+    headline when fresh; `model_state` says which of the two the row is showing (see model_state()).
+    """
     if not isinstance(a, dict):
         a = {"status": a}
     upd = _ts(_first(a, "last_update", "updated", "updated_at", "ts", "last_seen"))
@@ -159,15 +212,51 @@ def _agent_row(name, a, now):
     alive = _first(a, "alive", "running")
     stood = _first(a, "stood_down", "stood-down")
     model = _scalar(_first(a, "model"))
+    # Older payloads carry no runtime_model at all: `_scalar` keeps a non-scalar out of the page, and the
+    # row then falls back to the configured model with state "configured" (never a fabricated "running").
+    rt_model = _scalar(a.get("runtime_model"))
+    rt_at = _ts(a.get("runtime_model_at"))
+    if rt_at is not None and not math.isfinite(rt_at):
+        rt_at = None
     ctx = _first(a, "context", "context_pct", "ctx")
+    tokens = context_count(a.get("context_tokens"))
+    window = context_count(a.get("context_window"), 1)
+    ceiling = context_count(a.get("context_ceiling"), 1)
+    floor = context_count(a.get("context_floor"), 1)
+    sampled = _ts(a.get("context_sampled_at"))
+    if sampled is not None and not math.isfinite(sampled):
+        sampled = None
+    sample_age = now - sampled if sampled is not None else None
+    stale = sample_age is not None and (sample_age > FLEET_STALE_S or sample_age < -30)
+    valid = tokens is not None and window is not None and sample_age is not None
+    pct = round(tokens * 100 / window, 1) if tokens is not None and window else context_percent(ctx)
     return {
         "name": _scalar(_first(a, "name", "agent", "id") or name),
+        "agent_type": a.get("agent_type", "standing") if a.get("agent_type", "standing") in ("standing", "tfa") else None,
         "model": model,
         "model_label": model_label(model),
+        # What the agent is RUNNING, when the producer observed it; else the configured model, labelled
+        # `configured` by model_state so the page can never present a mode-resolved default as running.
+        "runtime_model": rt_model,
+        "runtime_model_label": model_label(rt_model),
+        "runtime_model_at": rt_at,
+        "runtime_model_age": _round(max(0.0, now - rt_at)) if rt_at is not None else None,
+        "model_state": model_state(rt_model, rt_at, model, now),   # file-level staleness applied below
         "role": _scalar(_first(a, "role")),
         "effort": _scalar(_first(a, "effort")),
-        "ctx_tokens": ctx_tokens(ctx),
+        "ctx_tokens": tokens,
+        "context_tokens": tokens,
+        "context_window": window,
+        "context_ceiling": ceiling,
+        "context_floor": floor if floor is not None and (ceiling is None or floor <= ceiling) else None,
+        "context_pct": pct,
+        "context_sampled_at": sampled,
+        "context_age": _round(max(0, sample_age)) if sample_age is not None else None,
+        "context_state": "stale" if stale else "ok" if valid else "unknown",
+        "runtime": _scalar(a.get("runtime")),
         "ledger": ledger_excerpt(_first(a, "status", "state")),
+        # "now" = the agent's own one-line NOW.md (written for humans); "state" = a line scraped from STATE.md
+        "ledger_source": a.get("status_source") if a.get("status_source") in ("now", "state") else None,
         "ledger_age": _ledger_age(a.get("cwd"), now),
         "alive": bool(alive) if alive is not None else None,
         "stood_down": bool(stood) if stood is not None else None,
@@ -208,17 +297,33 @@ def _read_fleet(status_path, md_path, now):
         pairs = [(None, a) for a in agents]
     else:
         pairs = []
+    # The producer merges standing registry rows and pooled TFA metadata. A lease
+    # can repeat an owner; standing identity wins a collision regardless of order.
+    rows = {}
+    for n, a in pairs:
+        row = _agent_row(n, a, now)
+        name = row["name"]
+        if name is None:
+            continue
+        if name not in rows or (rows[name]["agent_type"] == "tfa" and row["agent_type"] == "standing"):
+            rows[name] = row
     out.update({
         "file_age": _round(file_age),
         "generated_age": _round(max(0.0, now - gen)) if gen is not None else _round(file_age),
-        "stale": file_age > FLEET_STALE_S,
-        "ceiling": FLEET_CTX_CEILING,
-        "soft": FLEET_CTX_SOFT,
-        "agents": [_agent_row(n, a, now) for n, a in pairs[:FLEET_MAX_AGENTS]],
+        "stale": file_age > FLEET_STALE_S or (gen is not None and now - gen > FLEET_STALE_S),
+        "ceiling": None,  # compatibility keys; thresholds belong to individual agents
+        "soft": None,
+        "agents": list(rows.values())[:FLEET_MAX_AGENTS],
     })
     flags, out["supervisor"], live = supervisor_flags(
         os.environ.get("SUPERVISOR_STATUS_PATH") or SUPERVISOR_STATUS_DEFAULT, now)
     for a in out["agents"]:
+        if out["stale"]:
+            a["context_state"] = "stale"
+            # A stale fleet-status.json cannot vouch for a model either: a runtime reading from a file
+            # nobody has rewritten in FLEET_STALE_S is history, not the current model.
+            if a["model_state"] == "running":
+                a["model_state"] = "stale"
         a["flags"] = flags.get(a["name"], [])
         busy, since = live.get(a["name"], (None, None))
         a["busy"] = busy                                   # Tower: null = no pane verdict (no tmux pane / unknown)
@@ -226,6 +331,8 @@ def _read_fleet(status_path, md_path, now):
         la = a["ledger_age"]
         a["silent"] = bool(a["busy_age"] is not None and a["busy_age"] > SILENT_S
                            and (la is None or la > SILENT_S))
+        if out["stale"] and a["agent_type"] == "tfa":
+            a.update(alive=None, busy=None, busy_age=None, silent=False, flags=[])
     return out
 
 
@@ -278,12 +385,68 @@ def supervisor_flags(path, now):
     return out, meta, live
 
 
+_fleet_gen_lock = threading.Lock()
+# "thread" holds the last dispatched generator thread (tests join it); nothing joins it in production,
+# it's fire-and-forget.
+_fleet_gen_state = {"at": 0.0, "running": False, "thread": None}
+
+
+def _run_fleet_gen(gen, status_path):
+    """Runs on its own daemon thread, OUTSIDE any lock an HTTP request could be waiting on. Never raises:
+    a missing/non-executable path, a non-zero exit and a hang (killed at FLEET_GEN_TIMEOUT_S) are all
+    logged and swallowed, same fail-soft contract as the read side.
+
+    status_path (FLEET_STATUS_PATH) is passed as argv[1]: the contract documented at FLEET_STATUS_GEN
+    above, so the generator writes where the dash actually reads from, not wherever its own default is."""
+    try:
+        r = subprocess.run([gen, status_path], timeout=FLEET_GEN_TIMEOUT_S, capture_output=True, text=True)
+        if r.returncode != 0:
+            log.warning("fleet status generator %s exited %d: %s", gen, r.returncode,
+                        (r.stderr or "").strip()[:500])
+    except subprocess.TimeoutExpired:
+        log.warning("fleet status generator %s timed out after %ds", gen, FLEET_GEN_TIMEOUT_S)
+    except OSError as e:
+        log.warning("fleet status generator %s failed to start: %s", gen, e)
+    except Exception as e:   # belt-and-braces: a generator-dispatch bug must never affect anything else
+        log.exception("fleet status generator %s: unexpected error: %s", gen, e)
+    finally:
+        with _fleet_gen_lock:
+            _fleet_gen_state["running"] = False
+
+
+def _maybe_run_fleet_gen(now, status_path):
+    """Kicks off FLEET_STATUS_GEN on a background thread, at most once per FLEET_GEN_PERIOD_S and never
+    more than one in flight. Unset FLEET_STATUS_GEN = feature off (a no-op, same as before this existed).
+    Also a no-op when status_path (FLEET_STATUS_PATH) is unset: there's nowhere to tell the generator to
+    write, and running it against its own default would write somewhere the dash never reads.
+    Returns immediately either way: the generator subprocess (with its own timeout) never runs on the
+    calling (HTTP request) thread."""
+    gen = os.environ.get("FLEET_STATUS_GEN") or FLEET_STATUS_GEN_DEFAULT
+    if not gen or not status_path:
+        return
+    with _fleet_gen_lock:
+        if _fleet_gen_state["running"] or now - _fleet_gen_state["at"] < FLEET_GEN_PERIOD_S:
+            return
+        _fleet_gen_state["running"] = True
+        _fleet_gen_state["at"] = now
+        t = threading.Thread(target=_run_fleet_gen, args=(gen, status_path), name="r3-fleet-gen", daemon=True)
+        _fleet_gen_state["thread"] = t
+    t.start()
+
+
 def fleet_snapshot(now=None):
     """Cached, fail-soft fleet view for /state. Paths are env-configurable (FLEET_STATUS_PATH,
-    FLEET_MD_PATH); the cache is keyed on them so a path change takes effect immediately."""
+    FLEET_MD_PATH); the cache is keyed on them so a path change takes effect immediately.
+    Also the trigger point for FLEET_STATUS_GEN: every call (cache hit or miss) tries to dispatch a
+    background refresh (passing FLEET_STATUS_PATH as the generator's argv[1]), so the file stays warm as
+    long as something is polling /state, with no new timer or cron owning it."""
     now = time.time() if now is None else now
-    key = (os.environ.get("FLEET_STATUS_PATH") or FLEET_STATUS_DEFAULT,
-           os.environ.get("FLEET_MD_PATH") or FLEET_MD_DEFAULT)
+    status_path = os.environ.get("FLEET_STATUS_PATH") or FLEET_STATUS_DEFAULT
+    try:
+        _maybe_run_fleet_gen(now, status_path)
+    except Exception as e:   # dispatching the generator must never block/break the read side
+        log.exception("fleet status generator dispatch failed: %s", e)
+    key = (status_path, os.environ.get("FLEET_MD_PATH") or FLEET_MD_DEFAULT)
     with _fleet_lock:
         c = _fleet_cache
         if c["key"] == key and c["val"] is not None and 0 <= now - c["at"] < FLEET_CACHE_S:
@@ -321,6 +484,14 @@ def snapshot(broker, cap=None, hist=HISTORY_PAGE):
         pending = [_pending_view(key, p, now) for key, p in broker.coalescer.pending.items()]
 
     workers = [_worker_view(key, wk, now) for key, wk in _worker_items(broker)]
+    waiting = _waiting_items(broker)
+    for row in live:
+        if row["key"] in waiting:
+            row["waiting"] = waiting[row["key"]]
+
+    stamps = dict(getattr(broker, "route_stamps", None) or {})
+    for row in live:
+        row["route"] = _scalar(stamps.get(row["key"])) or None
 
     hist_all = stream.history() if stream.enabled() else []
     return {
@@ -343,7 +514,54 @@ def snapshot(broker, cap=None, hist=HISTORY_PAGE):
             "allowlist_rejected": getattr(broker, "rejected", 0),
         },
         "fleet": fleet_snapshot(now),   # fail-soft, cached
+        "drain": _drain_view(broker),
+        # Page labels from site config: the instance name beside the logo and the ticket link template
+        # (TICKET_URL_TEMPLATE, `{}` = ticket id; the page links only http(s) templates).
+        "instance": os.getenv("DASH_INSTANCE_NAME", "")[:60],
+        "ticket_url": os.getenv("TICKET_URL_TEMPLATE", "")[:300],
+        "queue": _queue_view(broker, now),
+        "next_subject": getattr(getattr(broker, "semaphore", None), "front", None),
     }
+
+
+QUEUE_SCAN = 500   # intake rows read per poll; the page lists distinct subjects from these, oldest first
+
+
+def _drain_view(broker):
+    """broker.drain_status() (the /health `drain` block), or None when the broker has none or it fails.
+    It takes coalescer.lock then the journal lock, the same order as ingest, and snapshot holds neither here."""
+    try:
+        return broker.drain_status()
+    except Exception:
+        return None
+
+
+def _queue_view(broker, now):
+    """Durable intake waiting to dispatch, one row per subject in arrival order:
+    {key, kind, events, arrived_age}. [] without a journal. Read-only and fail-soft."""
+    st = getattr(broker, "state", None)
+    if st is None or not hasattr(st, "queued"):
+        return []
+    try:
+        rows = st.queued(QUEUE_SCAN)
+    except Exception:
+        return []
+    out = {}
+    for _id, kind, payload, arrived in rows:
+        try:
+            if kind == "rerun":
+                key = tickets.vikunja_ref(payload.get("task_id")) or "vikunja:task:?"
+            else:
+                key = coalescer.normalize(payload.get("event") or {})
+        except Exception:
+            continue
+        row = out.get(key)
+        if row is None:
+            out[key] = {"key": key, "kind": kind, "events": 1,
+                        "arrived_age": _round(max(0.0, now - arrived)) if isinstance(arrived, (int, float)) else None}
+        else:
+            row["events"] += 1
+    return list(out.values())
 
 
 def _live_view(key, w, now):
@@ -369,10 +587,35 @@ def _worker_items(broker):
 def _worker_view(key, wk, now):
     ts = getattr(wk, "turn_started", None)
     sid = getattr(wk, "session_id", None) or ""
+    # The model THIS worker was launched with (adapters record it at the exec point, see
+    # cc.record_launch), plus the backend/harness it resolved to. Absent on a worker whose harness never
+    # recorded one (or a payload from before this field existed): the row then reads "unknown", never a
+    # configured default dressed up as the running model. No staleness window here: a row only exists
+    # while its worker is live, and a turn's model is the session's model until it is re-launched.
+    model = _scalar(getattr(wk, "model", None))
+    backend = _scalar(getattr(wk, "backend", None))
+    harness = _scalar(getattr(wk, "harness", None))
+    at = getattr(wk, "model_at", None)
+    at = float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) and math.isfinite(at) else None
     return {"key": key, "run_id": getattr(wk, "run_id", None), "session": sid[:8],
             "turns": getattr(wk, "turns", 0), "tokens": getattr(wk, "tokens", 0),
+            "items": getattr(wk, "items", None), "last_activity": getattr(wk, "last_activity", None),
             "forwards": getattr(wk, "forwards", 0), "in_turn": bool(getattr(wk, "in_turn", False)),
-            "done": bool(getattr(wk, "done", False)), "turn_age": _round(now - ts) if ts else None}
+            "done": bool(getattr(wk, "done", False)), "turn_age": _round(now - ts) if ts else None,
+            "model": model, "model_label": model_label(model),
+            "backend": backend or None, "harness": harness or None,
+            "model_at": at, "model_age": _round(max(0.0, now - at)) if at is not None else None,
+            "model_state": "running" if model else "unknown",
+            "title": _scalar(getattr(wk, "title", None)) or None, "route": _scalar(getattr(wk, "route", None)) or None}
+
+
+def _waiting_items(broker):
+    adapter = getattr(broker, "adapter", None)
+    lock = getattr(adapter, "_lock", None)
+    if lock is None:
+        return {}
+    with lock:
+        return dict(getattr(adapter, "_waiting", {}))
 
 
 # What GET /runs/<subject_key> answers: the coalescer's view of one subject, newest phase first.
@@ -382,7 +625,7 @@ _RUN_KEY_RE = re.compile(r"[\x21-\x7e]{1,512}")   # printable ASCII, no spaces; 
 
 def run_status(broker, key):
     """(http code, body) for GET /runs/<key>. Pure read, same lock discipline as snapshot (one lock at a time).
-    status: pending (collecting a burst), running / idle / closing (a worker is live), completed (finished cleanly
+    status: pending (collecting a burst), waiting (repo lock / turn cap), running / idle / closing (live), completed (finished cleanly
     and not re-armed since), else 404 unknown. completed_at is kept for the last MAX_COMPLETED subjects only."""
     if not isinstance(key, str) or not _RUN_KEY_RE.fullmatch(key):
         return 400, {"ok": False, "error": "bad subject key"}
@@ -395,6 +638,9 @@ def run_status(broker, key):
     worker = next((_worker_view(k, wk, now) for k, wk in _worker_items(broker) if k == key), None)
     if live:
         status = _RUN_STATUS.get(live["state"], live["state"])
+        reason = _waiting_items(broker).get(key)
+        if reason and live["state"] in ("open_running", "open_idle"):
+            live["waiting"], status = reason, "waiting"
     elif pend:
         status = "pending"
     elif done:
@@ -428,92 +674,217 @@ PAGE = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
 <title>eph-broker</title>
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%231c232b'/%3E%3Cpath d='M16 8.5 23.5 16 16 23.5 8.5 16z' fill='%23fff'/%3E%3C/svg%3E">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%232b57c9'/%3E%3Crect x='7' y='9.5' width='18' height='4.5' rx='2.2' fill='%23fff'/%3E%3Crect x='7' y='18' width='11.5' height='4.5' rx='2.2' fill='%23fff'/%3E%3C/svg%3E">
 <style>
+  /* Tokens: one brand colour, the rest semantic. Every text pairing clears WCAG AA (4.5:1) in both themes.
+     run/wait/block are always paired with an icon shape and a word, never colour alone. */
   :root{
     color-scheme:light;
-    --bg:#f2f4f6; --panel:#ffffff; --panel2:#f0f2f5; --ink:#1c232b; --muted:#5d6875; --faint:#939ca7;
-    --line:#e1e5ea; --accent:#36659b; --green:#2f8a57; --amber:#b26b00; --red:#c23b30;
-    --user:#edf2f8; --code:#f3f5f7;
-    --shadow:0 1px 2px rgba(28,35,43,.04);
-    --r:12px;
+    --bg:#f4f5f7; --s1:#ffffff; --s2:#f0f2f5; --s3:#e6e9ee; --line:#dce0e6;
+    --t1:#141920; --t2:#475160; --t3:#626c7b; --brand:#2b57c9; --onbrand:#ffffff;
+    --run:#17734a; --wait:#8a5600; --block:#bb3328; --shadow:0 1px 2px rgba(20,25,32,.05);
   }
   :root[data-theme=dark]{
     color-scheme:dark;
-    --bg:#161a1f; --panel:#1d2229; --panel2:#252b33; --ink:#e4e8ed; --muted:#97a1ad; --faint:#69737f;
-    --line:#2c333c; --accent:#8fb4e0; --green:#5cc08a; --amber:#e2a446; --red:#f07c70;
-    --user:#222c38; --code:#191d23;
-    --shadow:none;
+    --bg:#0f1216; --s1:#161a20; --s2:#1d222a; --s3:#262c35; --line:#2b323c;
+    --t1:#e8ecf1; --t2:#aab3bf; --t3:#8a94a2; --brand:#8eabff; --onbrand:#0c1120;
+    --run:#4cc38a; --wait:#e3a63d; --block:#f27c71; --shadow:none;
   }
   @media (prefers-color-scheme:dark){
     :root:not([data-theme=light]){
       color-scheme:dark;
-      --bg:#161a1f; --panel:#1d2229; --panel2:#252b33; --ink:#e4e8ed; --muted:#97a1ad; --faint:#69737f;
-      --line:#2c333c; --accent:#8fb4e0; --green:#5cc08a; --amber:#e2a446; --red:#f07c70;
-      --user:#222c38; --code:#191d23;
-      --shadow:none;
+      --bg:#0f1216; --s1:#161a20; --s2:#1d222a; --s3:#262c35; --line:#2b323c;
+      --t1:#e8ecf1; --t2:#aab3bf; --t3:#8a94a2; --brand:#8eabff; --onbrand:#0c1120;
+      --run:#4cc38a; --wait:#e3a63d; --block:#f27c71; --shadow:none;
     }
+  }
+  /* The transcript styles below predate the tokens and use these names */
+  :root{
+    --panel:var(--s1); --panel2:var(--s2); --ink:var(--t1); --muted:var(--t2); --faint:var(--t3);
+    --accent:var(--brand); --green:var(--run); --amber:var(--wait); --red:var(--block);
+    --user:color-mix(in srgb,var(--brand) 7%,var(--s1)); --code:var(--s2);
+    --r:12px; --btn:120px;
   }
   *{box-sizing:border-box}
   [hidden]{display:none !important}
+  /* All views stay in document flow: wrapped titles, tall sidebars and short windows scroll. */
+  html{overflow-y:auto}
   body{margin:0;font:14px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI Variable Text","Segoe UI",system-ui,sans-serif;
-       background:var(--bg);color:var(--ink);-webkit-font-smoothing:antialiased}
+       background:var(--bg);color:var(--t1);-webkit-font-smoothing:antialiased}
   code,pre,.mono{font-family:ui-monospace,SFMono-Regular,"JetBrains Mono",Menlo,monospace}
   button{font:inherit;color:inherit}
+  a{color:inherit}
+  :focus-visible{outline:2px solid var(--brand);outline-offset:2px}
 
-  /* ---- top bar */
-  .top{position:sticky;top:0;z-index:5;backdrop-filter:saturate(1.4) blur(12px);
-       background:color-mix(in srgb,var(--bg) 85%,transparent);border-bottom:1px solid var(--line)}
-  .top-in{max-width:1440px;margin:0 auto;padding:12px 20px;display:flex;flex-wrap:wrap;align-items:center;gap:10px 16px}
-  .brand{display:flex;align-items:center;gap:9px;font-weight:600;font-size:15px;letter-spacing:-.01em}
-  .logo{width:22px;height:22px;border-radius:6px;display:grid;place-items:center;color:var(--panel);font-size:11px;background:var(--ink)}
-  .dot{width:7px;height:7px;border-radius:50%;background:var(--green)}
-  .dot.bad{background:var(--red)}
-  .chips{display:flex;flex-wrap:wrap;gap:8px;margin-left:auto;align-items:center}
-  .chip{display:inline-flex;align-items:baseline;gap:5px;background:transparent;border:0;
-        border-radius:999px;padding:4px 6px;font-size:12.5px;color:var(--muted)}
-  .chip b{color:var(--ink);font-weight:650;font-variant-numeric:tabular-nums}
-  .btn{border:1px solid var(--line);background:var(--panel);border-radius:7px;padding:5px 11px;font-size:13px;
-       cursor:pointer;color:var(--ink)}
-  .btn:hover{border-color:color-mix(in srgb,var(--ink) 25%,var(--line))}
-  .btn:focus-visible,.cmd:focus-visible,.sess:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-  .btn.on{background:color-mix(in srgb,var(--accent) 10%,var(--panel));border-color:color-mix(in srgb,var(--accent) 40%,var(--line));color:var(--accent)}
+  /* ---- header: brand, view tabs, paused chip, theme */
+  .top{position:sticky;top:0;z-index:5;background:var(--s1);border-bottom:1px solid var(--line)}
+  .top-in{max-width:1440px;margin:0 auto;padding:0 40px;height:64px;display:flex;align-items:center;gap:28px}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:650;font-size:16px;letter-spacing:-.01em;white-space:nowrap}
+  .logo{width:24px;height:24px;border-radius:7px;background:var(--brand);position:relative;flex:none}
+  .logo::before,.logo::after{content:"";position:absolute;left:22%;height:14%;border-radius:2px;background:var(--onbrand)}
+  .logo::before{top:30%;width:56%} .logo::after{top:56%;width:36%}
+  .inst{font-weight:400;font-size:13px;color:var(--t2)}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--run)}
+  .dot.bad{background:var(--block)}
+  .nav{display:flex;align-self:stretch;gap:4px}
+  .nav a{display:flex;align-items:center;padding:0 14px;text-decoration:none;color:var(--t2);font-size:14px;border-bottom:3px solid transparent;margin-bottom:-1px}
+  .nav a:hover{color:var(--t1)}
+  .nav a[aria-current=page]{color:var(--t1);font-weight:600;border-bottom-color:var(--brand)}
+  .top-r{margin-left:auto;display:flex;align-items:center;gap:12px}
+  .chip{text-decoration:none;display:inline-flex;align-items:center;gap:6px;padding:5px 12px;border-radius:999px;font-size:13px;font-weight:600;white-space:nowrap}
+  .chip.wait{color:var(--wait);background:color-mix(in srgb,var(--wait) 13%,var(--s1))}
+  .chip.mode{color:var(--t2);background:var(--s3);font-weight:600}
+  .chip.pause::before{content:"";width:8px;height:10px;border-left:3px solid currentColor;border-right:3px solid currentColor;box-sizing:border-box}
 
-  /* ---- layout */
-  .app{max-width:1440px;margin:0 auto;padding:18px 20px 40px;display:grid;grid-template-columns:340px minmax(0,1fr);gap:18px;align-items:start}
-  @media (max-width:900px){ .app{grid-template-columns:minmax(0,1fr)}
-    /* One column: the selected session sits above the lists instead of below them */
-    .app:has(#d-main:not([hidden])) .detail{order:-1} }
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow)}
-  .side{display:flex;flex-direction:column;gap:14px}
-  .sec-h{display:flex;align-items:center;justify-content:space-between;padding:12px 14px 6px;
-         font-size:13px;color:var(--ink);font-weight:600}
-  .count{font-size:12.5px;font-weight:400;color:var(--muted);font-variant-numeric:tabular-nums}
-  .list{padding:4px 8px 8px;display:flex;flex-direction:column;gap:4px}
-  /* Previous sessions scroll inside their card instead of running the page on forever */
-  #h-list{max-height:min(46vh,420px);overflow-y:auto;overscroll-behavior:contain}
-  .empty{padding:10px 8px 14px;color:var(--faint);font-size:13px}
-  .err-banner{max-width:1440px;margin:12px auto 0;padding:10px 14px;border-radius:12px;font-size:13px;
-              border:1px solid color-mix(in srgb,var(--red) 50%,var(--line));color:var(--red);
-              background:color-mix(in srgb,var(--red) 8%,var(--panel))}
+  /* ---- buttons: row actions share ONE width so a column of them lines up */
+  .btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-width:var(--btn);height:36px;padding:0 16px;
+       border-radius:8px;border:1px solid var(--line);background:var(--s1);color:var(--t1);font-weight:600;font-size:14px;
+       text-decoration:none;cursor:pointer;white-space:nowrap}
+  .btn:hover{border-color:color-mix(in srgb,var(--t1) 28%,var(--line))}
+  .btn.pri{background:var(--brand);border-color:var(--brand);color:var(--onbrand)}
+  .btn.sq{min-width:36px;width:36px;padding:0}
+  .btn.on{border-color:var(--brand);color:var(--brand)}
+  .btn.bad{color:var(--red)} .btn.bad:hover{border-color:var(--red)}
+  .btn:disabled{opacity:.5;cursor:default}
+  .sw{position:relative;flex:none;width:44px;height:26px;border-radius:13px;border:0;background:var(--s3);cursor:pointer;transition:background .2s}
+  .sw::after{content:"";position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;background:#fff;box-shadow:var(--shadow);
+             transition:transform .25s cubic-bezier(.3,1.4,.5,1)}
+  .sw[aria-checked=true]{background:var(--wait)} .sw[aria-checked=true]::after{transform:translateX(18px)}
+  .msg{display:flex;gap:8px;align-items:flex-end;padding:12px 16px;border-top:1px solid var(--line)}
+  .msg textarea{flex:1;min-height:36px;max-height:160px;resize:vertical;border:1px solid var(--line);border-radius:8px;background:var(--s1);
+                color:var(--t1);padding:8px 12px;font:inherit;font-size:14px}
+  .pick-sel{height:36px;border:1px solid var(--line);border-radius:8px;background:var(--s1);color:var(--t1);font:inherit;
+            font-size:14px;padding:0 8px;max-width:100%}
+  .pick-sel.num{width:84px}
+  .pick-sel.set{border-color:var(--brand)}
+  .toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:50;max-width:min(520px,90vw);padding:10px 16px;border-radius:10px;
+         background:var(--t1);color:var(--s1);font-size:14px;font-weight:600;box-shadow:var(--shadow)}
+  .toast.bad{background:var(--red);color:#fff}
+  @media (prefers-reduced-motion:reduce){.sw,.sw::after{transition:none}}
+  .lnk{color:var(--brand);font-weight:600;text-decoration:none;background:none;border:0;padding:0;cursor:pointer;font-size:14px}
+  .lnk:hover{text-decoration:underline}
 
-  /* ---- session list */
-  .sess{display:flex;flex-direction:column;gap:3px;width:100%;text-align:left;background:transparent;
-        border:1px solid transparent;border-radius:11px;padding:9px 10px;cursor:pointer}
-  .sess:hover{background:var(--panel2)}
-  .sess.sel{background:color-mix(in srgb,var(--accent) 8%,var(--panel));border-color:color-mix(in srgb,var(--accent) 30%,var(--line))}
-  .sess-top{display:flex;align-items:center;gap:8px;min-width:0}
-  .sname{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
-  .src{font-size:12.5px;color:var(--muted)}
-  .sess-meta{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
-  .qrow{display:flex;flex-direction:column;padding:7px 10px;font-size:12.5px}
-  .qrow code{font-size:12px}
-  .muted{color:var(--muted);font-size:12px}
-  .tiles{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:4px 12px 12px}
-  .tile{background:var(--panel2);border-radius:10px;padding:8px 10px;display:flex;flex-direction:column}
-  .tile span{font-size:11.5px;color:var(--muted)}
-  .tile b{font-size:17px;font-weight:650;font-variant-numeric:tabular-nums}
+  /* ---- status icons: shape + colour, always next to a word */
+  .st{width:16px;height:16px;flex:none;display:inline-grid;place-items:center;border-radius:50%;font:700 10px/1 system-ui,sans-serif}
+  .st.run::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--run)}
+  .st.wait::before{content:"";width:9px;height:9px;border-radius:50%;border:2px solid var(--wait)}
+  .st.idle::before{content:"";width:9px;height:9px;border-radius:50%;border:1.5px solid var(--t3)}
+  .st.block{border-radius:4px;background:var(--block);color:var(--s1)} .st.block::before{content:"!"}
+  .st.ask{background:var(--wait);color:var(--s1)} .st.ask::before{content:"?"}
+  .st.ok{background:color-mix(in srgb,var(--run) 16%,var(--s1));color:var(--run)} .st.ok::before{content:"✓"}
+  .st.fail{background:color-mix(in srgb,var(--block) 16%,var(--s1));color:var(--block)} .st.fail::before{content:"✕"}
+  .st.off{background:var(--s3);color:var(--t2)} .st.off::before{content:"–"}
 
+  /* ---- page */
+  .page{max-width:1440px;margin:0 auto;padding:32px 40px 64px}
+  .ph{display:flex;align-items:baseline;gap:12px;margin:0 0 20px}
+  .ph h1{margin:0;font-size:28px;line-height:1.2;font-weight:650;letter-spacing:-.02em;min-width:0;overflow-wrap:anywhere}
+  .upd{margin-left:auto;display:inline-flex;align-items:center;gap:8px;font-size:13px;color:var(--t2);white-space:nowrap}
+  .upd::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--run)}
+  .upd.bad::before{background:var(--block)}
+  .crumb{font-size:13px;color:var(--t2);margin-bottom:4px} .crumb a{color:var(--brand);font-weight:600;text-decoration:none}
+  .card{background:var(--s1);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow);min-width:0}
+  .sec{margin-top:32px;min-width:0}
+  .sec h2{display:flex;align-items:center;gap:8px;margin:0 0 12px;font-size:17px;font-weight:650;letter-spacing:-.01em}
+  .sec h2 + .sub{margin:-8px 0 12px}
+  .sub{font-size:13px;color:var(--t2)}
+  .cnt{font-size:12px;font-weight:600;color:var(--t2);background:var(--s3);border-radius:999px;padding:1px 8px;font-variant-numeric:tabular-nums}
+  .cols{display:grid;grid-template-columns:minmax(0,1fr) 440px;gap:0 20px;align-items:start}
+  .empty{padding:18px 24px;color:var(--t2);font-size:13px}
+  .err-banner{max-width:1360px;margin:16px auto 0;padding:10px 14px;border-radius:10px;font-size:13px;
+              border:1px solid color-mix(in srgb,var(--block) 50%,var(--line));color:var(--block);
+              background:color-mix(in srgb,var(--block) 8%,var(--s1))}
+
+  /* ---- summary strip */
+  .strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));padding:20px 0}
+  .strip > div{padding:0 24px;border-left:1px solid var(--line);min-width:0}
+  .strip > div:first-child{border-left:0}
+  .strip .k{font-size:13px;color:var(--t2)}
+  .strip .v{display:flex;align-items:baseline;gap:8px;margin-top:2px;white-space:nowrap}
+  .strip .v b{font-size:26px;font-weight:650;font-variant-numeric:tabular-nums;line-height:1.2}
+  .strip .v span{font-size:13px;color:var(--t2);overflow:hidden;text-overflow:ellipsis}
+  .pips{display:inline-flex;gap:4px;margin-left:auto;align-self:center}
+  .pips i{width:16px;height:6px;border-radius:3px;background:var(--s3)} .pips i.on{background:var(--run)}
+
+  /* ---- row lists (needs you, attention, recent) */
+  .rows > *{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;gap:4px 16px;align-items:center;padding:16px 20px 16px 22px;
+          border-top:1px solid var(--line);text-decoration:none;color:inherit;background:none;border-left:0;border-right:0;border-bottom:0;width:100%;text-align:left}
+  .rows > *:first-child{border-top:0}
+  .rows .st{align-self:start;margin-top:2px}
+  .rows .h{font-size:14px;overflow:hidden;text-overflow:ellipsis} .rows .h b{font-weight:600}
+  .rows .s{font-size:13px;color:var(--t2);overflow-wrap:anywhere}
+  .rows .when{font-size:13px;color:var(--t2);white-space:nowrap;font-variant-numeric:tabular-nums}
+  .rows .acts{display:flex;gap:8px}
+  .rows button,.rows a.row{cursor:pointer} .rows button:hover,.rows a.row:hover{background:var(--s2)}
+  .ref{color:var(--t2);font-variant-numeric:tabular-nums;margin-right:6px;white-space:nowrap}
+
+  /* ---- tables (become stacked rows on a phone) */
+  .tbl{width:100%;border-collapse:collapse;font-size:14px}
+  .tbl th{text-align:left;font-size:12px;font-weight:500;color:var(--t2);padding:14px 12px;border-bottom:1px solid var(--line);white-space:nowrap}
+  .tbl td{padding:14px 12px;border-top:1px solid var(--line);vertical-align:middle;min-width:0}
+  .tbl tbody tr:first-child td{border-top:0}
+  .tbl th:first-child,.tbl td:first-child{padding-left:20px} .tbl th:last-child,.tbl td:last-child{padding-right:20px}
+  .tbl .num{font-variant-numeric:tabular-nums;white-space:nowrap}
+  .tbl .r{text-align:right}
+  .tbl .t{font-weight:600;overflow:hidden;text-overflow:ellipsis}
+  .tbl .s2{font-size:13px;color:var(--t2)}
+  .tbl tr.pick{cursor:pointer} .tbl tr.pick:hover td{background:var(--s2)}
+  .tbl tr.sel td{background:color-mix(in srgb,var(--brand) 7%,var(--s1))}
+  .tbl tr.sel td:first-child{box-shadow:inset 3px 0 0 var(--brand)}
+  .runc{display:flex;gap:12px;align-items:flex-start;min-width:0} .runc .st{margin-top:3px} .runc > div{min-width:0}
+  .stw{display:inline-flex;align-items:center;gap:8px;white-space:nowrap}
+  .nw{white-space:nowrap}
+  .tfoot{display:flex;align-items:center;gap:12px;padding:14px 20px;border-top:1px solid var(--line);font-size:13px;color:var(--t2)}
+  .tfoot .lnk{margin-left:auto}
+  .tag{display:inline-block;font-size:12px;font-weight:600;color:var(--t2);background:var(--s3);border-radius:999px;padding:1px 8px;white-space:nowrap}
+
+  /* ---- queue panel + segmented control */
+  .qhead{display:flex;align-items:flex-start;gap:16px;padding:20px 24px;border-bottom:1px solid var(--line)}
+  .qhead b{display:block;font-weight:600}
+  .qstate{margin-left:auto}
+  .qrow{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:12px;align-items:center;padding:12px 24px;font-size:14px}
+  .qrow + .qrow{border-top:1px solid var(--line)}
+  .qmore{padding:12px 24px 16px}
+  .seg{display:inline-flex;background:var(--s3);border-radius:9px;padding:3px;gap:2px}
+  .seg button{border:0;background:none;border-radius:7px;padding:5px 12px;font-size:13px;font-weight:600;color:var(--t2);cursor:pointer;white-space:nowrap}
+  .seg button[aria-pressed=true]{background:var(--s1);color:var(--t1);box-shadow:var(--shadow)}
+  .bar{display:flex;align-items:center;gap:16px;margin-bottom:16px;flex-wrap:wrap}
+  .search{margin-left:auto;width:280px;max-width:100%;height:36px;border:1px solid var(--line);border-radius:8px;background:var(--s1);
+          color:var(--t1);padding:0 12px;font:inherit}
+  .kv{display:grid;grid-template-columns:auto minmax(0,1fr);font-size:14px}
+  .kv > *{padding:10px 0;border-top:1px solid var(--line)}
+  .kv dt{color:var(--t2)} .kv dd{margin:0;text-align:right;font-weight:600;overflow-wrap:anywhere}
+  .side{padding:20px 24px 24px}
+  .side h3{margin:0 0 4px;font-size:18px;font-weight:650;letter-spacing:-.01em}
+  .side .acts{display:flex;gap:10px;margin-top:20px;flex-wrap:wrap}
+  .bars > div{display:grid;grid-template-columns:110px minmax(0,1fr) 40px;gap:12px;align-items:center;padding:10px 24px;font-size:14px}
+  .bars > div + div{border-top:1px solid var(--line)}
+  .bars i{display:block;height:6px;border-radius:3px;background:color-mix(in srgb,var(--brand) 65%,var(--s3))}
+  .bars .num{text-align:right;font-variant-numeric:tabular-nums}
+
+  /* ---- details drawer */
+  .drawer{margin-top:32px;border-top:1px solid var(--line);padding-top:16px}
+  .drawer > summary{cursor:pointer;font-size:14px;list-style-position:outside}
+  .drawer > summary span{color:var(--t2);margin-left:8px}
+  .tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px;margin:16px 0}
+  .tile{background:var(--s1);border:1px solid var(--line);border-radius:10px;padding:12px 16px;display:flex;flex-direction:column}
+  .tile span{font-size:13px;color:var(--t2)} .tile b{font-size:20px;font-variant-numeric:tabular-nums}
+
+  /* ---- worker view */
+  .conv{display:flex;flex-direction:column;min-height:0;overflow:hidden}
+  .conv-h{display:flex;align-items:center;gap:12px;padding:12px 16px 12px 24px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+  .conv-h .sp{flex:1}
+  .conn{font-size:13px;color:var(--t2);display:inline-flex;align-items:center;gap:6px}
+  .conn::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--t3)}
+  .conn.live::before{background:var(--run)} .conn.warn::before{background:var(--wait)} .conn.bad::before{background:var(--block)}
+  .seg b{font-weight:600;color:var(--t3);margin-left:4px;font-variant-numeric:tabular-nums}
+  .qhead .sub{display:block}
+  .capv{display:flex;align-items:baseline;gap:8px;margin:4px 0 12px} .capv b{font-size:26px;font-weight:650;font-variant-numeric:tabular-nums}
+  .side > b{font-weight:600}
+  .side .ref{font-size:13px}
+  .bars > .empty{display:block}
+  .rows > .empty,.rows > .qmore{display:block}
+  @media (max-width:720px){ .dk{display:none} }
   /* ---- badges */
   .pill{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-weight:500;padding:1px 8px;border-radius:999px;
         white-space:nowrap;color:var(--muted);background:var(--panel2)}
@@ -525,32 +896,21 @@ PAGE = r"""<!DOCTYPE html>
   .pill.bad{color:var(--red);background:color-mix(in srgb,var(--red) 13%,transparent)}
   @keyframes pulse{50%{opacity:.3}}
 
-  /* ---- detail */
-  .detail{min-height:60vh;display:flex;flex-direction:column;overflow:hidden}
-  .empty-state{margin:auto;padding:60px 20px;text-align:center;color:var(--muted)}
-  .empty-state b{display:block;color:var(--ink);font-size:16px;margin-bottom:4px}
-  .d-head{display:flex;flex-wrap:wrap;gap:10px 16px;align-items:flex-start;padding:16px 18px 10px}
-  .d-title{display:flex;align-items:center;gap:10px;font-size:18px;font-weight:650;letter-spacing:-.01em}
-  .d-key{font-size:12px;color:var(--muted)}
-  .d-actions{margin-left:auto;display:flex;gap:8px;align-items:center}
-  .conn{font-size:12px;color:var(--muted);display:inline-flex;align-items:center;gap:6px}
-  .conn::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--faint)}
-  .conn.live::before{background:var(--green)} .conn.warn::before{background:var(--amber)} .conn.bad::before{background:var(--red)}
-  .stats{display:flex;flex-wrap:wrap;gap:6px 22px;padding:0 18px 14px;border-bottom:1px solid var(--line)}
-  .stat{display:flex;flex-direction:column}
-  .stat span{font-size:12px;color:var(--muted)}
-  .stat b{font-weight:600;font-variant-numeric:tabular-nums}
-
   /* ---- timeline */
-  .tl,.rawlog{flex:1;overflow:auto;max-height:calc(100vh - 250px);min-height:320px;padding:16px 18px 24px}
+  /* Bound only the transcript, not the page. No assumed header/title/composer height: the document
+     scrolls to the whole card, and this list scrolls to its last row even in a short window. */
+  .tl{flex:none;overflow:auto;max-height:60vh;min-height:0;padding:16px 18px 24px}
   .tl{display:flex;flex-direction:column;gap:10px}
+  .tl > *{flex-shrink:0}
   .notice{color:var(--muted);font-size:13px;padding:14px;border:1px dashed var(--line);border-radius:12px}
   .ev{max-width:880px;border-radius:14px;padding:10px 14px;border:1px solid var(--line);background:var(--panel)}
   .ev.user{background:var(--user);border-color:color-mix(in srgb,var(--accent) 22%,var(--line));align-self:flex-end;max-width:760px}
+  .ev.user.you{align-self:stretch;max-width:880px}
   .ev.err{border-color:var(--red);background:color-mix(in srgb,var(--red) 7%,var(--panel))}
   .ev-meta{display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--muted);margin-bottom:4px}
   .who{font-weight:650;color:var(--ink)}
   .ev.user .who{color:var(--accent)}
+  .ev.you.pending{border-style:dashed}
   .ts{font-size:11px;color:var(--faint);font-variant-numeric:tabular-nums;margin-left:auto;white-space:nowrap}
   .md{overflow-wrap:anywhere}
   .md p{margin:.35em 0} .md ul,.md ol{margin:.35em 0;padding-left:1.4em}
@@ -598,7 +958,37 @@ PAGE = r"""<!DOCTYPE html>
   .tpre.diff span{display:block;min-height:1.2em}
   .tpre.diff .del{color:var(--red);background:color-mix(in srgb,var(--red) 8%,transparent)}
   .tpre.diff .add{color:var(--green);background:color-mix(in srgb,var(--green) 8%,transparent)}
-  details.harness{font-size:12px;color:var(--muted);padding:0 4px}
+  details.harness{font-size:12px;color:var(--muted);padding:0 4px;display:none}
+  .show-harness details.harness{display:block}
+  .think-empty{display:flex;align-items:center;gap:8px;padding:2px 4px;font-size:12.5px;color:var(--faint)}
+  .think-empty .ticon{background:color-mix(in srgb,var(--amber) 16%,transparent);color:var(--amber)}
+  .think-empty .ts{margin-left:auto}
+  .think-empty.cx{color:var(--muted)}
+  .think-empty.cx .ticon{background:var(--panel2);color:var(--muted)}
+  details.tool.grp .ticon,details.tool.edit .ticon{background:var(--panel);color:var(--muted)}
+  .steps{padding:2px 12px 8px}
+  .step{font-size:12.5px;min-width:0}
+  .step > summary,div.step{display:flex;align-items:center;gap:8px;padding:3px 0;list-style:none;min-width:0}
+  .step > summary{cursor:pointer}
+  .step > summary::-webkit-details-marker{display:none}
+  .step > summary::after{content:"›";color:var(--faint);transition:transform .15s}
+  .step[open] > summary::after{transform:rotate(90deg)}
+  .sline{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+  .step > .tbody,.step > .tpre{border:0;padding:0 0 6px;margin-top:2px}
+  .steps details.tool{border:0;background:transparent;max-width:none}
+  .steps details.tool > summary{padding:3px 0}
+  .pill.done{display:none}
+  .steps details.tool .ticon,.steps details.tool .tname:empty,.steps .pill.ok{display:none}
+  .pm{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;display:inline-flex;gap:6px;flex:none}
+  .pa{color:var(--green)} .pr{color:var(--red)}
+  .tpre.diff .hunk{color:var(--faint)}
+  .thought{color:var(--muted)}
+  .thought .ttext{font-style:italic}
+  ul.todo{list-style:none;margin:8px 0 2px;padding:0;font-size:13px;line-height:1.7}
+  ul.todo li.done{color:var(--faint)}
+  .cx-turn{display:flex;align-items:center;gap:10px;font-size:11.5px;color:var(--faint);padding:6px 4px}
+  .cx-turn::before,.cx-turn::after{content:"";flex:1;border-top:1px solid var(--line)}
+  .cx-turn .ts{order:3}
   details.harness summary{cursor:pointer;color:var(--faint)}
   details.harness .ln{padding:1px 0 1px 16px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px}
   /* JSON message bodies as structured cards */
@@ -614,261 +1004,209 @@ PAGE = r"""<!DOCTYPE html>
   details.ent > summary{color:var(--ink);font-weight:600}
   details.blank > summary{color:var(--faint);font-style:italic}
   details.blank table.kv{opacity:.75}
-  .rawbtn{padding:1px 8px;font-size:11px}
   .btn.more{margin:4px 2px 2px;align-self:flex-start}
-  .rawlog{font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
-  .rawlog .rl{white-space:pre-wrap;word-break:break-all;padding:4px 0;border-bottom:1px dashed var(--line)}
-  /* Fleet tab = mode ladder + tallies, then a roster: one dense row per running agent (liveness
-     rail, name/role, model, context meter vs the 200k fleet ceiling, STATE.md headline + its age); stood-down
-     agents fold into one collapsed group. Rows expand in place to show the full ledger line. */
-  .tabs{display:flex;gap:4px}
-  body.on-fleet .chip.wk{display:none}
-  .fleet{max-width:1440px;margin:0 auto;padding:16px 20px 40px;display:flex;flex-direction:column;gap:14px}
-  .fsum{display:flex;flex-wrap:wrap;align-items:center;gap:12px 26px;padding:2px 2px 0}
-  .ladder{display:flex;align-items:center;gap:10px}
-  .ladder-l{font-size:12.5px;color:var(--muted)}
-  .rungs{display:inline-flex;gap:2px;padding:2px;border-radius:8px;background:var(--panel2)}
-  .rung{padding:3px 10px;font-size:12.5px;color:var(--faint);border-radius:6px}
-  .rung.on{display:inline-flex;align-items:center;gap:6px;color:var(--ink);background:var(--panel);font-weight:600;
-           box-shadow:0 0 0 1px var(--line)}
-  .rung.on::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--mc)}
-  .tally{order:1;font-size:15px;color:var(--muted);flex-basis:100%;margin-top:-8px}
-  .fresh{margin-left:auto;font-size:12px;color:var(--muted);display:flex;gap:8px;align-items:center}
-  .ag,.rhead{display:grid;grid-template-columns:minmax(150px,210px) 96px minmax(150px,200px) minmax(0,1fr);
-             gap:0 20px;align-items:center;padding:0 18px 0 20px}
-  .rhead{padding-top:10px;padding-bottom:8px;font-size:12px;color:var(--muted)}
-  .ag{position:relative;padding-top:11px;padding-bottom:11px;border-top:1px solid color-mix(in srgb,var(--line) 70%,transparent);cursor:pointer;outline:none}
-  .ag:hover{background:color-mix(in srgb,var(--panel2) 55%,transparent)}
-  .ag:focus-visible{box-shadow:inset 0 0 0 2px var(--accent)}
-  .ag::before{content:"";position:absolute;left:8px;top:50%;width:6px;height:6px;margin-top:-3px;border-radius:50%;background:var(--sc)}
-  .ag.up{--sc:var(--green)} .ag.down{--sc:var(--red)} .ag.unk{--sc:var(--faint)} .ag.off{--sc:var(--line)}
-  .ag.down{background:color-mix(in srgb,var(--red) 6%,transparent)}
-  .an{min-width:0;display:flex;flex-direction:column}
-  .an-top{display:flex;align-items:center;gap:8px;min-width:0}
-  .an b{font-weight:600;white-space:nowrap}
-  .role{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .mdl-c{display:flex;align-items:center;gap:6px;white-space:nowrap}
-  .mdl{font-size:12.5px;color:var(--muted)}
-  .mdl.local{color:var(--amber)}
-  .eff{font-size:11.5px;color:var(--muted)}
-  .meter{display:grid;grid-template-columns:minmax(0,1fr) 40px;align-items:center;gap:10px;min-width:0}
-  .track{position:relative;height:5px;border-radius:3px;background:var(--panel2)}
-  .fill{position:absolute;left:0;top:0;bottom:0;border-radius:3px;background:color-mix(in srgb,var(--ink) 35%,var(--panel2))}
-  .fill.warm{background:var(--amber)} .fill.hot{background:var(--red)}
-  .tick{position:absolute;top:-3px;bottom:-3px;width:1px;background:var(--ink);opacity:.35}
-  .mval{font-size:12.5px;font-variant-numeric:tabular-nums;white-space:nowrap;color:var(--muted)}
-  .mval.warm{color:var(--amber)} .mval.hot{color:var(--red)}
-  .meter.none{display:block;font-size:12px;color:var(--faint)}
+  .bk{font-size:11.5px;color:var(--faint)}
   .led{min-width:0;font-size:13px;line-height:1.45;color:color-mix(in srgb,var(--ink) 80%,var(--muted));overflow:hidden;
        overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
-  .ag.open .led{display:block;color:var(--ink)}
   .led i{font-style:normal;color:var(--faint)}
+  .led.old{color:var(--muted)}
   .lage{display:inline-block;margin-right:8px;font-size:12.5px;color:var(--faint);white-space:nowrap;font-variant-numeric:tabular-nums}
   .lage.stale{color:var(--amber)} .lage.old{color:var(--faint)}
-  @media (prefers-reduced-motion:reduce){ .pill.run::before{transition:none;animation:none} }
-  /* Tower: "who needs me" first. Headline counts, NEEDS YOU cards (down / supervisor alarm / over the ceiling /
-     busy but silent), then the roster split IN FLIGHT (pane mid-turn) vs PARKED; side column = context runway,
-     eph workers, hangar (stood down). */
-  .fhead{margin:0;font-size:30px;line-height:1.15;font-weight:650;letter-spacing:-.025em;white-space:nowrap}
-  .tower{display:grid;grid-template-columns:minmax(0,1fr) minmax(300px,380px);gap:16px;align-items:start}
-  .tw-main,.tw-side{display:flex;flex-direction:column;gap:14px;min-width:0}
-  .grp{font-size:13px;font-weight:600;color:var(--ink);padding:2px 2px 10px}
-  .grp span{font-weight:400;color:var(--muted);margin-left:4px;font-variant-numeric:tabular-nums}
-  .roster .grp{padding:14px 20px 8px;border-top:1px solid var(--line)}
-  .roster .grp:first-child{border-top:0}
-  .needs{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:12px}
-  .need-c{padding:14px 16px 14px;display:flex;flex-direction:column;gap:8px;min-width:0;box-shadow:none;
-          background:color-mix(in srgb,var(--sc) 5%,var(--panel));border-color:color-mix(in srgb,var(--sc) 28%,var(--line))}
-  .need-c.bad{--sc:var(--red)} .need-c.warn{--sc:var(--amber)}
-  .need-h{display:flex;flex-direction:column;gap:1px}
-  .need-h b{font-size:16px;font-weight:600}
-  .need-h span{font-size:13px;font-weight:500;color:var(--sc)}
-  .need-c p{margin:0;font-size:13px;line-height:1.45;color:color-mix(in srgb,var(--ink) 80%,var(--muted));overflow-wrap:anywhere}
-  .need-c p i{font-style:normal;color:var(--muted)}
-  .need-f{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;margin-top:auto;font-size:12px;color:var(--muted)}
-  .need-f .when{margin-left:auto;font-variant-numeric:tabular-nums}
+  /* ---- Fleet: summary strip, needs-attention rows, then one row per agent. Clicking a row opens its full
+     ledger line. Context bar: the tick is the clear floor; brand under it, amber past it, red past the ceiling. */
+  .ag td{vertical-align:top}
+  .ag .an b{font-weight:600}
+  .ag .role{display:block;font-size:13px;color:var(--t2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:240px}
+  .ag .mdl-c{white-space:nowrap;display:block}
+  .ag .mst-l{display:block;font-size:13px;color:var(--t2)}
+  .ag.open .led{display:block;-webkit-line-clamp:unset}
+  .ag .meter{width:140px}
+  .ag .stw.block{color:var(--block)} .ag .stw.wait{color:var(--wait)}
+  .meter{display:flex;flex-direction:column;gap:4px;min-width:0}
+  .meter .track{position:relative;display:block;width:100%;height:6px;border-radius:3px;background:var(--s3)}
+  .meter .fill{position:absolute;left:0;top:0;bottom:0;border-radius:3px;background:var(--brand)}
+  .meter .fill.warm{background:var(--amber)} .meter .fill.hot{background:var(--red)}
+  .meter .tick{position:absolute;top:-3px;bottom:-3px;width:2px;background:var(--t1);opacity:.7}
+  .meter .mval{font-size:12px;color:var(--t2)} .meter .mval.warm{color:var(--amber)} .meter .mval.hot{color:var(--red)}
+  .meter.none{font-size:12px;color:var(--t3)}
+  .legend{padding:12px 20px;border-top:1px solid var(--line);font-size:12px;color:var(--t2)}
+  .mdl{font-weight:500} .mdl.none{color:var(--t3)}
+  .mst{font-size:12px;color:var(--t2);margin-left:6px}
+  .mst.stale{color:var(--wait)}
   .cmd{font:12px/1 ui-monospace,SFMono-Regular,Menlo,monospace;padding:5px 8px;border:1px solid var(--line);border-radius:6px;
-       background:var(--panel);cursor:copy;user-select:all;white-space:nowrap}
-  .cmd:hover{border-color:color-mix(in srgb,var(--accent) 45%,var(--line))}
-  .cmd.copied{color:var(--green);border-color:var(--green)}
-  .ag.busy{--sc:var(--accent)}
-  .busy-l{font-size:11.5px;color:var(--accent);white-space:nowrap;font-variant-numeric:tabular-nums}
-  .side-c{padding:14px 18px 16px;box-shadow:none}
-  .side-h{display:flex;justify-content:space-between;align-items:baseline;gap:10px;padding-bottom:10px;font-size:13px;font-weight:600;color:var(--ink)}
-  .side-h span+span{font-size:12.5px;font-weight:400;color:var(--muted)}
-  .rw{display:grid;grid-template-columns:minmax(0,120px) minmax(0,1fr) 44px;gap:10px;align-items:center;padding:3px 0;font-size:12.5px}
-  .rw .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .rw .track .soft{position:absolute;top:-2px;bottom:-2px;width:1px;background:var(--ink);opacity:.18}
-  .rw .mval{text-align:right}
-  .wk-r{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:2px 10px;padding:7px 0;border-top:1px solid color-mix(in srgb,var(--line) 70%,transparent);font-size:13px}
-  .wk-r:first-child{border-top:0}
-  .wk-r .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap} .wk-r .t i{font-style:normal;color:var(--faint)}
-  .wk-r .a{color:var(--muted);font-variant-numeric:tabular-nums}
-  .hangar{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:13px;color:var(--muted)}
-  @media (max-width:1100px){ .tower{grid-template-columns:minmax(0,1fr)} }
-  /* Mobile: header wraps cleanly with tappable tabs; each Fleet agent becomes a 3-line card
-     (name + model, then the context meter, then the ledger line + its age) */
-  @media (max-width:700px){
-    .top-in{padding:10px 12px;gap:8px 10px}
-    .tabs{margin-left:auto}
-    .tabs .btn{min-height:40px;min-width:64px;padding:8px 14px;font-size:14px}
-    .chips{margin-left:0;width:100%;gap:6px}
-    .chips .btn{min-height:32px}
-    .app,.fleet{padding:12px 12px 30px}
-    .app{grid-template-columns:minmax(0,1fr)}
-    .err-banner{margin:12px 12px 0}
-    .qrow code{overflow-wrap:anywhere}
-    .d-head,.stats{padding-left:14px;padding-right:14px}
-    .tl,.rawlog{padding:12px 12px 20px}
-    .fresh{margin-left:0;width:100%}
-    .fhead{font-size:21px;white-space:normal}
-    .rhead{display:none}
-    .ag{grid-template-columns:minmax(0,1fr) auto;gap:7px 12px;padding:11px 14px 11px 16px}
-    .ag:first-of-type{border-top:0}
-    .mdl-c{grid-row:1;grid-column:2;align-self:start}
-    .meter{grid-column:1 / -1;grid-template-columns:minmax(0,1fr) 84px}
-    .led{grid-column:1 / -1}
-    /* Tower on a phone = one screen, not three (too much scrolling otherwise): theme button joins the top row,
-       summary shrinks to two lines (headline, live mode rung; the tally sentence and the needs-you label hide),
-       needs-you cards lose the ledger + tmux chip,
-       roster rows are one line (name · mini meter · model; tap a row for role + ledger), context runway is
-       dropped (every row has its meter), hangar is a single scrolling strip. */
-    body.on-fleet .chips{width:auto}
-    body.on-fleet .top-in{flex-wrap:nowrap}
-    body.on-fleet #theme{min-width:40px;min-height:40px;padding:0;font-size:16px}
-    body.on-fleet .th-l{display:none}
-    .fleet{gap:10px;padding-top:10px}
-    .fsum{gap:6px 14px}
-    .fhead{font-size:19px;width:100%}
-    .tally{gap:2px 12px}
-    .tally,#f-needs-w > .grp{display:none}   /* the headline + cards + roster already say it */
-    .ladder-l{display:none}
-    .rungs .rung:not(.on){display:none}
-    .rung{padding:2px 9px;font-size:12px}
-    .fresh{width:auto;margin-left:auto;font-size:11px;gap:6px}
-    .fresh .pill{font-size:11px}
-    .tower,.tw-main,.tw-side{gap:10px}
-    .needs{gap:8px}
-    .need-c{padding:9px 12px 10px;gap:3px}
-    .need-h{flex-direction:row;flex-wrap:wrap;align-items:baseline;gap:0 8px;padding-right:64px}
-    .need-h b{font-size:15px} .need-h span{font-size:12.5px}
-    .need-c p{font-size:12.5px;line-height:1.35;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-    .need-c p.nl,.need-f .cmd{display:none}
-    .need-f{margin-top:0}
-    .need-f .when{position:absolute;right:12px;top:10px}
-    .need-c{position:relative}
-    .roster .grp{padding:10px 14px 6px 22px}
-    .ag{grid-template-columns:minmax(0,1fr) 108px auto;gap:2px 10px;padding:9px 12px 9px 22px;min-height:44px}
-    .ag .role{display:none}
-    .ag .meter{grid-column:2;grid-row:1;grid-template-columns:minmax(0,1fr) 34px;gap:6px}
-    .ag .meter.none{font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-    .ag .mval{font-size:12px;text-align:right}
-    .ag .mdl-c{grid-column:3;grid-row:1;align-self:center}
-    .ag .mdl{font-size:11px;padding:1px 6px}
-    .ag .eff{display:none}
-    .ag .led{display:none;grid-row:2;margin-top:4px}
-    .ag.open .led{display:block}
-    .ag.open .role{display:block;white-space:normal}
-    #f-runway-c{display:none}
-    .side-c{padding:9px 12px 10px}
-    .side-h{padding-bottom:4px}
-    .wk-r{padding:5px 0}
-    .hangar{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none;padding-bottom:2px}
-    .hangar span{flex:none}
-    footer{padding-bottom:16px}
+       background:var(--s1);cursor:copy;user-select:all;white-space:nowrap}
+  .cmd.copied{color:var(--run);border-color:var(--run)}
+
+  /* ---- bottom tab bar, phone only */
+  .tabbar{display:none}
+
+  @media (max-width:1100px){
+    .cols{grid-template-columns:minmax(0,1fr)}
+    #r-side{display:none}
   }
-  footer{max-width:1440px;margin:0 auto;padding:0 20px 30px;font-size:11.5px;color:var(--faint);text-align:center}
+  /* Mobile: a real app layout. View tabs move to a bottom bar, the summary strip becomes a short list,
+     tables become stacked rows (title line, then one muted detail line), row actions collapse into the row. */
+  @media (max-width:720px){
+    .top-in{padding:0 16px;height:56px;gap:12px}
+    .nav,.inst{display:none}
+    .page{padding:20px 16px 96px}
+    .ph h1{font-size:26px}
+    .sec{margin-top:24px}
+    .tabbar{display:grid;grid-template-columns:repeat(4,1fr);position:fixed;left:0;right:0;bottom:0;z-index:6;
+            background:var(--s1);border-top:1px solid var(--line);padding:6px 0 calc(6px + env(safe-area-inset-bottom))}
+    .tabbar a{display:flex;flex-direction:column;align-items:center;gap:3px;padding:4px 0;min-height:48px;justify-content:center;
+              font-size:11px;font-weight:600;color:var(--t2);text-decoration:none}
+    .tabbar a[aria-current=page]{color:var(--brand)}
+    .tabbar svg{width:22px;height:22px}
+    .strip{grid-template-columns:minmax(0,1fr);padding:0}
+    .strip > div{border-left:0;border-top:1px solid var(--line);padding:12px 16px;display:flex;align-items:center;gap:12px}
+    .strip > div:first-child{border-top:0}
+    .strip .v{margin:0 0 0 auto} .strip .v b{font-size:15px} .strip .v span,.pips{display:none}
+    .strip .k{font-size:15px;color:var(--t1)}
+    .rows > *{grid-template-columns:auto minmax(0,1fr);padding:14px 16px}
+    .rows .when,.rows .acts{display:none}
+    .rows .acts.keep{display:flex;grid-column:2;flex-wrap:wrap} .rows .acts.keep .btn{min-width:0;flex:1;padding:0 10px}
+    .toast{bottom:84px}
+    .tbl thead{display:none}
+    .tbl,.tbl tbody{display:block}
+    .tbl tr{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:2px 12px;padding:12px 16px;border-top:1px solid var(--line)}
+    .tbl tbody tr:first-child{border-top:0}
+    .tbl td{display:block;padding:0 !important;border:0}
+    .tbl td.m-hide{display:none}
+    .tbl td.m-sub{grid-column:1;font-size:13px;color:var(--t2)}
+    .tbl td.m-end{grid-column:2;grid-row:1;text-align:right;font-size:13px;color:var(--t2)}
+    .tbl td .btn{display:none}
+    .tbl tr.sel td{background:none;box-shadow:none}
+    .set-tbl tr{grid-template-columns:1fr 1fr;gap:6px 12px}
+    .set-tbl td:first-child{grid-column:1 / -1}
+    .set-tbl .pick-sel:not(.num){width:100%}
+    .set-tbl td[data-l]::before{content:attr(data-l);display:block;font-size:12px;color:var(--t3);margin-bottom:2px}
+    .ag .meter{width:100%}
+    .ag .role{max-width:none}
+    .qhead,.qrow,.qmore,.side{padding-left:16px;padding-right:16px}
+    .bars > div{padding:10px 16px;grid-template-columns:90px minmax(0,1fr) 32px}
+    .bar .search{width:100%;margin-left:0}
+    .conv-h{padding:10px 12px}
+    .tl{padding:12px 12px 20px}
+    .err-banner{margin:12px 12px 0}
+  }
+  @media (prefers-reduced-motion:reduce){ *{transition:none !important;animation:none !important} }
 </style>
 </head>
 <body>
-<div class="top"><div class="top-in">
-  <div class="brand"><span class="logo">◆</span>eph-broker <span class="dot" id="dot" title="state feed"></span></div>
-  <div class="tabs">
-    <button class="btn on" id="tab-workers" data-tab="workers">Workers</button>
-    <button class="btn" id="tab-fleet" data-tab="fleet">Fleet</button>
+<header class="top"><div class="top-in">
+  <div class="brand"><span class="logo" aria-hidden="true"></span>eph-broker<span class="inst" id="inst"></span><span class="dot" id="dot" title="state feed"></span></div>
+  <nav class="nav" aria-label="Views">
+    <a href="#now" data-view="now">Now</a><a href="#runs" data-view="runs">Runs</a>
+    <a href="#queue" data-view="queue">Queue</a><a href="#fleet" data-view="fleet" id="tab-fleet">Fleet</a>
+  </nav>
+  <div class="top-r">
+    <a class="chip wait pause" id="paused" href="#queue" hidden>New runs paused</a>
+    <button class="btn sq" id="theme" title="Theme: auto" aria-label="Theme: auto">◐</button>
   </div>
-  <div class="chips">
-    <span class="chip wk">workers <b id="b-workers">n/a</b>/<b id="b-cap">n/a</b></span>
-    <span class="chip wk">live <b id="b-live">n/a</b></span>
-    <span class="chip wk">queued <b id="b-pending">n/a</b></span>
-    <span class="chip wk">updated <b id="b-age">n/a</b></span>
-    <button class="btn" id="theme" title="theme: auto / light / dark">◐ Auto</button>
-  </div>
-</div></div>
+</div></header>
 
-<div id="err" class="err-banner" style="display:none"></div>
+<div id="err" class="err-banner" style="display:none" role="alert"></div>
 
-<section class="fleet" id="fleet-view" hidden>
-  <div class="fsum">
-    <h1 class="fhead" id="f-head"></h1>
-    <div class="tally" id="f-tally"></div>
-    <div class="ladder" title="FLEET_MODE in FLEET.md, loosest to tightest"><span class="ladder-l">Fleet mode</span><span class="rungs" id="f-mode"></span></div>
-    <div class="fresh" id="f-gen"></div>
+<main class="page">
+<section id="v-now">
+  <div class="ph"><h1>Now</h1><span class="upd"></span></div>
+  <div class="card strip" id="n-strip"></div>
+  <div class="sec"><h2>Needs you <span class="cnt" id="n-needs-n">0</span></h2><div class="card rows" id="n-needs"></div></div>
+  <div class="cols">
+    <div class="sec"><h2>Running <span class="cnt" id="n-run-n"></span></h2><div class="card" id="n-run"></div></div>
+    <div class="sec"><h2>Queue <span class="cnt" id="n-q-n"></span></h2><div class="card" id="n-q"></div></div>
+    <div class="sec"><h2>Waiting to start <span class="cnt" id="n-wait-n"></span> <span class="chip wait" id="n-wait-drain" hidden>Drain on</span></h2>
+      <p class="sub">Admitted, but no worker yet. Each one starts as soon as its blocker clears.</p><div class="card" id="n-wait"></div></div>
+    <div class="sec" id="h-card"><h2>Recent <span class="cnt" id="n-history"></span></h2>
+      <p class="sub">Worker sessions this broker recorded, newest first.</p><div class="card rows" id="h-list"></div></div>
   </div>
-  <div class="tower">
-    <div class="tw-main">
-      <div id="f-needs-w" hidden><div class="grp">Needs you <span id="f-needs-n"></span></div><div class="needs" id="f-needs"></div></div>
-      <div class="card roster">
-        <div id="f-err" class="empty" hidden></div>
-        <div id="f-rows"></div>
-      </div>
-    </div>
-    <aside class="tw-side">
-      <div class="card side-c" id="f-runway-c"><div class="side-h"><span>Context runway</span><span id="f-runway-k"></span></div><div id="f-runway"></div></div>
-      <div class="card side-c"><div class="side-h"><span>Eph workers</span><span>details in Workers</span></div><div id="f-wk"></div></div>
-      <div class="card side-c" id="f-hangar-c" hidden><div class="side-h"><span>Hangar</span><span>stood down</span></div><div class="hangar" id="f-hangar"></div></div>
-    </aside>
+  <details class="drawer" id="drawer"><summary><b>Details</b><span>Broker counters</span></summary>
+    <div class="tiles" id="counters"></div></details>
+</section>
+
+<section id="v-runs" hidden>
+  <div class="ph"><h1>Runs</h1><span class="upd"></span></div>
+  <div class="bar"><div class="seg" id="r-seg" role="group" aria-label="Filter runs"></div>
+    <input class="search" id="r-q" type="search" placeholder="Search tickets or titles" aria-label="Search runs"></div>
+  <div class="cols">
+    <div class="card"><table class="tbl" id="r-tbl"><thead><tr><th>Run</th><th>Status</th><th>Model</th><th>Started</th><th>Time</th><th class="r">Tokens</th></tr></thead>
+      <tbody id="r-rows"></tbody></table><div class="tfoot" id="r-foot"></div></div>
+    <aside class="card side" id="r-side"></aside>
   </div>
 </section>
 
-<main class="app" id="workers-view">
-  <aside class="side">
-    <div class="card">
-      <div class="sec-h">Sessions <span class="count" id="n-sessions">0</span></div>
-      <div class="list" id="s-list"></div>
+<section id="v-queue" hidden>
+  <div class="ph"><h1>Queue</h1><span class="upd"></span></div>
+  <div class="cols">
+    <div>
+      <div class="card" id="q-drain"></div>
+      <div class="sec"><h2>Next up <span class="cnt" id="q-n"></span></h2><p class="sub" id="q-sub"></p>
+        <div class="card"><table class="tbl"><thead><tr><th>#</th><th>Ticket</th><th>Source</th><th>Events</th><th>Arrived</th><th>Action</th></tr></thead>
+          <tbody id="q-rows"></tbody></table><div class="tfoot" id="q-foot" hidden></div></div></div>
     </div>
-    <div class="card" id="h-card" hidden>
-      <div class="sec-h">Previous sessions <span class="count" id="n-history">0</span></div>
-      <div class="list" id="h-list"></div>
+    <div>
+      <div class="card side" id="q-cap"></div>
+      <div class="sec"><h2>Waiting to start <span class="cnt" id="q-wait-n"></span> <span class="chip wait" id="q-wait-drain" hidden>Drain on</span></h2><div class="card bars" id="q-wait"></div></div>
+      <div class="sec"><h2>By source</h2><div class="card bars" id="q-src"></div></div>
     </div>
-    <div class="card">
-      <div class="sec-h">Queued (pre-spawn) <span class="count" id="n-pending">0</span></div>
-      <div class="list" id="p-list"></div>
-    </div>
-    <div class="card">
-      <div class="sec-h">Counters</div>
-      <div class="tiles" id="counters"></div>
-    </div>
-  </aside>
+  </div>
+</section>
 
-  <section class="card detail">
-    <div class="empty-state" id="d-empty"><b>No session selected</b>Pick a session on the left to see its state and live transcript.</div>
-    <div id="d-main" hidden style="display:flex;flex-direction:column;flex:1;min-height:0">
-      <div class="d-head">
-        <div>
-          <div class="d-title"><span id="d-title"></span><span id="d-badge"></span></div>
-          <code class="d-key" id="d-key"></code>
-        </div>
-        <div class="d-actions">
-          <span class="conn" id="sv-st"></span>
-          <button class="btn" id="raw" title="show the raw jsonl transcript">Raw</button>
-          <button class="btn" id="sv-x">Close</button>
-        </div>
-      </div>
-      <div class="stats" id="d-stats"></div>
+<section id="fleet-view" hidden>
+  <div class="ph"><h1>Fleet</h1><span class="chip mode" id="f-mode"></span><span class="upd" id="f-gen"></span></div>
+  <div id="f-err" class="empty card" hidden></div>
+  <div class="card strip" id="f-strip"></div>
+  <div class="sec" id="f-needs-w" hidden><h2>Needs attention <span class="cnt" id="f-needs-n"></span></h2><div class="card rows" id="f-needs"></div></div>
+  <div class="sec"><div class="bar"><h2 style="margin:0">Agents <span class="cnt" id="f-n"></span></h2>
+      <div class="seg" id="f-seg" role="group" aria-label="Filter agents" style="margin-left:auto"></div></div>
+    <div class="card"><table class="tbl"><thead><tr><th>Agent</th><th>Status</th><th>Model</th><th>Context</th><th>Working on</th><th>Updated</th></tr></thead>
+      <tbody id="f-rows"></tbody></table>
+      <div class="legend">Context bar: the tick is the agent's clear floor. Blue under it, amber past it, red past the ceiling.</div></div>
+  </div>
+  <div class="sec" id="s-w" hidden><h2>Worker settings</h2>
+    <p class="sub" id="s-sub">Applies to new runs. Running work keeps the model it started with. Blue outline = changed here; Default puts it back.</p>
+    <div class="card"><table class="tbl set-tbl"><thead><tr><th>Row</th><th class="m-hide">Harness</th><th>Backend</th><th>Model</th></tr></thead>
+      <tbody id="s-rows"></tbody></table></div>
+    <div class="card" style="margin-top:12px"><table class="tbl"><thead><tr><th>Group</th><th>Max at once</th></tr></thead>
+      <tbody id="s-caps"></tbody></table>
+      <div class="legend">A group covers its row and every row under it (code covers code/...). 0 holds new runs in the queue; running work is not stopped.</div></div>
+  </div>
+</section>
+
+<section id="v-run" hidden>
+  <nav class="crumb"><a href="#runs" id="sv-x">Runs</a> › <span id="d-ref"></span></nav>
+  <div class="ph"><h1 id="d-title"></h1><span class="upd"></span></div>
+  <div class="cols">
+    <div class="card conv">
+      <div class="conv-h"><span id="d-badge"></span><span class="conn" id="sv-st"></span><span class="sp"></span>
+        <div class="seg" role="group" aria-label="Transcript detail"><button id="cv" aria-pressed="true">Conversation</button><button id="hr" aria-pressed="false"
+          title="Also show behind-the-scenes steps and technical run details">Everything<b id="hr-n">0</b></button></div></div>
       <div class="tl" id="sv-log"></div>
-      <div class="rawlog" id="sv-raw" hidden></div>
+      <form class="msg" id="d-msg" hidden><textarea id="d-msg-t" rows="1" maxlength="4000" aria-label="Message this run"
+        placeholder="Message this run. Enter to send, Shift+Enter for newline."></textarea><button class="btn pri">Send</button></form>
     </div>
-  </section>
+    <aside>
+      <div class="card side" id="d-stats"></div>
+      <div class="sec" id="d-prev-w" hidden><h2>Sessions</h2><div class="card rows" id="d-prev"></div></div>
+    </aside>
+  </div>
+</section>
 </main>
 
-<footer>
-  Read-only, refreshes every 5 seconds
-  <!-- Control verbs (retry / kill / close) are a separate lane: they need auth IN THE APP, not just
-       at the proxy. Loopback :8787 is reachable by anything on the broker host and the Caddy IP guard is
-       documented defense-in-depth only. Today every write requires HMAC; a human surface has none,
-       so it must verify the proxy's username header itself. -->
+<nav class="tabbar" aria-label="Views">
+  <a href="#now" data-view="now"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3.5" fill="currentColor"/></svg>Now</a>
+  <a href="#runs" data-view="runs"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M5 7h14M5 12h14M5 17h14"/></svg>Runs</a>
+  <a href="#queue" data-view="queue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M5 6h14M7 11h10M9 16h6"/></svg>Queue</a>
+  <a href="#fleet" data-view="fleet"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="4" y="4" width="7" height="7" rx="2"/><rect x="13" y="4" width="7" height="7" rx="2"/><rect x="4" y="13" width="7" height="7" rx="2"/><rect x="13" y="13" width="7" height="7" rx="2"/></svg>Fleet</a>
+</nav>
+
+<footer class="page" style="padding-top:0;font-size:12px;color:var(--t3)">
+  <span id="foot">Read-only, refreshes every 5 seconds</span>
+  <!-- Buttons appear only when GET /actions says this viewer may act; actions.py re-checks every POST
+       (proxy secret + SSO group + same-origin), so hiding a button is courtesy, not the security boundary. -->
 </footer>
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -896,7 +1234,9 @@ function applyTheme(t){
   if(t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
   else delete document.documentElement.dataset.theme;
   const [ic, lb] = t === 'light' ? ['☀', 'Light'] : t === 'dark' ? ['☾', 'Dark'] : ['◐', 'Auto'];
-  $('theme').replaceChildren(ic, el('span', 'th-l', ' ' + lb));
+  $('theme').textContent = ic;
+  $('theme').title = 'Theme: ' + lb;
+  $('theme').setAttribute('aria-label', 'Theme: ' + lb + '. Click to change.');
 }
 applyTheme(theme);
 $('theme').onclick = () => {
@@ -1021,6 +1361,8 @@ const STATES = {open_running: ['Running', 'run'], open_idle: ['Idle', 'idle'],
                 closing: ['Closing', 'close'], closed: ['Closed', 'close']};
 function badge(label, cls){ return '<span class="pill ' + cls + '">' + esc(label) + '</span>'; }
 function stateBadge(s){
+  if(s.live && ['open_running', 'open_idle'].includes(s.live.state) && s.live.waiting) return badge('Waiting', 'idle');
+  if(s.live && s.live.state === 'open_running' && !s.worker) return badge('Starting', 'idle');
   if(s.live){ const st = STATES[s.live.state] || [s.live.state || 'unknown', '']; return badge(st[0], st[1]); }
   if(s.worker) return s.worker.in_turn ? badge('In turn', 'run') : badge('Idle', 'idle');
   return badge('Ended', 'done');
@@ -1047,167 +1389,176 @@ function previous(d){
     return true;
   });
 }
-function when(ts){ const t = new Date(ts * 1000); return isNaN(t) ? 'n/a' : t.toLocaleString(); }
 
-let lastState = null, selected = null, selectedPast = null;
+let lastState = null, lastDerived = null, selected = null, selectedPast = null, booted = false;
 const HIST_PAGE = 25;
 let histLimit = HIST_PAGE;      // Previous sessions are paged server-side (/state?hist=N)   // selectedPast = 8-char session of a previous one
-
-function paint(d){
-  lastState = d;
-  $('dot').className = 'dot';
-  $('b-workers').textContent = d.concurrency.in_use;
-  $('b-cap').textContent = d.concurrency.cap ?? 'n/a';
-  $('b-live').textContent = d.live.length;
-  $('b-pending').textContent = d.pending.length;
-  $('b-age').textContent = new Date(d.now * 1000).toLocaleTimeString();
-
-  const ss = sessions(d);
-  $('n-sessions').textContent = ss.length;
-  $('s-list').innerHTML = ss.length ? ss.map(s => {
-    const t = title(s.key), w = s.worker, l = s.live, meta = [];
-    if(w){ meta.push(w.turns + ' turns', fmtNum(w.tokens) + ' tok'); if(w.in_turn && w.turn_age != null) meta.push('turn ' + age(w.turn_age)); }
-    if(l){ meta.push(l.events + ' events'); if(l.expire_in != null) meta.push('expires ' + age(l.expire_in)); }
-    return '<button class="sess' + (s.key === selected && !selectedPast ? ' sel' : '') + '" data-key="' + esc(s.key) + '" title="' + esc(s.key) + '">'
-      + '<span class="sess-top">' + (t.src ? '<span class="src">' + esc(t.src) + '</span>' : '')
-      + '<span class="sname">' + esc(t.name) + '</span>' + stateBadge(s) + '</span>'
-      + '<span class="sess-meta">' + esc(meta.join(' · ')) + '</span></button>';
-  }).join('') : '<div class="empty">No live sessions right now.</div>';
-
-  const hs = previous(d);
-  $('h-card').hidden = !d.stream_enabled;
-  $('n-history').textContent = d.history_total ?? hs.length;
-  $('h-list').innerHTML = hs.length ? hs.map(h => {
-    const t = title(h.key), sel = h.key === selected && h.session === selectedPast;
-    return '<button class="sess' + (sel ? ' sel' : '') + '" data-key="' + esc(h.key) + '" data-past="' + esc(h.session)
-      + '" title="' + esc(h.key) + '"><span class="sess-top">' + (t.src ? '<span class="src">' + esc(t.src) + '</span>' : '')
-      + '<span class="sname">' + esc(t.name) + '</span>' + badge('Ended', 'done') + '</span>'
-      + '<span class="sess-meta">' + esc('started ' + when(h.ts) + ' · ' + h.session) + '</span></button>';
-  }).join('') + ((d.history_total || 0) > (d.history || []).length
-    ? '<button class="btn more" id="h-more">Show ' + esc(Math.min(HIST_PAGE, d.history_total - d.history.length)) + ' more</button>' : '')
-    : '<div class="empty">No previous sessions recorded yet.</div>';
-
-  $('n-pending').textContent = d.pending.length;
-  $('p-list').innerHTML = d.pending.length ? d.pending.map(p =>
-    '<div class="qrow"><code>' + esc(p.key) + '</code><span class="muted">' + p.events
-    + ' events · spawns in ' + age(p.spawn_in) + '</span></div>').join('') : '<div class="empty">Nothing queued.</div>';
-
-  const c = d.counters;
-  $('counters').innerHTML = [
-    ['Deduped', c.deduped], ['Dedup re-armed', c.dedup_cleared],
-    ['Echo dropped', c.echo_dropped], ['Allowlist rejected', c.allowlist_rejected],
-  ].map(([k, v]) => '<div class="tile"><span>' + k + '</span><b>' + fmtNum(v) + '</b></div>').join('');
-
-  paintFleet(d.fleet);
-  paintDetail();
-}
-
-// ---- Fleet tab: fleet-status.json + FLEET_MODE + STATE.md age, read-only.
-// Every string is agent-controlled -> esc(); numbers are formatted before they touch HTML.
-const MODES = ['high', 'normal', 'lean', 'min', 'zero'];
-const MODE_CLR = {high: 'var(--accent)', normal: 'var(--green)', lean: 'var(--amber)', min: 'var(--amber)', zero: 'var(--red)'};
+let runsFilter = 'all', runsQ = '', runsSel = null, fleetFilter = 'all', qLimit = 10;
 const fleetOpen = new Set();          // agents whose ledger line is expanded; survives the 5s repaint
+const HARNESS = {cc: 'Claude Code', codex: 'Codex', hermes: 'Hermes'};
+// Why an admitted subject has no worker yet (adapter._waiting reasons), in plain words
+const WAIT_WHY = {repo_lock: 'Repository lock: another run on the same repository holds it', concurrency: 'All worker slots are busy'};
+const WAIT_GROUP = {repo_lock: 'Repository lock', concurrency: 'Slots full'};
+
+// ---- shared renderers. Every agent/ticket string goes through esc(); numbers are formatted first.
+function kTok(n){ return Math.round(Number(n) / 1000) + 'k'; }
+function kfmt(n){ n = Number(n || 0); return n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1000 ? (n / 1000).toFixed(1).replace(/\.0$/, '') + 'k' : String(n); }
+function dur(s){
+  if(s === null || s === undefined) return '-';
+  s = Math.max(0, Math.round(s));
+  return s < 60 ? s + 's' : s < 3600 ? Math.floor(s / 60) + 'm ' + String(s % 60).padStart(2, '0') + 's'
+    : Math.floor(s / 3600) + 'h ' + Math.floor(s % 3600 / 60) + 'm';
+}
 function ago(s){
   if(s === null || s === undefined) return 'n/a';
   return s < 60 ? 'now' : s < 3600 ? Math.floor(s / 60) + 'm' : s < 172800 ? Math.floor(s / 3600) + 'h' : Math.floor(s / 86400) + 'd';
 }
-function kTok(n){ return Math.round(Number(n) / 1000) + 'k'; }
+function agoT(s){ const a = ago(s); return a === 'now' ? 'just now' : a === 'n/a' ? '-' : a + ' ago'; }
+function clock(ts){ const t = new Date(ts * 1000); return isNaN(t) ? 'n/a' : t.toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'}); }
+function stamp(ts){   // "4:02 PM" today, "Nov 4, 4:02 PM" before that
+  const t = new Date(ts * 1000);
+  if(isNaN(t)) return 'n/a';
+  return t.toDateString() === new Date().toDateString() ? clock(ts)
+    : t.toLocaleDateString([], {month: 'short', day: 'numeric'}) + ', ' + clock(ts);
+}
+function stIcon(k){ return '<span class="st ' + k + '" aria-hidden="true"></span>'; }
+function cell(k, v, s, extra){
+  return '<div><div class="k">' + esc(k) + '</div><div class="v"><b>' + esc(v) + '</b><span>' + esc(s) + '</span>' + (extra || '') + '</div></div>';
+}
+function segHtml(id, cur, opts){
+  return opts.map(([v, label]) => '<button data-seg="' + id + '" data-v="' + esc(v) + '" aria-pressed="' + (v === cur) + '">' + esc(label) + '</button>').join('');
+}
+function pips(used, cap){
+  return cap ? '<span class="pips" aria-hidden="true">' + Array.from({length: Math.min(cap, 12)},
+    (_, i) => '<i' + (i < used ? ' class="on"' : '') + '></i>').join('') + '</span>' : '';
+}
+
+// ---- Fleet: fleet-status.json + FLEET_MODE + STATE.md age, read-only.
+const EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 function agentKind(a){ return a.stood_down ? 'off' : a.alive === false ? 'down' : a.alive === true ? 'up' : 'unk'; }
 function modelFamily(a){ const m = String(a.model_label || ''); return m.startsWith('opus') ? 'opus' : m === 'local' ? 'local' : ''; }
-function ctxMeter(a, ceil, soft){
-  const t = a.ctx_tokens;
-  if(t === null || t === undefined)
-    return '<div class="meter none">' + (a.stood_down ? '' : a.model_label === 'local' ? 'local runtime, no meter' : 'no pane reading') + '</div>';
-  const max = ceil * 1.5, heat = t >= ceil ? 'hot' : t >= soft ? 'warm' : '';
-  const pos = v => (Math.min(v, max) / max * 100).toFixed(1) + '%';
-  const pane = esc(a.context ?? '?');
-  return '<div class="meter" title="' + esc(fmtNum(t)) + ' tokens in context (pane reads ' + pane + '% of 1M). Fleet ceiling '
-      + esc(kTok(ceil)) + ', aim to reset by ' + esc(kTok(soft)) + '.">'
-    + '<span class="track"><span class="fill ' + heat + '" style="width:' + pos(t) + '"></span>'
-    + '<span class="tick" style="left:' + pos(ceil) + '"></span></span>'
-    + '<span class="mval ' + heat + '">' + esc(kTok(t)) + '</span></div>';
+// Normalize a row's model fields into {label, state, run, title}. `runtime_model*` (a Fleet row from
+// fleet-status.json) is OBSERVED evidence about a running process; a Fleet row's `model` is only the
+// mode-resolved CONFIGURED model. A Worker row's own `model` IS observed (its harness recorded it at
+// launch), so its model_state is trusted as given. state: running | stale | configured | unknown.
+function effModel(a){
+  const st = a.model_state || 'unknown';
+  const obs = a.runtime_model_label || a.runtime_model || null;
+  const cfg = a.model_label || a.model || null;
+  const obsRaw = a.runtime_model || a.model || '';
+  const cfgRaw = a.model || '';
+  const age = a.runtime_model_age;
+  if((st === 'running' || st === 'stale') && (obs || cfg)){
+    const label = obs || cfg;
+    return {label: label, state: st, run: true,
+      title: (st === 'stale' ? 'Last observed running model: ' : 'Observed running model: ') + obsRaw
+        + (age == null ? '' : ' (' + ago(age) + ' ago)')
+        + (obs && cfgRaw && cfgRaw !== obsRaw ? '. Configured for this mode: ' + cfgRaw : '')};
+  }
+  if(st === 'configured' && cfg)
+    return {label: cfg, state: 'configured', run: false,
+      title: 'Configured model for this mode, not observed running: ' + cfgRaw};
+  return {label: null, state: 'unknown', run: false, title: 'No model reported for this row'};
 }
-function agentRow(a, ceil, soft){
-  const name = String(a.name ?? '?'), k = agentKind(a), open = fleetOpen.has(name);
-  const eff = a.effort && a.effort !== 'default' ? '<span class="eff">' + esc(a.effort) + '</span>' : '';
-  const la = a.ledger_age;
-  const busy = a.busy === true && k === 'up';
-  return '<div class="ag ' + k + (busy ? ' busy' : '') + (open ? ' open' : '') + '" data-agent="' + esc(name) + '" tabindex="0" role="button" aria-expanded="' + open + '">'
-    + '<div class="an"><span class="an-top"><b>' + esc(a.name ?? '?') + '</b>' + (k === 'down' ? badge('down', 'bad') : '')
-    + (busy ? '<span class="busy-l" title="pane mid-turn (busy turn) per the supervisor">busy ' + esc(a.busy_age == null ? '' : ago(a.busy_age)) + '</span>' : '')
-    + (a.flags || []).map(x => badge(x.t, x.sev === 'bad' ? 'bad' : 'warn')).join('') + '</span>'
-    + '<span class="role" title="' + esc(a.role || '') + '">' + esc(a.role || '') + '</span></div>'
-    + '<div class="mdl-c"><span class="mdl ' + modelFamily(a) + '" title="' + esc(a.model ?? 'unknown model') + '">'
-    + esc(a.model_label || a.model || 'n/a') + '</span>' + eff + '</div>'
-    + ctxMeter(a, ceil, soft)
-    + '<div class="led">' + (la == null ? '' : '<span class="lage' + (la > 86400 ? ' old' : la > 21600 ? ' stale' : '')
-      + '" title="STATE.md last edited ' + esc(ago(la)) + ' ago">' + esc(ago(la)) + '</span>')
-    + (a.ledger ? esc(a.ledger) : '<i>no STATE.md headline</i>') + '</div></div>';
+// One chip for both views: the observed model when there is one, else the configured model labelled as
+// such, else "model unknown". State is always spelled out in text, never colour alone.
+function modelChip(a){
+  const m = effModel(a);
+  if(!m.label) return '<span class="mdl none">-</span>';
+  return '<span class="mdl ' + modelFamily({model_label: m.label}) + (m.run ? ' run' : '') + '" title="'
+    + esc(m.title) + '">' + esc(m.label) + '</span>'
+    + (m.state === 'stale' ? '<span class="mst stale" title="' + esc(m.title) + '">stale</span>' : '');
+}
+// Context bar scaled to the agent's ceiling; the tick is its clear floor. Unknown/stale readings say so in
+// words instead of drawing a bar (a percent is never multiplied into a fake token count).
+function ctxMeter(a){
+  const t = a.ctx_tokens, soft = a.context_floor, ceil = a.context_ceiling || a.context_window;
+  if(t == null) return '<div class="meter none" title="No token count reported">'
+    + esc(a.context_pct == null ? '-' : a.context_pct + '%') + '</div>';
+  if(a.context_state !== 'ok' || ceil == null)
+    return '<div class="meter none" title="' + esc(a.context_state === 'stale' ? 'Last reading is old' : 'No limit known') + '">'
+      + esc(kTok(t) + (a.context_state === 'stale' ? ' (old)' : '')) + '</div>';
+  const heat = t >= ceil ? 'hot' : soft != null && t >= soft ? 'warm' : '';
+  const pos = v => (Math.min(v, ceil) / ceil * 100).toFixed(1) + '%';
+  return '<div class="meter" title="' + esc(fmtNum(t)) + ' tokens in context (' + esc(a.context_pct)
+      + '% of ' + esc(fmtNum(a.context_window)) + '). Ceiling ' + esc(kTok(ceil))
+      + (soft == null ? '' : ', clear floor ' + esc(kTok(soft))) + '.">'
+    + '<span class="track"><span class="fill ' + heat + '" style="width:' + pos(t) + '"></span>'
+    + (soft == null ? '' : '<span class="tick" style="left:' + pos(soft) + '"></span>') + '</span>'
+    + '<span class="mval ' + heat + '">' + esc(kTok(t) + ' of ' + kTok(ceil)) + '</span></div>';
 }
 // Supervisor trouble sorts with the down agents (bad) or just after them (warn)
 function rank(a){
   const f = a.flags || [];
   return a.alive === false || f.some(x => x.sev === 'bad') ? 0 : f.length ? 1 : 2;
 }
-// Tower: why an agent needs a human now -> {sev, head, why} or null. Order = most urgent first.
-function needWhy(a, ceil){
+// Why an agent needs a human now -> {sev, head, why} or null. Order = most urgent first.
+function needWhy(a){
+  const ceil = a.context_ceiling;
   if(a.stood_down) return null;
   const bad = (a.flags || []).filter(x => x.sev === 'bad');
   if(a.alive === false) return {sev: 'bad', head: 'Down', why: bad.length ? bad.map(x => x.t).join('; ')
     : 'Pane gone and the supervisor has not brought it back.'};
   if(bad.length) return {sev: 'bad', head: bad[0].t, why: bad.slice(1).map(x => x.t).join('; ')};
-  if(a.ctx_tokens >= ceil) return {sev: 'bad', head: 'Over the ceiling at ' + kTok(a.ctx_tokens),
+  if(a.context_state === 'ok' && a.ctx_tokens != null && ceil != null && a.ctx_tokens >= ceil)
+    return {sev: 'bad', head: 'Over the ceiling at ' + kTok(a.ctx_tokens),
     why: kTok(a.ctx_tokens - ceil) + ' past the ' + kTok(ceil) + ' ceiling. Must clear at its next clean seam.'};
   if(a.silent) return {sev: 'warn', head: 'Silent for ' + ago(a.busy_age),
     why: 'Busy for ' + ago(a.busy_age) + ' but STATE.md/TASKS.md ' + (a.ledger_age == null ? 'are unreadable'
       : 'last moved ' + ago(a.ledger_age) + ' ago') + '. Possible wedge or permission prompt.'};
   return null;
 }
+// Status column: [icon, word]. Supervisor flags and needWhy() win over the busy/idle reading.
+function agentStatus(a){
+  if(a.stood_down) return ['off', 'Stood down'];
+  const n = needWhy(a), warn = (a.flags || [])[0];
+  if(n) return [n.sev === 'bad' ? 'block' : 'wait', n.head];
+  if(warn) return ['wait', warn.t];
+  if(a.busy === true) return ['run', a.busy_age == null || a.busy_age < 60 ? 'Working' : 'Working, ' + ago(a.busy_age)];
+  if(a.busy === false) return ['idle', 'Idle'];
+  if(a.alive === true) return ['run', 'Online'];
+  return ['off', 'Unknown'];   // missing/stale metadata is not evidence that a TFA has no session
+}
 function needCard(a, n){
   const name = String(a.name ?? '?');
-  return '<div class="card need-c ' + n.sev + '"><div class="need-h"><b>' + esc(name) + '</b><span>' + esc(n.head) + '</span></div>'
-    + (n.why ? '<p>' + esc(n.why) + '</p>' : '')
-    + (a.ledger ? '<p class="nl"><i>Last ledger:</i> ' + esc(clip(a.ledger, 140)) + '</p>' : '')
-    + '<div class="need-f">' + ((a.busy === true || a.busy === false) && /^[A-Za-z0-9_.-]+$/.test(name)   // pane verdict + shell-safe name
-      ? '<code class="cmd" title="click to copy">' + esc('tmux attach -t ' + name) + '</code>' : '')
-    + (a.ledger_age == null ? '' : '<span class="when" title="STATE.md/TASKS.md last edited">' + esc('ledger ' + ago(a.ledger_age)) + '</span>')
-    + '</div></div>';
+  return '<div>' + stIcon(n.sev === 'bad' ? 'block' : 'wait') + '<div><div class="h"><b>' + esc(name) + '</b> ' + esc(n.head) + '</div>'
+    + (n.why ? '<div class="s">' + esc(n.why) + '</div>' : '') + '</div>'
+    + '<span class="when" title="STATE.md/TASKS.md last edited">' + esc(a.ledger_age == null ? '' : 'ledger ' + ago(a.ledger_age)) + '</span>'
+    + '<span class="acts">' + ((a.busy === true || a.busy === false) && /^[A-Za-z0-9_.-]+$/.test(name)   // pane verdict + shell-safe name
+      ? '<code class="cmd" tabindex="0" title="click to copy">' + esc('tmux attach -t ' + name) + '</code>' : '') + '</span></div>';
 }
-function runwayRow(a, ceil, soft){
-  const max = ceil * 1.5, t = a.ctx_tokens, heat = t >= ceil ? 'hot' : t >= soft ? 'warm' : '';
-  const pos = v => (Math.min(v, max) / max * 100).toFixed(1) + '%';
-  return '<div class="rw" title="' + esc(fmtNum(t)) + ' tokens"><span class="nm">' + esc(a.name ?? '?') + '</span>'
-    + '<span class="track"><span class="fill ' + heat + '" style="width:' + pos(t) + '"></span>'
-    + '<span class="soft" style="left:' + pos(soft) + '"></span><span class="tick" style="left:' + pos(ceil) + '"></span></span>'
-    + '<span class="mval ' + heat + '">' + esc(kTok(t)) + '</span></div>';
+function agentRow(a){
+  const name = String(a.name ?? '?'), open = fleetOpen.has(name), [k, word] = agentStatus(a), la = a.ledger_age;
+  const eff = EFFORTS.has(a.effort) ? '<span class="mst-l">' + esc(a.effort + ' effort') + '</span>' : '';
+  const now = a.ledger_source === 'now';
+  return '<tr class="ag pick' + (open ? ' open' : '') + '" data-agent="' + esc(name) + '" tabindex="0" aria-expanded="' + open + '">'
+    + '<td><div class="an"><b>' + esc(a.name ?? '?') + '</b><span class="role" title="' + esc(a.role || '') + '">' + esc(
+      [a.agent_type === 'tfa' ? 'Temporary' : '', a.runtime && a.runtime !== 'claude' ? HARNESS[a.runtime] || a.runtime : '', a.role]
+        .filter(Boolean).join(' · ')) + '</span></div></td>'
+    + '<td class="m-end"><span class="stw ' + k + '">' + stIcon(k) + esc(word) + '</span></td>'
+    + '<td class="m-hide"><div class="mdl-c">' + modelChip(a) + eff + '</div></td>'
+    + '<td class="m-sub">' + ctxMeter(a) + '</td>'
+    + '<td class="m-sub"><div class="led' + (a.ledger && !now ? ' old' : '') + '"' + (a.ledger && !now
+      ? ' title="From its notes (STATE.md): this agent has no NOW.md line yet"' : '') + '>' + (a.ledger ? esc(a.ledger) : '<i>-</i>') + '</div></td>'
+    + '<td class="num m-hide"><span class="lage' + (la > 86400 ? ' old' : la > 21600 ? ' stale' : '')
+    + '" title="STATE.md last edited">' + esc(la == null ? '-' : ago(la)) + '</span></td></tr>';
 }
-function workerRow(w){
-  const t = title(w.key);
-  return '<div class="wk-r" title="' + esc(w.key) + '"><span class="t">' + (t.src ? '<i>' + esc(t.src) + ' </i>' : '') + esc(t.name) + '</span>'
-    + '<span class="a">' + esc(w.in_turn ? 'turn ' + ago(w.turn_age) : 'idle') + '</span></div>';
-}
+function fleetSort(a){ return a.stood_down ? 4 : rank(a) === 0 ? 0 : needWhy(a) ? 1 : a.busy === true ? 2 : 3; }
 function paintFleet(f){
   f = f || {error: 'no fleet data in /state'};
-  const ceil = Number(f.ceiling) || 200000, soft = Number(f.soft) || 150000;
-  $('f-mode').innerHTML = MODES.map(m => '<span class="rung' + (m === f.mode ? ' on' : '') + '" style="--mc:'
-    + MODE_CLR[m] + '">' + esc(m) + '</span>').join('')
-    + (f.mode ? '' : '<span class="rung on" style="--mc:var(--red)">' + esc(f.mode_error || 'unknown') + '</span>');
+  $('f-mode').textContent = 'Mode: ' + (f.mode || f.mode_error || 'unknown');
   const rows = Array.isArray(f.agents) ? f.agents : [];
   const act = rows.filter(a => !a.stood_down), bench = rows.filter(a => a.stood_down);
-  act.sort((x, y) => rank(x) - rank(y) || (y.ctx_tokens ?? -1) - (x.ctx_tokens ?? -1) || String(x.name).localeCompare(String(y.name)));
-  const needs = act.map(a => [a, needWhy(a, ceil)]).filter(p => p[1]);
-  const needSet = new Set(needs.map(p => p[0]));
-  const rest = act.filter(a => !needSet.has(a));
-  const fly = rest.filter(a => a.busy === true && a.alive !== false), park = rest.filter(a => !fly.includes(a));
-  const wk = (lastState && Array.isArray(lastState.workers)) ? lastState.workers : [];
-  // Tower headline reads as a sentence: who needs you, then the rest of the board in plain words
-  $('f-head').textContent = !needs.length ? 'All clear' : needs.length === 1 ? '1 agent needs you' : needs.length + ' agents need you';
-  $('f-tally').textContent = (fly.length ? fly.length + ' in flight' : 'None in flight') + ', ' + park.length + ' parked, '
-    + act.length + ' standing. ' + (wk.length ? wk.length + ' eph worker' + (wk.length === 1 ? '' : 's') + ' running' : 'No eph workers running')
-    + (bench.length ? ', ' + bench.length + ' stood down.' : '.');
-  const gen = f.generated_age == null ? '' : f.generated_age < 60 ? 'updated just now'
-    : 'updated ' + ago(f.generated_age) + ' ago';
+  const needs = act.map(a => [a, needWhy(a)]).filter(p => p[1]);
+  const working = act.filter(a => a.busy === true && a.alive !== false);
+  const idle = act.filter(a => a.busy === false && a.alive !== false);
+  const tfas = rows.filter(a => a.agent_type === 'tfa');
+  const standing = rows.filter(a => a.agent_type == null || a.agent_type === 'standing');
+  $('f-strip').innerHTML = cell('Working', working.length, 'agents mid-task') + cell('Idle', idle.length, 'ready for work')
+    + cell('Needs attention', needs.length, needs.length === 1 ? 'agent' : 'agents') + cell('Stood down', bench.length, 'by mode or by hand');
+  const gen = f.generated_age == null ? '' : f.generated_age < 60 ? 'Updated just now' : 'Updated ' + ago(f.generated_age) + ' ago';
   const sup = f.supervisor;   // Only speak up when the supervisor feed exists but is unhealthy
+  $('f-gen').className = 'upd' + (f.stale || f.error ? ' bad' : '');
   $('f-gen').innerHTML = esc(gen) + (f.stale ? ' <span class="pill bad">stale</span>' : '')
     + (sup && sup.error ? ' <span class="pill warn">' + esc(sup.error) + '</span>'
       : sup && sup.stale ? ' <span class="pill warn">supervisor ' + esc(ago(sup.age)) + ' old</span>'
@@ -1217,16 +1568,15 @@ function paintFleet(f){
   $('f-needs-w').hidden = !needs.length;
   $('f-needs-n').textContent = needs.length;
   $('f-needs').innerHTML = needs.map(p => needCard(p[0], p[1])).join('');
-  const grp = (label, list) => list.length ? '<div class="grp">' + esc(label) + '<span>' + esc(list.length) + '</span></div>'
-    + list.map(a => agentRow(a, ceil, soft)).join('') : '';
-  $('f-rows').innerHTML = grp('In flight', fly) + grp('Parked', park);
-  const run = act.filter(a => a.ctx_tokens != null).sort((x, y) => y.ctx_tokens - x.ctx_tokens);
-  $('f-runway-c').hidden = !run.length;
-  $('f-runway-k').textContent = 'reset by ' + kTok(soft) + ', ceiling ' + kTok(ceil);
-  $('f-runway').innerHTML = run.map(a => runwayRow(a, ceil, soft)).join('');
-  $('f-wk').innerHTML = wk.length ? wk.map(workerRow).join('') : '<div class="empty">' + esc('No eph workers running.') + '</div>';
-  $('f-hangar-c').hidden = !bench.length;
-  $('f-hangar').innerHTML = bench.map(a => '<span title="' + esc(a.role || '') + '">' + esc(a.name ?? '?') + '</span>').join('');
+  $('f-n').textContent = rows.length;
+  $('f-seg').innerHTML = segHtml('fleet', fleetFilter, [['all', 'All'], ['standing', 'Standing ' + standing.length],
+    ['tfa', 'Temporary ' + tfas.length]]);
+  const pool = (fleetFilter === 'tfa' ? tfas : fleetFilter === 'standing' ? standing : rows).slice()
+    .sort((x, y) => fleetSort(x) - fleetSort(y) || String(x.name).localeCompare(String(y.name)));
+  const off = pool.filter(a => a.stood_down).length, shown = fleetBench ? pool : pool.filter(a => !a.stood_down);
+  $('f-rows').innerHTML = (shown.length ? shown.map(agentRow).join('') : '<tr><td colspan="6" class="empty">No agents.</td></tr>')
+    + (off ? '<tr class="more"><td colspan="6"><button class="lnk" id="f-bench">' + esc(fleetBench ? 'Hide stood-down agents'
+      : 'Show ' + off + ' stood-down ' + (off === 1 ? 'agent' : 'agents')) + '</button></td></tr>' : '');
 }
 // Tower: click a `tmux attach` chip to copy it (user-select:all is the no-clipboard fallback)
 $('f-needs').addEventListener('click', e => {
@@ -1234,7 +1584,9 @@ $('f-needs').addEventListener('click', e => {
   if(!c || !navigator.clipboard) return;
   navigator.clipboard.writeText(c.textContent).then(() => { c.classList.add('copied'); setTimeout(() => c.classList.remove('copied'), 1200); }, () => {});
 });
+let fleetBench = false;   // stood-down agents are hidden until asked for
 function toggleAgent(e){
+  if(e.type === 'click' && e.target.id === 'f-bench'){ fleetBench = !fleetBench; paintFleet(lastState && lastState.fleet); return; }
   const r = e.target.closest('.ag[data-agent]');
   if(!r || (e.type === 'keydown' && e.key !== 'Enter' && e.key !== ' ')) return;
   if(e.type === 'keydown') e.preventDefault();
@@ -1244,54 +1596,294 @@ function toggleAgent(e){
   r.setAttribute('aria-expanded', open);
 }
 ['f-rows'].forEach(id => { $(id).addEventListener('click', toggleAgent); $(id).addEventListener('keydown', toggleAgent); });
-function showTab(t){
-  $('fleet-view').hidden = t !== 'fleet';
-  $('workers-view').hidden = t === 'fleet';
-  $('tab-fleet').classList.toggle('on', t === 'fleet');
-  document.body.classList.toggle('on-fleet', t === 'fleet');
-  $('tab-workers').classList.toggle('on', t !== 'fleet');
-  try{ localStorage.setItem('eph-tab', t); }catch(e){}
+
+// ---- runs. /state's live[] is the coalescer's ADVERTISED state (a subject waiting on a repository lock still
+// reads open_running); workers[] is real liveness. "Running" is only ever a worker; an admitted subject without
+// one (or one parked on a lock or slot) is "Waiting to start", with the reason in words.
+function tid(key){ const m = /^vikunja:task:(\d+)$/.exec(String(key)); return m ? m[1] : null; }
+const titles = new Map();   // run key -> ticket title, from live workers and recorded history (newest wins)
+function learnTitles(d){
+  for(const h of (d.history || []).slice().reverse()) if(h.title) titles.set(h.key, h.title);
+  for(const w of d.workers) if(w.title) titles.set(w.key, w.title);
 }
-$('tab-workers').onclick = () => showTab('workers');
-$('tab-fleet').onclick = () => showTab('fleet');
-try{ if(localStorage.getItem('eph-tab') === 'fleet') showTab('fleet'); }catch(e){}
+function runName(key, w){
+  const id = tid(key), t = title(key);
+  return {ref: id ? '#' + id : (t.src ? t.src + ' ' : '') + t.name, title: (w && w.title) || titles.get(key) || ''};
+}
+function runLabel(key, w){
+  const r = runName(key, w);
+  return r.title ? '<span class="ref">' + esc(r.ref) + '</span>' + esc(r.title) : esc(r.ref);
+}
+function ticketUrl(key){
+  const id = tid(key), tpl = lastState && lastState.ticket_url;
+  return id && typeof tpl === 'string' && /^https?:\/\//.test(tpl) && tpl.includes('{}') ? tpl.split('{}').join(id) : '';
+}
+// What needs a human decision. Today: the durable journal's own blockers (an ambiguous launch after a restart
+// blocks every new run until someone settles it, and a journal error stops intake).
+function needsYou(d){
+  const dr = d.drain || {}, out = [];
+  if(dr.error) out.push({k: 'block', key: null, head: 'The intake journal reports an error',
+    sub: String(dr.error) + '. New runs cannot start until it is fixed.'});
+  for(const key of dr.recovery_subjects || []) out.push({k: 'block', key: String(key),
+    head: 'Launch outcome unknown after a restart', sub: 'New runs are blocked until you settle this one.'});
+  return out;
+}
+function derive(d){
+  const wk = new Map(d.workers.map(w => [w.key, w])), liveBy = new Map(d.live.map(l => [l.key, l]));
+  const paused = !!(d.drain && d.drain.enabled);
+  const started = new Map();
+  for(const h of d.history || []) if(!started.has(h.key)) started.set(h.key, h.ts);
+  const running = d.workers.filter(w => !(liveBy.get(w.key) || {}).waiting);
+  const waiting = d.live.filter(l => !wk.has(l.key) || l.waiting).map(l => ({key: l.key, route: l.route,
+      why: WAIT_WHY[l.waiting] || (l.waiting ? String(l.waiting) : l.state === 'open_idle' ? 'Idle, no worker attached' : 'Starting up'),
+      group: l.waiting ? WAIT_GROUP[l.waiting] || String(l.waiting) : 'Starting up'}))
+    .concat(d.pending.map(p => ({key: p.key,
+      why: paused ? 'Paused: broker draining' : 'Collecting events, starts in ' + dur(p.spawn_in),
+      group: paused ? 'Paused for drain' : 'Collecting events'})));
+  const queue = new Map((d.queue || []).map(q => [q.key, {...q, movable: !liveBy.has(q.key)}]));
+  for(const p of d.pending) queue.set(p.key, {...(queue.get(p.key) || {}), ...p,
+    movable: !liveBy.has(p.key) || liveBy.get(p.key).state === 'parking'});
+  for(const l of d.live) if(l.waiting === 'concurrency') queue.set(l.key, {...l, kind: 'slot', movable: true});
+  const ordered = [...queue.values()].sort((a, b) => Number(b.key === d.next_subject) - Number(a.key === d.next_subject));
+  return {wk, started, running, waiting, queue: ordered, needs: needsYou(d), drain: d.drain || null,
+          cap: d.concurrency.cap, used: d.concurrency.in_use};
+}
+function allRuns(d, D){
+  const rows = [];
+  for(const w of D.running){
+    const t0 = D.started.get(w.key);
+    rows.push({key: w.key, w, live: true, k: w.in_turn ? 'run' : 'idle', word: w.in_turn ? 'Running' : 'Idle', grp: 'running',
+      model: w.model_label || w.model, started: t0, time: t0 != null ? d.now - t0 : w.turn_age, tokens: w.tokens});
+  }
+  for(const x of D.waiting) rows.push({key: x.key, w: D.wk.get(x.key), k: 'wait', word: 'Waiting', why: x.why, grp: 'waiting', route: x.route});
+  for(const h of previous(d)) rows.push({key: h.key, past: h.session, k: 'off', word: 'Ended', grp: 'finished', started: h.ts,
+    model: h.model, harness: h.harness, tokens: h.tokens, ended: h.ended, time: h.ended != null ? h.ended - h.ts : null});
+  return rows;
+}
+function runCard(r, inView){
+  const w = r.w || {}, nm = runName(r.key, r.w), url = ticketUrl(r.key);
+  const now = lastState ? lastState.now : Date.now() / 1000;
+  // Technical fields (backend, step count, session id) only with "Everything" on
+  const kv = [['Status', r.word + (r.why ? ': ' + r.why : '')], ['Model', w.model_label || w.model || r.model],
+    ['Harness', HARNESS[w.harness || r.harness] || w.harness || r.harness], ['Kind of work', w.route || r.route], ['Turns', w.turns],
+    ['Tokens', w.tokens != null ? kfmt(w.tokens) : r.tokens != null ? kfmt(r.tokens) : null],
+    ['Started', r.started != null ? stamp(r.started) + ' (' + agoT(now - r.started) + ')' : null],
+    ['Ran for', r.ended != null && r.started != null ? dur(r.ended - r.started) : null],
+    ['Last activity', w.last_activity ? agoT(now - w.last_activity) : null]]
+    .concat(showHarness ? [['Backend', w.backend], ['Steps', w.items], ['Session', r.past || w.session]] : [])
+    .filter(p => p[1] !== null && p[1] !== undefined && p[1] !== '');
+  const open = !inView && r.grp !== 'waiting'
+    ? '<button class="btn pri" data-key="' + esc(r.key) + '"' + (r.past ? ' data-past="' + esc(r.past) + '"' : '') + '>'
+      + (r.past ? 'Open transcript' : 'Watch live') + '</button>' : '';
+  const ctl = !can ? '' : r.live ? actBtn('Cancel run', 'cancel', {subject_key: r.key}, {bad: true, done: 'Cancelled ' + nm.ref,
+      confirm: 'Cancel ' + nm.ref + '? The worker stops now and the ticket will not start again on its own.'})
+    : r.grp === 'finished' && tid(r.key) && !(lastState && lastState.live.some(l => l.key === r.key))
+      ? modelPick(r.key) + actBtn('Run again', 'rerun', {task_id: Number(tid(r.key))}, {done: 'Queued ' + nm.ref + ' to run again', pickFor: r.key}) : '';
+  return (inView ? '<h3>Run</h3>' : '<div class="ref">' + esc(nm.ref) + '</div><h3>' + esc(nm.title || nm.ref) + '</h3>')
+    + '<dl class="kv">' + kv.map(([k, v]) => '<dt>' + esc(k) + '</dt><dd>' + esc(v) + '</dd>').join('') + '</dl>'
+    + (open || url || ctl ? '<div class="acts">' + open + (url ? '<a class="btn" href="' + esc(url) + '" target="_blank" rel="noopener">Open ticket</a>' : '') + ctl + '</div>' : '');
+}
+function drainHead(dr, long){
+  const on = !!(dr && dr.enabled), durable = !!(dr && dr.durable);
+  return '<div class="qhead"><div><b>Pause new runs</b><span class="sub">' + esc(!durable
+      ? 'Unavailable: pausing needs the durable intake journal (BROKER_STATE_PATH).'
+      : 'Queued tickets wait here instead of starting.' + (long ? ' Running work is not touched.' : '')) + '</span></div>'
+    + (can && durable ? '<button class="sw qstate" role="switch" aria-checked="' + on + '" aria-label="Pause new runs"'
+        + actAttrs('drain', {enabled: !on}, on ? 'New runs resumed' : 'New runs paused') + '></button>'
+      : '<span class="qstate chip ' + (on ? 'wait' : 'mode') + '">' + (on ? 'On' : 'Off') + '</span>') + '</div>';
+}
+function bars(pairs){
+  const max = Math.max(1, ...pairs.map(p => p[1]));
+  return pairs.length ? pairs.map(([k, n]) => '<div><span>' + esc(k) + '</span><i style="width:' + (n / max * 100).toFixed(0)
+    + '%"></i><span class="num">' + esc(n) + '</span></div>').join('') : '<p class="empty">None.</p>';
+}
+function countBy(xs, f){
+  const m = new Map();
+  for(const x of xs){ const k = f(x); m.set(k, (m.get(k) || 0) + 1); }
+  return [...m].sort((a, b) => b[1] - a[1]);
+}
+
+function needRow(n){
+  const url = n.key ? ticketUrl(n.key) : '';
+  return '<div>' + stIcon(n.k) + '<div><div class="h">' + (n.key ? '<span class="ref">' + esc(runName(n.key).ref) + '</span>' : '')
+    + '<b>' + esc(n.head) + '</b></div><div class="s">' + esc(n.sub) + '</div></div><span></span>'
+    + '<span class="acts' + (can && n.key ? ' keep' : '') + '">' + (can && n.key ? actBtn('Retry', 'reconcile', {subject_key: n.key, decision: 'retry'},
+        {done: 'Retrying ' + runName(n.key).ref,
+        confirm: 'Retry ' + runName(n.key).ref + '? If the last launch did start, this runs it a second time.'})
+      + actBtn('Abandon', 'reconcile', {subject_key: n.key, decision: 'abandon'}, {bad: true, done: 'Abandoned ' + runName(n.key).ref,
+        confirm: 'Abandon ' + runName(n.key).ref + '? It is marked done and will not start again on its own.'}) : '')
+    + (url ? '<a class="btn" href="' + esc(url) + '" target="_blank" rel="noopener">Open ticket</a>' : '') + '</span></div>';
+}
+function runRow(w, D, d){
+  const t0 = D.started.get(w.key), r = runName(w.key, w);
+  return '<tr class="pick" data-key="' + esc(w.key) + '"><td><div class="runc">' + stIcon(w.in_turn ? 'run' : 'idle')
+    + '<div><div class="t">' + esc(r.title || r.ref) + '</div><div class="s2">'
+    + esc([r.title ? r.ref : '', w.in_turn ? 'Running' : 'Idle between turns', w.route].filter(Boolean).join(' · ')) + '</div></div></div></td>'
+    + '<td class="m-sub nw">' + esc(w.model_label || w.model || 'model unknown') + '<div class="s2 dk">' + esc(HARNESS[w.harness] || w.harness || '') + '</div></td>'
+    + '<td class="num m-end">' + esc(dur(t0 != null ? d.now - t0 : w.turn_age)) + '</td>'
+    + '<td class="num m-hide">' + esc(kfmt(w.tokens)) + '</td>'
+    + '<td class="r m-hide"><button class="btn" data-key="' + esc(w.key) + '">Watch</button></td></tr>';
+}
+
+function paint(d){
+  lastState = d;
+  learnTitles(d);
+  const D = lastDerived = derive(d), paused = !!(D.drain && D.drain.enabled);
+  $('dot').className = 'dot';
+  document.querySelectorAll('.upd:not(#f-gen)').forEach(u => { u.textContent = 'Updated ' + clock(d.now); u.classList.remove('bad'); });
+  $('inst').textContent = d.instance || '';
+  $('paused').hidden = !paused;
+  $('foot').textContent = can ? 'Refreshes every 5 seconds. Every action you take here is logged with your name.' : 'Read-only, refreshes every 5 seconds';
+
+  // Now
+  $('n-strip').innerHTML = cell('Running', D.used, D.cap != null ? 'of ' + D.cap + ' slots' : 'workers', pips(D.used, D.cap))
+    + cell('Waiting to start', D.waiting.length, 'behind a lock or limit')
+    + cell('Queued', D.queue.length, paused ? 'held while paused' : 'waiting to dispatch')
+    + cell('Needs you', D.needs.length, D.needs.length === 1 ? 'decision waiting' : 'decisions waiting');
+  $('n-needs-n').textContent = D.needs.length;
+  $('n-needs').innerHTML = D.needs.length ? D.needs.map(needRow).join('') : '<p class="empty">Nothing needs you right now.</p>';
+
+  const free = D.cap == null ? null : Math.max(0, D.cap - D.used);
+  $('n-run-n').textContent = D.cap != null ? D.running.length + ' of ' + D.cap : D.running.length;
+  $('n-run').innerHTML = (D.running.length ? '<table class="tbl"><thead><tr><th>Run</th><th>Model</th><th>Time</th><th>Tokens</th><th></th></tr></thead><tbody>'
+    + D.running.map(w => runRow(w, D, d)).join('') + '</tbody></table>' : '<p class="empty">No workers running.</p>')
+    + (free == null ? '' : '<div class="tfoot">' + esc(free + (free === 1 ? ' slot' : ' slots') + ' free.'
+      + (paused && D.queue.length ? ' New runs are paused, so the queue will not start them.' : '')) + '</div>');
+
+  $('n-q-n').textContent = D.queue.length;
+  $('n-q').innerHTML = drainHead(D.drain, false) + (D.queue.length ? D.queue.slice(0, 3).map(q =>
+    '<div class="qrow"><span class="ref">' + esc(runName(q.key).ref) + '</span><span>' + esc(q.events + (q.events === 1 ? ' event' : ' events')
+      + (q.kind === 'rerun' ? ', rerun' : '')) + '</span><span class="sub">' + esc(agoT(q.arrived_age)) + '</span></div>').join('')
+    + (D.queue.length > 3 ? '<div class="qmore"><a class="lnk" href="#queue">View all ' + esc(D.queue.length) + '</a></div>' : '')
+    : '<p class="empty">Nothing queued.</p>');
+
+  $('n-wait-n').textContent = D.waiting.length;
+  $('n-wait-drain').hidden = !paused;
+  $('n-wait').innerHTML = D.waiting.length ? '<table class="tbl"><thead><tr><th>Run</th><th>Blocked by</th></tr></thead><tbody>'
+    + D.waiting.slice(0, 5).map(x => '<tr><td><div class="runc">' + stIcon('wait') + '<div class="t">' + runLabel(x.key, D.wk.get(x.key))
+      + '</div></div></td><td class="m-sub">' + esc(x.why) + '</td></tr>').join('') + '</tbody></table>'
+    + (D.waiting.length > 5 ? '<div class="tfoot"><a class="lnk" href="#runs" data-filter="waiting">Show all ' + esc(D.waiting.length) + '</a></div>' : '')
+    : '<p class="empty">Nothing waiting.</p>';
+
+  const hs = previous(d);
+  $('h-card').hidden = !d.stream_enabled;
+  $('n-history').textContent = d.history_total ?? hs.length;
+  $('h-list').innerHTML = hs.length ? hs.slice(0, 6).map(h => '<button class="row" data-key="' + esc(h.key) + '" data-past="' + esc(h.session) + '">'
+      + stIcon('off') + '<div><div class="h">' + runLabel(h.key) + '</div><div class="s">' + esc(['Started ' + stamp(h.ts), h.model,
+        h.tokens != null ? kfmt(h.tokens) + ' tokens' : ''].filter(Boolean).join(' · ')) + '</div></div>'
+      + '<span class="when">' + esc(agoT(d.now - h.ts)) + '</span><span></span></button>').join('')
+    + '<div class="qmore"><a class="lnk" href="#runs" data-filter="finished">View history</a></div>'
+    : '<p class="empty">No previous sessions recorded yet.</p>';
+
+  const c = d.counters;
+  $('counters').innerHTML = [
+    ['Deduped events', c.deduped], ['Dedup re-armed', c.dedup_cleared], ['Echoes dropped', c.echo_dropped],
+    ['Allowlist rejected', c.allowlist_rejected], ['Queued intake events', D.drain ? D.drain.queued : null],
+    ['Open subjects (advertised)', d.live.length],
+  ].map(([k, v]) => '<div class="tile"><span>' + esc(k) + '</span><b>' + esc(v == null ? 'n/a' : fmtNum(v)) + '</b></div>').join('');
+
+  paintRuns(d, D);
+  paintQueue(d, D);
+  paintFleet(d.fleet);
+  paintDetail();
+}
+
+function paintRuns(d, D){
+  const all = allRuns(d, D), n = g => all.filter(r => r.grp === g).length;
+  $('r-seg').innerHTML = segHtml('runs', runsFilter, [['all', 'All'], ['running', 'Running ' + n('running')],
+    ['waiting', 'Waiting ' + n('waiting')], ['finished', 'Finished']]);
+  const rows = all.filter(r => (runsFilter === 'all' || r.grp === runsFilter) && (!runsQ
+    || (r.key + ' ' + runName(r.key, r.w).ref + ' ' + ((r.w && r.w.title) || '')).toLowerCase().includes(runsQ)));
+  const sel = rows.find(r => runsSel && r.key === runsSel.key && (r.past || null) === runsSel.past) || rows[0] || null;
+  $('r-rows').innerHTML = rows.length ? rows.map(r => '<tr class="pick' + (r === sel ? ' sel' : '') + '" data-pick="' + esc(r.key) + '"'
+      + (r.past ? ' data-ppast="' + esc(r.past) + '"' : '') + ' data-grp="' + r.grp + '">'
+      + '<td><div class="t">' + runLabel(r.key, r.w) + '</div></td>'
+      + '<td class="m-sub"><span class="stw">' + stIcon(r.k) + esc(r.word) + '</span></td>'
+      + '<td class="m-hide nw">' + esc(r.model || '-') + '</td>'
+      + '<td class="num m-hide">' + esc(r.started != null ? stamp(r.started) : '-') + '</td>'
+      + '<td class="num m-end">' + esc(r.time != null ? dur(r.time) : r.started != null ? agoT(d.now - r.started) : '-') + '</td>'
+      + '<td class="num r m-hide">' + esc(r.tokens != null ? kfmt(r.tokens) : '-') + '</td></tr>').join('')
+    : '<tr><td colspan="6" class="empty">No runs match.</td></tr>';
+  const more = (d.history_total || 0) > (d.history || []).length;
+  $('r-foot').innerHTML = '<span>' + esc('Showing ' + rows.length + ' runs' + (d.stream_enabled ? ', ' + (d.history || []).length + ' of '
+      + (d.history_total || 0) + ' recorded sessions' : '')) + '</span>'
+    + (more ? '<button class="lnk" id="h-more">Load ' + esc(Math.min(HIST_PAGE, d.history_total - d.history.length)) + ' more</button>' : '');
+  if(!picking('r-side')) $('r-side').innerHTML = sel ? runCard(sel, false) : '<p class="sub">Pick a run to see its details.</p>';
+}
+
+function paintQueue(d, D){
+  const paused = !!(D.drain && D.drain.enabled);
+  $('q-drain').innerHTML = drainHead(D.drain, true);
+  $('q-n').textContent = D.queue.length;
+  $('q-sub').textContent = paused ? 'Waiting until new runs resume' + (D.cap ? ', up to ' + D.cap + ' at once.' : '.')
+    : 'Next eligible selection first, then the configured dispatch policy. Running work is not interrupted.';
+  $('q-rows').innerHTML = D.queue.length ? D.queue.slice(0, qLimit).map((q, i) => '<tr><td class="num m-hide">' + (i + 1) + '</td>'
+      + '<td><span class="t">' + runLabel(q.key) + '</span></td>'
+      + '<td class="m-hide">' + esc((title(q.key).src || '-') + (q.kind === 'rerun' ? ' (rerun)' : '')) + '</td>'
+      + '<td class="num m-sub">' + esc(q.events + (q.events === 1 ? ' event' : ' events')) + '</td>'
+      + '<td class="num m-end">' + esc(q.kind === 'slot' ? 'Waiting for slot' : agoT(q.arrived_age)) + '</td>'
+      + '<td>' + (q.key === d.next_subject ? '<span class="tag">Next eligible</span>' : can && q.movable
+        ? actBtn('Move to front', 'move-to-front', {subject_key: q.key}, {done: 'Selected ' + runName(q.key).ref + ' as next eligible'}) : '')
+      + '</td></tr>').join('')
+    : '<tr><td colspan="6" class="empty">Nothing queued.</td></tr>';
+  $('q-foot').hidden = D.queue.length <= qLimit;
+  $('q-foot').innerHTML = '<button class="lnk" id="q-more">Show all ' + esc(D.queue.length) + '</button>';
+  $('q-cap').innerHTML = '<b>Capacity</b><div class="capv"><b>' + esc(D.used) + '</b><span class="sub">'
+    + esc(D.cap != null ? 'of ' + D.cap + ' slots in use' : 'workers running') + '</span></div>' + pips(D.used, D.cap);
+  $('q-wait-n').textContent = D.waiting.length;
+  $('q-wait-drain').hidden = !paused;
+  $('q-wait').innerHTML = bars(countBy(D.waiting, x => x.group));
+  $('q-src').innerHTML = bars(countBy(D.queue, q => title(q.key).src || 'other'));
+}
+
+// ---- views. The hash is the route: #now #runs #queue #fleet, #run/<key>[/<session>] for one run.
+const VIEWS = {now: 'v-now', runs: 'v-runs', queue: 'v-queue', fleet: 'fleet-view', run: 'v-run'};
+function showTab(v){
+  for(const [k, id] of Object.entries(VIEWS)) $(id).hidden = k !== v;
+  const nav = v === 'run' ? 'runs' : v;
+  document.querySelectorAll('[data-view]').forEach(a => a.setAttribute('aria-current', a.dataset.view === nav ? 'page' : 'false'));
+  if(v !== 'run' && selected){ closeStream(); selected = null; selectedPast = null; }
+}
+function route(){
+  const h = location.hash.slice(1), m = /^run\/([^/]+)(?:\/([\w-]{1,64}))?$/.exec(h);
+  if(m){
+    let key = null;
+    try{ key = decodeURIComponent(m[1]); }catch(e){}
+    if(key){ select(key, m[2] || null); return; }
+  }
+  showTab(VIEWS[h] && h !== 'run' ? h : 'now');
+}
+window.addEventListener('hashchange', route);
 
 function paintDetail(){
   if(!selected || !lastState) return;
-  if(selectedPast){   // A previous session: static replay, only what the history recorded
-    const h = (lastState.history || []).find(x => x.key === selected && x.session === selectedPast) || {};
-    $('d-title').textContent = title(selected).name;
-    $('d-key').textContent = selected;
-    $('d-badge').innerHTML = badge('Previous', 'done');
-    $('d-stats').innerHTML = [['Started', h.ts != null ? when(h.ts) : null], ['Session', selectedPast]].map(([k, v]) =>
-      '<div class="stat"><span>' + k + '</span><b>' + esc(v ?? 'n/a') + '</b></div>').join('');
-    return;
-  }
-  const s =sessions(lastState).find(x => x.key === selected) || {key: selected, live: null, worker: null};
-  const w = s.worker || {}, l = s.live || {};
-  $('d-title').textContent = title(selected).name;
-  $('d-key').textContent = selected;
-  $('d-badge').innerHTML = stateBadge(s);
-  const tiles = [
-    ['Turns', w.turns], ['Tokens', w.tokens != null ? fmtNum(w.tokens) : null], ['Forwards', w.forwards ?? l.forwards],
-    ['Events', l.events], ['Buffered', l.buffered], ['Turn age', w.turn_age != null ? age(w.turn_age) : null],
-    ['Expires in', l.expire_in != null ? age(l.expire_in) : null], ['Session', w.session || null],
-  ];
-  $('d-stats').innerHTML = tiles.map(([k, v]) =>
-    '<div class="stat"><span>' + k + '</span><b>' + esc(v ?? 'n/a') + '</b></div>').join('');
+  const d = lastState;
+  const row = allRuns(d, lastDerived).find(r => r.key === selected && (r.past || null) === selectedPast)
+    || {key: selected, past: selectedPast, k: 'off', word: 'Ended', grp: 'finished'};
+  const nm = runName(selected, row.w);
+  $('d-ref').textContent = nm.ref;
+  $('d-title').textContent = nm.title || nm.ref;
+  $('d-badge').innerHTML = selectedPast ? badge('Previous session', 'done')
+    : stateBadge(sessions(d).find(x => x.key === selected) || {key: selected, live: null, worker: null});
+  if(!picking('d-stats')) $('d-stats').innerHTML = runCard(row, true);
+  $('d-msg').hidden = !(can && !selectedPast && d.live.some(l => l.key === selected));
+  const prev = (d.history || []).filter(h => h.key === selected);
+  $('d-prev-w').hidden = prev.length < 2;   // one session is just this run
+  $('d-prev').innerHTML = prev.map(h => '<button class="row" data-key="' + esc(h.key) + '" data-past="' + esc(h.session) + '"'
+    + (h.session === selectedPast ? ' aria-current="true"' : '') + '>' + stIcon(h.session === selectedPast ? 'run' : 'off')
+    + '<div><div class="h">' + esc('Started ' + stamp(h.ts)) + '</div><div class="s">' + esc(agoT(d.now - h.ts)
+      + (showHarness ? ' · session ' + h.session : '')) + '</div></div></button>').join('');
 }
 
 function select(key, past){
   past = past || null;
+  const h = '#run/' + encodeURIComponent(key) + (past ? '/' + past : '');
+  if(location.hash !== h) location.hash = h;   // the hashchange re-enters here and returns below
+  showTab('run');
   if(key === selected && past === selectedPast && es) return;
   selected = key; selectedPast = past;
-  document.querySelectorAll('.sess').forEach(b =>
-    b.classList.toggle('sel', b.dataset.key === key && (b.dataset.past || null) === past));
-  $('d-empty').hidden = true;
-  $('d-main').hidden = false;
   paintDetail();
-  // On the one-column layout the detail card moves to the top of the page (order:-1); go there
-  if(matchMedia('(max-width:900px)').matches) scrollTo({top:0});
+  scrollTo({top: 0});
   if(lastState && lastState.stream_enabled) openStream(key, past);
   else {
     closeStream(); resetLog();
@@ -1302,16 +1894,28 @@ function select(key, past){
 }
 
 // ---- live transcript (only reachable when /state says stream_enabled; the server enforces auth itself).
-// Rendered as a chat/timeline; the raw jsonl is kept in a parallel pane behind the Raw toggle.
-let es = null, rawMode = false, tools = new Map();
+// Rendered as a chat/timeline; bookkeeping records fold away unless "Everything" is on.
+let es = null, tools = new Map();
 function svStatus(t, cls){ $('sv-st').textContent = t; $('sv-st').className = 'conn ' + (cls || ''); }
 function atBottom(b){ return b.scrollTop + b.clientHeight >= b.scrollHeight - 20; }
 function trim(b){ while(b.childNodes.length > 1000) b.removeChild(b.firstChild); }
 
-// These top-level record `type`s are Claude Code harness plumbing, not turns; noisy runs of
-// them get collapsed into one expandable "N harness records" row instead of one <div> each.
-const HARNESS_TYPES = new Set(['attachment', 'atis-latch', 'last-prompt']);
+// Only conversation turns get timeline cards; `system`/`summary` records get a one-line meta row.
+// Every other top-level record `type` is harness bookkeeping (attachments, API request copies, session
+// ownership, cost state, ...). Claude Code adds new ones every few releases, so this is an allowlist:
+// anything unknown folds into the "N harness records" rows, which stay hidden until the Harness toggle.
+// The record's own `type` wins over `message.role`: api-request-blob records carry a copy of a message
+// (role assistant/user) and drawing them as turns duplicated tool cards that never got a result.
+const TURN_TYPES = new Set(['assistant', 'user']);
+const META_TYPES = new Set(['system', 'summary']);
+function recordType(o){ return typeof o.type === 'string' ? o.type : (o.message && o.message.role) || '?'; }
+function recordKind(o){
+  if(!o || typeof o !== 'object') return 'line';
+  const ty = recordType(o);
+  return TURN_TYPES.has(ty) ? 'turn' : META_TYPES.has(ty) ? 'meta' : 'harness';
+}
 let harnessGroup = null;   // the currently-open collapsed <details> run, or null between runs
+let harnessTotal = 0, showHarness = false;
 
 function harnessLabel(o, ty){
   // Generic: a record whose top-level type is T often nests its detail under a same-named key,
@@ -1321,7 +1925,11 @@ function harnessLabel(o, ty){
   const subtype = nested && typeof nested === 'object' && typeof nested.type === 'string' ? nested.type : null;
   return subtype ? ty + ' · ' + subtype : ty;
 }
-function resetLog(){ $('sv-log').innerHTML = ''; $('sv-raw').innerHTML = ''; harnessGroup = null; tools = new Map(); }
+function resetLog(){
+  $('sv-log').innerHTML = ''; harnessGroup = null; codexRun = null; tools = new Map(); root = '';
+  webMsgs = new Map(); webPending = new Set();
+  harnessTotal = 0; $('hr-n').textContent = '0';
+}
 function addHarness(o, ty){
   const log = $('sv-log'), stick = atBottom(log);
   if(!harnessGroup){
@@ -1336,15 +1944,18 @@ function addHarness(o, ty){
   }
   harnessGroup.count++;
   harnessGroup.sum.textContent = harnessGroup.count + ' harness records';   // literal wording
+  $('hr-n').textContent = String(++harnessTotal);
   const div = document.createElement('div');
   div.className = 'ln';
   div.textContent = harnessLabel(o, ty);   // textContent, never innerHTML: record content is untrusted
   // The record's fields sit behind a collapsed per-line toggle as a key/value table, not raw JSON
   const nested = o && o[ty] && typeof o[ty] === 'object' ? o[ty] : o;
-  const more = el('details', 'jd');
-  more.appendChild(el('summary', null, 'details · ' + shape(nested)));
-  more.appendChild(structured(nested));
-  div.appendChild(more);
+  if(nested && typeof nested === 'object' && Object.keys(nested).some(k => k !== 'type')){   // nothing to open otherwise
+    const more = el('details', 'jd');
+    more.appendChild(el('summary', null, 'details · ' + shape(nested)));
+    more.appendChild(structured(nested));
+    div.appendChild(more);
+  }
   harnessGroup.body.appendChild(div);
   trim(log);
   if(stick) log.scrollTop = log.scrollHeight;
@@ -1353,8 +1964,57 @@ function addHarness(o, ty){
 function timeEl(o){
   const t = o && o.timestamp ? new Date(o.timestamp) : null, ok = t && !isNaN(t);
   const e = el('time', 'ts', ok ? t.toLocaleTimeString() : '');
-  if(ok) e.title = t.toLocaleString();
+  if(ok){ e.title = t.toLocaleString(); e._ts = t.getTime(); }   // placeAt() orders by this
   return e;
+}
+// ---- operator messages sent from this page (steer.py records on the same stream). A queued one stays
+// pinned under the newest step; once delivered it moves to the moment the worker read it.
+let webMsgs = new Map(), webPending = new Set();
+function placeAt(node, ms){
+  const log = $('sv-log');
+  node.remove();
+  for(let c = log.lastElementChild; c; c = c.previousElementSibling){
+    const t = c.querySelector('time.ts');
+    if(t && Number.isFinite(t._ts) && t._ts <= ms){ c.after(node); return; }
+  }
+  log.prepend(node);
+}
+function pinPending(){ const log = $('sv-log'); for(const n of webPending) log.appendChild(n); }
+function webMsg(o){
+  const log = $('sv-log'), stick = atBottom(log);
+  let m = webMsgs.get(o.id);
+  if(!m){
+    const ev = el('div', 'ev user you'), meta = el('div', 'ev-meta');
+    meta.appendChild(el('span', 'who', 'You'));
+    const chip = el('span', 'pill');
+    meta.appendChild(chip);
+    const time = timeEl(o);
+    meta.appendChild(time);
+    ev.appendChild(meta);
+    ev.appendChild(el('div', 'md', o.text || ''));   // textContent: the operator's own words, never markup
+    m = {ev, chip, time, state: null};
+    webMsgs.set(o.id, m);
+  }
+  if(o.text && !m.ev.querySelector('.md').textContent) m.ev.querySelector('.md').textContent = o.text;
+  if(o.state === 'delivered'){
+    m.state = 'delivered';
+    m.chip.className = 'pill ok';
+    m.chip.textContent = o.via === 'tool' ? 'Read mid-turn' : 'Read at the start of its next turn';
+    m.time.replaceWith(m.time = timeEl(o));
+    m.ev.classList.remove('pending');
+    webPending.delete(m.ev);
+    const t = new Date(o.timestamp).getTime();
+    if(Number.isFinite(t)) placeAt(m.ev, t); else log.appendChild(m.ev);
+  }else if(m.state !== 'delivered'){
+    m.state = 'queued';
+    m.chip.className = 'pill pend';
+    m.chip.textContent = o.via === 'tool' ? 'Queued: it reads this after its next tool call'
+                                          : 'Queued: it reads this when its current turn ends';
+    m.ev.classList.add('pending');
+    webPending.add(m.ev);
+    log.appendChild(m.ev);
+  }
+  if(stick) log.scrollTop = log.scrollHeight;
 }
 function bubble(role, text, o, err){
   const ev = el('div', 'ev ' + role + (err ? ' err' : ''));
@@ -1364,18 +2024,9 @@ function bubble(role, text, o, err){
   meta.appendChild(timeEl(o));
   ev.appendChild(meta);
   const sj = splitJSON(text);
-  if(sj){   // JSON body -> structured card; the exact original stays one click away (per-message Raw)
-    const view = el('div');
-    if(sj.prose.trim()){ const p = el('div', 'md'); p.innerHTML = md(sj.prose); view.appendChild(p); }
-    view.appendChild(jsonCard(sj.obj, 0));
-    const raw = el('pre', 'tpre', String(text));
-    raw.hidden = true;
-    const btn = el('button', 'btn rawbtn', 'Raw');
-    btn.title = 'show this message exactly as sent';
-    btn.onclick = () => { raw.hidden = !raw.hidden; view.hidden = !raw.hidden; btn.classList.toggle('on', !raw.hidden); };
-    meta.appendChild(btn);
-    ev.appendChild(view);
-    ev.appendChild(raw);
+  if(sj){   // JSON body -> structured card, never the JSON itself
+    if(sj.prose.trim()){ const p = el('div', 'md'); p.innerHTML = md(sj.prose); ev.appendChild(p); }
+    ev.appendChild(jsonCard(sj.obj, 0));
     return ev;
   }
   const body = el('div', 'md');
@@ -1476,7 +2127,7 @@ function argSummary(inp){
 // or md() (escape-first) for prose text blocks, never raw innerHTML.
 const CODE_TOOLS = new Set(['Bash', 'BashOutput', 'Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Grep', 'Glob']);
 function isScalar(v){ return v === null || ['string', 'number', 'boolean'].includes(typeof v); }
-function scalar(v){ return v === null ? 'null' : v === undefined ? '' : String(v); }
+function scalar(v){ return v === null ? '-' : v === undefined ? '' : String(v); }
 function shape(v){
   if(Array.isArray(v)) return v.length + (v.length === 1 ? ' item' : ' items');
   if(v && typeof v === 'object'){ const n = Object.keys(v).length; return n + (n === 1 ? ' field' : ' fields'); }
@@ -1488,11 +2139,22 @@ function clipLines(s, n){
   const l = String(s ?? '').split('\n');
   return l.length > n ? l.slice(0, n).join('\n') + '\n… (' + (l.length - n) + ' more lines)' : l.join('\n');
 }
-function jsonDetails(v, what){   // collapsed by default: the pretty JSON is one click away, never shown up front
+// Deep or oversized values as an indented "key: value" outline: readable, and never JSON syntax on screen.
+function outline(v, ind, out, depth){
+  out = out || []; ind = ind || ''; depth = depth || 0;
+  if(out.length > 400){ if(out[out.length - 1] !== '…') out.push('…'); return out; }
+  const ents = Array.isArray(v) ? v.map((x, i) => [String(i + 1) + '.', x]) : Object.entries(v);
+  if(!ents.length) out.push(ind + '(empty)');
+  for(const [k, x] of ents){
+    if(x && typeof x === 'object' && depth < 8){ out.push(ind + k + (Array.isArray(v) ? '' : ':')); outline(x, ind + '  ', out, depth + 1); }
+    else out.push(ind + k + (Array.isArray(v) ? ' ' : ': ') + (x && typeof x === 'object' ? shape(x) : x === null ? '-' : String(x)).replace(/\s+/g, ' '));
+  }
+  return out;
+}
+function jsonDetails(v, what){   // collapsed by default
   const d = el('details', 'jd');
-  let s; try{ s = JSON.stringify(v, null, 2); }catch(e){ s = String(v); }
   d.appendChild(el('summary', null, 'details · ' + (what || shape(v))));
-  d.appendChild(pre(s));
+  d.appendChild(pre(v && typeof v === 'object' ? outline(v).join('\n') : String(v)));
   return d;
 }
 function kvValue(v, depth){
@@ -1758,7 +2420,7 @@ function addResult(p, o, tl){
   const t = p.tool_use_id && tools.get(p.tool_use_id);
   if(t){   // fold the result into its tool call's card
     t.st.textContent = bad ? 'error' : 'done';
-    t.st.className = 'pill ' + (bad ? 'bad' : 'ok');
+    t.st.className = 'pill ' + (bad ? 'bad' : 'ok done');   // "done" is the norm: hidden, only errors show
     if(bad) t.d.classList.add('err');
     t.body.appendChild(el('div', 'tlabel', bad ? 'Error' : 'Result'));
     const fact = renderResult(t.body, p.content, bad, t.name);
@@ -1776,11 +2438,25 @@ function addResult(p, o, tl){
 }
 function thinkingCard(p, o){
   const txt = String(p.thinking || '');
-  const c = card('think', '✦', 'Thinking', txt ? clip(txt.replace(/\s+/g, ' '), 120) : '(hidden)', o);
+  if(!txt){
+    // Nothing to expand: the harness kept only the signature (Claude Code writes no thinking text unless
+    // its showThinkingSummaries setting is on; redacted_thinking never has any). A plain row, no dropdown.
+    const r = el('div', 'think-empty');
+    r.nothought = true;   // carries nothing: a look-around group continues over it (lastStep)
+    r.appendChild(el('span', 'ticon', '✦'));
+    r.appendChild(el('span', 'tname', 'Thought'));
+    r.title = 'The harness did not record any thinking text for this step';
+    r.appendChild(timeEl(o));
+    return r;
+  }
+  const c = card('think', '✦', 'Thinking', clip(txt.replace(/\s+/g, ' '), 120), o);
   c.s.appendChild(timeEl(o));
-  if(txt){ const b = el('div', 'md'); b.innerHTML = md(txt); c.body.appendChild(b); }
-  else c.body.remove();
+  const b = el('div', 'md'); b.innerHTML = md(txt); c.body.appendChild(b);
   return c.d;
+}
+// A stream that ended leaves no more results coming: a tool call still pending then never got one.
+function settleTools(){
+  for(const t of tools.values()) if(t.st.classList.contains('pend')){ t.st.textContent = 'no result'; t.st.className = 'pill'; }
 }
 function metaRow(label, text, o, err){
   const r = el('div', 'meta-row' + (err ? ' err' : ''));
@@ -1794,12 +2470,27 @@ function renderRecord(o, ty, data){
   if(!o){ tl.appendChild(metaRow('line', data, null, false)); return; }
   const c = (o.message || {}).content;
   const err = !!(o.isApiErrorMessage || o.error || o.level === 'error');
+  if(typeof o.cwd === 'string' && o.cwd.startsWith('/')) root = o.cwd.replace(/\/+$/, '');
   if(ty === 'assistant' || ty === 'user'){
     const parts = typeof c === 'string' ? [{type: 'text', text: c}] : Array.isArray(c) ? c : [];
     for(const p of parts){
       if(!p || typeof p !== 'object') continue;
       if(p.type === 'text'){ if(String(p.text ?? '').trim()) tl.appendChild(bubble(ty, p.text, o, err)); }
-      else if(p.type === 'tool_use') tl.appendChild(toolCard(p, o));
+      else if(p.type === 'tool_use'){
+        const acts = ccExplore(p), d = toolCard(p, o), s = d.firstChild;
+        if(acts){
+          s.querySelector('.tname').textContent = '';
+          s.querySelector('.targs').textContent = actLine(acts);
+          const g = exploreGroup(tl, o); countGroup(g, acts); g.c.body.appendChild(d);
+        }else{
+          if(p.name === 'Bash' && p.input && typeof p.input.command === 'string'){   // same wording as Codex rows
+            const u = unwrapCmd(p.input.command);
+            s.querySelector('.tname').textContent = isTest(u.segs) ? 'Ran tests' : 'Ran';
+            s.querySelector('.targs').textContent = clip(u.text.split('\n')[0], 200);
+          }
+          tl.appendChild(d);
+        }
+      }
       else if(p.type === 'tool_result') addResult(p, o, tl);
       else if(p.type === 'thinking' || p.type === 'redacted_thinking') tl.appendChild(thinkingCard(p, o));
       else {   // Unknown block type -> collapsed card with a field table, not a raw object
@@ -1815,20 +2506,364 @@ function renderRecord(o, ty, data){
   const text = typeof o.content === 'string' ? o.content : (o.summary || o.subtype || '');
   tl.appendChild(metaRow(o.subtype ? ty + ' · ' + o.subtype : ty, text, o, err || /error/i.test(String(o.subtype || ''))));
 }
-function addRaw(data){
-  const box = $('sv-raw'), stick = atBottom(box);
-  box.appendChild(el('div', 'rl', data));
-  trim(box);
-  if(stick) box.scrollTop = box.scrollHeight;
+// ---- Codex progress and steps. Codex events come from adapters/codex.py ({"type":"system","subtype":"codex","content":"<event
+// json>"}): message and thought text, command line + exit code + output tail, per-file diffs, plan items. Commands
+// are unwrapped (`zsh -c '...'`, the gate's `cd <worktree> || exit 1; ` prefix) and classified the way Codex's own
+// TUI does (codex-rs parse_command.rs), so a run of reads, searches, listings and git peeks folds into ONE
+// "Explored" row, Claude Code's Read/Grep/Glob calls included. Edits merge into one "Edited" row with diffs.
+// Steps with no detail (older transcripts) fold into one counted row; started/updated events go under "Everything".
+const CODEX_ITEM = {
+  command_execution: ['⚙', 'Ran a command', n => 'Ran ' + n + ' commands'],
+  file_change: ['✎', 'Edited files', n => 'Edited files ' + n + ' times'],
+  agent_message: ['✉', 'Wrote a message', n => 'Wrote ' + n + ' messages'],
+  reasoning: ['✦', 'Thought', n => 'Thought ' + n + ' times'],
+  web_search: ['⌕', 'Searched the web', n => 'Searched the web ' + n + ' times'],
+  mcp_tool_call: ['⚙', 'Used a tool', n => 'Used tools ' + n + ' times'],
+  todo_list: ['☑', 'Updated its plan', n => 'Updated its plan ' + n + ' times'],
+};
+const CODEX_QUIET = {'thread.started': 'Session started', 'turn.started': 'Turn started',
+  'item.started': 'Step started', 'item.updated': 'Step updated'};
+let codexRun = null;   // the open counted row: {kind, n, name, time}
+let root = '';         // the worker's directory (cd prefix / record cwd): paths under it are shown relative
+function codexEvent(o){
+  const ev = typeof o.content === 'string' ? tryJSON(o.content) : null;
+  return ev && typeof ev === 'object' && typeof ev.type === 'string' ? ev : null;
+}
+function codexItem(t){ return CODEX_ITEM[t] || ['◇', 'Finished a step', n => 'Finished ' + n + ' steps']; }
+function rel(s){
+  s = String(s ?? '');
+  if(root){   // whole path components only: root /w/t never rewrites /w/t2
+    const esc = root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    s = s.replace(new RegExp(esc + '(?:/|(?=[\\s\'"]|$))', 'g'), m => m.endsWith('/') ? '' : '.');
+  }
+  return s.replace(/\/home\/[^\/\s'"]+\//g, '~/');   // outside the worktree: at least drop the home prefix
+}
+// Quote-aware split on ; && || | & -> [{words, start}] (words unquoted; start = offset of the segment's text)
+function shSplit(s){
+  const segs = [];
+  let words = [], w = null, q = '', start = 0, i = 0;
+  const endWord = () => { if(w !== null){ words.push(w); w = null; } };
+  const endSeg = at => { endWord(); if(words.length) segs.push({words, start}); words = []; start = at; };
+  for(; i < s.length; i++){
+    const c = s[i];
+    if(q === "'"){ if(c === "'") q = ''; else w += c; continue; }
+    if(q === '"'){ if(c === '"') q = ''; else if(c === '\\' && i + 1 < s.length){ w += s[++i]; } else w += c; continue; }
+    if(c === "'" || c === '"'){ q = c; w = w ?? ''; continue; }
+    if(c === '\\' && i + 1 < s.length){ w = (w ?? '') + s[++i]; continue; }
+    if(/\s/.test(c)){ endWord(); continue; }
+    if(c === ';' || c === '|' || c === '&'){
+      const two = s.slice(i, i + 2) === '&&' || s.slice(i, i + 2) === '||';
+      if(two) i++;
+      endSeg(i + 1);
+      continue;
+    }
+    w = (w ?? '') + c;
+  }
+  endSeg(s.length);
+  return segs;
+}
+// -> {text: the command as the worker meant it (wrapper and cd prefix gone, paths relative), segs}
+function unwrapCmd(cmd){
+  let c = String(cmd ?? '').trim();
+  const m = c.match(/^(?:\S*\/)?(?:ba|z)?sh\s+-l?c\s+([\s\S]+)$/);
+  if(m){ const w = shSplit(m[1]); if(w.length === 1 && w[0].words.length === 1) c = w[0].words[0]; }
+  let segs = shSplit(c);
+  if(segs.length > 1 && segs[0].words[0] === 'cd' && segs[0].words.length === 2){
+    const dir = segs[0].words[1].replace(/\/+$/, '');
+    if(dir.startsWith('/')) root = dir;   // a relative `cd src` is not the worker's directory
+    segs = segs.slice(segs[1].words.join(' ') === 'exit 1' ? 2 : 1);
+    c = segs.length ? c.slice(segs[0].start).trim() : c;
+  }
+  return {text: rel(c), segs};
+}
+const SEARCH_VALUE_FLAGS = new Set(['-g', '--glob', '-t', '--type', '-T', '--type-not', '-A', '-B', '-C', '-m',
+  '--max-count', '-e', '-f', '--context', '--after-context', '--before-context', '--max-depth', '-d']);
+const HEAD_VALUE_FLAGS = new Set(['-n', '-c', '--lines', '--bytes']);
+function plainArgs(a, valued){   // non-flag arguments, skipping the values of flags that take one
+  const out = [];
+  for(let i = 0; i < a.length; i++){
+    if(a[i] === '--'){ out.push(...a.slice(i + 1)); break; }
+    if(a[i].startsWith('-')){ if(valued.has(a[i])) i++; continue; }
+    out.push(a[i]);
+  }
+  return out;
+}
+const HELPERS = new Set(['wc', 'tr', 'cut', 'sort', 'uniq', 'tee', 'echo', 'true', 'column', 'fmt']);
+const GIT_PEEK = new Set(['status', 'diff', 'log', 'show', 'branch', 'rev-parse', 'blame', 'ls-files', 'grep', 'remote']);
+// One shell segment -> {verb: Read|Search|List|Git, what} | 'skip' (formatting helper) | null (real work)
+function segAction(words, piped){   // piped: not the first part, so it may be reading the previous one's output
+  const cmd = String(words[0] || '').split('/').pop(), args = words.slice(1);
+  const pa = plainArgs(args, cmd === 'head' || cmd === 'tail' ? HEAD_VALUE_FLAGS : SEARCH_VALUE_FLAGS);
+  const q = s => '"' + clip(s, 60) + '"';
+  if(HELPERS.has(cmd)) return 'skip';
+  if(['head', 'tail', 'cat', 'nl', 'less'].includes(cmd) && !pa.length) return 'skip';
+  if(['cat', 'bat', 'less', 'nl', 'head', 'tail'].includes(cmd) && pa.length) return {verb: 'Read', what: pa.map(rel)};
+  if(cmd === 'sed' && args.includes('-n')){   // sed -n '1,80p' file: -n takes no value here
+    const f = args.filter(x => !x.startsWith('-')).slice(1);
+    return f.length ? {verb: 'Read', what: f.map(rel)} : 'skip';
+  }
+  if((cmd === 'rg' || cmd === 'grep' || cmd === 'ag' || cmd === 'ack')){
+    if(args.includes('--files')) return {verb: 'List', what: [rel(pa[0] || '.')]};
+    if(!pa.length || (piped && pa.length === 1)) return 'skip';   // grep on a pipe: a filter, not a search
+    return {verb: 'Search', what: [q(pa[0]) + (pa.length > 1 ? ' in ' + pa.slice(1).map(rel).join(', ') : '')]};
+  }
+  if(['ls', 'tree', 'eza', 'du'].includes(cmd)) return {verb: 'List', what: [rel(pa[0] || '.')]};
+  if(cmd === 'find' || cmd === 'fd'){
+    const n = args.indexOf('-name') >= 0 ? args.indexOf('-name') : args.indexOf('-iname');
+    return n >= 0 ? {verb: 'Search', what: ['files named ' + q(args[n + 1] || '')]} : {verb: 'List', what: [rel(pa[0] || '.')]};
+  }
+  if(cmd === 'git' && GIT_PEEK.has(pa[0])) return {verb: 'Git', what: ['git ' + rel(args.join(' '))]};
+  if(cmd === 'pwd') return 'skip';
+  return null;
+}
+// -> actions[] when every part of the command only looks around, else null (it does real work: its own row)
+function exploreActions(segs){
+  const acts = [];
+  for(const [i, s] of segs.entries()){
+    const a = segAction(s.words, i > 0);
+    if(a === null) return null;
+    if(a !== 'skip') acts.push(a);
+  }
+  return acts.length ? acts : null;
+}
+function isTest(segs){   // judged by the program each part runs, never by its arguments (`git add tests/x.py`)
+  return segs.some(({words: w}) => {
+    const c = String(w[0] || '').split('/').pop(), a = w.slice(1);
+    if(/^(pytest|tox|jest|vitest|nox)$/.test(c) || /test|^check\.sh$/.test(c)) return true;
+    if(/^python[\d.]*$/.test(c)) return a.includes('pytest') || a.includes('unittest') || /(^|\/)test[^/]*\.py$/.test(a[0] || '');
+    if(c === 'go' || c === 'cargo') return a[0] === 'test';
+    if(['npm', 'yarn', 'pnpm', 'bun'].includes(c)) return a[0] === 'test' || (a[0] === 'run' && /test/.test(a[1] || ''));
+    return c === 'make' && /test|check/.test(a[0] || '');
+  });
+}
+function actLine(acts){ return acts.map(a => a.verb === 'Git' ? a.what.join(', ') : a.verb + ' ' + a.what.join(', ')).join(' · '); }
+function lastStep(tl){   // the newest row, ignoring folded bookkeeping and text-less "Thought" rows
+  let n = tl.lastElementChild;
+  while(n && (n.classList.contains('harness') || n.nothought || n.classList.contains('pending'))) n = n.previousElementSibling;
+  if(n && n._grp) for(let x = n.nextElementSibling, nx; x; x = nx){ nx = x.nextElementSibling; if(x.nothought) x.remove(); }
+  return n;
+}
+function stepCard(cls, icon, name, args, o){
+  const c = card(cls, icon, name, args, o);
+  c.ts = timeEl(o);
+  c.s.appendChild(c.ts);
+  return c;
+}
+function retime(c, o){ const t = timeEl(o); c.ts.replaceWith(t); c.ts = t; }
+// The open "Explored" group, reused while it is still the newest row
+function exploreGroup(tl, o){
+  const last = lastStep(tl);
+  if(last && last._grp && last._grp.kind === 'explore'){ retime(last._grp.c, o); return last._grp; }
+  const c = stepCard('grp', '⌕', 'Explored', '', o);
+  c.body.classList.add('steps');
+  const g = {kind: 'explore', c, reads: new Set(), n: {Search: 0, List: 0, Git: 0}, bad: 0};
+  c.d._grp = g;
+  tl.appendChild(c.d);
+  return g;
+}
+function countGroup(g, acts){
+  for(const a of acts){ if(a.verb === 'Read') a.what.forEach(f => g.reads.add(f)); else g.n[a.verb]++; }
+  const p = [], pl = (n, one, many) => n + ' ' + (n === 1 ? one : many);
+  if(g.reads.size) p.push(pl(g.reads.size, 'file', 'files'));
+  if(g.n.Search) p.push(pl(g.n.Search, 'search', 'searches'));
+  if(g.n.List) p.push(pl(g.n.List, 'listing', 'listings'));
+  if(g.n.Git) p.push(pl(g.n.Git, 'git check', 'git checks'));
+  g.c.s.querySelector('.targs').textContent = p.join(', ');
+}
+function outputBlock(body, ev, bad){
+  if(!str(ev.output)) return;
+  const n = ev.output_lines || 0, shown = ev.output.split('\n').length;
+  body.appendChild(tlabel(n > shown ? 'Output (last ' + shown + ' of ' + n + ' lines)' : 'Output'));
+  body.appendChild(pre(ev.output, bad ? 'bad' : ''));
+}
+function str(v){ return typeof v === 'string' && v.trim() !== ''; }
+function codexCommand(tl, ev, o){
+  const {text, segs} = unwrapCmd(ev.command), code = ev.exit_code, bad = Number.isInteger(code) && code !== 0;
+  const acts = exploreActions(segs);
+  if(acts){
+    const g = exploreGroup(tl, o);
+    countGroup(g, acts);
+    const searchMiss = bad && code === 1 && acts.every(a => a.verb === 'Search');   // rg/grep exit 1 = no match
+    const line = str(ev.output) || bad ? el('details', 'step') : el('div', 'step');
+    const head = line.tagName === 'DETAILS' ? line.appendChild(el('summary')) : line;
+    head.appendChild(el('span', 'sline', actLine(acts)));
+    head.title = text;
+    if(searchMiss) head.appendChild(el('span', 'muted', 'no matches'));
+    else if(bad){ head.appendChild(el('span', 'pill bad', 'exit ' + code)); g.c.d.classList.add('err'); }
+    if(line.tagName === 'DETAILS'){ const b = line.appendChild(el('div', 'tbody')); b.appendChild(pre('$ ' + text)); outputBlock(b, ev, bad && !searchMiss); }
+    g.c.body.appendChild(line);
+    return;
+  }
+  const test = isTest(segs);
+  const c = stepCard(bad ? 'err' : '', test ? (bad ? '✗' : '✓') : '⚙', test ? 'Ran tests' : 'Ran', clip(text.split('\n')[0], 200), o);
+  c.s.querySelector('.targs').title = clip(text, 2000);
+  if(bad) c.s.insertBefore(el('span', 'pill bad', 'exit ' + code), c.ts);
+  else if(test && Number.isInteger(code)) c.s.insertBefore(el('span', 'pill ok', 'passed'), c.ts);
+  c.body.appendChild(pre('$ ' + text));
+  outputBlock(c.body, ev, bad);
+  tl.appendChild(c.d);
+}
+function diffPre(d){
+  const p = el('pre', 'tpre diff');
+  for(const ln of clip(d, 20000).split('\n'))
+    p.appendChild(el('span', ln.startsWith('@@') ? 'hunk' : ln[0] === '+' ? 'add' : ln[0] === '-' ? 'del' : null, ln));
+  return p;
+}
+function plusMinus(a, r){
+  const s = el('span', 'pm');
+  if(a) s.appendChild(el('span', 'pa', '+' + a));
+  if(r) s.appendChild(el('span', 'pr', '−' + r));
+  return s;
+}
+function codexEdit(tl, ev, o){
+  const files = Array.isArray(ev.files) && ev.files.length ? ev.files
+    : (ev.paths || []).map(p => ({path: p, kind: 'update'}));   // transcripts from before diffs were recorded
+  const last = lastStep(tl);
+  let g = last && last._grp && last._grp.kind === 'edit' ? last._grp : null;
+  if(g) retime(g.c, o);
+  else {
+    g = {kind: 'edit', c: stepCard('edit', '✎', 'Edited', '', o), files: new Map(), add: 0, del: 0};
+    g.pm = g.c.s.insertBefore(el('span'), g.c.ts);
+    g.c.d._grp = g;
+    tl.appendChild(g.c.d);
+  }
+  for(const f of files){
+    const name = rel(f.path), verb = f.kind === 'add' ? 'Created ' : f.kind === 'delete' ? 'Deleted ' : '';
+    g.add += f.added || 0; g.del += f.removed || 0;
+    g.files.set(name, (g.files.get(name) || 0) + 1);
+    const fd = el(str(f.diff) ? 'details' : 'div', 'step');
+    const head = fd.tagName === 'DETAILS' ? fd.appendChild(el('summary')) : fd;
+    head.appendChild(el('span', 'sline', verb + name));
+    head.appendChild(plusMinus(f.added, f.removed));
+    if(str(f.diff)) fd.appendChild(diffPre(f.diff));
+    g.c.body.appendChild(fd);
+  }
+  const names = [...g.files.keys()];
+  g.c.s.querySelector('.tname').textContent = names.length > 1 ? 'Edited ' + names.length + ' files' : 'Edited';
+  g.c.s.querySelector('.targs').textContent = names.map(n => n.split('/').pop()).join(', ');
+  g.c.s.querySelector('.targs').title = names.join('\n');
+  g.pm.replaceWith(g.pm = plusMinus(g.add, g.del));
+}
+function thoughtRow(text, o){
+  const t = String(text).trim(), lines = t.split('\n');
+  const head = lines[0].replace(/^\*\*(.*)\*\*$/, '$1'), rest = lines.slice(1).join('\n').trim();
+  if(!rest){
+    const r = el('div', 'think-empty thought');
+    r.appendChild(el('span', 'ticon', '✦'));
+    r.appendChild(el('span', 'ttext', clip(head, 300)));
+    r.appendChild(timeEl(o));
+    return r;
+  }
+  const c = stepCard('think', '✦', clip(head, 140), '', o);
+  const b = el('div', 'md'); b.innerHTML = md(rest); c.body.appendChild(b);
+  return c.d;
+}
+function ccExplore(p){   // a Claude Code tool call that only looks around -> actions for the Explored group
+  const i = p.input && typeof p.input === 'object' ? p.input : {}, s = v => typeof v === 'string' && v;
+  if(p.name === 'Read' && s(i.file_path)) return [{verb: 'Read', what: [rel(i.file_path)]}];
+  if(p.name === 'Grep' && s(i.pattern)) return [{verb: 'Search', what: ['"' + clip(i.pattern, 60) + '"' + (s(i.path) ? ' in ' + rel(i.path) : '')]}];
+  if(p.name === 'Glob' && s(i.pattern)) return [{verb: 'List', what: [rel(i.pattern)]}];
+  if(p.name === 'LS' && s(i.path)) return [{verb: 'List', what: [rel(i.path)]}];
+  if(p.name === 'Bash' && s(i.command)) return exploreActions(unwrapCmd(i.command).segs);
+  return null;
+}
+function codexDetail(o, ev){   // -> true when the step carried detail and got its own row
+  const tl = $('sv-log');
+  const t = ev.item_type;
+  if(t === 'agent_message' && str(ev.text)){ codexRun = null; tl.appendChild(bubble('assistant', ev.text, o)); return true; }
+  if(t === 'reasoning' && str(ev.text)){ codexRun = null; tl.appendChild(thoughtRow(ev.text, o)); return true; }
+  if(t === 'command_execution' && str(ev.command)){ codexRun = null; codexCommand(tl, ev, o); return true; }
+  if(t === 'file_change' && ((Array.isArray(ev.files) && ev.files.length) || (Array.isArray(ev.paths) && ev.paths.length))){
+    codexRun = null; codexEdit(tl, ev, o); return true;
+  }
+  if(t === 'todo_list' && Array.isArray(ev.todo) && ev.todo.length){
+    codexRun = null;
+    const done = ev.todo.filter(i => i.done).length;
+    const c = stepCard('', '☑', 'Plan', done + ' of ' + ev.todo.length + ' done', o);
+    const ul = el('ul', 'todo');
+    for(const i of ev.todo){ const li = el('li', i.done ? 'done' : null, (i.done ? '✓ ' : '○ ') + i.text); ul.appendChild(li); }
+    c.body.appendChild(ul);
+    tl.appendChild(c.d);
+    return true;
+  }
+  let label, what;
+  if(t === 'mcp_tool_call' && str(ev.tool)){ label = 'Used'; what = ev.tool; }
+  else if(t === 'web_search' && str(ev.query)){ label = 'Searched the web'; what = ev.query; }
+  else return false;
+  codexRun = null;
+  const r = el('div', 'think-empty cx');
+  r.appendChild(el('span', 'ticon', codexItem(t)[0]));
+  r.appendChild(el('span', 'tname', label));
+  r.appendChild(el('span', 'targs', clip(what, 240)));
+  r.appendChild(timeEl(o));
+  tl.appendChild(r);
+  return true;
+}
+function codexRecord(o, ev){
+  const tl = $('sv-log');
+  if(CODEX_QUIET[ev.type]){
+    const what = CODEX_QUIET[ev.type] + (ev.item_type ? ': ' + codexItem(ev.item_type)[1].toLowerCase() : '');
+    addHarness({type: 'codex', codex: {type: what}}, 'codex');
+    return;
+  }
+  harnessGroup = null;
+  if(ev.type === 'item.completed' && codexDetail(o, ev)) return;
+  if(ev.type === 'item.completed'){
+    const kind = String(ev.item_type || '');
+    if(codexRun && codexRun.kind === kind && codexRun.row.isConnected){   // folded bookkeeping rows don't break a run
+      codexRun.n++;
+      codexRun.name.textContent = codexItem(kind)[2](codexRun.n);
+      codexRun.time.replaceWith(codexRun.time = timeEl(o));
+      return;
+    }
+    const [icon, label] = codexItem(kind), r = el('div', 'think-empty cx');
+    r.appendChild(el('span', 'ticon', icon));
+    const name = el('span', 'tname', label);
+    r.appendChild(name);
+    const time = timeEl(o);
+    r.appendChild(time);
+    tl.appendChild(r);
+    codexRun = {kind, n: 1, name, time, row: r};
+    return;
+  }
+  codexRun = null;
+  if(ev.type === 'turn.completed'){
+    const u = ev.usage || {}, bits = ['Turn finished'];
+    if(Number.isFinite(u.input_tokens)) bits.push(kfmt(u.input_tokens) + ' tokens read');
+    if(Number.isFinite(u.output_tokens)) bits.push(kfmt(u.output_tokens) + ' written');
+    const r = el('div', 'cx-turn');
+    r.appendChild(el('span', null, bits.join(' · ')));
+    r.appendChild(timeEl(o));
+    tl.appendChild(r);
+    return;
+  }
+  if(ev.type === 'turn.failed' || ev.type === 'error'){
+    tl.appendChild(metaRow(ev.type === 'error' ? 'Codex error' : 'Turn failed', ev.message || 'No details recorded', o, true));
+    return;
+  }
+  addHarness({type: 'codex', codex: {type: ev.type}}, 'codex');   // an event type this page does not know yet
 }
 function addLine(data){
-  addRaw(data);
   let ty = '?', o = null;
-  try{ o = JSON.parse(data); ty = (o.message && o.message.role) || o.type || '?'; }catch(e){ o = null; }
-  if(o && HARNESS_TYPES.has(ty)){ addHarness(o, ty); return; }
+  try{ o = JSON.parse(data); }catch(e){ o = null; }
+  const kind = recordKind(o);
+  if(o && typeof o === 'object') ty = recordType(o); else o = null;
+  if(o && o.type === 'broker' && o.subtype === 'web_message' && typeof o.id === 'string'){ webMsg(o); return; }
+  const cx = o && o.type === 'system' && o.subtype === 'codex' ? codexEvent(o) : null;
+  if(cx){
+    const log = $('sv-log'), stick = atBottom(log);
+    codexRecord(o, cx);
+    pinPending();
+    trim(log);
+    if(stick) log.scrollTop = log.scrollHeight;
+    return;
+  }
+  if(kind === 'harness'){ addHarness(o, ty); return; }
   harnessGroup = null;   // any non-harness line ends the current collapsed run
+  codexRun = null;
   const log = $('sv-log'), stick = atBottom(log);
   renderRecord(o, ty, data);
+  pinPending();
   trim(log);
   if(stick) log.scrollTop = log.scrollHeight;
 }
@@ -1841,7 +2876,7 @@ function openStream(key, past){
                       : new EventSource('/stream/' + encodeURIComponent(key));
   s.onopen = () => { resetLog(); svStatus(past ? 'loading' : 'live', past ? 'warn' : 'live'); };  // reconnect re-sends the backfill
   s.onmessage = e => addLine(e.data);
-  s.addEventListener('end', () => { svStatus(past ? 'previous session' : 'worker ended', ''); s.close(); if(es === s) es = null; });
+  s.addEventListener('end', () => { svStatus(past ? 'previous session' : 'worker ended', ''); settleTools(); s.close(); if(es === s) es = null; });
   s.onerror = () => {
     if(s.readyState === EventSource.CLOSED){ if(es === s) es = null; explainClose(key, past); }
     else svStatus('reconnecting', 'warn');
@@ -1868,43 +2903,368 @@ async function explainClose(key, past){
   }
   else svStatus('stream closed', '');
 }
-function setRaw(on){
-  rawMode = on;
-  $('sv-log').hidden = on;
-  $('sv-raw').hidden = !on;
-  $('raw').classList.toggle('on', on);
-  const b = on ? $('sv-raw') : $('sv-log');
-  b.scrollTop = b.scrollHeight;
+// ---- actions: POST /actions/<verb> (actions.py). Drawn only when GET /actions says this viewer may act.
+let can = false, settings = null;
+const rerunModel = {};       // subject key -> model picked for "Run again" (survives the 5-second repaint)
+async function loadCan(){
+  try{ const r = await fetch('/actions', {cache:'no-store'}); can = r.ok && (await r.json()).allowed === true; }catch(e){ can = false; }
+  if(can) await loadSettings();
 }
-document.addEventListener('click', e => {
-  const b = e.target.closest('.sess[data-key]');
-  if(b) select(b.dataset.key, b.dataset.past);
-  if(e.target.closest('#h-more')){ histLimit += HIST_PAGE; tick(); }
+async function loadSettings(){
+  try{ const r = await fetch('/actions/settings', {cache:'no-store'}); settings = r.ok ? await r.json() : null; }catch(e){ settings = null; }
+  paintSettings();
+}
+const NATIVE = ['haiku', 'opus', 'sonnet'];
+function opts(list, cur, dflt){
+  return '<option value="">' + esc('Default' + (dflt ? ' (' + dflt + ')' : '')) + '</option>'
+    + list.map(m => '<option' + (m === cur ? ' selected' : '') + '>' + esc(m) + '</option>').join('');
+}
+// An open model menu inside `id` would close under the user on the 5-second repaint: skip that box until it blurs.
+function picking(id){
+  const a = document.activeElement;
+  return !!(a && a.matches('[data-rr]') && $(id).contains(a));
+}
+function modelPick(key){
+  if(!settings) return '';
+  return '<select class="pick-sel' + (rerunModel[key] ? ' set' : '') + '" data-rr="' + esc(key) + '" aria-label="Model for this one run">'
+    + '<option value="">Usual model</option>' + settings.models.map(m => '<option' + (m === rerunModel[key] ? ' selected' : '') + '>'
+    + esc(m) + '</option>').join('') + '</select>';
+}
+function paintSettings(){
+  const s = settings;
+  $('s-w').hidden = !(can && s);
+  if(!can || !s) return;
+  const backends = ['claude'].concat(s.models.filter(m => !NATIVE.includes(m)));
+  const off = s.writable ? '' : ' disabled';
+  $('s-sub').textContent = !s.writable ? 'Read-only: the broker cannot write its routing overrides file, so changes here cannot be saved.'
+    : s.rejected ? 'The routing overrides file on disk is invalid, so the broker is using its last good copy. Fix the file by hand before editing here.'
+    : 'Applies to new runs. Running work keeps the model it started with. Blue outline = changed here; Default puts it back.';
+  $('s-rows').innerHTML = s.rows.map(r => {
+    const sel = (f, list, dflt) => '<select class="pick-sel' + (r.overridden.includes(f) ? ' set' : '') + '"' + off
+      + ' data-set-row="' + esc(r.row) + '" data-field="' + f + '" aria-label="' + esc(r.row + ' ' + (f === 'backend' ? 'backend' : 'model')) + '">'
+      + opts(list, r.overridden.includes(f) ? r[f] : null, dflt) + '</select>';
+    return '<tr><td><div class="t">' + esc(r.row) + '</div></td><td class="m-hide">' + esc(HARNESS[r.adapter] || r.adapter) + '</td>'
+      + '<td data-l="Backend">' + sel('backend', backends, r.default_backend || 'by fleet mode') + '</td>'
+      + '<td data-l="Model">' + sel('model_pin', s.models, r.default_model_pin || 'by fleet mode') + '</td></tr>';
+  }).join('');
+  $('s-caps').innerHTML = s.groups.map(g => '<tr><td><div class="t">' + esc(g.group) + '</div></td><td>'
+    + '<input class="pick-sel num' + (g.overridden ? ' set' : '') + '" type="number" min="0" step="1" inputmode="numeric"' + off
+    + ' data-cap="' + esc(g.group) + '" value="' + esc(g.cap ?? '') + '" placeholder="No cap" aria-label="' + esc('Max at once for ' + g.group) + '">'
+    + (g.overridden ? ' <button class="lnk" data-cap-reset="' + esc(g.group) + '">Default</button>' : '') + '</td></tr>').join('');
+}
+async function saveSetting(body, done){
+  const r = await fetch('/actions/settings', {method: 'POST', cache: 'no-store', body: JSON.stringify(body),
+    headers: {'Content-Type': 'application/json', 'X-Broker-Action': '1'}}).catch(e => null);
+  const j = r ? await r.json().catch(() => ({})) : {};
+  if(r && r.ok && j.settings){ settings = j.settings; toast(done); }
+  else {
+    if(r && (r.status === 403 || r.status === 404)) can = false;
+    toast(j.error || 'Failed: ' + (r ? 'HTTP ' + r.status : 'network error'), true);
+  }
+  paintSettings();
+}
+$('s-rows').addEventListener('change', e => {
+  const t = e.target.closest('[data-set-row]');
+  if(!t) return;
+  const row = t.dataset.setRow, f = t.dataset.field;
+  saveSetting({rows: {[row]: {[f]: t.value || null}}},
+    row + ' ' + (f === 'backend' ? 'backend' : 'model') + ': ' + (t.value || 'back to default') + '. New runs use it.');
 });
-$('raw').onclick = () => setRaw(!rawMode);
-$('sv-x').onclick = () => {
-  closeStream(); selected = null; selectedPast = null;
-  $('d-main').hidden = true; $('d-empty').hidden = false;
-  document.querySelectorAll('.sess.sel').forEach(b => b.classList.remove('sel'));
-};
+$('s-caps').addEventListener('change', e => {
+  const t = e.target.closest('[data-cap]');
+  if(!t) return;
+  const v = t.value.trim();
+  if(v !== '' && !/^\d+$/.test(v)){ toast('Use a whole number, 0 or more', true); paintSettings(); return; }
+  saveSetting({row_concurrency: {[t.dataset.cap]: v === '' ? null : Number(v)}},
+    t.dataset.cap + ': ' + (v === '' ? 'back to default' : 'at most ' + v + ' at once'));
+});
+$('s-caps').addEventListener('click', e => {
+  const b = e.target.closest('[data-cap-reset]');
+  if(b) saveSetting({row_concurrency: {[b.dataset.capReset]: null}}, b.dataset.capReset + ': back to default');
+});
+document.addEventListener('change', e => {
+  const t = e.target.closest('[data-rr]');
+  if(!t) return;
+  if(t.value) rerunModel[t.dataset.rr] = t.value; else delete rerunModel[t.dataset.rr];
+  t.classList.toggle('set', !!t.value);
+});
+function toast(t, bad){
+  const n = $('toast');
+  n.textContent = t; n.className = 'toast' + (bad ? ' bad' : ''); n.hidden = false;
+  clearTimeout(toast.t); toast.t = setTimeout(() => { n.hidden = true; }, bad ? 7000 : 3500);
+}
+function actAttrs(verb, body, done){
+  return ' data-act="' + verb + '" data-body="' + esc(JSON.stringify(body)) + '" data-done="' + esc(done) + '"';
+}
+function actBtn(label, verb, body, o){
+  return '<button class="btn' + (o.bad ? ' bad' : '') + '"' + actAttrs(verb, body, o.done)
+    + (o.confirm ? ' data-confirm="' + esc(o.confirm) + '"' : '') + (o.pickFor ? ' data-model-key="' + esc(o.pickFor) + '"' : '')
+    + '>' + esc(label) + '</button>';
+}
+async function act(verb, body, done){
+  try{
+    const r = await fetch('/actions/' + verb, {method: 'POST', cache: 'no-store', body: JSON.stringify(body),
+      headers: {'Content-Type': 'application/json', 'X-Broker-Action': '1'}});
+    const j = await r.json().catch(() => ({}));
+    if(!r.ok){
+      if(r.status === 403 || r.status === 404){ can = false; paintSettings(); if(lastState) paint(lastState); }
+      toast(j.error || 'Failed: HTTP ' + r.status, true);
+      return false;
+    }
+    toast(done);
+    tick();
+    return true;
+  }catch(e){ toast('Failed: ' + e.message, true); return false; }
+}
+$('d-msg').addEventListener('submit', async e => {
+  e.preventDefault();
+  const t = $('d-msg-t'), text = t.value.trim();
+  if(!text || !selected) return;
+  e.submitter && (e.submitter.disabled = true);
+  if(await act('message', {subject_key: selected, text}, 'Sent. It shows in the conversation until the run reads it.')) t.value = '';
+  e.submitter && (e.submitter.disabled = false);
+});
+$('d-msg-t').addEventListener('keydown', e => {
+  if(e.key === 'Enter' && !e.shiftKey && !e.isComposing){ e.preventDefault(); $('d-msg').requestSubmit(); }
+});
+// ---- end actions
+
+document.addEventListener('click', e => {
+  const a = e.target.closest('[data-act]');
+  if(a){
+    if(!a.dataset.confirm || confirm(a.dataset.confirm)){
+      a.disabled = true;
+      const body = JSON.parse(a.dataset.body), mk = a.dataset.modelKey, pick = mk && rerunModel[mk];
+      if(pick) body.model = pick;
+      act(a.dataset.act, body, pick ? a.dataset.done + ' on ' + pick : a.dataset.done).then(ok => { if(ok && mk) delete rerunModel[mk]; })
+        .finally(() => { a.disabled = false; });
+    }
+    return;
+  }
+  const s = e.target.closest('[data-seg]');
+  if(s){
+    if(s.dataset.seg === 'runs') runsFilter = s.dataset.v; else fleetFilter = s.dataset.v;
+    if(lastState) paint(lastState);
+    return;
+  }
+  const f = e.target.closest('a[data-filter]');
+  if(f) runsFilter = f.dataset.filter;          // the link itself then navigates to #runs
+  const b = e.target.closest('[data-key]');
+  if(b){ select(b.dataset.key, b.dataset.past); return; }
+  // Runs table: a wide screen shows the pick in the side panel, a narrow one opens it (no side panel there)
+  const p = e.target.closest('[data-pick]');
+  if(p){
+    if(matchMedia('(max-width:1100px)').matches && p.dataset.grp !== 'waiting') select(p.dataset.pick, p.dataset.ppast);
+    else { runsSel = {key: p.dataset.pick, past: p.dataset.ppast || null}; paint(lastState); }
+    return;
+  }
+  if(e.target.closest('#h-more')){ histLimit += HIST_PAGE; tick(); }
+  if(e.target.closest('#q-more')){ qLimit = Infinity; paint(lastState); }
+});
+$('r-q').addEventListener('input', e => { runsQ = e.target.value.trim().toLowerCase(); if(lastState) paint(lastState); });
+function setHarness(on){
+  showHarness = on;
+  paintDetail();
+  $('sv-log').classList.toggle('show-harness', on);
+  $('hr').setAttribute('aria-pressed', on);
+  $('cv').setAttribute('aria-pressed', !on);
+}
+$('hr').onclick = () => setHarness(true);
+$('cv').onclick = () => setHarness(false);
 
 async function tick(){
   try{
     const r = await fetch('/state' + (histLimit > HIST_PAGE ? '?hist=' + histLimit : ''), {cache:'no-store'});
     if(!r.ok) throw new Error('HTTP ' + r.status);
     paint(await r.json());
+    if(!booted){ booted = true; route(); }   // a deep link waits for the first state
     $('err').style.display = 'none';
   }catch(e){
     $('dot').className = 'dot bad';
+    document.querySelectorAll('.upd').forEach(u => u.classList.add('bad'));
     $('err').textContent = 'state fetch failed: ' + e.message;
     $('err').style.display = '';
   }
 }
-tick();
+loadCan().then(tick);
 setInterval(tick, 5000);
 </script>
 </body>
 </html>
+"""
+
+
+# Optional module UI is inserted only for authorized modules. With none configured
+# the returned HTML is exactly PAGE, including the original navigation and script.
+def module_page(modules):
+    if not modules:
+        return PAGE
+    config = json.dumps(modules).replace("<", "\\u003c").replace("&", "\\u0026")
+    page = PAGE.replace("function route(){\n", "function route(){\n  if(moduleRoute()) return;\n")
+    page = page.replace("</style>", "@media (max-width:720px){.tabbar{grid-template-columns:repeat("
+                        + str(4 + len(modules)) + ",minmax(64px,1fr));overflow-x:auto}"
+                        + ".tbl td [data-quick-module]{display:inline-flex}}\n</style>")
+    page = page.replace("function toggleAgent(e){\n",
+                        "function toggleAgent(e){\n  if(e.target.closest('[data-quick-module]')) return;\n")
+    page = page.replace("+ '<td><div class=\"an\"><b>' + esc(a.name ?? '?') + '</b><span",
+                        "+ '<td><div class=\"an\"><b>' + esc(a.name ?? '?') + '</b>' + moduleAffordance(name) + '<span")
+    return page.replace("loadCan().then(tick);", MODULE_JS.replace("__MODULE_CONFIG__", config) + "\nloadCan().then(tick);")
+
+
+MODULE_JS = r"""
+// Modules are trusted site-installed code, native DOM, not iframes.
+const viewerModules = __MODULE_CONFIG__;
+const viewerRuntime = new Map();
+let viewerStatus = {}, viewerBusy = false, quickCleanup = null, quickAbort = null, quickName = null, quickStatus = null;
+const quickPanel = el('aside', 'card side');
+quickPanel.hidden = true;
+$('fleet-view').appendChild(quickPanel);
+for(const m of viewerModules){
+  const key = 'module-' + m.name, section = el('section');
+  section.id = 'v-' + key; section.hidden = true;
+  document.querySelector('main').appendChild(section);
+  VIEWS[key] = section.id;
+  for(const nav of [document.querySelector('header nav'), document.querySelector('.tabbar')]){
+    const a = el('a', null, m.label);
+    a.href = '#module/' + m.name; a.dataset.view = key; nav.appendChild(a);
+  }
+  viewerRuntime.set(m.name, {section, index: new Set(), cleanup: null, abort: null, token: null, js: null});
+}
+function viewerContext(m, signal, agentName){
+  return {baseUrl: '/viewer/' + m.name + '/', canAct: can, signal, agentName,
+    openAgent: name => { location.hash = '#module/' + m.name + '/' + encodeURIComponent(name); }};
+}
+function moduleRoute(){
+  const match = /^module\/([a-z][a-z0-9_]*)(?:\/(.*))?$/.exec(location.hash.slice(1));
+  const m = match && viewerModules.find(x => x.name === match[1]);
+  if(!m) return false;
+  showTab('module-' + m.name);
+  renderViewer(m);
+  return true;
+}
+function clearViewer(r){
+  if(r.abort) r.abort.abort();
+  if(typeof r.cleanup === 'function'){ try{ r.cleanup(); }catch(e){} }
+  r.cleanup = null; r.token = null; r.section.replaceChildren();
+}
+function downViewer(m, s, error){
+  const r = viewerRuntime.get(m.name);
+  clearViewer(r);
+  const card = el('div', 'card side');
+  card.appendChild(el('h2', null, 'Agent viewer is down'));
+  card.appendChild(el('p', 'sub', (s.state || 'down') + ' since ' +
+    (s.since ? new Date(s.since * 1000).toLocaleString() : 'unknown') +
+    '. Restarts: ' + (s.restarts || 0)));
+  card.appendChild(el('p', null, error || s.last_error || 'Waiting for the module.'));
+  if(can && m.child){
+    const b = el('button', 'btn', 'Reload');
+    b.onclick = async () => { b.disabled = true; await act('module_reload', {name: m.name}, 'Reload requested'); await pollViewers(); };
+    card.appendChild(b);
+  }
+  r.section.appendChild(card);
+}
+async function viewerCode(m, s){
+  const r = viewerRuntime.get(m.name), version = (s.version || '') + ':' + s.restarts + ':' + s.since;
+  if(r.requestedVersion !== version){
+    r.requestedVersion = version; r.codeVersion = null; r.js = null;
+    r.codeFailures = 0; r.codeRetryAt = 0;
+  }
+  if(r.js) return r.js;
+  if(Date.now() < r.codeRetryAt) throw new Error('Viewer load retry pending.');
+  // Browsers cache failed imports by URL. Each retry needs a fresh URL, with
+  // shared in-flight loads and exponential backoff capped at one minute.
+  r.codeAttempt = (r.codeAttempt || 0) + 1;
+  const pending = import('/viewer/' + m.name + '/ui.js?v=' + encodeURIComponent(version) + '&attempt=' + r.codeAttempt);
+  r.js = pending;
+  try{
+    const js = await pending;
+    if(r.js === pending){ r.codeVersion = version; r.codeFailures = 0; r.codeRetryAt = 0; }
+    return js;
+  }catch(e){
+    if(r.js === pending){
+      r.js = null; r.codeVersion = null; r.codeFailures++;
+      r.codeRetryAt = Date.now() + Math.min(60000, 5000 * 2 ** Math.min(r.codeFailures - 1, 4));
+    }
+    throw e;
+  }
+}
+async function renderViewer(m){
+  const r = viewerRuntime.get(m.name), s = viewerStatus[m.name] || {};
+  if(s.state !== 'up'){ downViewer(m, s); return; }
+  if(r.section.hidden) return;
+  let agentName;
+  try{ agentName = decodeURIComponent(location.hash.split('/').slice(2).join('/')) || null; }catch(e){ agentName = null; }
+  const token = JSON.stringify([s.version, s.restarts, s.since, agentName, can]);
+  if(r.token === token) return;
+  clearViewer(r); r.token = token; r.abort = new AbortController();
+  const abort = r.abort;
+  const content = el('div'); r.section.appendChild(content);
+  try{
+    const js = await viewerCode(m, s);
+    if(abort.signal.aborted) return;
+    const cleanup = await js.mount(content, viewerContext(m, abort.signal, agentName));
+    if(abort.signal.aborted){ if(typeof cleanup === 'function') cleanup(); }
+    else r.cleanup = cleanup;
+  }catch(e){ if(!abort.signal.aborted) downViewer(m, s, 'Could not load viewer: ' + e.message); }
+}
+function moduleAffordance(name){
+  const m = viewerModules.find(m => viewerRuntime.get(m.name).index.has(name));
+  return m ? '<button class="btn" data-quick-module="' + esc(m.name) + '" data-quick-agent="' + esc(name) + '">Quick view</button>' : '';
+}
+function closeQuickViewer(){
+  if(quickAbort) quickAbort.abort();
+  if(typeof quickCleanup === 'function'){ try{ quickCleanup(); }catch(e){} }
+  quickCleanup = null; quickName = null; quickPanel.replaceChildren(); quickPanel.hidden = true;
+}
+$('f-rows').addEventListener('click', async e => {
+  const button = e.target.closest('[data-quick-module]');
+  if(!button) return;
+  const m = viewerModules.find(m => m.name === button.dataset.quickModule), name = button.dataset.quickAgent;
+  closeQuickViewer(); quickAbort = new AbortController(); const abort = quickAbort;
+  quickName = m.name; quickStatus = JSON.stringify(viewerStatus[m.name]);
+  quickPanel.hidden = false;
+  const close = el('button', 'btn', 'Close'); close.onclick = closeQuickViewer;
+  const full = el('a', 'btn', 'Open full view');
+  full.href = '#module/' + m.name + '/' + encodeURIComponent(name);
+  quickPanel.append(close, full);
+  const content = el('div'); quickPanel.appendChild(content);
+  try{
+    const js = await viewerCode(m, viewerStatus[m.name]);
+    if(abort.signal.aborted) return;
+    const cleanup = await js.quickView(content, name, viewerContext(m, abort.signal, name));
+    if(abort.signal.aborted){ if(typeof cleanup === 'function') cleanup(); }
+    else quickCleanup = cleanup;
+  }catch(e){ if(!abort.signal.aborted) content.textContent = 'Quick view unavailable: ' + e.message; }
+});
+async function pollViewers(){
+  if(viewerBusy) return;
+  viewerBusy = true;
+  try{
+    const r = await fetch('/viewer-status', {cache: 'no-store', signal: AbortSignal.timeout(5000)});
+    if(!r.ok) throw new Error('HTTP ' + r.status);
+    viewerStatus = await r.json();
+  }catch(e){ viewerStatus = {}; }
+  if(quickName && quickStatus !== JSON.stringify(viewerStatus[quickName])) closeQuickViewer();
+  await Promise.all(viewerModules.map(async m => {
+    const runtime = viewerRuntime.get(m.name), s = viewerStatus[m.name] || {};
+    runtime.index.clear();
+    renderViewer(m);
+    if(s.state === 'up'){
+      try{
+        const r = await fetch('/viewer/' + m.name + '/fleet-index', {cache: 'no-store', signal: AbortSignal.timeout(5000)});
+        const names = r.ok ? await r.json() : [];
+        if(Array.isArray(names)) runtime.index = new Set(names.filter(n => typeof n === 'string'));
+      }catch(e){}
+    }
+  }));
+  if(lastState) paintFleet(lastState.fleet);
+  viewerBusy = false;
+}
+window.addEventListener('hashchange', () => {
+  closeQuickViewer();
+  for(const r of viewerRuntime.values()) if(r.section.hidden) clearViewer(r);
+});
+pollViewers(); setInterval(pollViewers, 5000);
 """
 
 
@@ -1959,7 +3319,7 @@ def _selftest():
     assert "<!DOCTYPE html>" in PAGE and "/state" in PAGE and "EventSource" in PAGE
     # fleet parsing
     assert model_label("claude-opus-5-5") == "opus 5.5" and model_label("local-vllm") == "local"
-    assert ctx_tokens(13) == 130000 and ctx_tokens("41%") == 410000 and ctx_tokens("x") is None
+    assert context_percent(13) == 13 and context_percent("41%") == 41 and context_percent("x") is None
     assert ledger_excerpt("- _note_") == "note" and hist_param("/state?hist=50") == 50
     assert len(d["history"]) <= HISTORY_PAGE and "history_total" in d
     print("dash selftest: OK")

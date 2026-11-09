@@ -1,5 +1,20 @@
 # Operations
 
+For a planned restart, use the authenticated [durable drain](drain.md): enable it,
+wait on the documented health values while current workers finish, restart with
+the same journal, verify the persisted flag, then disable it. New intake waits
+durably. Queued/pending work may be nonzero during a safe coalesced-worker restart;
+detached TFAs need separate accounting. This workflow requires the drain-capable
+version and configured persistent storage.
+
+If a restart leaves `drain.recovery_required` nonzero (an interrupted worker launch
+was held), dispatch is blocked broker-wide until you settle it with
+`POST /reconcile` (see [drain.md](drain.md#settling-an-interrupted-launch-post-reconcile)).
+A restart is a `one-way door` into that state: the remedy the runbook gives for a
+wedge is exactly what creates it. Note also that `Restart=on-failure` does NOT
+restart the unit after a clean SIGTERM, so killing a stuck broker leaves the unit
+`inactive (dead)` and needing a manual start.
+
 Day-to-day running: where the logs go, what to reload and how, what the dashboard shows, and how to re-run a
 ticket by hand. Installation is in [install.md](install.md).
 
@@ -24,6 +39,9 @@ Most lines start with an upper-case tag, so they're easy to grep for.
 | `TURN-CAP`, `HARD-KILL` | a worker hit its turn cap, or was killed for running too long |
 | `COMMENT-RESPAWN` | a human comment restarted a ticket |
 | `OPS-RERUN` | a `/rerun` request, accepted or refused |
+| `RECONCILE-REQ` | a `/reconcile` request settling an interrupted launch, accepted or refused |
+| `WEB-ACTION` / `WEB-ACTION REJECT` | a dashboard action: who, what, on which run, and the result (or why it was refused) |
+| `WORKER CANCEL` | a run was cancelled from the dashboard |
 | `HMAC-CHECK` | the signature result for a `/event` call, in `log` and `enforce` modes |
 
 Escalations (an unparseable worker result or a refused start, for example) also go to `OPS_HANDLE` through
@@ -85,16 +103,35 @@ the key (`github:owner/repo#45` is `/runs/github:owner%2Frepo%2345`, since a bar
  "completed_at": null}
 ```
 
-`status` is `pending` (collecting a burst before the worker starts), `running` (in a turn), `idle` (warm, waiting
+`status` is `pending` (collecting a burst before the worker starts), `waiting` (queued on a repo lock or
+the global turn cap; `live.waiting` names the reason), `running` (in a turn), `idle` (warm, waiting
 for follow-ups), `closing`, or `completed` (finished and not started again since). `row` is the routing row while
 the subject is pending or live. A subject the broker doesn't know gets a 404 with `status: unknown`, and a key that
 isn't printable ASCII or is over 512 characters gets a 400. `completed` is remembered for the most recent
 subjects only (the same list that stops a closed ticket from starting again), and it survives a restart when
 it's persisted (`COMPLETED_PATH`, or `completed.json` next to `EVENTS_LOG`). Like the dashboard it has no login, so it sits behind the same proxy.
 
-- The Workers tab lists running workers and recent sessions. With `BROKER_STREAM_ENABLED` on, you can open a
-  running worker's live transcript or replay a past one (Claude Code harness only).
-- The Fleet tab is optional and only useful if you also run long-lived agents with their own status file; see
+The dashboard has four views, each at its own URL (`#now`, `#runs`, `#queue`, `#fleet`), and a phone layout
+with a bottom tab bar.
+
+- **Now** leads with what needs you (a launch whose outcome is unknown after a restart, or an intake journal
+  error), then what is running, the queue and whether new runs are paused, what is waiting to start, and recent
+  sessions, named by their ticket title. Broker counters sit behind **Details**; the raw JSON is at `/state`.
+- **Runs** lists running, waiting and finished runs, with search and a details panel. A run opens at
+  `#run/<key>` with its live transcript (needs `BROKER_STREAM_ENABLED`), or a past session's replay. An ended
+  run keeps its title, model, token total and how long it ran.
+  The transcript shows the conversation by default. **Everything** adds the behind-the-scenes steps
+  (session and turn bookkeeping, harness events) and the run's technical fields (backend, step count,
+  session id). Nothing on the page shows raw JSON: structured values render as tables or an indented outline,
+  and a Codex run reads as an activity feed: its messages, each command it ran (a failed one flagged with its
+  exit code), the files it edited, and "Turn finished · 12k tokens read" between turns.
+  **Running** only ever means a real worker. A subject queued on a repo lock or turn slot shows **Waiting** with
+  the reason, and setup before a worker is registered shows **Starting up**. Repo lock scope is
+  [configurable per route](routing-overrides.md).
+- **Queue** shows the durable intake queue (needs `BROKER_STATE_PATH`) in dispatch order, one row per ticket.
+- Set `DASH_INSTANCE_NAME` to label the page (for example `staging`), and `TICKET_URL_TEMPLATE` to an http(s)
+  URL to get **Open ticket** links.
+- **Fleet** is optional and only useful if you also run long-lived agents with their own status file; see
   [configuration.md](configuration.md#the-dashboard).
 
 ## Finding the result of a GitLab issue
@@ -125,7 +162,67 @@ curl -s -X POST 127.0.0.1:8787/rerun \
 The ticket has to be open, readable through `BROKER_MCP_SH`, and routed to a row that supports re-runs (the
 code, general and infrastructure assignee rows, or the `eph:` labels). Otherwise, or if a worker is already
 live or pending on it, the call returns 409 and arms nothing. The note is passed to the new worker along with
-the ticket.
+the ticket. Add `"model": "opus"` (any name a `model:` label accepts) to run just this run on that model; a row that
+pins its model refuses it with 409.
+
+## Settling an interrupted launch (`/reconcile`)
+
+A restart between a committed worker launch and its external effect leaves the launch held in
+`coalescer.recovery`, reported as `drain.recovery_required` / `drain.recovery_subjects`. It is a hard guard:
+while any entry exists, intake, the spawn tick and `/rerun` all refuse, so one ambiguous launch blocks all
+dispatch. `POST /reconcile` is the supported exit (same `X-Broker-Rerun-Token` as `/rerun` and `/drain`).
+
+```sh
+curl -s -X POST 127.0.0.1:8787/reconcile \
+  -H "X-Broker-Rerun-Token: $BROKER_RERUN_TOKEN" \
+  -d '{"subject_key": "vikunja:task:42", "decision": "retry", "note": "no MR opened, safe to retry"}'
+```
+
+Decide from the evidence: `retry` re-arms the retained intent (the launch did not take effect, or you accept
+a duplicate); `abandon` drops it and marks the subject completed so it never re-spawns on its own. An unknown
+subject is 409 and a bad decision is 400; both leave the guard intact. An optional `note` must be a string (a
+non-string is 400 and, being validated before any state moves, leaves recovery untouched). It is a decision,
+never an automatic clear - the durable ambiguous state is deliberate, so nothing here ever duplicates an
+ambiguous prior launch on its own. Full detail in
+[drain.md](drain.md#settling-an-interrupted-launch-post-reconcile).
+
+## Continuing an open MR (fix rounds)
+
+A code or general ticket normally gets a worktree cut from the target branch, and its commits land on a fresh
+feature branch with a new MR. To make a fix round update an MR the broker already opened, add a bare line
+`continue-mr: <branch>` to the ticket description (its own line, parsed like the `repo:` line). The broker then
+cuts the worktree from that branch and pushes the worker's commits back onto it, so the existing MR updates in
+place and no new MR is opened. The push is a plain fast-forward push, never forced: if the branch moved after the
+cut, the push is rejected and `OPS_HANDLE` is alerted. Only branches under `CONTINUE_MR_PREFIXES` (default `eph/`,
+the namespace the broker publishes to) are eligible, and never the MR target branch. Any other branch, or one that
+cannot be fetched, is refused before a worker is spawned, with a comment on the ticket.
+
+## Working from a non-default branch (`base:`)
+
+By default a code or general worktree is cut from the repo's default branch. To start from another branch, for
+example to fix review findings on an open MR's branch or to merge `main` into a release branch, add a bare line
+`base: <branch>` to the ticket description (its own line, parsed like the `repo:` line; a leading `origin/` is
+ignored). The broker fetches that branch from `origin` with an explicit refspec and cuts the worktree from it, and
+the worker's new MR targets that branch instead of the default branch. The default branch's tracking ref
+(`origin/<default>`) is refreshed too, so the worker can merge it. If the branch name is invalid or the branch does
+not exist on the remote, no worker is spawned and the ticket gets a comment. The broker never quietly falls back to
+the default branch. `base:` can be used together with `continue-mr:`: the worktree is cut from the `continue-mr:`
+branch and the commits are pushed back onto it.
+
+Code workers may run `git merge` and `git cherry-pick` on refs that are already in the repo, inside their own
+worktree. They still cannot fetch, pull, push, reset, rebase or check out. The broker's push rules are unchanged:
+it pushes only a fresh feature branch or an eligible `continue-mr:` branch. To resolve a merge conflict, the worker
+edits the files, then runs `git add` and `git commit -m`. Forms of `git merge` that read a file into the commit
+message (`-F` / `--file`) are denied, as is `git merge-file`. Because that deny is a plain pattern, any `git merge`
+command with an uppercase `F` in it is refused, so merge a ref with an `F` in its name by its SHA instead.
+
+## Refreshing the repo catalog
+
+With repo inference on, the repo catalog is cached for `REPO_CATALOG_TTL_S`. `SIGHUP` drops the cached copy, and
+`POST /catalog/refresh` re-lists GitLab right now and returns what was added and removed. It needs the token in
+the variable named by `CATALOG_REFRESH_TOKEN_ENV` (default `BROKER_CATALOG_REFRESH_TOKEN`), sent as
+`X-Broker-Catalog-Refresh-Token`; with the variable unset every call gets a 401. A failed GitLab listing answers
+503 and keeps the previous catalog.
 
 ## Other harnesses and the CD module
 

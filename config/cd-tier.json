@@ -1,4 +1,8 @@
 {
+  "default_full_repos": {
+    "*/portcullis": ["docs/*", "tests/*", "README*"],
+    "*/portcullis-site": ["docs/*", "tests/*", "README*"]
+  },
   "repo_patterns": {
     "*/eph-broker": {
       "engine": [
@@ -21,7 +25,8 @@
         "prompts.py",
         "approved-prompts.json",
         "packaging/*",
-        "workers/*"
+        "workers/*",
+        "docs/oss-export.*"
       ]
     }
   }

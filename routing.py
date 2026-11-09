@@ -7,11 +7,15 @@ ansible`, NOT hard-coded, so a fleet-mode change moves the worker's model too.
 
 Value-free: no secrets. ZBUS_ENV / repo path are references, not credentials.
 """
-import os, re, html, json, subprocess, logging
-from dataclasses import dataclass, field
+import fnmatch, os, re, html, json, subprocess, logging
+from dataclasses import dataclass, field, replace
 
 import provenance
 import site_env  # noqa: F401  load the site overlay before the env reads below
+import cd   # reused by the tiered MR review below for cd._patterns(tier_cfg, repo) - its Full-path glob
+            # CATEGORIES, keyed fresh per call to the MR's own repo/site-config (never its
+            # classify_paths()/DEFAULT_FULL_REPOS logic, a stricter deploy-MERGE-gate axis); no circular
+            # import (cd.py imports gitlab_mr + site_env, never routing).
 
 log = logging.getLogger("eph-broker.routing")
 
@@ -147,6 +151,76 @@ def repo_push_broad_cred_enabled():
     return _flag("REPO_PUSH_BROAD_CRED_ENABLED")
 
 
+# Code rows (and their equivalents on hermes/codex) run CLASSIFIER-JUDGED Bash - the SAME
+# `--permission-mode auto` + hard deny-floor mechanism the general row already uses (see
+# adapters.cc.capability_tool_grant's "code" branch) - instead of being limited to a FIXED test-runner MENU
+# (CODE_REPO_RUNNERS, else "none"/a guessed default). A repo's own declared test command stays a pre-allowed
+# fast path (no judge round-trip); anything else now reaches the classifier instead of being flatly
+# unreachable, which is what left every undeclared repo's code worker unable to run its tests at all.
+# DEFAULT OFF (fix round 7): merging must not flip every native code turn on its own - ops enables it
+# EXPLICITLY (CODE_JUDGED_BASH_ENABLED=1) after deploy, once the residual below is accepted. OFF (the
+# default) restores the old fixed-menu-only, acceptEdits behaviour byte-for-byte (resolve_test_runner's
+# catalog-none / marker-detect ladder is what the off path consults; see resolve_declared_test_runner below
+# for the judged-mode resolver).
+#
+# RECORDED DESIGN RESIDUAL (ops decides on enable; NOT fixed here): every allowed runner executes
+# worker-writable code (a repo's conftest.py, tests/*.sh), so write-then-run is judge-free exec as the broker
+# uid - which can read the broker's env files and git credentials. Turning this flag on is gated on accepting
+# (or separately mitigating) that.
+def code_judged_bash_enabled():
+    return _flag("CODE_JUDGED_BASH_ENABLED", "0")
+
+
+# Portcullis (the PreToolUse Bash adjudicator) for the CODE worker. The code lane has no Bash allow-list: a
+# small hard deny-floor (cc._CODE_ADJUDICATED_DENIED, also enforced actively by a floor-guard hook ordered
+# alongside Portcullis) plus this hook decide every Bash call. Both knobs are deployment
+# config, never hardcoded: CODE_PORTCULLIS_HOOK is the hook's shell command (e.g. "python3 /path/gate-hook.py")
+# and CODE_PORTCULLIS_GATE_DIR is the worker-only gate dir the hook reads via PORTCULLIS_GATE_DIR. The dir
+# must exist and hold BOTH a `mode` file = enforce AND a `full` file = on (enforce alone blocks every call,
+# fail closed; a missing/off/shadow dir would leave the hook inert). Point it at an ephemeral-worker dir,
+# NEVER a standing agent's. Read at call time. Returns (hook_cmd, gate_dir) or None when unset; a half-set
+# pair or an unarmed dir is refused (warned) and the code lane keeps its legacy allow-list grant, so the
+# allow-list is never removed without a live adjudicator in its place.
+def _gate_file(gate, name):
+    try:
+        with open(os.path.join(gate, name), encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+
+def code_portcullis():
+    cmd = os.getenv("CODE_PORTCULLIS_HOOK", "").strip()
+    gate = os.path.expanduser(os.getenv("CODE_PORTCULLIS_GATE_DIR", "").strip())
+    if not cmd and not gate:
+        return None
+    if not cmd or not os.path.isabs(gate):
+        log.warning("CODE_PORTCULLIS_HOOK and an absolute CODE_PORTCULLIS_GATE_DIR must be set together; "
+                    "code workers spawn WITHOUT the Portcullis hook (legacy allow-list grant)")
+        return None
+    if _gate_file(gate, "mode") != "enforce" or _gate_file(gate, "full") != "on":
+        log.warning("CODE_PORTCULLIS_GATE_DIR %s is missing or not armed (needs mode=enforce and full=on); "
+                    "code workers keep the legacy allow-list grant", gate)
+        return None
+    return cmd, gate
+
+
+def resolve_declared_test_runner(repo_path, runner_map=None):
+    """The PRE-ALLOWED (classifier-bypassed) test-runner KEY for a judged-mode code worker: an explicit
+    CODE_REPO_RUNNERS/CODE_REPO_RUNNER_SEEDS map entry for repo_path (e.g. a checked-in `repo-test` /
+    `./run-tests.sh` declaration, or any other reviewed key such as `venv`/`pytest`/`npm`), else None.
+
+    Unlike resolve_test_runner (the legacy/rollback resolver below, still used when
+    code_judged_bash_enabled() is off), this NEVER forces "none" for a repo admitted only by repo inference
+    and NEVER marker-detects a default for an allowlisted repo (that guessing is exactly what produced the
+    wrong runner for venv-dependent / shell-test repos). Under judged mode an UNDECLARED repo simply has no
+    fast-path grant at all: the worker's Bash goes to the classifier instead (capability_tool_grant's judged
+    arm), never a guessed runner. Pure function; runner_map threadable for tests (default: CODE_REPO_RUNNERS,
+    i.e. the merged CODE_REPO_RUNNER_SEEDS + CODE_REPO_RUNNERS env maps)."""
+    runner_map = CODE_REPO_RUNNERS if runner_map is None else runner_map
+    return runner_map.get(repo_path)
+
+
 def repo_infer_rerun_users():
     """Vikunja usernames (besides the ticket's creator) whose comment may re-run a parked ladder (the
     operator). REPO_INFER_RERUN_USERS, comma-separated; "" means the ticket creator only."""
@@ -202,9 +276,9 @@ def comment_respawn_domain(assignees, labels, rows=None):
 # The code worker's test runner is picked PER REPO, not per route. A route-level
 # CODE_TEST_RUNNER=pytest ran system py3.9 pytest against every repo, so a Python repo with deps died on
 # ModuleNotFoundError and shell/JS repos got the wrong runner. Value = a KEY into cc's reviewed runner menu
-# (pytest/npm/go/venv/bash-n/ansible-syntax/none), never a raw command. An unmapped repo uses the route default (unchanged).
-# `venv` = the repo's OWN pre-provisioned `<repo>/.venv` (provisioned out of band; the broker fails the spawn
-# closed with "venv missing at <path>" if absent; it never falls back to system python).
+# (pytest/npm/go/venv/bash-n/bash-n+unittest/ansible-syntax/none), never a raw command. An unmapped repo uses the route default (unchanged).
+# `venv` = the repo's OWN `<repo>/.venv`, provisioned out of band or through CODE_TEST_DEPS_CONFIG.
+# If absent, the worker gets an explicit verification gap; it never falls back to system python.
 # The site's seed map is CODE_REPO_RUNNER_SEEDS (site.env, same `<abs-path>=<key>,...` shape); env
 # CODE_REPO_RUNNERS overrides/extends it per path. With both unset, every repo uses the route default.
 
@@ -229,6 +303,18 @@ def parse_repo_runner_map(raw):
 
 _CODE_REPO_RUNNER_SEEDS = parse_repo_runner_map(os.getenv("CODE_REPO_RUNNER_SEEDS", ""))
 CODE_REPO_RUNNERS = {**_CODE_REPO_RUNNER_SEEDS, **parse_repo_runner_map(os.getenv("CODE_REPO_RUNNERS", ""))}
+
+
+def bad_runner_seed_paths(seeds=None):
+    """The keys of CODE_REPO_RUNNER_SEEDS / CODE_REPO_RUNNERS whose absolute path is NOT an existing
+    directory. Such a seed can never take effect: the worktree cut needs the directory, so the map lookup
+    misses on the repo's real path and resolve_test_runner silently falls through to the route default
+    (2026-10-31 incident: the seed keyed an old checkout path that no longer existed, so the repo's real
+    path resolved to the infra row's `none` and the worker got no test Bash at all). Sibling of
+    site_env.bad_push_hosts(): a warn-only signal, never fatal, because an NFS
+    repo can be momentarily unmounted. `seeds` threadable for tests."""
+    m = CODE_REPO_RUNNERS if seeds is None else seeds
+    return sorted(p for p in m if not os.path.isdir(p))
 
 
 # Repo markers that make an UNMAPPED repo pick its runner by itself. A Python marker wins (so a Python
@@ -320,13 +406,167 @@ def parse_repo_ref(text):
 
 
 _DESCRIPTION_LABEL_RE = re.compile(r'(?i)^\*\*description:\*\*\s*')
+# Fixed fields in vikunja-bridge's get render, not arbitrary Markdown labels in a description.
+_TICKET_FIELD_RE = re.compile(
+    r'(?im)^\*\*(id|title|description|done|done_at|due_date|project_id|repeat_after|repeat_mode|'
+    r'priority|start_date|end_date|assignees|labels|hex_color|percent_done|identifier|index|'
+    r'related_tasks|cover_image_attachment_id|is_favorite|created|updated|bucket_id|position|'
+    r'created_by):\*\*[ \t]*')
+
+
+def _ticket_token_text(text):
+    """Routing declarations belong to the ticket's OWN description, not its rendered related tasks.
+
+    Accept bare descriptions too (e.g. issue bodies and the list fallback). Only a blob with both
+    line-start id and description fields is a get envelope; its description ends at the next fixed field.
+    Callers must keep queued comments separate from this input, even when description is the last field.
+    """
+    text = str(text)
+    fields = list(_TICKET_FIELD_RE.finditer(text))
+    if not {"id", "description"} <= {field.group(1).lower() for field in fields}:
+        return text
+    for i, field in enumerate(fields):
+        name = field.group(1).lower()
+        if name == "related_tasks":
+            break
+        if name == "description":
+            end = fields[i + 1].start() if i + 1 < len(fields) else len(text)
+            return text[field.end():end]
+    return ""                       # rendered ticket without an own description declares nothing
 
 
 def _repo_token_values(text):
     """Yield the value of every bare-line `repo:` token in ticket text (see parse_repo_token), in order."""
+    return _line_token_values(text, "repo:")
+
+
+# a fix-round ticket may CONTINUE an MR the broker already opened instead of opening a superseding one.
+# A bare `continue-mr: <branch>` line (same bare-line anchoring + HTML tolerance as `repo:`) makes the code lane
+# cut the worktree from that branch and push the worker's commits back onto it (fast-forward only, never a
+# force-push), so the existing MR updates in place. Only branches under CONTINUE_MR_PREFIXES (colon-separated,
+# default `eph/`, i.e. branches the broker itself created) are eligible; anything else is refused.
+_BRANCH_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
+
+
+def continue_mr_prefixes():
+    """The branch prefixes a `continue-mr:` line may name (env CONTINUE_MR_PREFIXES, colon-separated, read at
+    call time). Default `eph/`. Every prefix must end in `/` so `eph` can never admit `ephemeral-main`; a
+    prefix without one is ignored (fail closed: an empty result admits nothing)."""
+    raw = os.getenv("CONTINUE_MR_PREFIXES", "eph/")
+    return tuple(p.strip() for p in raw.split(":") if p.strip().endswith("/") and len(p.strip()) > 1)
+
+
+def parse_continue_mr(text):
+    """Pure parser: the branch named by the first bare-line `continue-mr:` token in ticket text, else None.
+    The value is its first word with wrapping backticks/quotes/trailing punctuation stripped. Eligibility is
+    NOT checked here (see continue_mr_refusal); a mid-sentence mention never matches."""
+    for val in _line_token_values(text, "continue-mr:"):
+        word = re.sub(r"^[`'\"(]+|[`'\".,;:)]+$", "", (val.split() or [""])[0])
+        if word:
+            return word
+    return None
+
+
+def continue_mr_refusal(branch, target_ref=None):
+    """None when `branch` may be continued, else a human-readable refusal reason. Eligible = a well-formed
+    branch name under one of continue_mr_prefixes() that is not the MR target ref. Fail closed."""
+    prefixes = continue_mr_prefixes()
+    allowed = ", ".join(prefixes) or "(none configured)"
+    if not _valid_branch_name(branch):
+        return f"continue-mr branch {branch!r} is not a valid branch name"
+    if target_ref and branch == target_ref:
+        return f"continue-mr branch {branch!r} is the MR target ref (only broker feature branches can be continued)"
+    if not any(branch.startswith(p) for p in prefixes):
+        return (f"continue-mr branch {branch!r} was not created by the broker (eligible prefixes: {allowed}); "
+                f"only broker-created MR branches can be continued")
+    return None
+
+
+def _valid_branch_name(branch):
+    """True iff `branch` is a conservative, well-formed git branch name (no `..`, `//`, `/.`, no leading `-`,
+    no trailing `/`, `.` or `.lock`). Shared by continue-mr and base."""
+    return bool(branch) and bool(_BRANCH_NAME_RE.fullmatch(branch)) and ".." not in branch \
+        and "//" not in branch and not branch.endswith(("/", ".", ".lock")) and "/." not in branch
+
+
+def mr_iteration_refusal(branch, target_ref=None):
+    """Note iterations may update only broker feature branches, never a target/default ref."""
+    prefix = cd.WORKER_BRANCH_PREFIX
+    if not isinstance(branch, str) or not _valid_branch_name(branch):
+        return "invalid MR iteration branch"
+    if (not prefix or not prefix.endswith("/") or not branch.startswith("eph/")
+            or not branch.startswith(prefix) or branch == target_ref):
+        return "MR iterations require an eph/* broker feature branch, not the target ref"
+    return None
+
+
+def mr_iteration_max():
+    """Invalid limits disable intake rather than admitting an unbounded number of notes."""
+    try:
+        return max(0, int(os.getenv("MR_ITERATION_MAX", "3")))
+    except ValueError:
+        return 0
+
+
+def mr_note_author_allowed(username):
+    authors = {a.strip().lower() for a in os.getenv("MR_NOTE_AUTHOR_ALLOWLIST", "").split(",") if a.strip()}
+    return isinstance(username, str) and username.lower() in authors
+
+
+def mr_note_allowed(evt):
+    """Defense-in-depth for normalized notes, including signed /event callers and stamped subjects."""
+    comment = evt.get("comment")
+    return (evt.get("source") == "mr" and evt.get("event_name") == "mr.note"
+            and mr_note_author_allowed(evt.get("doer"))
+            and mr_iteration_max() > 0
+            and isinstance(evt.get("project"), str) and bool(evt["project"])
+            and type(evt.get("mr_iid")) is int and evt["mr_iid"] > 0
+            and type(evt.get("comment_id")) is int and evt["comment_id"] > 0
+            and isinstance(evt.get("target_ref"), str) and _valid_branch_name(evt["target_ref"])
+            and not mr_iteration_refusal(evt.get("source_branch"), evt.get("target_ref"))
+            and isinstance(evt.get("head_sha"), str) and bool(re.fullmatch(r"[0-9a-fA-F]{40}", evt["head_sha"]))
+            and isinstance(comment, str) and bool(comment.strip())
+            and not re.search(r"<!--\s*broker-run:", comment, re.I))
+
+
+def _mr_note_signal_predicates(_signal):
+    def route_pred(evt):
+        return mr_note_allowed(evt) or ("mr.note" in evt.get("event_names", [])
+                                       and mr_note_author_allowed(evt.get("last_doer"))
+                                       and mr_iteration_max() > 0)
+    return route_pred, mr_note_allowed
+
+
+# A bare `base: <branch>` line (same bare-line anchoring + HTML tolerance as `repo:`) makes the code/general
+# lane cut the worktree from origin/<branch> instead of the repo's default branch, and the worker's MR targets that
+# branch. A branch missing on the remote is refused (no silent fallback to the default branch).
+def parse_base_branch(text):
+    """Pure parser: the branch named by the first bare-line `base:` token in ticket text, else None. The value is
+    its first word with wrapping backticks/quotes/trailing punctuation stripped; a leading `origin/` is dropped
+    (the cut is always from the remote). Validity is NOT checked here (see base_branch_refusal)."""
+    for val in _line_token_values(text, "base:"):
+        word = re.sub(r"^[`'\"(]+|[`'\".,;:)]+$", "", (val.split() or [""])[0])
+        if word.startswith("origin/"):
+            word = word[len("origin/"):]
+        if word.startswith("refs/heads/"):
+            word = word[len("refs/heads/"):]
+        if word:
+            return word
+    return None
+
+
+def base_branch_refusal(branch):
+    """None when `branch` may be used as a `base:` branch, else a human-readable refusal reason. Fail closed."""
+    if not _valid_branch_name(branch):
+        return f"base branch {branch!r} is not a valid branch name"
+    return None
+
+
+def _line_token_values(text, prefix):
+    """Yield the value of every bare-line `<prefix>` token (e.g. `repo:`) in ticket text, in order."""
     if not text:
         return
-    for raw in str(text).splitlines():
+    for raw in _ticket_token_text(text).splitlines():
         # A physical line can hold multiple logical lines AND a leading field label: joined by <br> (with/without
         # attrs), concatenated sibling blocks with no newline (</p><p>, </div>, </li>), or a `**label:** <p>token`
         # prefix. Split on OPENING and closing block tags + <br> so the label and each block separate cleanly.
@@ -337,8 +577,8 @@ def _repo_token_values(text):
             # on one line with no tag to split on, so strip that one leading field label, then anchor as usual
             # (still strictly start-anchored: `**description:** the repo:/x` does NOT route).
             clean = _DESCRIPTION_LABEL_RE.sub('', clean, count=1)
-            if clean.lower().startswith("repo:"):
-                yield clean[len("repo:"):].strip()
+            if clean.lower().startswith(prefix):
+                yield clean[len(prefix):].strip()
 
 
 def resolve_infra_repo(ticket_text, default, allowed_fn):
@@ -396,8 +636,12 @@ ISSUE_REPO_MAP = parse_issue_repo_map(os.getenv("ISSUE_REPO_MAP", ""))
 # open an issue, and its body becomes the worker's task, so an open default is not acceptable. Checked in
 # Router.classify for every forge source, which covers /webhooks/gitlab and a forge-shaped body on /event alike.
 # GitHub and GitLab usernames are case-insensitive, so the list is compared lowercased.
-ISSUE_AUTHOR_ALLOWLIST = set(filter(None, (x.strip().lower()
-                                           for x in os.getenv("ISSUE_AUTHOR_ALLOWLIST", "").split(","))))
+def parse_issue_author_allowlist(raw):
+    """Comma-separated usernames -> set of lowercased, stripped names; blanks dropped. Pure."""
+    return set(filter(None, (x.strip().lower() for x in (raw or "").split(","))))
+
+
+ISSUE_AUTHOR_ALLOWLIST = parse_issue_author_allowlist(os.getenv("ISSUE_AUTHOR_ALLOWLIST", ""))
 
 
 def issue_author_allowed(username, allowlist=None):
@@ -498,8 +742,83 @@ def resolve_model(agent):
     return _NATIVE_FALLBACK_MODEL   # fail-safe cheap, same spirit as the launcher's default
 
 
-# The worker harnesses a Route.adapter may name (adapters/cc.py, adapters/hermes.py). Default "cc".
-ADAPTERS = ("cc", "hermes")
+# The worker harnesses a Route.adapter may name (adapters/cc.py, adapters/hermes.py, adapters/codex.py).
+# Default "cc". Every built-in worker row reads its own <ROW>_ADAPTER knob (default "cc"), see _row_adapter.
+ADAPTERS = ("cc", "hermes", "codex")
+
+# ---- the code lane's browser config validator ------------------------------------------------
+# A worker driving a browser reaches whatever that browser holds, and the allowed browser_evaluate /
+# browser_tabs tools expose it regardless of any tool exclusion. So the config the knob names must describe a
+# FRESH, ISOLATED, LOGGED-OUT browser, never one attached to a human's sessions. Checked at Route load AND at
+# spawn (cc.build_argv): exactly one stdio server keyed `playwright`, launched `--isolated` with
+# `--allowed-origins`, and nothing that attaches to / persists a profile or loads outside config.
+_BROWSER_MCP_SERVER = "playwright"
+_BROWSER_MCP_ALLOWED_KEYS = frozenset({"type", "command", "args", "env"})
+# Launch flags that attach to an existing browser, reuse/persist a profile or session, or pull in config the
+# validator cannot see. Matched on the flag name (before any `=`).
+_BROWSER_MCP_REFUSED_FLAGS = frozenset({
+    "--cdp-endpoint", "--cdp-header", "--user-data-dir", "--storage-state", "--extension", "--config",
+    "--browser-url", "--remote-debugging-port", "--allow-unrestricted-file-access", "--init-script",
+    "--init-page", "--no-isolated",
+})
+
+
+def validate_browser_mcp_config(path):
+    """Raise ValueError unless `path` is an absolute path to an MCP config holding exactly ONE stdio server
+    keyed `playwright`, launched `--isolated` with a non-empty `--allowed-origins`, and none of the refused
+    flags/transports (CDP endpoint, url/http transport, persistent profile, storage state, extension, --config).
+    Fail-closed on a missing/unparseable file. Returns None."""
+    def refuse(why):
+        raise ValueError(f"browser_mcp_config {path!r} refused (fail-closed): {why}")
+    if not isinstance(path, str) or not os.path.isabs(path):
+        refuse("must be an ABSOLUTE path (a relative one would resolve against the worker's worktree)")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError) as e:
+        refuse(f"cannot read/parse the file ({e})")
+    servers = cfg.get("mcpServers") if isinstance(cfg, dict) else None
+    if not isinstance(servers, dict) or set(servers) != {_BROWSER_MCP_SERVER}:
+        refuse(f"mcpServers must contain exactly one server keyed {_BROWSER_MCP_SERVER!r}")
+    srv = servers[_BROWSER_MCP_SERVER]
+    if not isinstance(srv, dict):
+        refuse("the playwright server entry must be an object")
+    extra = set(srv) - _BROWSER_MCP_ALLOWED_KEYS
+    if extra:
+        refuse(f"unsupported server keys {sorted(extra)} (url/http transports and the like are refused)")
+    if srv.get("type", "stdio") != "stdio":
+        refuse(f"transport {srv.get('type')!r} is not stdio")
+    if not isinstance(srv.get("command"), str) or not srv["command"].strip():
+        refuse("a stdio server needs a non-empty `command`")
+    args = srv.get("args", [])
+    if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+        refuse("`args` must be a list of strings")
+    env = srv.get("env", {})
+    if not isinstance(env, dict):
+        refuse("`env` must be an object")
+    bad_env = sorted(k for k in env if str(k).upper().startswith("PLAYWRIGHT_MCP_"))
+    if bad_env:
+        refuse(f"env {bad_env} would override the reviewed launch flags")
+    flags = [a.split("=", 1)[0] for a in args]
+    bad = sorted({f for f in flags if f in _BROWSER_MCP_REFUSED_FLAGS})
+    if bad:
+        refuse(f"flag(s) {bad} attach to or persist a browser session")
+    if "--isolated" not in args:
+        refuse("`--isolated` is required (a fresh in-memory profile, never a persistent one)")
+    origins = None
+    for i, a in enumerate(args):
+        if a.startswith("--allowed-origins="):
+            origins = a.split("=", 1)[1]
+        elif a == "--allowed-origins":
+            origins = args[i + 1] if i + 1 < len(args) else ""
+    if not (origins and origins.strip().strip(";")):
+        refuse("`--allowed-origins` with a non-empty origin list is required")
+
+
+def _row_adapter(name, default="cc"):
+    """A built-in row's harness from its <ROW>_ADAPTER env knob (e.g. CODE_CHANGE_ADAPTER=codex). Unset = `default`
+    ("cc", every row unchanged). An unknown value fails closed in Route.__post_init__ at import."""
+    return os.getenv(name, default).strip() or default
 
 
 def _is_registry_backend(name):
@@ -515,6 +834,29 @@ def _is_registry_backend(name):
         return cc._backend_entry(name) is not None
     except Exception:                      # noqa: BLE001; fail-safe: never break routing on a registry problem
         return False
+
+
+def worker_git_identity(route):
+    """Per-row commit metadata, independent of the host config and push credentials.
+
+    Settings are operator-owned, never derived from ticket text. Use row_key rather than
+    prompt domain so config rows and infra/general have their own identities.
+    """
+    row = getattr(route, "row_key", None) or route.domain
+    slug = re.sub(r"[^a-z0-9]+", "-", row.lower()).strip("-")
+    prefix = slug.replace("-", "_").upper()
+    enabled = os.getenv(f"{prefix}_GIT_IDENTITY_ENABLED", "1").strip().lower()
+    if enabled in ("0", "false", "no", "off"):
+        return {}                       # explicit compatibility opt-out for restrictive push rules
+    if enabled not in ("1", "true", "yes", "on"):
+        raise ValueError(f"{prefix}_GIT_IDENTITY_ENABLED must be a boolean")
+    name = os.getenv(f"{prefix}_GIT_NAME", f"eph-{slug}").strip()
+    email = os.getenv(f"{prefix}_GIT_EMAIL", f"eph-{slug}@noreply.invalid").strip()
+    if (not name or not email or any(c in name + email for c in "\r\n\0<>")
+            or "@" not in email or any(c.isspace() for c in email)):
+        raise ValueError(f"{prefix}_GIT_NAME and {prefix}_GIT_EMAIL must be a nonempty Git identity")
+    return {"GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email,
+            "GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email}
 
 
 @dataclass
@@ -580,8 +922,9 @@ class Route:
     # (_TFA_ROW) is the ONE exception: its model comes from spawn.sh's own registry (agent=""), not
     # resolve_model, so it stays False.
     backend_from_mode: bool = False
-    # The HARNESS this row's worker runs on: "cc" (Claude Code, every existing row) or
-    # "hermes" (adapters/hermes.py: hermes-agent one-shot, same envelope/caps/sinks). Validated at LOAD
+    # The HARNESS this row's worker runs on: "cc" (Claude Code, every existing row),
+    # "hermes" (adapters/hermes.py: hermes-agent one-shot, same envelope/caps/sinks) or "codex" (adapters/codex.py:
+    # the Codex CLI on its own ChatGPT login, `codex exec` per turn under the eph-gate hook). Validated at LOAD
     # (__post_init__): an unknown value raises, so a typo'd row never silently runs on the wrong harness.
     adapter: str = "cc"
     # True when `backend` came from the row's explicit `<ROW>_BACKEND` pin (set by with_model), not from
@@ -604,19 +947,57 @@ class Route:
     # then the site capability's built-in base, so every branch keyed on capability behaves as for the base;
     # cc.build_argv adds the site capability's extra allow/deny rules on top of the base grant. Empty = none.
     site_capability: str = ""
+    # A code route's OPT-IN browser: the path of a playwright MCP config file. Set (non-empty) on a
+    # capability=="code" row, cc.build_argv loads ONLY that server via --strict-mcp-config and adds the
+    # reviewed playwright tool ids (cc._PLAYWRIGHT_TOOLS) to the code grant, so the worker can DRIVE a
+    # browser and return screenshot/console evidence for a UI change. Empty (every existing
+    # row) = no browser, no MCP surface, byte-identical argv. Ignored by every non-code capability (a
+    # read-only grant can never gain a browser id). FAIL-CLOSED: a set-but-missing path refuses the spawn.
+    browser_mcp_config: str = ""
+    # "phases": lock only shared cut/publish/remove operations; "run": single-flight the whole run.
+    # Wiki opts into "run" for its shared publish branch; code/general keep independent edits parallel.
+    repo_lock_scope: str = "phases"
 
     @property
     def row_key(self):
         return self.row_id or self.domain
 
     def __post_init__(self):
+        if self.repo_lock_scope not in ("phases", "run"):
+            raise ValueError(f"Route {self.row_key!r}: repo_lock_scope must be 'phases' or 'run'")
         if self.adapter not in ADAPTERS:
             raise ValueError(f"Route {self.domain!r}: unknown adapter {self.adapter!r} "
                              f"(known: {', '.join(ADAPTERS)}) - refusing (fail-closed)")
+        if self.browser_mcp_config:
+            # Fail at start, not mid-lane: the playwright grant is Claude Code only, and the
+            # config it loads must be an isolated, logged-out, origin-restricted stdio server.
+            if self.adapter != "cc":
+                raise ValueError(f"Route {self.row_key!r}: browser_mcp_config is set but the row runs on the "
+                                 f"{self.adapter!r} harness; the playwright grant is Claude Code only "
+                                 "- refusing (fail-closed)")
+            validate_browser_mcp_config(self.browser_mcp_config)
 
     def with_model(self):
+        from routing_overrides import OVERRIDES
+        self = OVERRIDES.apply(self)
         if self.model_pin:                   # pinned model, no mode lookup
             model, backend = self.model_pin, self.backend
+            # a model_pin pins the MODEL only. If the pin NAMES a spawn-registry backend (e.g.
+            # ROW_MODEL=some-backend), the bare name must be promoted to a backend, never handed to
+            # Claude Code as a literal `--model`, `claude --model sol-astra` fails as a bogus model with no
+            # useful error, so the row would look pin-correct and silently not work. Promoting it routes
+            # through cc.load_backend exactly like an explicit `<ROW>_BACKEND` pin, which is what the pin
+            # always meant. The /capability refusal still runs at spawn, so this cannot smuggle a
+            # backend past the capability refusal.
+            # Scope this to the PROMOTION. Rewriting `model` whenever `backend` is non-empty (the shape
+            # the mode-driven branch below uses) is wrong here: it also fires on a row's PRE-EXISTING
+            # backend, so `model_pin=opus` + `MR_REVIEWER_BACKEND=claude` silently became `claude-sonnet-5`
+            #, the operator asks for opus and gets sonnet. A native pin must survive whatever backend the
+            # row already carries (caught by the independent review). An explicitly-pinned non-native
+            # backend needs no rewrite either: cc._one_turn resolves the backend's own model and that wins.
+            if not backend and _is_registry_backend(model):
+                backend = model
+                model = _NATIVE_FALLBACK_MODEL   # the promoted backend supplies its own model
         else:
             model, backend = resolve_model(self.agent), self.backend
         if self.backend_from_mode and not self.model_pin and (
@@ -632,7 +1013,7 @@ class Route:
                      dict(self.publish), self.mcp_config_dir, self.test_runner, self.setting_sources,
                      self.mcp_config_path, backend, self.backend_from_mode, self.adapter,
                      bool(self.backend) or bool(self.model_pin), self.row_id, self.model_pin,
-                     self.from_config, self.site_capability)
+                     self.from_config, self.site_capability, self.browser_mcp_config, self.repo_lock_scope)
 
 
 # Per-ticket model selection via a `model:<name>` label. The name is either a native
@@ -651,8 +1032,11 @@ NATIVE_MODEL_ALIASES = frozenset({"opus", "sonnet", "haiku"})
 def model_label_trusted_creators():
     """Ticket creators (Vikunja usernames) whose `model:` label may pick a NON-Anthropic backend.
     MODEL_LABEL_TRUSTED_CREATORS, comma-separated (site.env); unset means nobody (fail closed). Read at call time."""
-    return {u.strip().lower() for u in os.getenv("MODEL_LABEL_TRUSTED_CREATORS", "").split(",")
-            if u.strip()}
+    from routing_overrides import OVERRIDES
+    creators = OVERRIDES.reload().get("trusted_creators")
+    if creators is None:
+        creators = os.getenv("MODEL_LABEL_TRUSTED_CREATORS", "").split(",")
+    return {u.strip().lower() for u in creators if u.strip()}
 
 
 # Friendly aliases for a model label, and BARE labels accepted as model names (Vikunja
@@ -721,6 +1105,13 @@ def apply_model_label(route, labels, creator, backend_resolvable):
     if route.backend_pinned:
         log.info("model label %r ignored: row %s backend is pinned to %r", name, route.domain, route.backend)
         return route
+    return apply_model_choice(route, name, trusted, backend_resolvable, creator)
+
+
+def apply_model_choice(route, name, trusted, backend_resolvable, creator=None):
+    """`route` on model `name` (a native alias, `local`, `claude` or a registry backend). The core of
+    apply_model_label, also used for an operator's pick from the dashboard (trusted=True). Ignores the pin;
+    callers check route.backend_pinned first. Raises ValueError (fail-closed) like apply_model_label."""
     if name.lower() in MODEL_LABEL_ALIASES:      # `local` maps to vLLM-Main, before any branch below
         name = MODEL_LABEL_ALIASES[name.lower()]
     low = name.lower()
@@ -740,52 +1131,91 @@ def apply_model_label(route, labels, creator, backend_resolvable):
     return out
 
 
+def model_choice_error(name):
+    """None when `name` is a model an operator may pick for one run (POST /rerun `model`), else why not. Same
+    names a model label accepts; a registry backend is checked against registry metadata only."""
+    from routing_overrides import backend_ok
+    if not isinstance(name, str) or not name.strip():
+        return "model must be a non-empty string"
+    low = name.strip().lower()
+    if low in NATIVE_MODEL_ALIASES or low == "claude" or low in MODEL_LABEL_ALIASES or backend_ok(name.strip()):
+        return None
+    return "model is not a known model or spawn-registry backend"
+
+
+def row_pinned(row_key):
+    """True when the row `row_key` pins its model or backend (env or routing overrides), so a per-run pick
+    would be ignored at spawn. Unknown rows are not pinned."""
+    from routing_overrides import OVERRIDES, templates
+    t = templates().get(row_key)
+    if t is None:
+        return False
+    t = OVERRIDES.apply(t)
+    return bool(t.backend or t.model_pin)
+
+
 # A bare `hermes` ticket label flips ONE ticket's worker onto the hermes harness
 # (adapters/hermes.py). Same trust model as the model label: honoured only for MODEL_LABEL_TRUSTED_CREATORS
 # (ignored + logged otherwise), never on a pinned row. The label may only flip a capability listed in
 # HERMES_LABEL_CAPABILITIES; anything else is a fail-closed spawn REJECT (never a silent cc fallback).
-# ACTIVATION: "general" only, and only because the general row's deny-first gate
-# (eph-gate floors, then unmapped DENY, then the policy judge, then deny-and-report) is merged
-# AND verified live. Never widen without the same: a code lane needs a reviewed CODE_NONCLAUDE_OK
-# posture (separate proposal). A code constant, not env, so widening it is always a reviewed diff.
+# ACTIVATION: "general" first, and only because the general row's deny-first gate
+# (eph-gate floors, then unmapped DENY, then the exec-gate judge, then deny-and-report) is merged
+# AND verified live. "code" is also listed: the code lane's reviewed CODE_NONCLAUDE_OK=1 posture is live on the
+# broker AND the hermes adapter re-checks it at call time (adapters/hermes.py hermes_toolsets), so a `hermes`
+# code ticket runs under the SAME eph-gate posture as general instead of being a fail-closed spawn REJECT.
+# Anything NOT listed stays a fail-closed REJECT; do not widen without a reviewed posture like this one.
+# A code constant, not env, so widening it is always a reviewed diff.
 HERMES_LABEL = "hermes"
-HERMES_LABEL_CAPABILITIES = frozenset({"general"})
+HERMES_LABEL_CAPABILITIES = frozenset({"general", "code"})
 # Hermes workers never get an Anthropic route (no API-credit spend). A native/empty or
 # claude-* backend is a fail-closed REJECT (it used to map to the retired claude-api registry entries); the
 # ticket must choose a non-Anthropic registry backend with a model label (e.g. `model:deepseek`).
+# A bare `codex` label flips ONE ticket's worker onto the Codex harness (adapters/codex.py), under the SAME trust
+# rules as `hermes` (trusted creator, unpinned row, listed capability, no site capability). Codex runs on its own
+# ChatGPT login, so there is no Anthropic-backend check: the harness takes its model from the backend's `codex`
+# block in the spawn registry (or CODEX_BACKEND) and refuses when there is none. Both labels on one ticket refuse.
+CODEX_LABEL = "codex"
+CODEX_LABEL_CAPABILITIES = frozenset({"general", "code"})
+ADAPTER_LABELS = {HERMES_LABEL: HERMES_LABEL_CAPABILITIES, CODEX_LABEL: CODEX_LABEL_CAPABILITIES}
 
 
 def apply_adapter_label(route, labels, creator, capabilities=None):
-    """Return `route` with a ticket's `hermes` label applied (see the block above). Run AFTER
+    """Return `route` with a ticket's harness label (`hermes` or `codex`, see the blocks above) applied. Run AFTER
     apply_model_label (its backend choice is kept when it is a registry backend). No label, untrusted creator,
-    pinned row, or a row already on hermes, returns `route` unchanged. Raises ValueError (fail-closed) when the row's
-    capability is not in `capabilities` (default HERMES_LABEL_CAPABILITIES). Pure; never mutates `route`."""
+    pinned row, or a row already on that harness, returns `route` unchanged. Raises ValueError (fail-closed) when
+    both labels are present, or when the row's capability is not in `capabilities` (default: the label's own
+    ADAPTER_LABELS set). Pure; never mutates `route`."""
     if isinstance(labels, str):
         labels = [labels]
-    if not any(str(lab).strip().lower() == HERMES_LABEL for lab in labels or []):
+    names = {str(lab).strip().lower() for lab in labels or []}
+    hits = [h for h in (HERMES_LABEL, CODEX_LABEL) if h in names]
+    if not hits:
         return route
     if str(creator or "").strip().lower() not in model_label_trusted_creators():
-        log.info("hermes label ignored: ticket creator %r is not in MODEL_LABEL_TRUSTED_CREATORS", creator)
+        log.info("%s label ignored: ticket creator %r is not in MODEL_LABEL_TRUSTED_CREATORS", hits[0], creator)
         return route
-    if route.adapter == "hermes":
+    if len(hits) > 1:
+        raise ValueError(f"{hits[0]} label: conflicting harness labels {hits!r} on one ticket (fail-closed)")
+    harness = hits[0]
+    if route.adapter == harness:
         return route
     if route.backend_pinned:
-        log.info("hermes label ignored: row %s backend is pinned to %r", route.domain, route.backend)
+        log.info("%s label ignored: row %s backend is pinned to %r", harness, route.domain, route.backend)
         return route
-    allowed = HERMES_LABEL_CAPABILITIES if capabilities is None else capabilities
+    allowed = ADAPTER_LABELS[harness] if capabilities is None else capabilities
     cap = getattr(route, "capability", "read")
-    if getattr(route, "site_capability", ""):   # hermes has no allow/deny lists to add the site rules to
-        raise ValueError(f"hermes label: site capability {route.site_capability!r} runs on the cc harness only "
+    if getattr(route, "site_capability", ""):   # neither harness has allow/deny lists to add the site rules to
+        raise ValueError(f"{harness} label: site capability {route.site_capability!r} runs on the cc harness only "
                          "(fail-closed)")
     if cap not in allowed:
-        raise ValueError(f"hermes label: capability {cap!r} is not enabled for the hermes harness "
+        raise ValueError(f"{harness} label: capability {cap!r} is not enabled for the {harness} harness "
                          f"(enabled: {sorted(allowed) or 'none'}) (fail-closed)")
     backend = route.backend
-    if not backend or backend == "claude" or backend.startswith("claude-"):
+    if harness == HERMES_LABEL and (not backend or backend == "claude" or backend.startswith("claude-")):
         raise ValueError(f"hermes label: backend {backend or 'native'!r} is Anthropic - hermes workers never run on "
                          f"Anthropic API credits; add a non-Anthropic model label, e.g. model:deepseek (fail-closed)")
     out = Route(**{**route.__dict__, "env": dict(route.env), "publish": dict(route.publish)})
-    out.adapter, out.backend = "hermes", backend
+    out.adapter, out.backend = harness, backend
     return out
 
 
@@ -810,6 +1240,7 @@ _ANSIBLE_ROW = Route(
     # / spawn-models registry, cc._one_turn). Empty (default) = native Claude, UNCHANGED.
     backend=os.getenv("ANSIBLE_BACKEND", ""),
     backend_from_mode=True,             # every row follows FLEET_MODE; a pin wins
+    adapter=_row_adapter("ANSIBLE_ADAPTER"),   # harness knob, default cc (see ADAPTERS / _row_adapter)
 )
 
 # The FIRST write-capable profile: wiki-docs. Routes a `wiki`-labelled ticket to the
@@ -849,6 +1280,7 @@ _WIKI_DOCS_ROW = Route(
     agent=os.getenv("WIKI_AGENT", "wiki-agent"),        # used by fleet-model.sh; the tier is an operator call
     read_only=False,
     capability="write",             # ENFORCED by cc.build_argv: acceptEdits + git-commit, NO push
+    repo_lock_scope="run",           # shared-branch writer keeps whole-run single-flight by default
     # zbus reads $ZBUS_ENV as a LITERAL path (no slug resolution); the wiki worker's bus identity is its own
     # bot-env file. Default must be that absolute path, not the bare slug.
     env=_zbus_env("WIKI_ZBUS_ENV"),
@@ -863,6 +1295,7 @@ _WIKI_DOCS_ROW = Route(
     # (default) = native Claude, UNCHANGED.
     backend=os.getenv("WIKI_DOCS_BACKEND", ""),
     backend_from_mode=True,             # every row follows FLEET_MODE; a pin wins
+    adapter=_row_adapter("WIKI_DOCS_ADAPTER"),
 )
 
 # Matcher FACTORY for SOURCE/namespace-signalled rows. Defined here (ahead of PROFILES,
@@ -997,6 +1430,10 @@ def _assignee_label_signal_predicates(signal):
 # │ cc.capability_tool_grant match. NOT the claude.ai account-connector names.                                   │
 # │ COUPLED SURFACE: `agent="mail-agent"` selects the fleet-model.sh model tier. mail-agent is already in        │
 # │   fleet-model.sh's table (sonnet in normal); keep the two in sync if it is retiered.                         │
+# │                                                                                                              │
+# │ The SIBLING "inbox-chat" row (below) reads these SAME per-account files but RENAMES each one's               │
+# │ `google-workspace` server to `google-workspace-<account>` when it combines all of them into one chat        │
+# │ session's --mcp-config (cc._merge_inbox_chat_mcp_config); it never writes a per-account file itself.        │
 # └──────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 _INBOX_ROW = Route(
     domain="inbox",
@@ -1013,15 +1450,20 @@ _INBOX_ROW = Route(
     # (default) = native Claude, UNCHANGED.
     backend=os.getenv("INBOX_TRIAGE_BACKEND", ""),
     backend_from_mode=True,             # every row follows FLEET_MODE; a pin wins
+    adapter=_row_adapter("INBOX_TRIAGE_ADAPTER"),   # hermes and codex both refuse inbox today (fail-closed)
 )
 
 # Zulip-wake: a 1:1 DM from an allowlisted human to a wake-mapped bot (config/zulip-wake.json, first:
 # mail-bot) gives an ephemeral inbox CHAT worker. Source-signalled like the gmail row (zulip_wake.py
-# ingests {source:"zulip"} only after its guards pass). Same inbox domain + per-account MCP config as triage,
-# but its OWN capability "inbox-chat" (cc.capability_tool_grant): Gmail read/label/archive/draft + read-only
+# ingests {source:"zulip"} only after its guards pass). Same per-account MCP config FILES as triage (each
+# still named `google-workspace` on disk), but cc._merge_inbox_chat_mcp_config combines EVERY account in
+# inbox_accounts.ACCOUNTS (not just the bot map's named one) into ONE combined --mcp-config, renaming each
+# account's server `google-workspace-<account>` so a single chat session can hold all of them at once. Its
+# OWN capability "inbox-chat" (cc.capability_tool_grant): Gmail read/label/archive/draft + read-only
 # Hindsight, NO zbus / git / edits, and NO ZBUS_ENV at all, so the worker has no bus identity to DM anyone
-# with. The BROKER posts the envelope summary back to the original sender as the DMed bot. The account is
-# NOT in the subject key (zulip:<bot>:<sender_id>): cc takes it from the bot map, fail-closed if unmapped.
+# with. The BROKER posts the envelope summary back to the original sender as the DMed bot. The bot map's
+# `account` field (zulip-wake.json) still gates admission (fail closed: an unmapped bot, or an account not in
+# ACCOUNTS, still refuses the spawn); it just no longer limits WHICH accounts the admitted worker can see.
 ZULIP_ROW_SOURCE = os.getenv("ZULIP_ROW_SOURCE", "")
 
 _ZULIP_INBOX_ROW = Route(
@@ -1032,11 +1474,14 @@ _ZULIP_INBOX_ROW = Route(
     read_only=False,                # Gmail label/archive/draft (no file edits; see capability)
     capability="inbox-chat",        # ENFORCED by cc: Gmail read/label/archive/draft + HS read; NO zbus/git/Edit
     env={},                         # deliberately NO ZBUS_ENV: the broker, not the worker, replies on Zulip
-    mcp_config_dir=INBOX_MCP_CONFIG_DIR,   # same per-account <dir>/<account>.json as triage; fail-closed if absent
+    # Still the SAME per-account <dir>/<account>.json files as triage; cc merges ALL of them (not just one)
+    # into a combined --mcp-config at spawn (_merge_inbox_chat_mcp_config), fail closed if any is absent.
+    mcp_config_dir=INBOX_MCP_CONFIG_DIR,
     # Per-row inference backend override (same pattern/resolution path as GENERAL_BACKEND). Empty
     # (default) = native Claude, UNCHANGED.
     backend=os.getenv("INBOX_CHAT_BACKEND", ""),
     backend_from_mode=True,             # every row follows FLEET_MODE; a pin wins
+    adapter=_row_adapter("INBOX_CHAT_ADAPTER"),
 )
 
 # PROFILES entry = (namespace_prefix, trigger_label, Route-template). `trigger_label` is the
@@ -1050,6 +1495,16 @@ _ZULIP_INBOX_ROW = Route(
 # semantics UNCHANGED. The inbox row carries an explicit factory (`_source_signal_predicates`) because
 # mail-tap events have no label; `signal` there is the event SOURCE, not a label. First-match-wins order
 # is preserved: ansible, then wiki, then inbox.
+# The code lane's OPT-IN browser (playwright MCP). Unset (default) = no browser on any code
+# row, argv byte-identical to before. When set to the path of a playwright MCP config file, cc.build_argv
+# loads ONLY that server (--strict-mcp-config) and adds the reviewed cc._PLAYWRIGHT_TOOLS ids to the code
+# grant, so a dispatched code worker can navigate/click/screenshot a real page and return console/UI
+# evidence for a UI change. The config file is authored/placed out of band (ops), exactly like
+# GENERAL_MCP_CONFIG; this code only EXPOSES the path and fails closed if it is absent. Kept a single
+# module-level constant (not a per-row literal) so the ONE knob turns it on for the whole code lane and a
+# later routing edit cannot silently drop it from one row while leaving it on another.
+CODE_BROWSER_MCP_CONFIG = os.getenv("CODE_BROWSER_MCP_CONFIG", "")
+
 # The code change-proposer write row. Routes an `eph:code-change`-labelled ticket to
 # the SIGNED change-proposer prompt (domain=code, class=change-proposer). capability="code" gives
 # cc.build_argv teeth: acceptEdits + git add/commit + a NARROW per-repo test-Bash (test_runner KEY into
@@ -1071,17 +1526,19 @@ _CODE_ROW = Route(
     read_only=False,
     capability="code",                  # ENFORCED by cc.build_argv: acceptEdits + git-commit + scoped test-Bash, NO push
     test_runner=os.getenv("CODE_TEST_RUNNER", "pytest"),   # KEY into cc._CODE_TEST_RUNNERS; FALLBACK only, CODE_REPO_RUNNERS per-repo wins
+    browser_mcp_config=CODE_BROWSER_MCP_CONFIG,   # OPT-IN playwright MCP; "" = no browser
     env=_zbus_env("CODE_ZBUS_ENV"),   # LITERAL path (no slug resolution)
     publish={                           # filled by the publisher; code MRs push a FEATURE BRANCH and open an MR, NEVER push to main
         "code_repo_path": os.getenv("CODE_REPO_PATH", ""),   # local checkout the publisher cuts from and pushes
         "mr_target_ref": os.getenv("CODE_MR_TARGET_REF", "main"),   # MR target (worktree cut FROM this; NEVER pushed to directly)
         "branch_prefix": os.getenv("CODE_BRANCH_PREFIX", "eph/code-change"),        # feature-branch namespace for the MR
-        "worktree_base": os.getenv("CODE_WORKTREE_BASE", os.path.expanduser("~/.cache/eph-code-worktrees")),
+        "worktree_base": os.getenv("CODE_WORKTREE_BASE", os.path.expanduser("~/.cache/ew/c")),
     },
     # Per-row inference backend override (same pattern/resolution path as GENERAL_BACKEND). Empty
     # (default) = native Claude, UNCHANGED.
     backend=os.getenv("CODE_CHANGE_BACKEND", ""),
     backend_from_mode=True,             # every row follows FLEET_MODE; a pin wins
+    adapter=_row_adapter("CODE_CHANGE_ADAPTER"),
 )
 
 # GitHub/GitLab issue to code change-proposer row. Unlike _CODE_ROW (a Vikunja LABEL row), an issue
@@ -1101,17 +1558,19 @@ _ISSUE_CODE_ROW = Route(
     read_only=False,
     capability="code",                  # ENFORCED by cc.build_argv: acceptEdits + git-commit + test-Bash, NO push
     test_runner=os.getenv("ISSUE_CODE_TEST_RUNNER", ""),   # per-issue repos vary; empty means no test Bash (fail-closed)
+    browser_mcp_config=CODE_BROWSER_MCP_CONFIG,   # OPT-IN playwright MCP; "" = no browser
     env=_zbus_env("ISSUE_CODE_ZBUS_ENV"),   # LITERAL path
     publish={                           # feature-branch MR; code_repo_path is a DEFAULT overridden per-issue in cc
         "code_repo_path": os.getenv("ISSUE_CODE_REPO_PATH", ""),   # irrelevant default
         "mr_target_ref": os.getenv("ISSUE_CODE_MR_TARGET_REF", "main"),   # MR target (worktree cut FROM it)
         "branch_prefix": os.getenv("ISSUE_CODE_BRANCH_PREFIX", "eph/issue"),   # feature-branch namespace; NEVER main
-        "worktree_base": os.getenv("ISSUE_CODE_WORKTREE_BASE", os.path.expanduser("~/.cache/eph-issue-worktrees")),
+        "worktree_base": os.getenv("ISSUE_CODE_WORKTREE_BASE", os.path.expanduser("~/.cache/ew/i")),
     },
     # Per-row inference backend override (same pattern/resolution path as GENERAL_BACKEND). Empty
     # (default) = native Claude, UNCHANGED.
     backend=os.getenv("ISSUE_CODE_BACKEND", ""),
     backend_from_mode=True,             # every row follows FLEET_MODE; a pin wins
+    adapter=_row_adapter("ISSUE_CODE_ADAPTER"),
 )
 
 # The INFRA stack-proposer row, triggered by assignee INFRA_ASSIGNEE. It REUSES the code lane's capability ("code":
@@ -1144,6 +1603,7 @@ _INFRA_ROW = Route(
     },
     backend=os.getenv("INFRA_BACKEND", ""),
     backend_from_mode=True,
+    adapter=_row_adapter("INFRA_ADAPTER"),
 )
 
 # The GENERALIST infra row, infra/general, triggered by assignee INFRA_ASSIGNEE + label INFRA_GENERAL_LABEL (the
@@ -1170,6 +1630,7 @@ _INFRA_GENERAL_ROW = Route(
     publish=dict(_INFRA_ROW.publish),
     backend=os.getenv("INFRA_GENERAL_BACKEND", _INFRA_ROW.backend),
     backend_from_mode=True,
+    adapter=_row_adapter("INFRA_GENERAL_ADAPTER", _INFRA_ROW.adapter),
     row_id="infra/general",
 )
 
@@ -1227,9 +1688,11 @@ _MR_REVIEW_ROW = Route(
     backend_from_mode=True,             # every row follows FLEET_MODE; a pin wins
     # Worker harness for this row. Default "cc" = inert (unchanged native Claude Code review). "hermes"
     # ALSO requires MR_REVIEWER_BACKEND set to a non-native backend; hermes_provider refuses "" / "claude"
-    # (adapters/hermes.py, no Claude Code OAuth path in hermes). Route.__post_init__ fail-closes any value
-    # outside ADAPTERS (typo'd row never silently runs on the wrong harness).
-    adapter=os.getenv("MR_REVIEW_ADAPTER", "cc"),
+    # (adapters/hermes.py, no Claude Code OAuth path in hermes). "codex" reviews on the Codex CLI (read-only
+    # sandbox, model from the backend's `codex` block or CODEX_BACKEND). Route.__post_init__ fail-closes any value
+    # outside ADAPTERS (typo'd row never silently runs on the wrong harness). The original per-row knob; every
+    # other worker row now has its own <ROW>_ADAPTER (_row_adapter).
+    adapter=_row_adapter("MR_REVIEW_ADAPTER"),
     # Claude as a supported reviewer backend, flipped by config alone. Empty
     # (default) = UNCHANGED: FLEET_MODE / MR_REVIEWER_BACKEND decide (deepseek today). Set to a Claude model
     # (e.g. "opus") uses the model_pin path: native Claude Code on that model in EVERY
@@ -1237,6 +1700,425 @@ _MR_REVIEW_ROW = Route(
     # MR_REVIEWER_BACKEND unset (or "claude"); an explicit non-native backend pin still rides through.
     model_pin=os.getenv("MR_REVIEWER_MODEL", ""),
 )
+
+# Tiered MR review: the diff's OWN risk picks which model reviews it, so a docs-only
+# tweak doesn't cost the same model as a change touching the gate; review depth stays proportional to
+# risk. This is the REVIEWER'S OWN model choice, a different axis from cd.py's post-review deploy-risk
+# tier (same name, unrelated code). Generic by design: no deployment-specific paths here, only
+# shape-of-change rules (sensitive-looking path globs, diff size); a site narrows MR_REVIEW_FULL_PATHS
+# for its own gate/engine layout via config/env, same seam as cd.py's config/cd-tier.json.
+#
+# Escalate, never downgrade: a diff matching ANY full-tier rule is full regardless of what else it looks
+# like; quick needs EVERY rule to clear (small AND every path quick-shaped). Knobs unset keeps the
+# built-in generic defaults below (so an OSS install tiers out of the box); MR_REVIEWER_MODEL or
+# MR_REVIEWER_BACKEND, if set (today's existing single-model pin), OVERRIDES every tier's model
+# unconditionally - an operator who already pinned the reviewer keeps that exact behaviour, unchanged.
+# The tier is still computed and still named on the MR note either way (transparency costs nothing).
+#
+# Agent-instruction / prompt-shaped files: a file an AGENT reads as directives, not prose a human reads,
+# so a worker's own rewrite of one can't ride the prose-extension allowlist below into quick OR stop at
+# standard - it is the single highest-leverage class of file in this repo (fix round 4: a
+# narrower quick allowlist alone still let CLAUDE.local.md / AGENTS.override.md / a .claude/commands/*.md
+# slip through at a smaller scale, same class of bug as the prior B2). Matched like MR_REVIEW_FULL_PATHS
+# below (full path AND basename, case-insensitive), so a nested CLAUDE.local.md is caught by the
+# basename alone; `.claude/*`/`.codex/*`/`prompts/*` need the `*/…/*` pair since a directory component
+# isn't a basename.
+_MR_REVIEW_FULL_PATHS_BUILTIN = ",".join([
+    "CLAUDE*.md", "AGENTS*.md", "FLEET.md", "GEMINI.md",
+    ".claude/*", "*/.claude/*", ".codex/*", "*/.codex/*",
+    "prompts/*", "*/prompts/*", "SKILL.md", "commands/*.md", "*/commands/*.md",
+])
+# MR_REVIEW_FULL_PATHS, when set, only ADDS globs onto the built-in list above (same add-only contract
+# as cd.py's own config/cd-tier.json): a site can WIDEN what counts as sensitive, never narrow it, so a
+# worker-authored ticket can't shrink its own review depth by setting this env var.
+MR_REVIEW_FULL_PATHS = ",".join(dict.fromkeys(
+    [g.strip() for g in _MR_REVIEW_FULL_PATHS_BUILTIN.split(",") if g.strip()] +
+    [g.strip() for g in (os.getenv("MR_REVIEW_FULL_PATHS") or "").split(",") if g.strip()]))
+MR_REVIEW_FULL_DIFF_LINES = int(os.getenv("MR_REVIEW_FULL_DIFF_LINES", "") or 400)
+MR_REVIEW_QUICK_MAX_DIFF_LINES = int(os.getenv("MR_REVIEW_QUICK_MAX_DIFF_LINES", "") or 20)
+# Quick is a NARROW ALLOWLIST of provably low-risk NAMES/DIRECTORIES, never a blanket by-extension rule.
+# Fix round 5 (broker BLOCK on !188): the round-4 allowlist (*.md/*.rst/*.txt, matched by
+# EXTENSION alone) still admitted EVERY prose-looking file in the tree into quick just because it ended in
+# .md/.rst/.txt - identities.md, a charters/*.md policy file, a random agents/*.txt note - with only the
+# named agent-instruction globs (MR_REVIEW_FULL_PATHS, above) escalating out. Round 5 then rewrote this as
+# README*/CHANGELOG*/LICENSE*/CONTRIBUTING* (a PREFIX glob) plus docs/doc by DIRECTORY ALONE (any
+# extension inside).
+#
+# Fix round 6 (H1): round 5 was still too wide two ways. (1) fnmatch's `*` is a plain
+# wildcard with no basename anchoring, so a *prefix* glob like "README*" also hits a basename that merely
+# STARTS WITH readme - "readme_utils.py", "license_check.py" - and, matched against the FULL path too (the
+# same `*` crosses `/`), even a directory prefix - "changelog/gen.py" matches "CHANGELOG*" as a full-path
+# hit. (2) docs/doc admitting "any extension inside" let plain executable/config code (docs/build.sh,
+# docs/conf.py, docs/Makefile, app/docs/routes.py) ride the directory alone into quick. Both are now a
+# CLOSED set: the named files are ANCHORED exact-basename matches only (bare, or with one of the prose
+# extensions below - "README.md" matches, "README-OLD.md" and "readme_utils.py" do not), and docs/doc
+# content must ALSO carry a prose extension to qualify (directory-trust alone is gone; "docs/foo.md" is
+# quick, "docs/build.sh" is not). Fix round 4 (H1)'s point about a test suite being
+# executable code, never quick on its own, still holds below via MR_REVIEW_QUICK_EXCLUDE_PATHS's tests/*
+# exclude (belt-and-braces: a tests/README.md would otherwise match README.md by basename). Config-driven:
+# a site's config/cd-tier.json `quick_patterns` list is UNIONED onto this (add-only, same contract as
+# cd.py's full_patterns/extra_patterns - see _quick_patterns below), so a site may only WIDEN the
+# allowlist, never narrow away these defaults.
+_MR_REVIEW_QUICK_PROSE_BASENAMES = ("README", "LICENSE", "CHANGELOG", "CONTRIBUTING", "COPYING", "NOTICE")
+_MR_REVIEW_QUICK_PROSE_EXTS = (".md", ".txt", ".rst")
+_MR_REVIEW_QUICK_PATHS_BUILTIN = ",".join(
+    list(_MR_REVIEW_QUICK_PROSE_BASENAMES)                                      # bare, extensionless
+    + [b + e for b in _MR_REVIEW_QUICK_PROSE_BASENAMES for e in _MR_REVIEW_QUICK_PROSE_EXTS]  # README.md, ...
+    + [f"{d}/*{e}" for d in ("docs", "doc") for e in _MR_REVIEW_QUICK_PROSE_EXTS]              # docs/*.md, ...
+    + [f"*/{d}/*{e}" for d in ("docs", "doc") for e in _MR_REVIEW_QUICK_PROSE_EXTS])           # */docs/*.md, ...
+MR_REVIEW_QUICK_PATHS = os.getenv("MR_REVIEW_QUICK_PATHS", _MR_REVIEW_QUICK_PATHS_BUILTIN)
+# Deliberate carve-outs FROM the allowlist above (add-only, like MR_REVIEW_FULL_PATHS - a site may only
+# WIDEN this, never narrow it): a path that would otherwise match the allowlist above (by basename, e.g.
+# tests/README.md, or by directory, e.g. docs/.github/x) but is provably NOT the low-risk thing the
+# allowlist means to admit. Fix round 4 (H1): the prior exclude list was the earlier
+# report's own examples copied literally (CLAUDE.md, AGENTS.md, SKILL.md, modules/, scopes/, skills/),
+# not the CLASS they stood for, so a same-class file one character off (CLAUDE.local.md,
+# AGENTS.override.md, GEMINI.md, FLEET.md, any dot-directory) still slipped through at the smaller
+# scale the next review caught. Rewritten as the actual classes: tests-dir content of any extension
+# (belt-and-braces beside dropping tests/* from the allowlist above - a tests/README.md must not get a
+# free pass either); every dot-DIRECTORY (`.*/*`, `*/.*/*` - .claude/, .codex/, .github/, .cursor/, ...;
+# agent-instruction names matched elsewhere by MR_REVIEW_FULL_PATHS - CLAUDE.md/AGENTS.md/etc - still hit
+# full FIRST, escalate-never-downgrade, so listing a dot-dir here only matters for one NOT already full);
+# a *.txt file that is build config, not prose (CMakeLists.txt), by exact name since no extension-based
+# rule can tell a build script from a text file; and the prompt-module directories this repo's OWN
+# prompts render from.
+#
+# Fix round 7 (N2, Full review of !192): a pip requirements file is ALSO build config, not
+# prose, same class as CMakeLists.txt - but it has no single fixed name (docs/doc-requirements.txt,
+# docs/rtd_requirements.txt are both real Read-the-Docs conventions, neither starting with "requirements"
+# the way an exact-name exclude could catch), and a docs BUILD executes it. docs/*.txt (and */docs/*.txt)
+# above still admits it by directory+extension alone, so exclude by the "*requirements*.txt" shape
+# instead of an exact name - basename-matched (_glob_hit checks the basename too), so it catches the file
+# regardless of which directory it lives in.
+_MR_REVIEW_QUICK_EXCLUDE_BUILTIN = ",".join([
+    "tests/*", "*/tests/*",
+    ".*/*", "*/.*/*",
+    "CMakeLists.txt", "*/CMakeLists.txt",
+    "*requirements*.txt",
+    "*copilot-instructions*", "charters/*", "agents/*", "*/agents/*",
+    "modules/*", "*/modules/*", "scopes/*", "*/scopes/*", "skills/*", "*/skills/*",
+])
+MR_REVIEW_QUICK_EXCLUDE_PATHS = ",".join(dict.fromkeys(
+    [g.strip() for g in _MR_REVIEW_QUICK_EXCLUDE_BUILTIN.split(",") if g.strip()] +
+    [g.strip() for g in (os.getenv("MR_REVIEW_QUICK_EXCLUDE_PATHS") or "").split(",") if g.strip()]))
+# Per-tier model. "" (default) for standard/full means NO override: the row's existing resolution
+# (MR_REVIEWER_MODEL / FLEET_MODE) decides, exactly as before this feature. Quick defaults to haiku (a
+# cheap, fast sanity check matches a cheap model); MR_REVIEW_QUICK_MODEL_CODEX is its codex-harness
+# counterpart (a cheap gpt-* id), since "haiku" means nothing to that harness; "" there also means no
+# override (quick-on-codex then runs whatever model the row already resolves to).
+MR_REVIEW_QUICK_MODEL = os.getenv("MR_REVIEW_QUICK_MODEL", "haiku")
+MR_REVIEW_QUICK_MODEL_CODEX = os.getenv("MR_REVIEW_QUICK_MODEL_CODEX", "")
+MR_REVIEW_STANDARD_MODEL = os.getenv("MR_REVIEW_STANDARD_MODEL", "")
+MR_REVIEW_FULL_MODEL = os.getenv("MR_REVIEW_FULL_MODEL", "opus")
+
+MR_REVIEW_TIERS = ("skip", "quick", "standard", "full")
+
+# Skip tier: an MR whose EVERY changed path is a ledger/anchor or wiki-content markdown file gets NO
+# reviewer at all (the broker posts a neutral "skipped" note instead). Narrow allowlist, markdown only;
+# the full-review globs, the size/binary/unparseable-diff rules and the mode/link/rename guards all run
+# FIRST and win, and MR_REVIEW_QUICK_EXCLUDE_PATHS (tests, dot-dirs, prompt-module dirs) carves out of it.
+# MR_REVIEW_SKIP_PATHS only ADDS globs (same add-only contract as MR_REVIEW_FULL_PATHS). No own size
+# cap: MR_REVIEW_FULL_DIFF_LINES already sends a huge diff to full before this is consulted.
+_MR_REVIEW_SKIP_PATHS_BUILTIN = ",".join([
+    "STATE.md", "TASKS.md", "*-archive.md",          # ledger/anchor files (STATE, TASKS, *-archive)
+    "content/*.md", "*/content/*.md",                # wiki content markdown (any depth)
+])
+MR_REVIEW_SKIP_PATHS = ",".join(dict.fromkeys(
+    [g.strip() for g in _MR_REVIEW_SKIP_PATHS_BUILTIN.split(",") if g.strip()] +
+    [g.strip() for g in (os.getenv("MR_REVIEW_SKIP_PATHS") or "").split(",") if g.strip()]))
+
+_BINARY_DIFF_RE = re.compile(r"^Binary files .* differ$|^GIT binary patch$", re.M)
+
+# The pair regex only matches the PLAIN (unquoted) `diff --git a/X b/X` header shape. The line regex
+# matches every `diff --git ` header LINE regardless of shape, including a C-quoted header (git falls
+# back to wrapping a path in double quotes with octal escapes - e.g. `diff --git "a/odd\317\200.pem"
+# "b/odd\317\200.pem"` - for a path with a space or other special byte, unless `-c core.quotepath=false`
+# is in effect for that invocation). Comparing their counts is how _diff_header_mismatch below notices a
+# header _diff_paths silently couldn't parse.
+_DIFF_GIT_HEADER_PAIR_RE = re.compile(r"^diff --git a/(.+) b/(.+)$", re.M)
+_DIFF_GIT_HEADER_LINE_RE = re.compile(r"^diff --git ", re.M)
+
+
+def _diff_paths(diff_text):
+    """Changed file paths (both sides, deduped) parsed from a unified `git diff`'s `diff --git a/X
+    b/X` headers. Pure/best-effort: a diff with no such headers (unparseable, or not a git diff at all)
+    yields []. worktree.mr_diff runs with `-c core.quotepath=false` so a non-ASCII path is never
+    C-quoted/escaped in that header; this parse still fails closed (empty, not a guess) on anything else
+    it can't read - select_mr_review_tier treats that as "full", never "standard". See
+    _diff_header_mismatch for the case where SOME headers parse and others (e.g. a C-quoted one) don't -
+    this function alone can't tell that apart from "no changed files at all", since both yield []."""
+    return sorted({p for m in _DIFF_GIT_HEADER_PAIR_RE.finditer(diff_text or "") for p in m.groups() if p})
+
+
+def _diff_header_mismatch(diff_text):
+    """True iff `diff_text` declares MORE `diff --git ` header LINES than _diff_paths' pair regex could
+    parse into paths - i.e. at least one changed file's header used a shape (e.g. C-quoted) the pair
+    regex doesn't capture, so that file's path(s) were silently dropped from _diff_paths' output even
+    though OTHER files in the same diff parsed fine (so `paths` comes back non-empty and the
+    whole-diff-unparseable check below never fires). select_mr_review_tier fails this closed to "full",
+    never a lower tier that only ever saw the paths it could parse: a diff mixing one ordinary header with
+    one C-quoted sensitive-path header must never be rated by the ordinary path alone."""
+    total = len(_DIFF_GIT_HEADER_LINE_RE.findall(diff_text or ""))
+    parsed = len(_DIFF_GIT_HEADER_PAIR_RE.findall(diff_text or ""))
+    return total > parsed
+
+
+def _diff_changed_lines(diff_text):
+    """A cheap, format-agnostic diff 'size': the count of added/removed content lines, counted ONLY
+    inside a hunk body (after a `@@ ... @@` line, until the next `diff --git `). Fix round 4 (ticket
+    1625, L1): a line-prefix check alone (every line starting with `+`/`-`, except `+++`/`---`) silently
+    miscounts hunk CONTENT that itself starts with `++`/`--` (C/JS `++i;`, a SQL/Lua `--` comment, or
+    even a markdown `---` rule): the diff-added `+`/`-` prefix plus that content starts with `+++`/`---`,
+    which the old check mistook for the `+++ b/file`/`--- a/file` extended-header line and silently
+    dropped - exactly the shape probed in the review (60 added `++`-prefixed lines counted as 0). Hunk
+    tracking sidesteps this: the real `+++`/`---` header lines always appear BEFORE the first `@@` of a
+    file, so once inside a hunk every `+`/`-`-prefixed line is counted regardless of what follows."""
+    count = 0
+    in_hunk = False
+    for ln in (diff_text or "").splitlines():
+        if ln.startswith("@@"):
+            in_hunk = True
+        elif ln.startswith("diff --git "):
+            in_hunk = False
+        elif in_hunk and (ln.startswith("+") or ln.startswith("-")):
+            count += 1
+    return count
+
+
+def _diff_has_binary(diff_text):
+    """True iff the diff declares a binary (or `-diff`-attributed, e.g. via .gitattributes) file: git
+    prints 'Binary files a/X and b/X differ' (or a binary patch block) instead of +/- content lines for
+    one, so _diff_changed_lines silently undercounts it. A diff this shape can't be size-checked, so
+    select_mr_review_tier treats it as full outright rather than risk a large change gaming the
+    line-count threshold by hiding behind a binary/-diff attribute."""
+    return bool(_BINARY_DIFF_RE.search(diff_text or ""))
+
+
+# A symlink (120000), a submodule/gitlink (160000), or a chmod-only mode change (`old mode`/`new mode`,
+# no content lines at all) every one escapes the plain-prose/tests allowlist's size+shape checks below:
+# none of them necessarily show up as "content" at all, so a 0-line `chmod +x README.md`, a 1-line
+# symlink pointing a `tests/*`-looking path at `/etc/passwd`, or a 1-line gitlink pointing `tests/vendor`
+# at an arbitrary commit can all look like a tiny, quick-allowlisted docs/tests change. Fix round 4
+# (M1, carried from a prior round that asked for this and didn't land it): git always
+# renders one of these four line shapes for such a change, so rate ANY of them at least standard, in
+# front of the quick check, regardless of the (fail-closed to full, not quick) is_regular_file-shaped
+# contract the allowlist above already states.
+#
+# Fix round 5 (broker BLOCK on !188): those four shapes still missed a RETARGET of an
+# ALREADY-TRACKED symlink/gitlink - git emits no `new file mode` line for an existing path (that only
+# appears when the path is newly created) and, for a gitlink whose body isn't rendered as `Subproject
+# commit` (worktree.mr_diff's `git diff` calls now force `--ignore-submodules=none --submodule=short` -
+# fix round 6, M2 - precisely because a committed .gitmodules `ignore = all` otherwise drops
+# that path's diff entry ENTIRELY, header and all, not merely its hunk body; without that override the
+# path would be invisible here no matter what this regex matches), no content line either. The ONLY mode
+# signal left is the `index <old-sha>..<new-sha> <mode>` header line itself, which always carries the file
+# mode for a symlink/gitlink. Matching that line too closes the gap for both a tracked-symlink retarget
+# and a gitlink pointer update with no Subproject-commit body.
+#
+# Fix round 6 (M1): `100755` (an executable regular file) joins `120000`/`160000` in both the
+# new/deleted-file-mode line and the index-line mode checks - a brand-new executable script (`new file
+# mode 100755`) or an edit to an already-executable one (mode unchanged, so it shows up ONLY on the index
+# line: `index <sha>..<sha> 100755`) must rate at least standard the same way a symlink/gitlink does.
+_MODE_OR_LINK_RE = re.compile(
+    r"^(?:new|deleted) file mode (?:120000|160000|100755)$|^(?:old|new) mode \d+$|^Subproject commit |"
+    r"^index [0-9a-f]+\.\.[0-9a-f]+ (?:120000|160000|100755)$", re.M)
+
+
+def _diff_has_mode_or_link_change(diff_text):
+    """True iff the diff contains a symlink/submodule/executable file-mode line, an old/new chmod-only
+    mode line, a submodule pointer-update `Subproject commit` line, or an `index <sha>..<sha>
+    120000|160000|100755` header (a retarget of an ALREADY-TRACKED symlink/gitlink/executable carries the
+    mode only there). select_mr_review_tier never rates such a diff quick, regardless of its apparent size
+    or path shape (see _MODE_OR_LINK_RE)."""
+    return bool(_MODE_OR_LINK_RE.search(diff_text or ""))
+
+
+# Fix round 6 (L2): a 100%-similarity rename/copy (e.g. a plain `git mv` with no content or
+# mode change) renders NEITHER a content hunk NOR any mode/index line at all - just `similarity index
+# 100%` + `rename from `/`rename to ` (or `copy from `/`copy to `) - so a rename of a symlink or gitlink
+# whose target is unchanged is indistinguishable, by shape alone, from an equally quiet rename of an
+# ordinary 100644 text file. _diff_has_mode_or_link_change above can't catch this (there is no mode line
+# to match), and the path alone can look exactly like a quick-allowlist member (e.g. a docs/ path).
+# Fail closed instead of assuming "regular file": a rename/copy block must carry its own positive proof of
+# regular-file-ness (a `100644` on its index/mode line) to stay eligible for quick; its absence escalates
+# to at least standard, same spirit as every other guard in this section.
+#
+# Fix round 7 (N1, Full review of !192): the first alternative had no `^` anchor, so it
+# matched `index <sha>..<sha> 100644` ANYWHERE in the block, not just on its own header line - including
+# inside a `rename to <path>` (or `diff --git a/x b/<path>`) line whose PATH happens to end in literal
+# text shaped like that header (e.g. a symlink renamed to `docs/index 1234567..89abcde 100644`). That
+# false "regular file" proof let a renamed symlink/gitlink rate quick whenever a site's quick_patterns
+# widened to cover the destination directory (e.g. `docs/*`). Anchored to `^` like the second
+# alternative already was, so only an actual index-line header - never a path substring - counts as proof.
+_RENAME_OR_COPY_RE = re.compile(r"^(?:rename|copy) (?:from|to) ", re.M)
+_REGULAR_FILE_MODE_RE = re.compile(r"(?:^index [0-9a-f]+\.\.[0-9a-f]+ 100644$|^(?:old|new) mode 100644$)", re.M)
+
+
+def _diff_has_non_regular_rename_or_copy(diff_text):
+    """True iff any single `diff --git ` block of `diff_text` carries a rename/copy header (`rename
+    from`/`rename to`/`copy from`/`copy to`) WITHOUT also carrying an explicit `100644` (regular file)
+    mode marker in that same block - i.e. a rename/copy whose file type can't be confirmed regular.
+    select_mr_review_tier never rates such a diff quick (see the comment above _RENAME_OR_COPY_RE)."""
+    blocks = re.split(r"(?=^diff --git )", diff_text or "", flags=re.M)
+    return any(_RENAME_OR_COPY_RE.search(b) and not _REGULAR_FILE_MODE_RE.search(b) for b in blocks)
+
+
+class _QuickPatternsConfigError(ValueError):
+    """config/cd-tier.json `quick_patterns` is present but not a list (see _quick_patterns)."""
+
+
+def _quick_patterns(tier_cfg):
+    """Quick-allowlist globs: the built-in/env MR_REVIEW_QUICK_PATHS list UNION the site's
+    config/cd-tier.json `quick_patterns` list (add-only - same contract as cd.py's own full_patterns/
+    extra_patterns, see cd._patterns: a site may only WIDEN the quick allowlist, never narrow it away from
+    the shipped defaults by setting config). `tier_cfg` is the same parsed cd-tier.json dict
+    select_mr_review_tier already threads into cd._patterns; a missing/empty `quick_patterns` leaves the
+    built-in list unchanged.
+
+    Fix round 6 (L1): `quick_patterns` MUST be a list. A string value (an operator's typo
+    for a one-glob list, e.g. `"quick_patterns": "*"`) is iterable too, so the old
+    `for g in (tier_cfg...get("quick_patterns") or [])` silently split it CHARACTER BY CHARACTER instead
+    of raising - `"*"` alone becomes the single-character glob `"*"`, which then `_glob_hit`-matches
+    EVERY path in existence, fail OPEN to quick repo-wide; a longer string like `"*.md"` becomes
+    `["*", ".", "m", "d"]`, same result. Raises _QuickPatternsConfigError instead, so the caller
+    (select_mr_review_tier) can fail CLOSED to "standard" rather than silently admitting every path."""
+    globs = [g.strip() for g in MR_REVIEW_QUICK_PATHS.split(",") if g.strip()]
+    extra = (tier_cfg or {}).get("quick_patterns")
+    if extra is not None and not isinstance(extra, list):
+        raise _QuickPatternsConfigError(
+            f"config/cd-tier.json quick_patterns must be a list, got {type(extra).__name__}")
+    globs += [str(g).strip() for g in (extra or []) if str(g).strip()]
+    return globs
+
+
+def _glob_hit(path, globs):
+    """The first glob (of `globs`) that matches `path`, tried against the full path and the basename,
+    case-insensitively (same matching style as cd.py's classify_paths); None if none hit."""
+    low = (path or "").lower()
+    base = low.rsplit("/", 1)[-1]
+    return next((g for g in globs if fnmatch.fnmatchcase(low, g.lower()) or fnmatch.fnmatchcase(base, g.lower())),
+                None)
+
+
+def select_mr_review_tier(diff_text, paths=None, repo=None, tier_cfg=None):
+    """Pick the mr-review tier purely from the diff: returns (tier, reason). `paths`, when given,
+    skips the `diff --git` parse (so a test can feed a changed-path list directly without a full diff
+    blob) and also skips the fail-closed unparseable-diff rule below (an explicit, deliberate path list
+    is not a parse failure). `repo` is the MR's own GitLab project ("ns/name"); `tier_cfg` is the site's
+    parsed `config/cd-tier.json` (or None): both are forwarded, fresh on every call, into
+    `cd._patterns(tier_cfg, repo)` to build the full-review glob set (fix round 4, L2+L3) -
+    cd.py's per-repo "engine" Full category (e.g. eph-broker's own adapters/*, routing.py, ...) then only
+    escalates an MR actually against THAT repo, never a blanket union applied regardless of project, and
+    a site's config/cd-tier.json full_patterns/repo_patterns additions reach this review-depth tier the
+    same call they reach cd.py's own deploy-merge gate, instead of only the latter. Escalate, never
+    downgrade, checked in this order:
+      1. a changed path matches MR_REVIEW_FULL_PATHS (agent-instruction/prompt-file globs, see above) or
+         one of cd.py's own Full-path glob categories for this `repo`/`tier_cfg` (its generic
+         sensitive/deploy categories plus any repo-specific one, e.g. "engine") -> full, regardless of
+         size. The reason names only the matching GLOB (e.g. "a changed path matches a full-review path
+         glob '*secret*'"), never the path itself: that path can be worker-chosen (a file the worker's
+         own diff introduces), and the reason is posted verbatim into the MR note (see adapters/cc.py's
+         _post_mr_verdict) - a glob is site config, trusted; a path is untrusted diff content;
+      2. the diff is bigger than MR_REVIEW_FULL_DIFF_LINES changed lines -> full;
+      3. the diff declares a binary (or -diff-attributed) file, whose true size can't be trusted from
+         the +/- line count -> full (fail-closed against line-count gaming);
+      4. the diff has at least one `diff --git` header line that the pair regex couldn't parse into a
+         path (see _diff_header_mismatch) - e.g. one ordinary header plus one C-quoted header - -> full,
+         NEVER a lower tier computed from only the paths that DID parse: that file was effectively
+         invisible to checks 1-3 above, so treating the diff as if it were only the paths that parsed
+         would be silent trust, not a decision. This also covers the degenerate case of NO header parsing
+         at all (an empty, foreign-format, or otherwise unreadable diff with changed content);
+      5. the diff contains a symlink/submodule/executable mode-only-change line (see
+         _diff_has_mode_or_link_change, now also 100755) -> at least standard, never quick: none of those
+         necessarily show up as sized "content" at all, so a 0-line chmod or a 1-line symlink/gitlink
+         could otherwise look like a tiny docs/tests change;
+      6. the diff contains a rename/copy of anything not provably a regular (100644) file (see
+         _diff_has_non_regular_rename_or_copy) -> at least standard: a 100%-similarity rename/copy shows
+         no content and no mode line at all, so a renamed symlink/gitlink is otherwise indistinguishable
+         from a renamed text file.
+    Only once none of the above fired: "skip" when EVERY changed path matches MR_REVIEW_SKIP_PATHS (ledger/
+    anchor + wiki-content markdown) and none matches MR_REVIEW_QUICK_EXCLUDE_PATHS (no reviewer is spawned);
+    else "quick" when EVERY changed path matches the (narrow allowlist-only,
+    see above) MR_REVIEW_QUICK_PATHS plus the site's cd-tier.json `quick_patterns` additions (_quick_patterns,
+    add-only, same spirit as the full-path glob union above - a non-list `quick_patterns` is a config error
+    and fails closed to "standard" rather than being admitted), none matches MR_REVIEW_QUICK_EXCLUDE_PATHS, and
+    the diff is at or under MR_REVIEW_QUICK_MAX_DIFF_LINES changed lines; otherwise "standard" - the common
+    case, ordinary code (including tests and build files) with no sensitive/instruction path and no
+    mode/link change."""
+    explicit_paths = paths is not None
+    paths = paths if paths is not None else _diff_paths(diff_text)
+    full_globs = [g.strip() for g in MR_REVIEW_FULL_PATHS.split(",") if g.strip()]
+    full_globs += sorted({g for pats in cd._patterns(tier_cfg, repo).values() for g in pats})
+    hit = next((p for p in paths if _glob_hit(p, full_globs)), None)
+    size = _diff_changed_lines(diff_text)
+    if hit:
+        return "full", f"a changed path matches a full-review path glob {_glob_hit(hit, full_globs)!r}"
+    if size > MR_REVIEW_FULL_DIFF_LINES:
+        return "full", f"diff is {size} changed lines (over the {MR_REVIEW_FULL_DIFF_LINES}-line full-review threshold)"
+    if _diff_has_binary(diff_text):
+        return "full", "diff declares a binary/undiffable file (size can't be trusted, fail-closed to full)"
+    if not explicit_paths and _diff_header_mismatch(diff_text):
+        return "full", ("diff has a `diff --git` header that could not be parsed into a path "
+                         "(fail-closed, never standard)")
+    if not explicit_paths and not paths and (diff_text or "").strip():
+        return "full", "diff has changed content but no `diff --git` path header could be parsed (fail-closed, never standard)"
+    quick_exclude = [g.strip() for g in MR_REVIEW_QUICK_EXCLUDE_PATHS.split(",") if g.strip()]
+    skip_globs = [g.strip() for g in MR_REVIEW_SKIP_PATHS.split(",") if g.strip()]
+    if (paths and not _diff_has_mode_or_link_change(diff_text)
+            and not _diff_has_non_regular_rename_or_copy(diff_text)
+            and all(_glob_hit(p, skip_globs) and not _glob_hit(p, quick_exclude) for p in paths)):
+        return "skip", f"only ledger/wiki markdown paths ({size} changed lines), no reviewer needed"
+    try:
+        quick_globs = _quick_patterns(tier_cfg)
+    except _QuickPatternsConfigError as e:
+        return "standard", f"{e} (failed closed to standard)"
+    if (paths and size <= MR_REVIEW_QUICK_MAX_DIFF_LINES and not _diff_has_mode_or_link_change(diff_text)
+            and not _diff_has_non_regular_rename_or_copy(diff_text)
+            and all(_glob_hit(p, quick_globs) and not _glob_hit(p, quick_exclude) for p in paths)):
+        return "quick", f"small diff ({size} changed lines), only plain-docs paths"
+    return "standard", "ordinary code change"
+
+
+def _mr_review_tier_model(tier, adapter):
+    if tier == "quick":
+        return MR_REVIEW_QUICK_MODEL_CODEX if adapter == "codex" else MR_REVIEW_QUICK_MODEL
+    if tier == "full":
+        return MR_REVIEW_FULL_MODEL
+    return MR_REVIEW_STANDARD_MODEL
+
+
+def resolve_mr_review_tier(route, diff_text, paths=None, repo=None, tier_cfg=None):
+    """The full tiering decision for one MR review. Picks the tier from the diff
+    (select_mr_review_tier, forwarded `repo`/`tier_cfg` unchanged - see its docstring for the L2/L3
+    repo-keyed-engine-glob / site-cd-tier-config seam), then resolves that tier's model: unless the operator already pinned a
+    single reviewer model or backend (MR_REVIEWER_MODEL / MR_REVIEWER_BACKEND - today's behaviour, left
+    completely unchanged, every tier), the tier's model knob (empty = no override, keep `route`'s
+    already-resolved model/backend) is resolved FRESH from the unresolved `_MR_REVIEW_ROW` template via
+    `with_model()` - never by re-running `with_model()` on the already-resolved `route`, whose `.backend`
+    may already carry a FLEET_MODE-promoted non-Claude backend name that a second pass would misread as
+    an explicit pin. Returns (tier, reason, model, backend, backend_pinned, prompt_class); `prompt_class`
+    is "quick" only on the quick tier (prompts/mr-review/quick.md, a lighter scope sized for a cheap
+    model), else the row's own (`agent`).
+
+    The per-tier model knob is a CLAUDE-only pick (haiku/opus): it goes through the SAME FLEET_MODE
+    lookup the single-model path uses (`_MR_REVIEW_ROW.with_model()`, fresh from the template, never
+    `route`) before applying, so a tier never fights the fleet's own mode. If that lookup already
+    promoted mr-reviewer to a non-Claude backend (FLEET_MODE routes it off Anthropic entirely), the
+    tier's Claude model pick is skipped and the mode's own choice wins - unset knobs already fall through
+    to this same branch, so this generalizes "unset knobs = today's single-model behaviour" to the
+    mode-promoted-backend case too, instead of silently overriding FLEET_MODE's policy with a literal
+    `--model haiku`/`--model opus`."""
+    tier, reason = select_mr_review_tier(diff_text, paths, repo=repo, tier_cfg=tier_cfg)
+    model, backend, backend_pinned = route.model, route.backend, route.backend_pinned
+    if not (_MR_REVIEW_ROW.model_pin or _MR_REVIEW_ROW.backend):   # the legacy pin always wins, every tier
+        mode_resolved = _MR_REVIEW_ROW.with_model()   # the FLEET_MODE lookup, same as the single-model path
+        tier_model = _mr_review_tier_model(tier, route.adapter)
+        if tier_model and not mode_resolved.backend:
+            resolved = replace(_MR_REVIEW_ROW, model_pin=tier_model).with_model()
+            model, backend, backend_pinned = resolved.model, resolved.backend, resolved.backend_pinned
+    prompt_class = "quick" if tier == "quick" else _MR_REVIEW_ROW.prompt_class
+    return tier, reason, model, backend, backend_pinned, prompt_class
+
 
 # General-purpose worker: broad tools adjudicated by the auto-classifier
 # (capability="general": cc runs --permission-mode auto with a deny-floor, NO allow-list), loading the user-level rules and
@@ -1285,6 +2167,7 @@ _GENERAL_ROW = Route(
     #            refused and the operator alerted, never silently re-run on native Anthropic. "claude" = native.
     backend=os.getenv("GENERAL_BACKEND", ""),
     backend_from_mode=True,             # unset GENERAL_BACKEND means FLEET_MODE decides (see with_model)
+    adapter=_row_adapter("GENERAL_ADAPTER"),
 )
 
 # @fleet: a FULL INTERACTIVE temp fleet agent, NOT an ephemeral `claude -p` worker. The
@@ -1307,6 +2190,9 @@ _TFA_ROW = Route(
 # unchanged. Env knobs: ANSIBLE_BACKEND, WIKI_DOCS_BACKEND, INBOX_TRIAGE_BACKEND, INBOX_CHAT_BACKEND,
 # CODE_CHANGE_BACKEND, ISSUE_CODE_BACKEND, MR_REVIEWER_BACKEND, GENERAL_BACKEND (mode-driven), TFA_BACKEND.
 # MR_REVIEWER_MODEL pins the reviewer to a native Claude model (see _MR_REVIEW_ROW).
+# Harness knobs, same rows (default cc, see _row_adapter): ANSIBLE_ADAPTER, WIKI_DOCS_ADAPTER, INBOX_TRIAGE_ADAPTER,
+# INBOX_CHAT_ADAPTER, CODE_CHANGE_ADAPTER, ISSUE_CODE_ADAPTER, INFRA_ADAPTER, INFRA_GENERAL_ADAPTER, MR_REVIEW_ADAPTER,
+# GENERAL_ADAPTER, DIVING_ADAPTER. A harness that can't run a row's capability refuses the spawn (fail-closed).
 
 def _build_profiles():
     """The PROFILES table."""
@@ -1336,6 +2222,8 @@ _BASE_PROFILES = [
     # domain="tfa" makes app.ingest launch spawn.sh (real tmux TFA) instead of enqueuing a coalescer worker.
     ("vikunja:task", FLEET_ASSIGNEE_ALT, _TFA_ROW, _assignee_signal_predicates),
     # appended so first-match order for the existing vikunja rows is unchanged; source-signalled like inbox.
+    # Separate subject from the reviewer: a human note must never become a reviewer forward.
+    ("mr:note:", "mr", _CODE_ROW, _mr_note_signal_predicates),
     ("mr", MR_REVIEW_ROW_SOURCE, _MR_REVIEW_ROW, _source_signal_predicates),
     # GitHub/GitLab issue gives a code change-proposer. Source-signalled (github/gitlab namespaces); both give
     # the SAME _ISSUE_CODE_ROW (code lane reused). Distinct namespaces from every vikunja row, so first-match
@@ -1366,7 +2254,7 @@ CONFIG_ROUTE_CAPABILITIES = {"read": _ANSIBLE_ROW, "code": _CODE_ROW, "general":
 # prompt domains cc.py/app.py branch on by name (tfa launch, inbox account gate, infra grants): a config row
 # reusing one would inherit that special handling, so they are refused.
 CONFIG_ROUTE_RESERVED_DOMAINS = frozenset({"tfa", "inbox", "infra"})
-_CONFIG_ROUTE_KEYS = {"id", "match", "prompt", "capability", "repo", "agent", "model"}
+_CONFIG_ROUTE_KEYS = {"id", "match", "prompt", "capability", "repo", "agent", "model", "repo_lock_scope"}
 
 # Every capability name cc.capability_tool_grant knows. A site capability may not reuse one.
 BUILTIN_CAPABILITIES = frozenset({"read", "write", "code", "general", "inbox", "inbox-chat", "mr-review",
@@ -1614,11 +2502,14 @@ def load_config_routes(path=None, prompts_dir=None, approved_path=None, site_cap
                 raise RoutesConfigError(f"{where}: match {match} is already taken by route {other.row_key!r} "
                                         "(earlier in the file; this row would never run)")
         tmpl = CONFIG_ROUTE_CAPABILITIES[cap]
+        if row.get("repo_lock_scope", tmpl.repo_lock_scope) not in ("phases", "run"):
+            raise RoutesConfigError(f"{where}: repo_lock_scope must be 'phases' or 'run'")
         # agent + backend pin come from the template row, so fleet-model.sh and an operator's <ROW>_BACKEND pin
         # apply as they do to the built-in worker of that capability
         fields = dict(domain=domain, repo=repo, prompt_class=prompt_class, agent=row.get("agent", tmpl.agent),
                       capability=cap, row_id=rid, model_pin=row.get("model", ""), backend=tmpl.backend,
-                      backend_from_mode=True, from_config=True, site_capability=site_cap)
+                      backend_from_mode=True, from_config=True, site_capability=site_cap,
+                      repo_lock_scope=row.get("repo_lock_scope", tmpl.repo_lock_scope))
         if cap != "read":
             fields.update(read_only=False, env=dict(tmpl.env), test_runner=tmpl.test_runner,
                           setting_sources=tmpl.setting_sources, mcp_config_path=tmpl.mcp_config_path,
@@ -1779,6 +2670,9 @@ class Router:
         # the comment-forward branch below and before the source-signalled issue rows can match, so a
         # forge-shaped comment can't forward into a live worker and the broker does not depend on the external
         # tap alone. vikunja/gmail/mr events are NOT in _FORGE_SOURCES and are unaffected.
+        if key.startswith("mr:note:") or (evt.get("source") == "mr" and evt.get("event_name") == "mr.note"):
+            if not mr_note_allowed(evt):
+                return None
         if str(evt.get("source", "")).lower() in _FORGE_SOURCES \
                 and (evt.get("event_name") not in ISSUE_TRIGGERING_EVENTS
                      or not issue_author_allowed(evt.get("doer"))):

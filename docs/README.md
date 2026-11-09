@@ -5,9 +5,12 @@ how it works first.
 
 ## Getting started
 
+- [docker.md](docker.md): the local Docker preview, state, security limits and worker-image release work.
+- [first-merge-request.md](first-merge-request.md): the manual GitLab setup and optional Vikunja integration.
 - [install.md](install.md): requirements, running from source, the RPM and systemd unit, and wiring webhooks.
 - [tracker-script.md](tracker-script.md): the script you write so the broker can read tracker tickets and
   post comments (`BROKER_MCP_SH`), and the events your tap sends.
+- [modules.md](modules.md): optional UI modules, such as an Agents tab, run as supervised processes next to the broker.
 - [n8n.md](n8n.md): n8n workflows to import: a Vikunja tap, a GitLab issue tap, a run-event receiver and a run
   status lookup, plus a trigger node and a lookup node for self-hosted n8n.
 
@@ -20,6 +23,8 @@ how it works first.
 - [configuration.md](configuration.md): the files you'll touch, the main settings, the secrets, limits and
   batching files, models and backends, the reviewer's model, live transcripts and the dashboard's data sources.
 - [settings.md](settings.md): every environment variable the code reads, with its default.
+- [routing-overrides.md](routing-overrides.md): changing an existing worker's CLI, backend, model or concurrency live.
+- [worker-runtime.md](worker-runtime.md): per-repo test runners, dependency setup and worktree paths.
 - [repo-push-cred.md](repo-push-cred.md): the push credential line for a repo, and repo inference
   (experimental).
 
@@ -45,6 +50,8 @@ how it works first.
 
 ## Operations
 
+- [drain.md](drain.md): durable maintenance drain, queued intake, restart checks and crash recovery limits.
+- [queue-priority.md](queue-priority.md): move a waiting subject to the front from the Queue tab or operator API.
 - [operations.md](operations.md): logs, state files, `SIGHUP` reload, `/health`, the dashboard, re-running a
   ticket and upgrading.
 - [cd-deploy-paths.md](cd-deploy-paths.md): the optional auto-merge and deploy hand-off.

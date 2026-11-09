@@ -11,10 +11,16 @@ The broker binds to 127.0.0.1 only. Anything that reaches it from outside goes t
 | Endpoint | Check |
 |---|---|
 | `POST /event` | HMAC-SHA256 of the raw body in `X-Broker-HMAC`, keyed by `BROKER_HMAC_SECRET` (format below). Enforced by default: an unsigned or badly signed call gets 401, and so does every call while the secret is unset. The body says who the author is, so an unsigned `/event` would let anyone who reaches it claim any author. `BROKER_HMAC_MODE=log` accepts everything and only records the result; use it briefly while you add signing to an existing tap. |
-| `POST /webhooks/gitlab` (and its deprecated alias `/forge/gitlab`) | `X-Gitlab-Token` must equal `GITLAB_WEBHOOK_TOKEN`. Refused while that's unset. The issue's author must also be in `ISSUE_AUTHOR_ALLOWLIST` (case-insensitive), which is empty by default, because anyone who can open an issue on the project would otherwise be handing the worker its task. |
-| `POST /rerun` | `X-Broker-Rerun-Token` must equal `BROKER_RERUN_TOKEN`. Refused while that's unset. |
-| `GET /dash.html`, `/dash`, `/state`, `/health`, `/runs/<key>`, `/stream-status/<key>` | No auth and no write actions. Put an authenticating proxy in front. |
+| `POST /webhooks/gitlab` (and its deprecated alias `/forge/gitlab`) | `X-Gitlab-Token` must equal `GITLAB_WEBHOOK_TOKEN`. Refused while that's unset. The issue's author must also be in `ISSUE_AUTHOR_ALLOWLIST` (case-insensitive), which is empty by default, because anyone who can open an issue on the project would otherwise be handing the worker its task. `GET /health` shows the effective list as `issue_author_allowlist` (usernames only), so a bot that mirrors untrusted issues can prove it is not on it. |
+| `POST /rerun` | `X-Broker-Rerun-Token` must equal `BROKER_RERUN_TOKEN`. Refused while that's unset. An optional `model` runs that one run on any native model or spawn-registry backend, whoever created the ticket. |
+| `GET /dash.html`, `/dash`, `/state`, `/health`, `/runs/<key>`, `/stream-status/<key>`, `/actions` | No auth and no write actions. Put an authenticating proxy in front. |
+| `POST /actions/<verb>` | Off unless `BROKER_ACTIONS_ENABLED`. Then all of: the proxy secret header, the user and group headers naming `BROKER_ACTIONS_GROUP`, `X-Broker-Action: 1` with a JSON body, and no cross-site `Sec-Fetch-Site`. `GET /actions/settings` makes the same proxy, duplicate-header and group check. See [Dashboard actions](configuration.md#dashboard-actions). |
 | `GET /stream/*`, `/history/*` | Off unless `BROKER_STREAM_ENABLED`. Then the user and group headers your proxy sets must name `BROKER_STREAM_GROUP`. |
+
+Treat everyone in `BROKER_ACTIONS_GROUP` and anyone holding `BROKER_RERUN_TOKEN` as an operator. Both can
+route a ticket, including one a guest created, to a non-Anthropic backend: a rerun's `model` is applied as
+trusted, and **Worker settings** can put a whole row on any registry backend. `MODEL_LABEL_TRUSTED_CREATORS`
+does not limit them. The spawn-time floors (`CODE_NONCLAUDE_OK` and the classifier-bypass refusal) still apply.
 
 The `/event` header is `X-Broker-HMAC: <hex sha256 HMAC of the raw body>`, hex (either case), with an optional
 `sha256=` prefix (the form the outbound signatures use). To sign a body from a shell:
@@ -42,6 +48,21 @@ a running worker are wrapped and labelled as data. Authors listed in `untrusted_
 `config/provenance.json` are never trusted for write grants, even if they're also handoff doers. Only creators in
 `MODEL_LABEL_TRUSTED_CREATORS` can use a `model:` label to move a ticket to a non-Anthropic backend, or a
 `hermes` label to move it to the hermes harness.
+
+MR note iteration is separately opt-in through `MR_NOTE_AUTHOR_ALLOWLIST` (empty means off), behind the same
+GitLab webhook token check. Only new, non-system notes on open, same-project broker MRs under
+`CD_WORKER_BRANCH_PREFIX` and `eph/` qualify. The broker's own `broker-run:` notes are ignored even if its
+username is allowlisted. Each distinct accepted note consumes one of `MR_ITERATION_MAX` slots (default 3);
+delivery retries do not. The broker journal persists these receipts and the cap across restarts. Without
+durable state they last only for the process lifetime.
+
+Note text is fenced with the existing untrusted-comment delimiter, with delimiter look-alikes neutralized.
+It cannot choose a repo, branch, runner or capability. The operator-owned GitLab project map chooses the
+local repo; authenticated MR metadata chooses the branch and pins the cut SHA. The worker stays cred-free.
+`publish_iteration` refuses main/non-broker branches, fetches the existing feature branch, checks ancestry
+and leases the push to that exact fetched tip. Deletion or any ref movement between fetch and push is
+refused, not recreated, rebased or overwritten. The ancestry check still requires a fast-forward. The existing
+MR receives a marked summary and a fresh review of the new SHA, not a new MR or an automatic merge.
 
 ## What a worker gets
 
@@ -85,9 +106,9 @@ Details are in [hermes.md](hermes.md); the security-relevant parts are these.
   denies: worktree confinement, git options that read files, the secret floor and `.git` writes. A pre-flight
   probe proves the gate is loaded before each turn, and a sentinel proves it ran; if either fails, the turn is
   refused or its result thrown away.
-- The general worker goes through the gate's floors and then an external policy judge. No judge configured, a
-  timeout or any unclear answer means deny. The judge keeps one shared state directory, so more than one
-  general worker on hermes at a time isn't supported. The general worker only reaches hermes through a `hermes`
+- The general worker goes through the gate's floors and then your exec gate ([hermes.md](hermes.md#plugging-in-your-own-exec-gate-general-worker-only)).
+  No gate configured, a timeout or any unclear answer means deny. The Portcullis provider keeps one shared state
+  directory, so more than one general worker on hermes at a time isn't supported with it. The general worker only reaches hermes through a `hermes`
   ticket label.
 - Only `mr-review` (read-only), `write`, `code` (with `CODE_NONCLAUDE_OK=1`) and `general` run on hermes. Every
   other capability is refused, as is a native Claude backend.
@@ -123,6 +144,11 @@ fsmonitor, skip external diff and textconv drivers, and stop if the worktree's `
 since it was created.
 
 ## Where it leaks
+
+For evaluation, prefer the [non-root Docker preview](docker.md), which mounts no host credentials.
+It uses host networking and is not a worker sandbox. A worker-enabled deployment should use a dedicated
+account with only the repo and login state it needs. Putting the whole broker in a container limits host
+filesystem exposure, but does not separate workers from credentials mounted into that same container.
 
 Workers run as the same OS user as the broker. The tool grants control what the harness will do on the worker's
 behalf (Claude Code's permission flags, hermes' `eph-gate`); they aren't a sandbox. A worker with any shell access

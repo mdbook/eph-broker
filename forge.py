@@ -73,3 +73,37 @@ def normalize_gitlab_issue(payload):
         "web_url": attrs.get("url"),
         "doer": (payload.get("user") or {}).get("username"),
     }
+
+
+def normalize_gitlab_mr_note(payload, iteration_count=0):
+    """A new human MR note -> bounded code feedback, or None (ack and ignore).
+
+    The broker counts accepted note IDs durably at admission; the optional count also lets callers
+    drop over-cap deliveries here. Never take a repo path or an iteration count from webhook text.
+    """
+    if not isinstance(payload, dict) or payload.get("object_kind") != "note":
+        return None
+    attrs, mr, project, user = (payload.get(k) or {} for k in
+                                ("object_attributes", "merge_request", "project", "user"))
+    if not all(isinstance(v, dict) for v in (attrs, mr, project, user)):
+        return None
+    if (attrs.get("noteable_type") != "MergeRequest" or attrs.get("system", False) is not False
+            or attrs.get("action", "create") != "create" or mr.get("state", "opened") != "opened"
+            or iteration_count >= routing.mr_iteration_max()):
+        return None
+    # A fork's branch is not a branch in the mapped target repo.
+    if mr.get("source_project_id") != mr.get("target_project_id"):
+        return None
+    commit = mr.get("last_commit") or {}
+    if not isinstance(commit, dict):
+        return None
+    evt = {"source": "mr", "event_name": "mr.note", "project": project.get("path_with_namespace"),
+           "mr_iid": mr.get("iid"), "source_branch": mr.get("source_branch"),
+           "target_ref": mr.get("target_branch"), "head_sha": commit.get("id"),
+           "title": (mr.get("title") or "")[:MAX_TICKET_TEXT],
+           "body": (mr.get("description") or "")[:MAX_TICKET_TEXT],
+           "web_url": mr.get("url") or mr.get("web_url"), "doer": user.get("username"),
+           "comment_id": attrs.get("id"), "comment": attrs.get("note")}
+    if not routing.mr_note_allowed(evt):
+        return None
+    return {**evt, "comment": evt["comment"][:MAX_TICKET_TEXT]}

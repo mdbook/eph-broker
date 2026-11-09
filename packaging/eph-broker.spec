@@ -7,7 +7,7 @@ Version:        %{pkg_version}
 Release:        %{pkg_release}%{?dist}
 Summary:        Ephemeral coding-agent worker broker (127.0.0.1:8787)
 
-License:        GPL-3.0-only
+License:        GPL-3.0-or-later
 URL:             https://github.com/mdbook/eph-broker
 Source0:        %{name}-%{pkg_version}.tar.gz
 
@@ -47,6 +47,7 @@ cp -a modules %{buildroot}/opt/eph-broker/
 cp -a prompts %{buildroot}/opt/eph-broker/
 cp -a workers %{buildroot}/opt/eph-broker/
 cp -a tools %{buildroot}/opt/eph-broker/
+cp -a hooks %{buildroot}/opt/eph-broker/
 cp -a approved-prompts.json %{buildroot}/opt/eph-broker/
 
 install -d -m 0755 %{buildroot}%{_unitdir}

@@ -84,7 +84,7 @@ branch must only ever fire once, remember the ids you've handled.
 
 [n8n-run-status.json](n8n-run-status.json) is a small workflow that other workflows call with "Execute Workflow"
 and a `subject_key`, like `vikunja:task:42`. It calls `GET /runs/<subject_key>` and hands back the broker's answer:
-`status` is `pending`, `running`, `idle`, `closing` or `completed`, and an unknown subject comes back as `unknown`
+`status` is `pending`, `waiting`, `running`, `idle`, `closing` or `completed`, and an unknown subject comes back as `unknown`
 ([operations.md](operations.md#health-and-the-dashboard)). The node is set to never fail on a 404, so check
 `status` instead.
 

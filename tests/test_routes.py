@@ -185,7 +185,8 @@ def test_config_rows_sit_between_builtins_and_general_fallbacks():
 
 
 def test_code_and_general_rows_copy_builtin_plumbing():
-    s = Site([row(id="svc", capability="code", prompt="svc/proposer", match={"label": "eph:svc"}),
+    s = Site([row(id="svc", capability="code", prompt="svc/proposer", match={"label": "eph:svc"},
+                  repo_lock_scope="run"),
               row(id="ask", capability="general", prompt="svc/general", match={"label": "eph:ask"})],
              prompts={"svc/proposer": "Propose a change.\n", "svc/general": "Help.\n"})
     try:
@@ -195,6 +196,7 @@ def test_code_and_general_rows_copy_builtin_plumbing():
     assert code.capability == "code" and not code.read_only and code.test_runner == routing._CODE_ROW.test_runner
     assert code.publish["code_repo_path"] == REPO and code.publish["branch_prefix"] == "eph/svc"
     assert code.publish["worktree_base"] == routing._CODE_ROW.publish["worktree_base"]
+    assert code.repo_lock_scope == "run" and gen.repo_lock_scope == "phases"
     assert code.mcp_config_path == "" and code.setting_sources == ""
     assert gen.mcp_config_path == routing._GENERAL_ROW.mcp_config_path and gen.mcp_config_path
     assert gen.setting_sources == routing._GENERAL_ROW.setting_sources
@@ -248,6 +250,8 @@ def test_unsigned_or_changed_prompt_refused():
 
 
 def test_bad_rows_refused():
+    for scope in ("", "publish", None, False, [], {}):
+        refused([{**row(), "repo_lock_scope": scope}], "repo_lock_scope")
     refused([row(id="code")], "built-in")
     refused([row(id="general")], "built-in")
     refused([row(id="tfa")], "built-in")

@@ -2,7 +2,7 @@
   "name": "n8n-nodes-eph-broker",
   "version": "0.1.0",
   "description": "n8n trigger and action nodes for eph-broker: signed run events in, run status out",
-  "license": "GPL-3.0-only",
+  "license": "GPL-3.0-or-later",
   "keywords": ["n8n-community-node-package", "eph-broker"],
   "files": ["credentials", "nodes", "README.md"],
   "scripts": {

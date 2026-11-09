@@ -126,6 +126,29 @@
               },
               "renameOutput": true,
               "outputKey": "mr.opened"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.event }}",
+                    "rightValue": "action.taken",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "action.taken"
             }
           ]
         },
@@ -178,6 +201,16 @@
         760,
         240
       ]
+    },
+    {
+      "parameters": {},
+      "name": "On action.taken",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        760,
+        400
+      ]
     }
   ],
   "connections": {
@@ -229,6 +262,13 @@
         [
           {
             "node": "On mr.opened",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "On action.taken",
             "type": "main",
             "index": 0
           }

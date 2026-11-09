@@ -35,6 +35,21 @@ same-uid write to it becomes a worker spawn on the next broker restart. Entries 
 `armed_at` and can simply stamp a fresh arm time. It only guards against stale rows left by a long outage and
 against corrupt rows: a non-finite or far-future `armed_at`, or a malformed row, is dropped individually.
 
+The mid-turn message inbox (`steer.py`, under `BROKER_STEER_ROOT`) is in the same position. A worker that can
+write files as the broker's uid there could drop a file into another ticket's inbox, and that worker's next tool
+call would read it as an operator message. It could also write fake records into a ticket's `log.jsonl`, which
+the dashboard then shows as messages from you. Who can write there:
+
+- A Claude Code worker, always (it runs as the broker's uid with no file sandbox).
+- A Codex worker only if the folder is inside its sandbox's writable set. `workspace-write` lets Codex write
+  `/tmp` and `$TMPDIR`, and the default `BROKER_STEER_ROOT` sits beside `EVENTS_LOG`, which defaults to
+  `$TMPDIR/eph-broker/`. So with the defaults, Codex workers can reach it too. Set `BROKER_STEER_ROOT` (and
+  `EVENTS_LOG`) outside `/tmp` and `$TMPDIR`; the systemd unit's `/var/lib/eph-broker` is.
+
+What limits the damage: the hook frames whatever it reads as UNTRUSTED operator text itself, so a forged file
+can't pose as system or broker instructions; the broker never follows a symlink in that folder; the hook adds
+no permission; and the same worker could already edit the other ticket's worktree directly.
+
 ### Possible fixes (both are deployment choices, not code changes)
 
 1. **Separate-uid worker sandbox.** Run the worker as a *different, unprivileged* uid (or in a container /

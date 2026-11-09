@@ -1,0 +1,13 @@
+# Default deny: private overlays must not even reach the build context.
+**
+!Dockerfile
+!*.py
+!adapters/
+!adapters/**
+!trackers/
+!trackers/**
+!config/
+!config/demo/
+!config/demo/broker.example.json
+**/__pycache__
+**/*.pyc

@@ -19,7 +19,7 @@ Flags count as on for `1`, `true`, `yes` or `on`, unless the row says otherwise.
 | `CONFIG_DIR` | `config/` next to `app.py` | Where the `*.json` config files are read from. |
 | `PROMPTS_DIR` | `prompts/` | Where rendered worker prompts are read from. |
 | `APPROVED_PROMPTS` | `approved-prompts.json` | The file of signed prompt hashes. |
-| `BROKER_CONFIG` | `config/broker.yaml` | The optional single config file. An explicit path that doesn't exist stops the broker. |
+| `BROKER_CONFIG` | `config/broker.yaml`, else `config/broker.json` if it exists | The optional single config file. YAML takes precedence when both exist. An explicit path that doesn't exist stops the broker. |
 | `BROKER_SITE_ENV` | `config/site.env` | The settings file. An explicit path that doesn't exist stops the broker. |
 | `BROKER_PROVENANCE_PATH` | `CONFIG_DIR/provenance.json` | Which accounts are agents ([configuration.md](configuration.md#who-counts-as-an-agent)). |
 | `BROKER_PROVENANCE_NEUTRAL` | unset | `1` lets the broker start without a provenance file, with only built-in agent names. |

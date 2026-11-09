@@ -19,7 +19,7 @@ reads.
 | `config/repo-companions.json` | Read-only source dependencies per code repo ([below](#companion-source-repositories)). Start from `config/repo-companions.example.json`. | No |
 | `BROKER_MCP_SH`, a script you write | Reading and commenting on tracker tickets ([tracker-script.md](tracker-script.md)). | For tracker tickets |
 | `FLEET_MODEL_SH`, `SPAWN_MODELS_JSON` | Which model and backend a worker runs on ([below](#models-and-backends)). | No |
-| `config/broker.yaml` | All the config above in one file, as an alternative ([below](#the-config-file)). | No |
+| `config/broker.yaml` or `config/broker.json` | All the config above in one file, as an alternative ([below](#the-config-file)). | No |
 
 ## Companion source repositories
 
@@ -46,7 +46,9 @@ See [worker-runtime.md](worker-runtime.md#companion-sources) for worker access a
 
 The config file is optional. Without it the broker reads `config/site.env` and the json files in `config/`, which
 is all the quick start needs. `config/broker.yaml` (start from `config/broker.example.yaml`, which starts the
-broker as is), or any file named by `BROKER_CONFIG`, gathers them into one file. A YAML file needs PyYAML
+broker as is), or any file named by `BROKER_CONFIG`, gathers them into one file. When `BROKER_CONFIG` is unset,
+the broker uses `config/broker.yaml` if it exists, otherwise `config/broker.json` if it exists. If neither exists,
+it uses the separate files as before. An existing invalid YAML file is never bypassed for JSON. A YAML file needs PyYAML
 (`python3-pyyaml`); a path ending in `.json` is read as JSON and needs nothing extra. An explicit path that doesn't
 exist stops the broker, and so does an unknown section, a repeated key or a parse error.
 

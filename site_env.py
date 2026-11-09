@@ -1,7 +1,7 @@
-"""Site overlay. Code defaults are neutral; a deployment's own values live in config/broker.yaml ($BROKER_CONFIG,
+"""Site overlay. Code defaults are neutral; a deployment's own values live in config/broker.yaml or broker.json ($BROKER_CONFIG,
 see read_config) and/or the older KEY=VALUE file $BROKER_SITE_ENV or config/site.env next to this module (private;
 the OSS export leaves both out and ships the .example files; NOT export-ignore, CI builds the RPM from `git archive`).
-Loaded on first import with setdefault: the real environment (systemd drop-ins, tests) always wins, then broker.yaml
+Loaded on first import with setdefault: the real environment (systemd drop-ins, tests) always wins, then broker config
 settings, then site.env. Import this before any module that reads env at import time."""
 import json
 import logging
@@ -10,9 +10,13 @@ import re
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 SITE_ENV = os.getenv("BROKER_SITE_ENV") or os.path.join(_HERE, "config", "site.env")
-# The single config file: $BROKER_CONFIG or config/broker.yaml (a .json path is read as JSON, no PyYAML needed).
+# The single config file: explicit path, else YAML first, then JSON (no PyYAML needed).
 BROKER_CONFIG = os.getenv("BROKER_CONFIG") or os.path.join(_HERE, "config", "broker.yaml")
-# Top-level keys of broker.yaml. `settings` feeds the environment; every other key is the content of the
+if not os.getenv("BROKER_CONFIG") and not os.path.exists(BROKER_CONFIG):
+    _json_config = os.path.join(_HERE, "config", "broker.json")
+    if os.path.exists(_json_config):
+        BROKER_CONFIG = _json_config
+# Top-level keys of the broker config. `settings` feeds the environment; every other key is the content of the
 # config/<key>.json file it replaces (routes: the rows list), except `capabilities` (routing.load_site_capabilities),
 # which has no file, and `model_denylist` (the launch policy). Anything else is a typo and stops the broker.
 SECTIONS = frozenset({"settings", "routes", "capabilities", "constraints", "windows", "provenance", "inbox-accounts",
@@ -20,7 +24,7 @@ SECTIONS = frozenset({"settings", "routes", "capabilities", "constraints", "wind
 
 
 class BrokerConfigError(ValueError):
-    """broker.yaml is present but invalid. Raised at import, so the broker refuses to start."""
+    """The broker config is present but invalid. Raised at import, so the broker refuses to start."""
 
 
 class ModelDenied(ValueError):
@@ -64,7 +68,7 @@ def _json_no_dups(pairs):
 
 
 def read_config(path=None):
-    """-> {section: value} from broker.yaml. Missing default file = {}; an explicit BROKER_CONFIG that does not
+    """-> {section: value} from the broker config. Missing default file = {}; an explicit BROKER_CONFIG that does not
     exist, a parse error, a non-mapping or an unknown section -> BrokerConfigError (message names the file)."""
     path = path or BROKER_CONFIG
     try:
@@ -136,7 +140,7 @@ CONFIG = read_config()
 
 
 def section(name, config=None):
-    """The broker.yaml section `name` (a fresh copy), or None when the file doesn't set it. Callers fall back to
+    """The broker config section `name` (a fresh copy), or None when the file doesn't set it. Callers fall back to
     their config/<name>.json file on None and log that the file is ignored otherwise."""
     if name not in SECTIONS:
         raise KeyError(name)
@@ -186,7 +190,7 @@ def load(path=SITE_ENV):
 
 # An explicit BROKER_SITE_ENV that does not exist is a typo, not "no site": refuse to start
 # (a silent no-op would drop every site allowlist/deny). If the default file is missing (an OSS install), warn once.
-# broker.yaml settings load first, so they win over site.env; the real environment wins over both.
+# Broker config settings load first, so they win over site.env; the real environment wins over both.
 if not os.path.exists(SITE_ENV):
     if os.getenv("BROKER_SITE_ENV"):
         raise FileNotFoundError(f"BROKER_SITE_ENV={SITE_ENV} does not exist")

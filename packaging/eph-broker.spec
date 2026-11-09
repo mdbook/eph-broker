@@ -19,7 +19,7 @@ Requires:       git
 Requires(pre):  shadow-utils
 # only the interactive-agent row and its duplicate check use tmux
 Recommends:     tmux
-# only for a YAML config/broker.yaml; a .json BROKER_CONFIG needs nothing extra
+# optional YAML config parser (JSON config needs only the standard library)
 Recommends:     python3-pyyaml
 %{?systemd_requires}
 

@@ -4,7 +4,7 @@
 stdlib assert only, same runner shape as test_routes.py. Import-time behaviour (settings precedence, refusing a bad
 file) runs in a subprocess with its own environment; everything else patches site_env.CONFIG and restores it.
 """
-import hashlib, json, logging, os, subprocess, sys, tempfile
+import hashlib, json, logging, os, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -39,10 +39,10 @@ def _write(d, name, text):
     return p
 
 
-def _probe(env, code):
+def _probe(env, code, root=ROOT):
     """Run `code` after `import site_env` in a fresh interpreter whose environment is exactly `env` (+PATH)."""
-    full = {"PATH": os.environ.get("PATH", ""), "PYTHONPATH": ROOT, **env}
-    return subprocess.run([sys.executable, "-c", "import site_env, os\n" + code], env=full, cwd=ROOT,
+    full = {"PATH": os.environ.get("PATH", ""), "PYTHONPATH": root, **env}
+    return subprocess.run([sys.executable, "-c", "import site_env, os\n" + code], env=full, cwd=root,
                           capture_output=True, text=True, timeout=60)
 
 
@@ -64,7 +64,9 @@ class patched_config:
 def test_no_file_is_empty_and_sets_nothing():
     with tempfile.TemporaryDirectory() as d:
         assert site_env.read_config(os.path.join(d, "broker.yaml")) == {}
-        p = _probe({"BROKER_SITE_ENV": os.devnull}, "print(site_env.CONFIG, os.getenv('CONCURRENCY'))")
+        p = _probe({"BROKER_SITE_ENV": os.devnull,
+                    "BROKER_CONFIG": os.path.join(HERE, "fixtures", "broker.test.json")},
+                   "print(site_env.CONFIG, os.getenv('CONCURRENCY'))")
         assert p.returncode == 0 and p.stdout.strip() == "{} None", (p.stdout, p.stderr)
     assert site_env.CONFIG == {} and site_env.section("routes") is None
     ok("no broker.yaml: empty config, no settings, every section None (behaviour unchanged)")
@@ -144,6 +146,63 @@ def test_model_denylist_config():
     with patched_config({}):
         site_env.require_model_allowed("any-model")
     ok("model_denylist: validates lists, literal case-insensitive matching, unrestricted when omitted")
+
+
+def test_default_config_selection_without_pyyaml():
+    with tempfile.TemporaryDirectory() as d:
+        shutil.copyfile(os.path.join(ROOT, "site_env.py"), os.path.join(d, "site_env.py"))
+        # Shadow even an installed PyYAML: default JSON must work in a stdlib-only installation.
+        _write(d, "yaml.py", 'raise ImportError("no PyYAML in this test")\n')
+        cdir = os.path.join(d, "config"); os.makedirs(cdir)
+        env = {"BROKER_SITE_ENV": os.devnull}
+        code = "print(os.path.basename(site_env.BROKER_CONFIG), site_env.CONFIG)"
+        p = _probe(env, code, root=d)
+        assert p.returncode == 0 and p.stdout.strip() == "broker.yaml {}", (p.stdout, p.stderr)
+        cfg = _write(cdir, "broker.json", '{"model_denylist": ["restricted-family"]}')
+        p = _probe(env, code, root=d)
+        assert p.returncode == 0 and p.stdout.strip() == "broker.json {'model_denylist': ['restricted-family']}", (
+            p.stdout, p.stderr)
+        _write(cdir, "broker.yaml", 'model_denylist: ["other-family"]\n')
+        p = _probe(env, code, root=d)
+        assert p.returncode != 0 and "BrokerConfigError" in p.stderr and "needs PyYAML" in p.stderr, p.stderr
+        p = _probe(dict(env, BROKER_CONFIG=cfg), code, root=d)
+        assert p.returncode == 0 and "restricted-family" in p.stdout, (p.stdout, p.stderr)
+        p = _probe(dict(env, BROKER_CONFIG=os.path.join(d, "missing.json")), code, root=d)
+        assert p.returncode != 0 and "does not exist" in p.stderr, p.stderr
+    ok("default config: YAML before JSON, JSON starts without PyYAML, no config is a no-op; explicit paths win "
+       "and missing explicit paths refuse startup")
+
+
+def test_model_denylist_only_config_preserves_json_config():
+    import app
+    with tempfile.TemporaryDirectory() as d:
+        cdir = os.path.join(d, "config"); os.makedirs(cdir)
+        # Include every JSON-backed section and an extra legacy file: none should be replaced.
+        names = site_env.SECTIONS - {"settings", "capabilities", "model_denylist"}
+        want = {name: {"initial": {}} if name == "windows" else {"from": name} for name in names}
+        want["legacy"] = {"unchanged": True}
+        for name, value in want.items():
+            _write(cdir, name + ".json", json.dumps(value))
+        cfg = _write(d, "broker.json", '{"model_denylist": ["restricted-family"]}')
+        doc = site_env.read_config(cfg)
+        assert doc == {"model_denylist": ["restricted-family"]}
+        if HAVE_YAML:
+            ycfg = _write(d, "broker.yaml", '# Site launch policy only.\nmodel_denylist: ["restricted-family"]\n')
+            assert site_env.read_config(ycfg) == doc
+        assert all(site_env.section(name, doc) is None for name in names)
+        saved_env, saved_path = os.environ.get("BROKER_CONFIG"), site_env.BROKER_CONFIG
+        site_env.BROKER_CONFIG = os.environ["BROKER_CONFIG"] = cfg
+        try:
+            with patched_config(doc):
+                assert site_env.load_settings(doc) == []
+                assert app.Config(cdir).data == want
+        finally:
+            site_env.BROKER_CONFIG = saved_path
+            if saved_env is None:
+                os.environ.pop("BROKER_CONFIG", None)
+            else:
+                os.environ["BROKER_CONFIG"] = saved_env
+    ok("denylist-only broker.json (and YAML when available) parses and leaves every JSON config file unchanged")
 
 
 def _uncomment(text, key):

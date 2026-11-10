@@ -677,8 +677,8 @@ What each action does:
   `/reconcile`. The model menu next to **Run again** runs that one run on the model or backend you pick, ahead
   of any `model:` label on the ticket. A row that pins its model (a `<ROW>_BACKEND` or `model_pin`) refuses
   the pick; change the row instead.
-- **Worker settings** (under **Fleet**) edits the [routing overrides file](routing-overrides.md): each row's
-  `backend` and `model_pin`, and the `row_concurrency` cap per group. **Default** removes your change and puts
+- **Settings > Workers** (header gear, or phone hamburger) edits the [routing overrides file](routing-overrides.md): each row's
+  `backend` and `model_pin`. **Settings > Groups** edits the `row_concurrency` cap per group. **Default** removes your change and puts
   back the environment value. New runs pick the change up; running ones keep what they started with. The
   broker needs write access to that file and its directory, otherwise the card says so and stays read-only.
   The harness, the repository lock scope and `trusted_creators` can only be changed in the file itself,

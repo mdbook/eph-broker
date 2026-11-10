@@ -100,7 +100,8 @@ back to another model. Invalid lists stop broker startup.
 - **Burst batching.** Saving a ticket fires several webhooks. The broker waits a few seconds so they become one worker with one brief, and follow-up comments reach the same worker.
 - **Pluggable agents.** Claude Code by default, [hermes-agent](docs/hermes.md) and other CLIs through [adapters](docs/adapters.md), with [custom worker types](docs/routes.md).
 - **Your tracker.** GitLab issues work natively. [Vikunja](https://vikunja.io) and others plug in through a [small script](docs/tracker-script.md) and [n8n](https://n8n.io) workflows ([ready-made](docs/n8n.md)).
-- **Dashboard and events.** A live view of workers and queues, plus [signed run events](docs/events.md) for your own automation.
+- **Dashboard and events.** Tabbed worker and queue views, a separate Settings page and phone hamburger navigation
+  ([dashboard guide](docs/operations.md#health-and-the-dashboard)), plus [signed run events](docs/events.md) for your own automation.
 - **Optional UI modules.** [Add a tab](docs/modules.md#try-it-in-ten-minutes) without embedding another app in the broker.
 
 ![The dashboard's worker view](docs/images/dashboard-workers.png)

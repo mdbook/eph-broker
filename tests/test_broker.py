@@ -12862,8 +12862,7 @@ def test_dash_pending_runs_paused_for_drain_rendering():
         print("  SKIP  dash_pending_runs_paused_for_drain_rendering: node unavailable")
         return
     page = dash.PAGE
-    for prefix in ("n", "q"):
-        assert f'id="{prefix}-wait-drain" hidden>Drain on</span>' in page
+    assert 'id="q-wait-drain" hidden>Drain on</span>' in page
 
     def js_between(start, end):
         return page[page.index(start):page.index(end)]
@@ -12891,19 +12890,16 @@ for(const drain of [{enabled: true, durable: true}, {enabled: false, durable: tr
   paint(d);
   const paused = !!(drain && drain.enabled), D = lastDerived;
   assert.equal(D.running.length, 1);
-  assert.equal(D.waiting.length, 5);
+  assert.equal(D.waiting.length, 3);
   assert.deepEqual(D.waiting.slice(0, 3).map(x => x.why), [WAIT_WHY.repo_lock, WAIT_WHY.concurrency, 'custom_wait']);
-  const reasons = paused ? ['Paused: broker draining', 'Paused: broker draining']
-    : ['Collecting events, starts in 0s', 'Collecting events, starts in 30s'];
-  assert.deepEqual(D.waiting.slice(3).map(x => x.why), reasons);
-  for(const why of reasons) assert(dom['n-wait'].innerHTML.includes('<td class="m-sub">' + why + '</td>'));
+  assert.equal(D.queue.length, 2, 'pending is not yet admitted');
+  for(const q of D.queue) assert(dom['n-q'].innerHTML.includes(queueWhy(q, d)));
   assert(dom['n-wait'].innerHTML.includes(WAIT_WHY.repo_lock));
   assert(dom['n-wait'].innerHTML.includes(WAIT_WHY.concurrency));
-  assert.equal(dom['n-wait'].innerHTML.includes('Collecting events'), !paused);
-  assert.equal(dom['q-wait'].innerHTML.includes('Paused for drain'), paused);
-  assert.equal(dom['q-wait'].innerHTML.includes('Collecting events'), !paused);
-  for(const prefix of ['n', 'q']) assert.equal(dom[prefix + '-wait-drain'].hidden, !paused);
-  assert.deepEqual(allRuns(d, D).filter(r => r.grp === 'waiting').slice(3).map(r => r.why), reasons);
+  assert.equal(dom['n-q'].innerHTML.includes('Collecting events'), !paused);
+  assert.equal(dom['q-wait'].innerHTML.includes('Collecting events'), false);
+  assert.equal(dom['q-wait-drain'].hidden, !paused);
+  assert.equal(allRuns(d, D).filter(r => r.grp === 'waiting').length, 3);
 }
 '''
     result = subprocess.run([node, "-e", js + harness], capture_output=True, text=True, timeout=10)
@@ -13218,7 +13214,7 @@ def test_dash_rerun_options_use_current_ticket_row():
 
 def test_dash_rerun_model_controls():
     page = dash.PAGE
-    for text in ('Run again on:', 'This row (', 'data-settings', 'class="rerun-controls"',
+    for text in ('Run again on:', 'This row (', '#settings/workers', 'class="rerun-controls"',
                  '<span class="control-label">Search runs</span>', '<span class="control-label">Message this run</span>',
                  '<span class="control-label">Max at once</span>'):
         assert text in page, text
@@ -13321,23 +13317,188 @@ const act = (verb, body) => {sent = body; return Promise.resolve(false);};
     ok('rerun controls stay grouped, use current defaults and preserve/block unvalidated explicit choices without a silent downgrade')
 
 
+def test_dash_navigation_settings_and_hash_tabs():
+    """Settings never belongs to Fleet; hash navigation and keyboard tabs use the shipped code."""
+    from html.parser import HTMLParser
+
+    class Sections(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.section = None
+            self.owners = {}
+        def handle_starttag(self, tag, attrs):
+            attrs = dict(attrs)
+            if tag == 'section':
+                self.section = attrs.get('id')
+            if attrs.get('id'):
+                self.owners[attrs['id']] = self.section
+        def handle_endtag(self, tag):
+            if tag == 'section':
+                self.section = None
+
+    parsed = Sections()
+    parsed.feed(dash.PAGE)
+    assert parsed.owners['f-rows'] == 'fleet-view'
+    for id_ in ('s-w', 's-rows', 's-caps', 's-modules'):
+        assert parsed.owners[id_] == 'v-settings', id_
+    for view, tabs in (('now', ('running', 'queue', 'recent')),
+                       ('queue', ('next', 'waiting', 'source')),
+                       ('settings', ('workers', 'groups', 'modules'))):
+        for tab in tabs:
+            assert f'role="tab" href="#{view}/{tab}" aria-controls="{view}-{tab}"' in dash.PAGE
+            assert f'id="{view}-{tab}" role="tabpanel" aria-labelledby="tab-{view}-{tab}"' in dash.PAGE or \
+                f'id="{view}-{tab}" role="tabpanel"' in dash.PAGE
+    for rule in ('button:hover', 'button:active', ':focus-visible', '.btn.pri:hover', '.btn.pri:active',
+                 '.btn.ghost:hover', '.btn.ghost:active', 'var(--onbrand)', '.seg button:hover'):
+        assert rule in dash.PAGE, rule
+    node = shutil.which('node')
+    if not node:
+        SKIPPED.append('dash navigation execution: node unavailable')
+        return
+    js = dash.PAGE[dash.PAGE.index('const VIEWS ='):dash.PAGE.index('function paintDetail()')]
+    harness = r'''
+const assert = require('node:assert/strict');
+const dom = {}, $ = id => dom[id] ||= {hidden: true, attrs: {}, setAttribute(k,v){this.attrs[k]=v;},
+  focus(){this.focused=true;}, addEventListener(){}, querySelector(){return $('first-link');}};
+const listeners = {}, document = {querySelectorAll: () => [], addEventListener: (k, f) => listeners[k] = f};
+const window = {addEventListener: (k,f) => listeners[k] = f}, location = {hash: ''};
+let selected = null, lastState = null, runsFilter, fleetFilter;
+function select(key,past){ selected = [key,past]; }
+function closeStream(){}
+'''
+    cases = r'''
+for(const [hash, view, tab] of [['#settings/groups','settings','groups'], ['#now/queue','now','queue'],
+  ['#queue/waiting','queue','waiting'], ['#queue/source','queue','source'], ['#now/recent','now','recent'],
+  ['#settings/modules','settings','modules'], ['#settings','settings','workers'],
+  ['#queue/not-a-tab','queue','next'], ['#nonsense','now','running']]){
+  location.hash = hash; route();
+  assert.equal($(VIEWS[view]).hidden, false);
+  for(const t of SUBTABS[view]){
+    assert.equal($(view+'-'+t).hidden, t !== tab);
+    assert.equal($('tab-'+view+'-'+t).attrs['aria-selected'], t === tab);
+    assert.equal($('tab-'+view+'-'+t).tabIndex, t === tab ? 0 : -1);
+  }
+}
+// Re-entering the same hashes models reload, back and forward without a separate state store.
+location.hash = '#settings/groups'; listeners.hashchange();
+assert.equal($('settings-groups').hidden, false);
+location.hash = '#runs/finished'; route(); assert.equal(runsFilter, 'finished');
+location.hash = '#fleet/tfa'; route(); assert.equal(fleetFilter, 'tfa');
+$('mobile-menu').hidden = true; $('menu-toggle').onclick();
+assert.equal($('menu-toggle').attrs['aria-expanded'], true);
+listeners.keydown({key:'Escape'}); assert.equal($('mobile-menu').hidden, true);
+const tabs = ['running','queue','recent'].map(t => ({hash:'#now/'+t, focus(){this.focused=true;}}));
+tabs[0].closest = () => ({querySelectorAll: () => tabs});
+let prevented = false;
+listeners.keydown({key:'ArrowRight', target:{closest:()=>tabs[0]}, preventDefault(){prevented=true;}});
+assert(prevented && tabs[1].focused); assert.equal(location.hash, '#now/queue');
+location.hash = '#run/vikunja%3Atask%3A9001/abc12345'; route();
+assert.deepEqual(selected, ['vikunja:task:9001','abc12345']);
+'''
+    r = subprocess.run([node, '-e', harness + js + cases], capture_output=True, text=True, timeout=10)
+    assert r.returncode == 0, r.stderr
+    ok('dash: Settings outside Fleet, hash sub-tabs, defaults, history re-entry, keyboard and hamburger')
+
+
+def test_dash_queue_preview_metadata_and_stages():
+    now = 1800000000
+    event = {'title': 'Fix <unsafe> ticket'}
+    assert dash._pending_view('vikunja:task:9001', {'events': [event], 'armed_at': now - 20}, now)['arrived_age'] == 20
+    row = dash._live_view('vikunja:task:9002', {'events': [event], 'admitted_at': now - 50}, now)
+    assert row['title'] == event['title'] and row['arrived_age'] == 50
+    assert dash._live_view('old', {}, now)['arrived_age'] is None
+    node = shutil.which('node')
+    if not node:
+        SKIPPED.append('dash queue preview execution: node unavailable')
+        return
+    page = dash.PAGE
+    js = page[page.index('function esc(s)'):page.index('// ---- theme')]
+    js += page[page.index('function title(key)'):page.index('// ---- Fleet:')]
+    js += page[page.index('function tid(key)'):page.index('// ---- views.')]
+    js += page[page.index('function actAttrs('):page.index('async function act(')]
+    harness = r'''
+const assert = require('node:assert/strict');
+const dom = {}, $ = id => dom[id] ||= {};
+const document = {querySelectorAll: () => []};
+let can = false;
+const showHarness = false, picking = () => false;
+function paintFleet(){} function paintDetail(){}
+const pending = {key:'vikunja:task:9001', title:'Fix <unsafe> ticket', spawn_in:30, arrived_age:20};
+const live = {key:'vikunja:task:9002', title:'Blocked ticket', waiting:'repo_lock', arrived_age:50};
+const d = {now:1800000000, workers:[], live:[live], pending:[pending],
+  queue:[pending, live], history:[], counters:{}, concurrency:{cap:2,in_use:0}};
+paint(d);
+assert.deepEqual(lastDerived.queue.map(x=>x.key), [pending.key]);
+assert.deepEqual(lastDerived.waiting.map(x=>x.key), [live.key]);
+for(const id of ['n-q','q-rows']){
+  assert(dom[id].innerHTML.includes('Fix &lt;unsafe&gt; ticket'));
+  assert(!dom[id].innerHTML.includes('Fix <unsafe> ticket'));
+}
+assert(dom['n-q'].innerHTML.includes('vikunja · Age: 20s'));
+assert(dom['n-wait'].innerHTML.includes('Blocked ticket'));
+assert(dom['n-wait'].innerHTML.includes('Age: 50s'));
+assert(dom['n-wait'].innerHTML.includes(WAIT_WHY.repo_lock));
+assert(dom['n-strip'].innerHTML.includes('href="#queue/waiting"'));
+assert(dom['n-strip'].innerHTML.includes('href="#queue/next"'));
+assert(dom['n-q'].innerHTML.includes('href="#queue/next"'));
+// Teardown overlaps are different launches, with or without an attached worker.
+can = true;
+for(const state of ['closing', 'closed', 'parking']){
+  for(const workers of [[], [{key:pending.key, in_turn:false}]]){
+    for(const drain of [null, {enabled:true, durable:false}]){
+      for(const stage of ['both', 'pending', 'intake']){
+        const next = {...d, workers, drain, live:[{...pending, state}],
+          pending:stage === 'intake' ? [] : [pending], queue:stage === 'pending' ? [] : [pending]};
+        paint(next);
+        assert.deepEqual(lastDerived.queue.map(x=>x.key), [pending.key], state + '/' + stage);
+        assert.deepEqual(lastDerived.waiting, [], 'teardown is not a new launch starting up');
+        assert.equal(dom['q-n'].textContent, 1);
+        assert.equal(dom['n-q-n'].textContent, 1);
+        assert.equal(dom['q-src-n'].textContent, 1);
+        assert.equal(dom['q-wait-n'].textContent, 0);
+        const why = drain ? 'Paused: broker draining' : 'Previous worker tearing down';
+        for(const id of ['n-q', 'q-rows']) assert(dom[id].innerHTML.includes(why), id + ': ' + state);
+        assert(dom['q-rows'].innerHTML.includes('data-act="move-to-front"'));
+        assert(!dom['n-wait'].innerHTML.includes('Starting up'));
+      }
+    }
+  }
+}
+// Once the old entry clears, the follow-up remains queued, then moves stages on admission.
+paint({...d, live:[], pending:[pending], queue:[pending]});
+assert.equal(lastDerived.queue.length, 1);
+assert(!dom['q-rows'].innerHTML.includes('Previous worker tearing down'));
+for(const state of ['open_running', 'open_idle']){
+  paint({...d, live:[{...pending, state, waiting:'repo_lock'}], pending:[], queue:[pending]});
+  assert.equal(lastDerived.queue.length, 0, 'same admitted launch is not counted twice');
+  assert.equal(lastDerived.waiting.length, 1);
+}
+'''
+    r = subprocess.run([node, '-e', js + harness], capture_output=True, text=True, timeout=10)
+    assert r.returncode == 0, r.stderr
+    ok('dash: admission stages preserve teardown rearms, counts, controls and blockers with escaped preview metadata')
+
+
 def test_dash_mobile_layout():
-    """<=720px is a phone app: bottom tab bar for the four views, the summary strip becomes a list, tables stack
+    """<=720px uses a hamburger for views and Settings, the summary strip becomes a list, tables stack
     into rows (title line + one muted detail line) and row buttons fold into the tappable row."""
     page = dash.PAGE
     m = re.search(r"/\* Mobile:.*?@media \(max-width:720px\)\{(.*?)\n  \}\n", page, re.S)
     assert m, "mobile media query missing"
     css = m.group(1)
-    for needle in (".nav,.inst{display:none}", ".tabbar{display:grid;grid-template-columns:repeat(4,1fr);position:fixed",
+    for needle in (".nav,.inst,#settings-gear{display:none}", "#menu-toggle{display:inline-flex}",
                    ".tbl thead{display:none}", ".tbl tr{display:grid", ".tbl td .btn{display:none}",
                    ".strip{grid-template-columns:minmax(0,1fr)", "min-height:48px"):
         assert needle in css, needle
     for v in ("now", "runs", "queue", "fleet"):
-        assert page.count('href="#%s" data-view="%s"' % (v, v)) == 2, v   # top nav + bottom tab bar
+        assert page.count('href="#%s" data-view="%s"' % (v, v)) == 2, v   # desktop + hamburger
+    assert 'class="tabbar"' not in page
+    assert 'aria-controls="mobile-menu"' in page and 'aria-expanded="false"' in page
+    assert page.count('href="#settings/workers" data-view="settings"') == 2
     body = page[page.index("function agentRow(a)"):page.index("function fleetSort(")]
     for needle in ('class="an"', 'class="mdl-c"', 'class="led', 'class="lage', "ctxMeter(a)", 'class="m-sub"'):
         assert needle in body, needle
-    ok("dash.PAGE is a phone app at <=720px: bottom tabs, stacked table rows, tappable rows")
+    ok("dash.PAGE uses a phone hamburger including Settings, stacked table rows, tappable rows")
 
 
 def test_fleet_parsing():
@@ -14705,7 +14866,8 @@ def test_dash_human_timeline_page():
             or rhs.startswith("sanitizeHtml(") or "needCard(" in rhs or "runwayRow(" in rhs \
             or "modelChip(" in rhs \
             or re.match(r"(sel \? )?(cell|segHtml|runCard|drainHead|bars)\(", rhs) \
-            or re.search(r"\.map\((agentRow|needRow|needCard)\)", rhs) or "map(w => runRow(" in rhs, m.group(0)
+            or re.search(r"\.map\((agentRow|needRow|needCard)\)", rhs) or "map(w => runRow(" in rhs \
+            or "map(x => stageRow(" in rhs, m.group(0)
     # the named renderers escape inside (the fleet escape test forbids raw `+ a.x` in the fleet ones)
     for fn in ("function needCard(", "function needRow(", "function runRow(", "function runCard(", "function cell(",
                "function segHtml(", "function drainHead(", "function bars("):

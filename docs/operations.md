@@ -111,12 +111,17 @@ isn't printable ASCII or is over 512 characters gets a 400. `completed` is remem
 subjects only (the same list that stops a closed ticket from starting again), and it survives a restart when
 it's persisted (`COMPLETED_PATH`, or `completed.json` next to `EVENTS_LOG`). Like the dashboard it has no login, so it sits behind the same proxy.
 
-The dashboard has four views, each at its own URL (`#now`, `#runs`, `#queue`, `#fleet`), and a phone layout
-with a bottom tab bar.
+The dashboard has Now, Runs, Queue and Fleet views plus a full Settings page. Desktop navigation keeps
+Settings in the header gear beside the theme button. On phones, the hamburger contains every view,
+Settings and any configured viewer modules. Escape closes the menu.
+Underlined sub-tabs keep their selection in the URL hash for reload, back and forward. Use Tab to reach
+the selected sub-tab, then Left/Right or Home/End to change it.
 
-- **Now** leads with what needs you (a launch whose outcome is unknown after a restart, or an intake journal
-  error), then what is running, the queue and whether new runs are paused, what is waiting to start, and recent
-  sessions, named by their ticket title. Broker counters sit behind **Details**; the raw JSON is at `/state`.
+- **Now** keeps the count strip and Needs you above Running / Queue / Recent sub-tabs
+  (`#now/running`, `#now/queue`, `#now/recent`). Queue counts link to the full Queue view. Its short preview
+  shows up to three items per stage with ticket, available title, source, age and held reason. Titles come
+  from intake metadata or known sessions; missing titles and legacy ages are not guessed. Broker counters
+  sit behind **Details**; the raw JSON is at `/state`.
 - **Runs** lists running, waiting and finished runs, with search and a details panel. A run opens at
   `#run/<key>` with its live transcript (needs `BROKER_STREAM_ENABLED`), or a past session's replay. An ended
   run keeps its title, model, token total and how long it ran.
@@ -128,11 +133,20 @@ with a bottom tab bar.
   **Running** only ever means a real worker. A subject queued on a repo lock or turn slot shows **Waiting** with
   the reason, and setup before a worker is registered shows **Starting up**. Repo lock scope is
   [configurable per route](routing-overrides.md).
-- **Queue** shows the durable intake queue (needs `BROKER_STATE_PATH`) in dispatch order, one row per ticket.
+- **Queue** is the full queue and control surface, with Next up / Waiting to start / By source sub-tabs
+  (`#queue/next`, `#queue/waiting`, `#queue/source`). Next up is arrived but not admitted, including events
+  still coalescing. Waiting to start is admitted without a worker, with each item's blocker in words.
+  Each launch appears in only one stage. Follow-up work for a ticket whose previous worker is closing,
+  closed or parking stays in Next up, labelled as waiting for the previous worker to tear down (or for
+  draining to end). Durable intake requires `BROKER_STATE_PATH`.
 - Set `DASH_INSTANCE_NAME` to label the page (for example `staging`), and `TICKET_URL_TEMPLATE` to an http(s)
   URL to get **Open ticket** links.
 - **Fleet** is optional and only useful if you also run long-lived agents with their own status file; see
-  [configuration.md](configuration.md#the-dashboard).
+  [configuration.md](configuration.md#the-dashboard). It contains the agent table, not worker settings.
+- **Settings** has Workers (`#settings/workers`) for harness/backend/model rows, Groups
+  (`#settings/groups`) for Max at once limits, and Modules (`#settings/modules`) for viewer state and
+  authorized child-module reloads. Worker and group editing still requires dashboard action access.
+  Module disable/enable uses the existing configured disabled-file marker, not a new browser action.
 
 ## Finding the result of a GitLab issue
 

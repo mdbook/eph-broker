@@ -173,7 +173,9 @@ class MoveToFrontTests(unittest.TestCase):
             assert state['next_subject'] == chosen
         assert 'id="v-queue"' in dash.PAGE
         assert "actBtn('Move to front', 'move-to-front'" in dash.PAGE
-        assert "l.waiting === 'concurrency'" in dash.PAGE
+        # Keep the button's full gate covered without coupling to the row variable name.
+        self.assertRegex(dash.PAGE, r"controls && waiting && can && [A-Za-z_$][\w$]*"
+                                   r"\.waiting === 'concurrency' \? actBtn\('Move to front', 'move-to-front'")
 
     def test_pending_selection_reserves_a_freed_slot_until_setup_reaches_the_gate(self):
         b = self.broker()

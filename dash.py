@@ -558,20 +558,33 @@ def _queue_view(broker, now):
         row = out.get(key)
         if row is None:
             out[key] = {"key": key, "kind": kind, "events": 1,
+                        "title": _event_title([payload.get("event") or {}]),
                         "arrived_age": _round(max(0.0, now - arrived)) if isinstance(arrived, (int, float)) else None}
         else:
             row["events"] += 1
     return list(out.values())
 
 
+def _event_title(events):
+    """Use titles already carried by intake; never fetch ticket data during a state poll."""
+    for event in reversed(events):
+        if isinstance(event, dict) and isinstance(event.get("title"), str) and event["title"].strip():
+            return event["title"][:300]
+    return None
+
+
 def _live_view(key, w, now):
     return {"key": key, "state": w.get("state"), "forwards": w.get("forwards", 0),
+            "title": _event_title(w.get("events") or []),
+            "arrived_age": _round(max(0.0, now - w["admitted_at"])) if w.get("admitted_at") is not None else None,
             "events": len(w.get("events") or []), "buffered": len(w.get("fwd_buffer") or []),
             "expire_in": _round(max(0.0, (w.get("expire") or now) - now))}
 
 
 def _pending_view(key, p, now):
     return {"key": key, "events": len(p.get("events") or []),
+            "title": _event_title(p.get("events") or []),
+            "arrived_age": _round(max(0.0, now - p["armed_at"])) if p.get("armed_at") is not None else None,
             "spawn_in": _round(max(0.0, (p.get("spawn_at") or now) - now))}
 
 
@@ -712,7 +725,11 @@ PAGE = r"""<!DOCTYPE html>
   body{margin:0;font:14px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI Variable Text","Segoe UI",system-ui,sans-serif;
        background:var(--bg);color:var(--t1);-webkit-font-smoothing:antialiased}
   code,pre,.mono{font-family:ui-monospace,SFMono-Regular,"JetBrains Mono",Menlo,monospace}
-  button{font:inherit;color:inherit}
+  button{font:inherit;color:var(--t1);appearance:none;background:var(--s1);border:1px solid var(--line);
+         border-radius:8px;padding:6px 12px;cursor:pointer}
+  button:hover{background:var(--s2)}
+  button:active{background:var(--s3)}
+  button:disabled{opacity:.5;cursor:default}
   a{color:inherit}
   :focus-visible{outline:2px solid var(--brand);outline-offset:2px}
 
@@ -741,7 +758,13 @@ PAGE = r"""<!DOCTYPE html>
        border-radius:8px;border:1px solid var(--line);background:var(--s1);color:var(--t1);font-weight:600;font-size:14px;
        text-decoration:none;cursor:pointer;white-space:nowrap}
   .btn:hover{border-color:color-mix(in srgb,var(--t1) 28%,var(--line))}
+  .btn:active{background:var(--s3);transform:translateY(1px)}
   .btn.pri{background:var(--brand);border-color:var(--brand);color:var(--onbrand)}
+  .btn.pri:hover{background:color-mix(in srgb,var(--brand) 85%,var(--t1))}
+  .btn.pri:active{background:color-mix(in srgb,var(--brand) 70%,var(--t1))}
+  .btn.ghost{background:transparent;border-color:transparent}
+  .btn.ghost:hover{background:var(--s2);border-color:var(--line)}
+  .btn.ghost:active{background:var(--s3)}
   .btn.sq{min-width:36px;width:36px;padding:0}
   .btn.on{border-color:var(--brand);color:var(--brand)}
   .btn.bad{color:var(--red)} .btn.bad:hover{border-color:var(--red)}
@@ -858,6 +881,15 @@ PAGE = r"""<!DOCTYPE html>
   .seg{display:inline-flex;background:var(--s3);border-radius:9px;padding:3px;gap:2px}
   .seg button{border:0;background:none;border-radius:7px;padding:5px 12px;font-size:13px;font-weight:600;color:var(--t2);cursor:pointer;white-space:nowrap}
   .seg button[aria-pressed=true]{background:var(--s1);color:var(--t1);box-shadow:var(--shadow)}
+  .seg button:hover,.lnk:hover{background:var(--s2)}
+  .seg button:active,.lnk:active{background:var(--s3)}
+  .subtabs{display:flex;gap:20px;border-bottom:1px solid var(--line);margin-top:24px;overflow-x:auto}
+  .subtabs a{padding:10px 0;border-bottom:3px solid transparent;text-decoration:none;white-space:nowrap;color:var(--t2)}
+  .subtabs a:hover{color:var(--t1);background:var(--s2)}
+  .subtabs a:active{background:var(--s3)}
+  .subtabs a[aria-selected=true]{border-bottom-color:var(--brand);color:var(--t1);font-weight:600}
+  .queue-preview{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px}
+  .sw:hover,.sw:active{box-shadow:0 0 0 2px var(--brand)}
   .bar{display:flex;align-items:center;gap:16px;margin-bottom:16px;flex-wrap:wrap}
   .search{margin-left:auto;width:280px;max-width:100%;height:36px;border:1px solid var(--line);border-radius:8px;background:var(--s1);
           color:var(--t1);padding:0 12px;font:inherit}
@@ -1047,27 +1079,30 @@ PAGE = r"""<!DOCTYPE html>
        background:var(--s1);cursor:copy;user-select:all;white-space:nowrap}
   .cmd.copied{color:var(--run);border-color:var(--run)}
 
-  /* ---- bottom tab bar, phone only */
-  .tabbar{display:none}
+  /* ---- phone navigation disclosure; modules append links to the same menu */
+  #menu-toggle,.mobile-menu{display:none}
 
   @media (max-width:1100px){
     .cols{grid-template-columns:minmax(0,1fr)}
     #r-side{display:none}
   }
-  /* Mobile: a real app layout. View tabs move to a bottom bar, the summary strip becomes a short list,
+  /* Mobile: view links move to a hamburger, the summary strip becomes a short list,
      tables become stacked rows (title line, then one muted detail line), row actions collapse into the row. */
   @media (max-width:720px){
     .top-in{padding:0 16px;height:56px;gap:12px}
-    .nav,.inst{display:none}
-    .page{padding:20px 16px 96px}
+    .nav,.inst,#settings-gear{display:none}
+    .top-r{gap:6px}
+    #theme{min-width:0;padding:0 6px;font-size:12px}
+    #paused{display:none} /* Pause remains visible in Now counts and Queue controls. */
+    #menu-toggle{display:inline-flex}
+    .mobile-menu{display:flex;flex-direction:column;padding:8px 16px;max-height:70vh;overflow-y:auto}
+    .mobile-menu a{padding:12px;min-height:48px;border-radius:8px;text-decoration:none}
+    .mobile-menu a:hover{background:var(--s2)}
+    .mobile-menu a[aria-current=page]{color:var(--brand);background:var(--s2)}
+    .queue-preview{grid-template-columns:minmax(0,1fr)}
+    .page{padding:20px 16px 48px}
     .ph h1{font-size:26px}
     .sec{margin-top:24px}
-    .tabbar{display:grid;grid-template-columns:repeat(4,1fr);position:fixed;left:0;right:0;bottom:0;z-index:6;
-            background:var(--s1);border-top:1px solid var(--line);padding:6px 0 calc(6px + env(safe-area-inset-bottom))}
-    .tabbar a{display:flex;flex-direction:column;align-items:center;gap:3px;padding:4px 0;min-height:48px;justify-content:center;
-              font-size:11px;font-weight:600;color:var(--t2);text-decoration:none}
-    .tabbar a[aria-current=page]{color:var(--brand)}
-    .tabbar svg{width:22px;height:22px}
     .strip{grid-template-columns:minmax(0,1fr);padding:0}
     .strip > div{border-left:0;border-top:1px solid var(--line);padding:12px 16px;display:flex;align-items:center;gap:12px}
     .strip > div:first-child{border-top:0}
@@ -1112,8 +1147,15 @@ PAGE = r"""<!DOCTYPE html>
   <div class="top-r">
     <a class="chip wait pause" id="paused" href="#queue" hidden>New runs paused</a>
     <button class="btn" id="theme" title="Theme: auto" aria-label="Theme: auto">Theme: auto</button>
+    <a class="btn sq ghost" id="settings-gear" href="#settings/workers" data-view="settings" aria-label="Settings" title="Settings">⚙</a>
+    <button class="btn sq ghost" id="menu-toggle" aria-expanded="false" aria-controls="mobile-menu" aria-label="Navigation menu">☰</button>
   </div>
-</div></header>
+</div>
+<nav class="mobile-menu" id="mobile-menu" aria-label="Mobile views" hidden>
+  <a href="#now" data-view="now">Now</a><a href="#runs" data-view="runs">Runs</a>
+  <a href="#queue" data-view="queue">Queue</a><a href="#fleet" data-view="fleet">Fleet</a>
+  <a href="#settings/workers" data-view="settings">Settings</a>
+</nav></header>
 
 <div id="err" class="err-banner" style="display:none" role="alert"></div>
 
@@ -1122,12 +1164,21 @@ PAGE = r"""<!DOCTYPE html>
   <div class="ph"><h1>Now</h1><span class="upd"></span></div>
   <div class="card strip" id="n-strip"></div>
   <div class="sec"><h2>Needs you <span class="cnt" id="n-needs-n">0</span></h2><div class="card rows" id="n-needs"></div></div>
-  <div class="cols">
-    <div class="sec"><h2>Running <span class="cnt" id="n-run-n"></span></h2><div class="card" id="n-run"></div></div>
-    <div class="sec"><h2>Queue <span class="cnt" id="n-q-n"></span></h2><div class="card" id="n-q"></div></div>
-    <div class="sec"><h2>Waiting to start <span class="cnt" id="n-wait-n"></span> <span class="chip wait" id="n-wait-drain" hidden>Drain on</span></h2>
-      <p class="sub">Admitted, but no worker yet. Each one starts as soon as its blocker clears.</p><div class="card" id="n-wait"></div></div>
-    <div class="sec" id="h-card"><h2>Recent <span class="cnt" id="n-history"></span></h2>
+  <nav class="subtabs" role="tablist" aria-label="Now sections">
+    <a id="tab-now-running" role="tab" href="#now/running" aria-controls="now-running">Running <span class="cnt" id="n-run-n"></span></a>
+    <a id="tab-now-queue" role="tab" href="#now/queue" aria-controls="now-queue">Queue <span class="cnt" id="n-q-n"></span></a>
+    <a id="tab-now-recent" role="tab" href="#now/recent" aria-controls="now-recent">Recent <span class="cnt" id="n-history"></span></a>
+  </nav>
+  <div id="now-running" role="tabpanel" aria-labelledby="tab-now-running"><div class="sec card" id="n-run"></div></div>
+  <div id="now-queue" role="tabpanel" aria-labelledby="tab-now-queue" hidden>
+    <p class="sub">Preview only. Open Queue for the full lists and controls.</p>
+    <div class="queue-preview">
+      <div><h2><a href="#queue/next">Next up</a></h2><div class="card rows" id="n-q"></div></div>
+      <div><h2><a href="#queue/waiting">Waiting to start <span class="cnt" id="n-wait-n"></span></a></h2><div class="card rows" id="n-wait"></div></div>
+    </div>
+  </div>
+  <div id="now-recent" role="tabpanel" aria-labelledby="tab-now-recent" hidden>
+    <div class="sec" id="h-card"><h2>Recent</h2>
       <p class="sub">Worker sessions this broker recorded, newest first.</p><div class="card rows" id="h-list"></div></div>
   </div>
   <details class="drawer" id="drawer"><summary><b>Details</b><span>Broker counters</span></summary>
@@ -1148,25 +1199,28 @@ PAGE = r"""<!DOCTYPE html>
 
 <section id="v-queue" hidden>
   <div class="ph"><h1>Queue</h1><span class="upd"></span></div>
-  <div class="cols">
-    <div>
-      <div class="card" id="q-drain"></div>
-      <div class="sec"><h2>Next up <span class="cnt" id="q-n"></span></h2><p class="sub" id="q-sub"></p>
+  <div class="card" id="q-drain"></div>
+  <nav class="subtabs" role="tablist" aria-label="Queue stages">
+    <a id="tab-queue-next" role="tab" href="#queue/next" aria-controls="queue-next">Next up <span class="cnt" id="q-n"></span></a>
+    <a id="tab-queue-waiting" role="tab" href="#queue/waiting" aria-controls="queue-waiting">Waiting to start <span class="cnt" id="q-wait-n"></span></a>
+    <a id="tab-queue-source" role="tab" href="#queue/source" aria-controls="queue-source">By source <span class="cnt" id="q-src-n"></span></a>
+  </nav>
+  <div id="queue-next" role="tabpanel" aria-labelledby="tab-queue-next">
+      <div class="sec"><h2>Next up: arrived, not admitted</h2><p class="sub" id="q-sub"></p>
         <div class="card"><table class="tbl"><thead><tr><th>#</th><th>Ticket</th><th>Source</th><th>Events</th><th>Arrived</th><th>Action</th></tr></thead>
           <tbody id="q-rows"></tbody></table><div class="tfoot" id="q-foot" hidden></div></div></div>
     </div>
-    <div>
+    <div id="queue-waiting" role="tabpanel" aria-labelledby="tab-queue-waiting" hidden>
       <div class="card side" id="q-cap"></div>
-      <div class="sec"><h2>Waiting to start <span class="cnt" id="q-wait-n"></span> <span class="chip wait" id="q-wait-drain" hidden>Drain on</span></h2><div class="card bars" id="q-wait"></div></div>
-      <div class="sec"><h2>By source</h2><div class="card bars" id="q-src"></div></div>
+      <div class="sec"><h2>Waiting to start: admitted, no worker <span class="chip wait" id="q-wait-drain" hidden>Drain on</span></h2><div class="card rows" id="q-wait"></div></div>
     </div>
-  </div>
+    <div id="queue-source" role="tabpanel" aria-labelledby="tab-queue-source" hidden><div class="sec"><h2>By source</h2><div class="card bars" id="q-src"></div></div></div>
 </section>
 
 <section id="fleet-view" hidden>
   <div class="ph"><h1>Fleet</h1><span class="chip mode" id="f-mode"></span><span class="upd" id="f-gen"></span></div>
   <div id="f-err" class="empty card" hidden></div>
-  <div class="card strip" id="f-strip"></div>
+  <div class="card strip" id="f-strip" hidden></div>
   <div class="sec" id="f-needs-w" hidden><h2>Needs attention <span class="cnt" id="f-needs-n"></span></h2><div class="card rows" id="f-needs"></div></div>
   <div class="sec"><div class="bar"><h2 style="margin:0">Agents <span class="cnt" id="f-n"></span></h2>
       <div class="seg" id="f-seg" role="group" aria-label="Filter agents" style="margin-left:auto"></div></div>
@@ -1174,13 +1228,30 @@ PAGE = r"""<!DOCTYPE html>
       <tbody id="f-rows"></tbody></table>
       <div class="legend">Context bar: the tick is the agent's clear floor. Blue under it, amber past it, red past the ceiling.</div></div>
   </div>
-  <div class="sec" id="s-w" hidden><h2 id="settings">Worker settings</h2>
+</section>
+
+<section id="v-settings" hidden>
+  <div class="ph"><h1>Settings</h1></div>
+  <nav class="subtabs" role="tablist" aria-label="Settings sections">
+    <a id="tab-settings-workers" role="tab" href="#settings/workers" aria-controls="settings-workers">Workers</a>
+    <a id="tab-settings-groups" role="tab" href="#settings/groups" aria-controls="settings-groups">Groups</a>
+    <a id="tab-settings-modules" role="tab" href="#settings/modules" aria-controls="settings-modules">Modules</a>
+  </nav>
+  <p class="sub" id="s-unavailable">Worker and group settings require dashboard action access.</p>
+  <div id="s-w" hidden>
+  <div class="sec" id="settings-workers" role="tabpanel" aria-labelledby="tab-settings-workers"><h2>Worker settings</h2>
     <p class="sub" id="s-sub">Applies to new runs. Running work keeps the model it started with. Blue outline = changed here; Default puts it back.</p>
     <div class="card"><table class="tbl set-tbl"><thead><tr><th>Row</th><th class="m-hide">Harness</th><th>Backend</th><th>Model</th></tr></thead>
       <tbody id="s-rows"></tbody></table></div>
-    <div class="card" style="margin-top:12px"><table class="tbl"><thead><tr><th>Group</th><th>Max at once</th></tr></thead>
+  </div>
+  <div class="sec" id="settings-groups" role="tabpanel" aria-labelledby="tab-settings-groups" hidden><h2>Group limits</h2>
+    <div class="card"><table class="tbl"><thead><tr><th>Group</th><th>Max at once</th></tr></thead>
       <tbody id="s-caps"></tbody></table>
       <div class="legend">A group covers its row and every row under it (code covers code/...). 0 holds new runs in the queue; running work is not stopped.</div></div>
+  </div>
+  </div>
+  <div class="sec" id="settings-modules" role="tabpanel" aria-labelledby="tab-settings-modules" hidden>
+    <h2>Modules</h2><div class="card rows" id="s-modules"><p class="empty">No viewer modules configured.</p></div>
   </div>
 </section>
 
@@ -1204,13 +1275,6 @@ PAGE = r"""<!DOCTYPE html>
   </div>
 </section>
 </main>
-
-<nav class="tabbar" aria-label="Views">
-  <a href="#now" data-view="now"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3.5" fill="currentColor"/></svg>Now</a>
-  <a href="#runs" data-view="runs"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M5 7h14M5 12h14M5 17h14"/></svg>Runs</a>
-  <a href="#queue" data-view="queue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M5 6h14M7 11h10M9 16h6"/></svg>Queue</a>
-  <a href="#fleet" data-view="fleet"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="4" y="4" width="7" height="7" rx="2"/><rect x="13" y="4" width="7" height="7" rx="2"/><rect x="4" y="13" width="7" height="7" rx="2"/><rect x="13" y="13" width="7" height="7" rx="2"/></svg>Fleet</a>
-</nav>
 
 <footer class="page" style="padding-top:0;font-size:12px;color:var(--t3)">
   <span id="foot">Read-only, refreshes every 5 seconds</span>
@@ -1576,7 +1640,7 @@ function paintFleet(f){
       : sup && sup.tmux_server_up === false ? ' <span class="pill bad">tmux server down</span>' : '');
   $('f-err').hidden = !f.error && rows.length > 0;
   $('f-err').textContent = f.error || 'No agents listed in fleet-status.json.';
-  $('f-needs-w').hidden = !needs.length;
+  $('f-needs-w').hidden = true;   // Fleet is the agent table; attention is also visible in each row.
   $('f-needs-n').textContent = needs.length;
   $('f-needs').innerHTML = needs.map(p => needCard(p[0], p[1])).join('');
   $('f-n').textContent = rows.length;
@@ -1615,6 +1679,7 @@ function tid(key){ const m = /^vikunja:task:(\d+)$/.exec(String(key)); return m 
 const titles = new Map();   // run key -> ticket title, from live workers and recorded history (newest wins)
 function learnTitles(d){
   for(const h of (d.history || []).slice().reverse()) if(h.title) titles.set(h.key, h.title);
+  for(const x of [...(d.queue || []), ...d.pending, ...d.live]) if(x.title) titles.set(x.key, x.title);
   for(const w of d.workers) if(w.title) titles.set(w.key, w.title);
 }
 function runName(key, w){
@@ -1641,20 +1706,19 @@ function needsYou(d){
 }
 function derive(d){
   const wk = new Map(d.workers.map(w => [w.key, w])), liveBy = new Map(d.live.map(l => [l.key, l]));
+  const retiring = new Set(d.live.filter(l => ['closing', 'closed', 'parking'].includes(l.state)).map(l => l.key));
   const paused = !!(d.drain && d.drain.enabled);
   const started = new Map();
   for(const h of d.history || []) if(!started.has(h.key)) started.set(h.key, h.ts);
   const running = d.workers.filter(w => !(liveBy.get(w.key) || {}).waiting);
-  const waiting = d.live.filter(l => !wk.has(l.key) || l.waiting).map(l => ({key: l.key, route: l.route,
+  const waiting = d.live.filter(l => !retiring.has(l.key) && (!wk.has(l.key) || l.waiting)).map(l => ({...l,
       why: WAIT_WHY[l.waiting] || (l.waiting ? String(l.waiting) : l.state === 'open_idle' ? 'Idle, no worker attached' : 'Starting up'),
-      group: l.waiting ? WAIT_GROUP[l.waiting] || String(l.waiting) : 'Starting up'}))
-    .concat(d.pending.map(p => ({key: p.key,
-      why: paused ? 'Paused: broker draining' : 'Collecting events, starts in ' + dur(p.spawn_in),
-      group: paused ? 'Paused for drain' : 'Collecting events'})));
-  const queue = new Map((d.queue || []).map(q => [q.key, {...q, movable: !liveBy.has(q.key)}]));
-  for(const p of d.pending) queue.set(p.key, {...(queue.get(p.key) || {}), ...p,
-    movable: !liveBy.has(p.key) || liveBy.get(p.key).state === 'parking'});
-  for(const l of d.live) if(l.waiting === 'concurrency') queue.set(l.key, {...l, kind: 'slot', movable: true});
+      group: l.waiting ? WAIT_GROUP[l.waiting] || String(l.waiting) : 'Starting up'}));
+  // A retiring live entry is the PREVIOUS launch, not the pending/intake follow-up.
+  const queued = key => !liveBy.has(key) || retiring.has(key);
+  const queue = new Map((d.queue || []).filter(q => queued(q.key)).map(q => [q.key, {...q, movable: true}]));
+  for(const p of d.pending) if(queued(p.key)) queue.set(p.key, {...(queue.get(p.key) || {}), ...p, movable: true});
+  for(const q of queue.values()) if(retiring.has(q.key)) q.why = 'Previous worker tearing down';
   const ordered = [...queue.values()].sort((a, b) => Number(b.key === d.next_subject) - Number(a.key === d.next_subject));
   return {wk, started, running, waiting, queue: ordered, needs: needsYou(d), drain: d.drain || null,
           cap: d.concurrency.cap, used: d.concurrency.in_use};
@@ -1738,6 +1802,24 @@ function runRow(w, D, d){
     + '<td class="r m-hide"><button class="btn" data-key="' + esc(w.key) + '">Watch</button></td></tr>';
 }
 
+function queueWhy(q, d){
+  if(d.drain && d.drain.error) return 'Intake journal error';
+  if(d.drain && (d.drain.recovery_subjects || []).length) return 'Launch recovery needs a decision';
+  if(d.drain && d.drain.enabled) return 'Paused: broker draining';
+  if(q.why) return q.why;
+  if(q.spawn_in > 0) return 'Collecting events, ready in ' + dur(q.spawn_in);
+  return 'Awaiting admission: dispatch policy, group limits and capacity apply';
+}
+function stageRow(x, d, waiting, controls){
+  const url = ticketUrl(x.key), reason = waiting ? x.why : queueWhy(x, d);
+  return '<div>' + stIcon('wait') + '<div><div class="h">' + runLabel(x.key)
+    + '</div><div class="s">' + esc((title(x.key).src || 'other') + ' · Age: ' + dur(x.arrived_age))
+    + '</div><div class="s">' + esc(reason) + '</div></div><span></span><span class="acts">'
+    + (url ? '<a class="btn ghost" href="' + esc(url) + '" target="_blank" rel="noopener">Open ticket</a>' : '')
+    + (controls && waiting && can && x.waiting === 'concurrency' ? actBtn('Move to front', 'move-to-front', {subject_key: x.key},
+      {done: 'Selected ' + runName(x.key).ref + ' as next eligible'}) : '') + '</span></div>';
+}
+
 function paint(d){
   lastState = d;
   learnTitles(d);
@@ -1750,8 +1832,8 @@ function paint(d){
 
   // Now
   $('n-strip').innerHTML = cell('Running', D.used, D.cap != null ? 'of ' + D.cap + ' slots' : 'workers', pips(D.used, D.cap))
-    + cell('Waiting to start', D.waiting.length, 'behind a lock or limit')
-    + cell('Queued', D.queue.length, paused ? 'held while paused' : 'waiting to dispatch')
+    + cell('Waiting to start', D.waiting.length, 'behind a lock or limit', '<a class="lnk" href="#queue/waiting">View</a>')
+    + cell('Queued', D.queue.length, paused ? 'held while paused' : 'waiting to dispatch', '<a class="lnk" href="#queue/next">View</a>')
     + cell('Needs you', D.needs.length, D.needs.length === 1 ? 'decision waiting' : 'decisions waiting');
   $('n-needs-n').textContent = D.needs.length;
   $('n-needs').innerHTML = D.needs.length ? D.needs.map(needRow).join('') : '<p class="empty">Nothing needs you right now.</p>';
@@ -1763,19 +1845,14 @@ function paint(d){
     + (free == null ? '' : '<div class="tfoot">' + esc(free + (free === 1 ? ' slot' : ' slots') + ' free.'
       + (paused && D.queue.length ? ' New runs are paused, so the queue will not start them.' : '')) + '</div>');
 
-  $('n-q-n').textContent = D.queue.length;
-  $('n-q').innerHTML = drainHead(D.drain, false) + (D.queue.length ? D.queue.slice(0, 3).map(q =>
-    '<div class="qrow"><span class="ref">' + esc(runName(q.key).ref) + '</span><span>' + esc(q.events + (q.events === 1 ? ' event' : ' events')
-      + (q.kind === 'rerun' ? ', rerun' : '')) + '</span><span class="sub">' + esc(agoT(q.arrived_age)) + '</span></div>').join('')
-    + (D.queue.length > 3 ? '<div class="qmore"><a class="lnk" href="#queue">View all ' + esc(D.queue.length) + '</a></div>' : '')
-    : '<p class="empty">Nothing queued.</p>');
+  $('n-q-n').textContent = D.queue.length + D.waiting.length;
+  $('n-q').innerHTML = D.queue.length ? D.queue.slice(0, 3).map(q => stageRow(q, d, false)).join('')
+    + '<div class="qmore"><a class="lnk" href="#queue/next">Open Queue (' + esc(D.queue.length) + ')</a></div>'
+    : '<p class="empty">Nothing queued.</p>';
 
   $('n-wait-n').textContent = D.waiting.length;
-  $('n-wait-drain').hidden = !paused;
-  $('n-wait').innerHTML = D.waiting.length ? '<table class="tbl"><thead><tr><th>Run</th><th>Blocked by</th></tr></thead><tbody>'
-    + D.waiting.slice(0, 5).map(x => '<tr><td><div class="runc">' + stIcon('wait') + '<div class="t">' + runLabel(x.key, D.wk.get(x.key))
-      + '</div></div></td><td class="m-sub">' + esc(x.why) + '</td></tr>').join('') + '</tbody></table>'
-    + (D.waiting.length > 5 ? '<div class="tfoot"><a class="lnk" href="#runs" data-filter="waiting">Show all ' + esc(D.waiting.length) + '</a></div>' : '')
+  $('n-wait').innerHTML = D.waiting.length ? D.waiting.slice(0, 3).map(x => stageRow(x, d, true)).join('')
+    + '<div class="qmore"><a class="lnk" href="#queue/waiting">Open Waiting to start (' + esc(D.waiting.length) + ')</a></div>'
     : '<p class="empty">Nothing waiting.</p>';
 
   const hs = previous(d);
@@ -1828,12 +1905,11 @@ function paintQueue(d, D){
   const paused = !!(D.drain && D.drain.enabled);
   $('q-drain').innerHTML = drainHead(D.drain, true);
   $('q-n').textContent = D.queue.length;
-  $('q-sub').textContent = paused ? 'Waiting until new runs resume' + (D.cap ? ', up to ' + D.cap + ' at once.' : '.')
-    : 'Next eligible selection first, then the configured dispatch policy. Running work is not interrupted.';
+  $('q-sub').textContent = queueWhy({}, d) + '. Next eligible selection first, then the configured dispatch policy. Running work is not interrupted.';
   $('q-rows').innerHTML = D.queue.length ? D.queue.slice(0, qLimit).map((q, i) => '<tr><td class="num m-hide">' + (i + 1) + '</td>'
       + '<td><span class="t">' + runLabel(q.key) + '</span></td>'
       + '<td class="m-hide">' + esc((title(q.key).src || '-') + (q.kind === 'rerun' ? ' (rerun)' : '')) + '</td>'
-      + '<td class="num m-sub">' + esc(q.events + (q.events === 1 ? ' event' : ' events')) + '</td>'
+      + '<td class="num m-sub">' + esc(q.events + (q.events === 1 ? ' event' : ' events')) + '<div class="s2">' + esc(queueWhy(q, d)) + '</div></td>'
       + '<td class="num m-end">' + esc(q.kind === 'slot' ? 'Waiting for slot' : agoT(q.arrived_age)) + '</td>'
       + '<td>' + (q.key === d.next_subject ? '<span class="tag">Next eligible</span>' : can && q.movable
         ? actBtn('Move to front', 'move-to-front', {subject_key: q.key}, {done: 'Selected ' + runName(q.key).ref + ' as next eligible'}) : '')
@@ -1845,12 +1921,43 @@ function paintQueue(d, D){
     + esc(D.cap != null ? 'of ' + D.cap + ' slots in use' : 'workers running') + '</span></div>' + pips(D.used, D.cap);
   $('q-wait-n').textContent = D.waiting.length;
   $('q-wait-drain').hidden = !paused;
-  $('q-wait').innerHTML = bars(countBy(D.waiting, x => x.group));
-  $('q-src').innerHTML = bars(countBy(D.queue, q => title(q.key).src || 'other'));
+  $('q-wait').innerHTML = D.waiting.length ? D.waiting.map(x => stageRow(x, d, true, true)).join('') : '<p class="empty">Nothing waiting.</p>';
+  $('q-src-n').textContent = D.queue.length + D.waiting.length;
+  $('q-src').innerHTML = bars(countBy([...D.queue, ...D.waiting], q => title(q.key).src || 'other'));
 }
 
-// ---- views. The hash is the route: #now #runs #queue #fleet, #run/<key>[/<session>] for one run.
-const VIEWS = {now: 'v-now', runs: 'v-runs', queue: 'v-queue', fleet: 'fleet-view', run: 'v-run'};
+// ---- views. Hash routes include sub-tabs; old view-only bookmarks use their default tab.
+const VIEWS = {now: 'v-now', runs: 'v-runs', queue: 'v-queue', fleet: 'fleet-view', settings: 'v-settings', run: 'v-run'};
+const SUBTABS = {now: ['running', 'queue', 'recent'], queue: ['next', 'waiting', 'source'], settings: ['workers', 'groups', 'modules']};
+function showSubtab(view, tab){
+  for(const name of SUBTABS[view] || []){
+    const active = name === tab, a = $('tab-' + view + '-' + name);
+    $(view + '-' + name).hidden = !active;
+    a.setAttribute('aria-selected', active);
+    a.tabIndex = active ? 0 : -1;
+  }
+}
+function closeMenu(focus){
+  $('mobile-menu').hidden = true;
+  $('menu-toggle').setAttribute('aria-expanded', 'false');
+  if(focus) $('menu-toggle').focus();
+}
+$('menu-toggle').onclick = () => {
+  const open = $('mobile-menu').hidden;
+  $('mobile-menu').hidden = !open;
+  $('menu-toggle').setAttribute('aria-expanded', open);
+  if(open) $('mobile-menu').querySelector('a').focus();
+};
+$('mobile-menu').addEventListener('click', e => { if(e.target.closest('a')) closeMenu(true); });
+document.addEventListener('keydown', e => {
+  if(e.key === 'Escape' && !$('mobile-menu').hidden){ closeMenu(true); return; }
+  const tab = e.target.closest('[role=tab]');
+  if(!tab || !['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
+  const tabs = [...tab.closest('[role=tablist]').querySelectorAll('[role=tab]')], i = tabs.indexOf(tab);
+  const next = e.key === 'Home' ? 0 : e.key === 'End' ? tabs.length - 1
+    : (i + (e.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+  e.preventDefault(); tabs[next].focus(); location.hash = tabs[next].hash;
+});
 function showTab(v){
   for(const [k, id] of Object.entries(VIEWS)) $(id).hidden = k !== v;
   const nav = v === 'run' ? 'runs' : v;
@@ -1864,7 +1971,13 @@ function route(){
     try{ key = decodeURIComponent(m[1]); }catch(e){}
     if(key){ select(key, m[2] || null); return; }
   }
-  showTab(VIEWS[h] && h !== 'run' ? h : 'now');
+  const parts = h.split('/'), v = VIEWS[parts[0]] && parts[0] !== 'run' ? parts[0] : 'now';
+  showTab(v);
+  if(SUBTABS[v]) showSubtab(v, SUBTABS[v].includes(parts[1]) ? parts[1] : SUBTABS[v][0]);
+  if(v === 'runs') runsFilter = ['all', 'running', 'waiting', 'finished'].includes(parts[1]) ? parts[1] : 'all';
+  if(v === 'fleet') fleetFilter = ['all', 'standing', 'tfa'].includes(parts[1]) ? parts[1] : 'all';
+  closeMenu(false);
+  if(lastState){ paintRuns(lastState, lastDerived); paintFleet(lastState.fleet); }
 }
 window.addEventListener('hashchange', route);
 
@@ -2970,13 +3083,15 @@ function rerunHint(key){
   const o = rerunOptions.get(key);
   return '<p class="sub">' + (!o || o.loading ? 'Checking the current row before offering a model override.'
     : o.error ? esc(o.error) : o.pinned ? esc('This row (' + o.row + ') is pinned to ' + o.model + '; change it in ')
-      + '<a href="#fleet" data-settings>Settings</a>.' : 'One-run override only. Row default follows current routing and ticket labels.')
+      + '<a href="#settings/workers">Settings</a>.' : 'One-run override only. Row default follows current routing and ticket labels.')
     + (rerunBlocked(key) ? ' Selected override ' + esc(rerunModel[key]) + ' cannot be used until validated. '
       + '<button class="lnk" data-rerun-default="' + esc(key) + '">Use row default</button>' : '') + '</p>';
 }
 function paintSettings(){
   const s = settings;
   $('s-w').hidden = !(can && s);
+  $('s-unavailable').hidden = !!(can && s);
+  $('s-unavailable').textContent = can ? 'Worker and group settings could not be loaded.' : 'Worker and group settings require dashboard action access.';
   if(!can || !s) return;
   const backends = ['claude'].concat(s.models.filter(m => !NATIVE.includes(m)));
   const off = s.writable ? '' : ' disabled';
@@ -3097,17 +3212,15 @@ document.addEventListener('click', e => {
     if(lastState) paint(lastState);
     return;
   }
-  if(e.target.closest('[data-settings]')){
-    setTimeout(() => $('settings').scrollIntoView({block: 'start'}), 0);
-  }
   const s = e.target.closest('[data-seg]');
   if(s){
     if(s.dataset.seg === 'runs') runsFilter = s.dataset.v; else fleetFilter = s.dataset.v;
+    location.hash = '#' + s.dataset.seg + '/' + s.dataset.v;
     if(lastState) paint(lastState);
     return;
   }
   const f = e.target.closest('a[data-filter]');
-  if(f) runsFilter = f.dataset.filter;          // the link itself then navigates to #runs
+  if(f){ e.preventDefault(); runsFilter = f.dataset.filter; location.hash = '#runs/' + runsFilter; }
   const b = e.target.closest('[data-key]');
   if(b){ select(b.dataset.key, b.dataset.past); return; }
   // Runs table: a wide screen shows the pick in the side panel, a narrow one opens it (no side panel there)
@@ -3160,8 +3273,7 @@ def module_page(modules):
         return PAGE
     config = json.dumps(modules).replace("<", "\\u003c").replace("&", "\\u0026")
     page = PAGE.replace("function route(){\n", "function route(){\n  if(moduleRoute()) return;\n")
-    page = page.replace("</style>", "@media (max-width:720px){.tabbar{grid-template-columns:repeat("
-                        + str(4 + len(modules)) + ",minmax(64px,1fr));overflow-x:auto}"
+    page = page.replace("</style>", "@media (max-width:720px){"
                         + ".tbl td [data-quick-module]{display:inline-flex}}\n</style>")
     page = page.replace("function toggleAgent(e){\n",
                         "function toggleAgent(e){\n  if(e.target.closest('[data-quick-module]')) return;\n")
@@ -3183,7 +3295,7 @@ for(const m of viewerModules){
   section.id = 'v-' + key; section.hidden = true;
   document.querySelector('main').appendChild(section);
   VIEWS[key] = section.id;
-  for(const nav of [document.querySelector('header nav'), document.querySelector('.tabbar')]){
+  for(const nav of [document.querySelector('header nav'), $('mobile-menu')]){
     const a = el('a', null, m.label);
     a.href = '#module/' + m.name; a.dataset.view = key; nav.appendChild(a);
   }
@@ -3197,6 +3309,7 @@ function moduleRoute(){
   const match = /^module\/([a-z][a-z0-9_]*)(?:\/(.*))?$/.exec(location.hash.slice(1));
   const m = match && viewerModules.find(x => x.name === match[1]);
   if(!m) return false;
+  closeMenu(false);
   showTab('module-' + m.name);
   renderViewer(m);
   return true;
@@ -3303,6 +3416,7 @@ async function pollViewers(){
     if(!r.ok) throw new Error('HTTP ' + r.status);
     viewerStatus = await r.json();
   }catch(e){ viewerStatus = {}; }
+  paintModuleSettings();
   if(quickName && quickStatus !== JSON.stringify(viewerStatus[quickName])) closeQuickViewer();
   await Promise.all(viewerModules.map(async m => {
     const runtime = viewerRuntime.get(m.name), s = viewerStatus[m.name] || {};
@@ -3318,6 +3432,21 @@ async function pollViewers(){
   }));
   if(lastState) paintFleet(lastState.fleet);
   viewerBusy = false;
+}
+function paintModuleSettings(){
+  const box = $('s-modules'); box.replaceChildren();
+  for(const m of viewerModules){
+    const row = el('div'), info = el('div'), s = viewerStatus[m.name] || {};
+    info.appendChild(el('b', null, m.label));
+    info.appendChild(el('p', 'sub', 'State: ' + (s.state || 'unknown') + '. Disable or enable via the configured disabled-file marker.'));
+    row.append(el('span'), info, el('span'));
+    if(can && m.child){
+      const reload = el('button', 'btn', 'Reload');
+      reload.onclick = async () => { reload.disabled = true; await act('module_reload', {name: m.name}, 'Reload requested'); await pollViewers(); };
+      row.appendChild(reload);
+    }
+    box.appendChild(row);
+  }
 }
 window.addEventListener('hashchange', () => {
   closeQuickViewer();

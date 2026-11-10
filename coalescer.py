@@ -741,7 +741,7 @@ class Coalescer:
         # Advertise the extended phase `open_running` (the worker starts by running
         # the seed turn) instead of the binary "open". The delivery buffer `fwd_buffer` is a PURE
         # ADDITION (it does not touch the Phase-0 `events`/`forwards` accounting the shadow selftest asserts).
-        entry = {"events": list(events), "forwards": 0, "state": "open_running", "fwd_buffer": [],
+        entry = {"events": list(events), "forwards": 0, "state": "open_running", "fwd_buffer": [], "admitted_at": now,
                  "expire": now + _win(key, RECEIVE_WINDOWS, RECEIVE_DEFAULT)}
         if self.state_store:
             entry["row"] = self.row_of(key) if self.row_of else None

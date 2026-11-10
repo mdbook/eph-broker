@@ -38,7 +38,7 @@ avoid partial reads. `SIGHUP` forces a reread even when those attributes are unc
 busy, the signal defers that reread to the next access rather than waiting on its lock. New workers use
 the updated routing; already-running workers, including resumed turns, retain their launch route.
 
-With [dashboard actions](configuration.md#dashboard-actions) on, the **Worker settings** card edits
+With [dashboard actions](configuration.md#dashboard-actions) on, **Settings > Workers** edits
 `backend`, `model_pin` and `row_concurrency` in this file for you. It validates the whole result the same way,
 writes a temporary file next to the target and renames it over, so the broker needs write access to the file
 and its directory. A symlinked file is followed, and the temporary file goes next to the real target. Every other key in the file is kept as it is.

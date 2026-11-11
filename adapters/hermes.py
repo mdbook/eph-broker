@@ -398,6 +398,11 @@ def gate_policy(capability, cwd, test_runner=None, test_repo=None, nonce=None):
         # CC's string patterns cannot confine no-index operands or validate sed programs. Only the
         # parsed eph-gate path (shared by hermes and codex) can safely grant these read-only forms.
         pol["allow"] += ["Bash(git diff --check)", "Bash(git diff --no-index:*)", "Bash(sed:*)"]
+        # Extend inspection with existing regular files only (enforced by the parsed gate). Do not restore
+        # broad `git diff:*`: two operands can implicitly enable no-index outside the repo.
+        diff_forms = ("git diff", "git diff --cached", "git diff --stat", "git diff --cached --stat",
+                      "git diff HEAD", "git diff --check")
+        pol["allow"] += ["Bash(%s --:*)" % cmd for cmd in diff_forms + ("git show", "git show HEAD")]
         pol["deny"] = [r for r in pol["deny"] if r not in
                        ("Bash(git diff --no-index*)", "Bash(git * --no-index*)")]
     if capability == "code":

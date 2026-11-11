@@ -119,6 +119,113 @@ def T(cmd, **kw):
     return dict(command=cmd, **kw)
 
 
+def test_dev_null_argument_exception():
+    f = fx()
+    syntax = G.Policy(H.gate_policy("code", f.wt, test_runner="ansible-syntax"))
+    # The real runner still permits only its reviewed syntax-check form. A broader program grant
+    # below exercises the generic argument checker, not a widening of ansible's runner options.
+    v = G.decide("terminal", T("ansible-playbook --syntax-check -i /dev/null f.txt"), syntax)
+    assert v.allowed, v.reason
+    broad = G.Policy(dict(cwd=f.wt, allow=["Bash(ansible-playbook:*)"]))
+    for cmd in ("ansible-playbook --syntax-check -i /dev/null f.txt",
+                "ansible-playbook -i/dev/null f.txt",
+                "ansible-playbook --inventory=/dev/null f.txt",
+                "ansible-playbook -i /dev/null -e key=value f.txt",
+                "ansible-playbook -e inventory=/dev/null f.txt"):
+        v = G.decide("terminal", T(cmd), broad)
+        assert v.allowed, (cmd, v.reason)
+    for value in ("/dev/zero", "/dev/tcp", "/dev/null/../etc", "/dev/../dev/null",
+                  "/dev/null/", "lnk_out", "../outside/secret.txt", "@f.txt"):
+        for flag in ("-i ", "--inventory="):
+            cmd = "ansible-playbook " + flag + value + " f.txt"
+            assert not G.decide("terminal", T(cmd), broad).allowed, cmd
+    for cmd in ("ansible-playbook -e @f.txt f.txt", "ansible-playbook --extra-vars=@f.txt f.txt"):
+        assert not G.decide("terminal", T(cmd), broad).allowed, cmd
+    # The argument exception does not grant out-of-tree file-tool access or extra ansible flags.
+    assert not G.decide("read_file", {"path": "/dev/null"}, f.code).allowed
+    assert not G.decide("write_file", {"path": "/dev/null", "content": "x"}, f.code).allowed
+    assert not G.decide("terminal", T("ansible-playbook --syntax-check -i /dev/null -e key=value f.txt"),
+                        syntax).allowed
+    ok("eph-gate: exact /dev/null argument exemption, device near-misses and @ forms denied")
+
+
+def test_git_inspection_path_operands():
+    f = fx()
+    for policy in (f.write, f.code):
+        for verb in ("diff", "log", "show", "status"):
+            for paths in ("f.txt", "src/pkg/m.py f.txt", "lnk_ok", shlex.quote(f.wt + "/f.txt")):
+                cmd = f"git {verb} -- {paths}"
+                v = G.decide("terminal", T(cmd), policy)
+                assert v.allowed, (cmd, v.reason)
+        for form in ("--cached", "--stat", "--cached --stat", "HEAD", "--check"):
+            cmd = f"git diff {form} -- f.txt src/pkg/m.py"
+            v = G.decide("terminal", T(cmd), policy)
+            assert v.allowed, (cmd, v.reason)
+    # An unfiltered/broader diff or show is not silently added to the imported allow-list.
+    for cmd in ("git diff --stat HEAD~3", "git show", "git diff f.txt src/pkg/m.py"):
+        assert not G.decide("terminal", T(cmd), f.code).allowed, cmd
+    broad = G.Policy(dict(cwd=f.wt, allow=["Bash(git:*)"]))
+    for policy in (f.write, f.code, broad):
+        for verb in ("diff", "log", "show", "status"):
+            for path in ("lnk_out", "lnk_secret", "../outside/secret.txt", "sec/.db-env", ".env",
+                         ".pii-store/data", "':(icase)f.txt'", "@f.txt", "/dev/null", "/dev/zero"):
+                cmd = f"git {verb} -- {path}"
+                assert not G.decide("terminal", T(cmd), policy).allowed, cmd
+        for cmd in ("git -c core.pager=cat diff -- f.txt", "git -C src status -- pkg",
+                    "git diff --output=/tmp/out -- f.txt", "git diff --out=out -- f.txt",
+                    "git show --output=out -- f.txt", "git diff --no-index -- f.txt lnk_out"):
+            assert not G.decide("terminal", T(cmd), policy).allowed, cmd
+    for policy in (f.mr, f.mr_widened):
+        assert not G.decide("terminal", T("git show -- f.txt"), policy).allowed
+    ok("eph-gate: confined git diff/log/show/status path operands, hard floors preserved")
+
+
+def test_git_inspection_preserves_unfiltered_grants():
+    f = fx()
+    for policy in (f.write, f.code):
+        for cmd in ("git diff", "git diff --cached", "git diff --stat", "git diff --cached --stat",
+                    "git diff HEAD", "git diff --check", "git log", "git status"):
+            v = G.decide("terminal", T(cmd), policy)
+            assert v.allowed, (cmd, v.reason)
+    # The hard floor must not narrow other imported grants either, or widen the real policies.
+    broad = G.Policy(dict(cwd=f.wt, allow=["Bash(git:*)"]))
+    for cmd in ("git show", "git show HEAD", "git diff --stat HEAD~3"):
+        v = G.decide("terminal", T(cmd), broad)
+        assert v.allowed, (cmd, v.reason)
+        assert not G.decide("terminal", T(cmd), f.code).allowed, cmd
+    ok("eph-gate: unfiltered inspection retains imported grants without widening the allow-list")
+
+
+def test_git_inspection_cannot_expand_to_tracked_secrets():
+    f = Fixture()
+    try:
+        # A benign directory name must not hide the tracked secret from the floor.
+        subprocess.run(["git", "-C", f.wt, "add", "--", "sec/.db-env", "src/pkg/m.py"], check=True)
+        subprocess.run(["git", "-C", f.wt, "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                        "commit", "-qm", "synthetic fixture"], check=True)
+        # These are real filenames too: existence alone must not turn a wildcard into a safe pathspec.
+        for name in ("sec/*", "sec/?", "sec/[a]"):
+            open(os.path.join(f.wt, name), "w").write("benign\n")
+        broad = G.Policy(dict(cwd=f.wt, allow=["Bash(git:*)"]))
+        for policy in (f.write, f.code, broad):
+            for verb in ("diff", "log", "show", "status"):
+                for path in ("sec", "src", "sec/*", "'sec/*'", "'sec/.*'", "'sec/?'", "'sec/[a]'",
+                             "'sec/.db-env'", "':(glob)sec/**'", "missing.py", "''"):
+                    cmd = f"git {verb} -- {path}"
+                    v = G.decide("terminal", T(cmd), policy)
+                    assert not v.allowed, (cmd, v.reason)
+                assert not G.decide("terminal", T("git " + verb + " --"), policy).allowed
+            for cmd in ("git show HEAD --",
+                        "git show HEAD -- sec", "git show HEAD -- 'sec/*'"):
+                assert not G.decide("terminal", T(cmd), policy).allowed, cmd
+            for cmd in ("git diff -- src/pkg/m.py", "git show HEAD -- src/pkg/m.py"):
+                v = G.decide("terminal", T(cmd), policy)
+                assert v.allowed, (cmd, v.reason)
+    finally:
+        f.close()
+    ok("eph-gate: explicit pathspecs cannot select tracked secrets via directories or wildcards")
+
+
 def test_search_file_glob_floor():
     with tempfile.TemporaryDirectory() as wt:
         os.makedirs(os.path.join(wt, "nested"))
@@ -179,8 +286,8 @@ def allow_table(f):
         ("terminal", T('git commit -m "fix #12: a/b path, F t O S"'), "write"),
         ("terminal", T("git add f.txt && git commit -m t"), "write"),
         ("terminal", T("git status --short; git log --oneline -5 HEAD~1..HEAD"), "write"),
-        ("terminal", T("git diff; git diff --cached --stat; git diff HEAD"), "write"),
-        ("terminal", T("git diff --check"), "write"),
+        ("terminal", T("git diff -- f.txt; git diff --cached --stat -- f.txt; git diff HEAD -- f.txt"), "write"),
+        ("terminal", T("git diff --check -- f.txt"), "write"),
         ("terminal", T("git diff --no-index f.txt src/pkg/m.py"), "write"),
         ("terminal", T("git diff --no-index -- f.txt lnk_ok"), "code"),
         ("terminal", T("git diff --no-index src src/pkg"), "write"),
@@ -977,7 +1084,10 @@ def test_adapter_gated_write_turn():
         pol = r["policy"]
         grant = CC.capability_tool_grant("write")
         assert pol["allow"] == G.split_rules(grant[grant.index("--allowedTools") + 1]) + [
-            "Bash(git diff --check)", "Bash(git diff --no-index:*)", "Bash(sed:*)"], pol["allow"]
+            "Bash(git diff --check)", "Bash(git diff --no-index:*)", "Bash(sed:*)",
+            "Bash(git diff --:*)", "Bash(git diff --cached --:*)", "Bash(git diff --stat --:*)",
+            "Bash(git diff --cached --stat --:*)", "Bash(git diff HEAD --:*)", "Bash(git diff --check --:*)",
+            "Bash(git show --:*)", "Bash(git show HEAD --:*)"], pol["allow"]
         assert pol["deny"] == [r for r in G.split_rules(grant[grant.index("--disallowedTools") + 1]) if r not in
                                ("Bash(git diff --no-index*)", "Bash(git * --no-index*)")], pol["deny"]
         assert pol["secret_globs"] == list(CC._SECRET_FILE_GLOBS) and pol["edits"] is True, pol

@@ -37,10 +37,12 @@ never has to model an expansion: any command whose meaning depends on one is den
 ARGUMENT CHECKS (what is actually checked, not "every argument is resolved"): each non-message word is split
 into path candidates (the word, an attached `-Xvalue`, every `=` value incl. bare `key=v` and nested `k=v=w`,
 every comma-list item, the part after the last `:`), and each candidate must resolve (normpath AND realpath)
-inside read_root and off the secret floor. Denied outright: a word starting with `:` (git pathspec magic such as
-`:(icase)`), any candidate starting with `@` (pytest/argparse response files). git: global options before the
+inside read_root and off the secret floor. The exact /dev/null candidate is benign, except in git pathspecs
+after `--`, which must stay in-tree. No other device path is exempt. Denied outright: a word starting with `:`
+(git pathspec magic such as `:(icase)`), any candidate starting with `@` (pytest/argparse response files). git: global options before the
 subcommand, GIT_DENY_LONG prefixes, `--paths*`, short F/t/O/S, `git add -f/--force`; after `--` every word is a
-path. Exact `diff --no-index <a> <b>` is an exception, with directory tree checks too. `log -L` ranges have
+plain existing regular file for inspection commands (no directories or wildcard pathspecs). Forms without
+`--` retain the imported grants. Exact `diff --no-index <a> <b>` is an exception, with directory tree checks too. `log -L` ranges have
 their file extracted before path checking (colon-bearing addresses/filenames remain denied as ambiguous).
 sed: only `-n '<range>p' <files>` (numeric/$
 print addresses). Test env assignments may wrap only the policy's reviewed runner, with an explicit allow-list
@@ -466,7 +468,7 @@ def _companion_command(policy, argv, cwd, skip=()):
         return _sed_hard(argv)
     if argv[0] in ("cat", "head", "tail", "wc", "nl", "ls", "grep", "rg"):
         return None
-    if argv[0] == "git" and len(argv) > 1 and argv[1] in ("diff", "status", "log"):
+    if argv[0] == "git" and len(argv) > 1 and argv[1] in ("diff", "status", "log", "show"):
         return _git_hard(argv)[0]
     if any(t == "Bash" and bash_rule_matches(s, argv, for_allow=True) for t, s in policy.test_allow):
         return None
@@ -582,7 +584,8 @@ def _path_candidates(arg):
 
 
 def _check_args_paths(policy, argv, cwd, skip):
-    log = len(argv) > 1 and os.path.basename(argv[0]) == "git" and argv[1] == "log"
+    git = os.path.basename(argv[0]) == "git"
+    log = git and len(argv) > 1 and argv[1] == "log"
     range_next = end_of_opts = False
     for idx, arg in enumerate(argv[1:], 1):
         if idx in skip:
@@ -596,13 +599,17 @@ def _check_args_paths(policy, argv, cwd, skip):
                 arg = _git_log_range_path(value)
                 if arg is None:
                     return "git log -L: expected a range and an unambiguous file operand"
-            elif arg == "--":
-                end_of_opts = True
+        if git and arg == "--":
+            end_of_opts = True
         if arg.startswith(":"):
             return "argument %r: git pathspec magic (e.g. :(icase)) / `:path` forms are not allowed" % arg
         for c in _path_candidates(arg):
             if c.startswith("@"):
                 return "argument %r: an @-prefixed argument (pytest/argparse response file) is not allowed" % arg
+            # Only this exact device spelling is benign; never normalize other /dev paths into it.
+            # Git pathspecs after the double-dash separator must still be inside the worktree, even for /dev/null.
+            if c == "/dev/null" and not (git and end_of_opts):
+                continue
             norm, real = _resolve(c, cwd)
             if not (_inside(norm, policy.read_root) and _inside(real, policy.read_root)):
                 return "argument %r reaches outside the worktree" % arg
@@ -628,6 +635,26 @@ def _no_index_paths(argv):
     if paths[:1] == ["--"]:
         paths = paths[1:]
     return paths if len(paths) == 2 and all(p and not p.startswith("-") for p in paths) else None
+
+
+def _git_inspection_paths(policy, argv, cwd):
+    """Vet literal files, not just the directory/glob spelling Git would expand recursively."""
+    if argv[1] not in ("diff", "log", "show", "status") or _no_index_paths(argv) is not None:
+        return None
+    if "--" not in argv[2:]:
+        return None                     # existing grants without explicit pathspecs are unchanged
+    paths = argv[argv.index("--", 2) + 1:]
+    if not paths:
+        return "git inspection requires a nonempty -- <file> list"
+    for path in paths:
+        if not path or path.startswith((":", "@")) or any(ch in path for ch in "*?["):
+            return "git inspection requires plain file paths (no magic, @-args or wildcards)"
+        real, why = _check_read_path(policy, path, cwd)
+        if why:
+            return why
+        if not os.path.isfile(real):
+            return "git inspection path %r must name an existing regular file" % path
+    return None
 
 
 def _git_hard(argv):
@@ -758,6 +785,9 @@ def check_segment(policy, argv, cwd):
     prog = os.path.basename(argv[0])
     if prog == "git":
         why, skip = _git_hard(argv)
+        if why:
+            return why
+        why = _git_inspection_paths(policy, argv, cwd)
         if why:
             return why
     elif prog in SHELLS:

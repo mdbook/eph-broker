@@ -6,6 +6,8 @@ argv / stdin / env-key names / HERMES_HOME config, and prints stream-json. No re
 """
 import gc, hashlib, json, os, pathlib, stat, subprocess, sys, tempfile, time
 
+os.environ.setdefault("WORKER_SANDBOX", "off")   # fake CLI; kernel boundary is tested in test_sandbox.py
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)

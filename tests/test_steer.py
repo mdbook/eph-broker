@@ -53,6 +53,21 @@ def test_subject_dir_is_path_safe():
     ok("steer: subject dirs stay under the root and never collide")
 
 
+def test_sandbox_paths_preparation_failure_is_optional():
+    key = "vikunja:task:9001"
+    for level in range(3):             # root, subject directory, or inbox can be unavailable
+        for error in (PermissionError("inaccessible storage"), OSError("read-only filesystem")):
+            with patch.dict(os.environ, {"BROKER_STEER_MID_TURN": "1"}), \
+                    patch.object(steer, "_private_dir", side_effect=[None] * level + [error]), \
+                    patch.object(steer.log, "warning") as warning:
+                assert steer.sandbox_paths(key) == ()
+                warning.assert_called_once()
+                message = warning.call_args[0][0] % warning.call_args[0][1:]
+                assert "mid-turn storage" in message and "turn-boundary delivery" in message, message
+                assert type(error).__name__ in message, message
+    ok("steer: unavailable launch storage logs once and grants nothing at every preparation level")
+
+
 def test_hook_script_output():
     key = "vikunja:task:2"
     steer.enqueue(key, "c3", "first")

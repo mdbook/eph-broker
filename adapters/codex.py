@@ -1113,6 +1113,8 @@ class CodexHarness:
         worker.kill_group = True
         _cc.site_env.require_model_allowed(model)
         _cc.record_launch(worker, model, backend, "codex")   # dash Worker view: the model this process gets
+        argv = _cc.sandbox.wrap(argv, worker.worktree, worker.sandbox_gitdir,
+                                writable_paths=(home, worker.test_tmpdir, *steer.sandbox_paths(worker.key)))
         worker.in_turn = True
         worker.turn_started = time.time()
         worker.hard_killed = False

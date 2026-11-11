@@ -16,6 +16,7 @@ BuildRequires:  systemd-rpm-macros
 
 Requires:       python3 >= 3.9
 Requires:       git
+Requires:       bubblewrap
 Requires(pre):  shadow-utils
 # only the interactive-agent row and its duplicate check use tmux
 Recommends:     tmux

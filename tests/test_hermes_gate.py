@@ -9,6 +9,8 @@ loading the copied plugin from the private HERMES_HOME exactly as hermes does (p
 import atexit, contextlib, json, os, shlex, shutil, stat, subprocess, sys, tempfile
 from unittest.mock import patch
 
+os.environ.setdefault("WORKER_SANDBOX", "off")   # fake CLI; kernel boundary is tested in test_sandbox.py
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)

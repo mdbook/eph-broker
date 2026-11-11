@@ -32,10 +32,13 @@ doesn't start. The GitLab issue path needs neither.
 
 ## Is a worker sandboxed?
 
-Not at the OS level. Workers run as the broker's user. Tool allow and deny lists limit what the harness will
-do (Claude Code through its permission flags, hermes through its `eph-gate` plugin), but a worker with shell
-access can read whatever that user can. Run workers under a separate user or in a
-container if that matters to you. [security.md](security.md) has the full picture.
+Yes, by default: `WORKER_SANDBOX=bwrap` wraps worker launches in bubblewrap. The host filesystem is read-only
+except the worktree, its base repo's `.git` and harness runtime state. A private PID namespace hides the broker's
+process and environment; secret paths are overmounted. Missing bubblewrap refuses startup, never silently
+disables isolation. `WORKER_SANDBOX=off` is an explicit unsafe opt-out, used during canary rollouts.
+`WORKER_SANDBOX_EXTRA_RO` and `WORKER_SANDBOX_HIDE` are colon-separated absolute path lists.
+This is not complete isolation: egress is unrestricted and writable `.git` permits planted config.
+[security.md](security.md) describes the boundary and residuals.
 
 ## Can it push to main or merge on its own?
 

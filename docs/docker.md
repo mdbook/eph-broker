@@ -35,6 +35,8 @@ image readability does not depend on the builder's checkout permissions.
 - Python 3.12 and the broker's runtime Python files. No agent CLI, git, test toolchain or worker prompts.
 - The neutral `config/demo/broker.example.json`, also used by the source preview. The real environment
   takes precedence. State is under `/var/lib/eph-broker` in the named volume.
+  This workerless preview explicitly sets `WORKER_SANDBOX=off`; the image contains no bubblewrap.
+  Real worker deployments must install bubblewrap and use `WORKER_SANDBOX=bwrap` (the code default).
 - A non-root UID, 10001. Compose drops capabilities, disallows privilege escalation, makes the root
   filesystem read-only and provides a temporary `/tmp`. No host directory or credential is mounted.
 - Copied code is made world-readable and directories searchable before switching to that UID, regardless

@@ -23,8 +23,10 @@ for a subagent's tool call (Claude Code puts `agent_id` in a subagent's hook inp
 the message must reach the MAIN agent, so it waits for the turn boundary instead.
 
 Every broker-side file op refuses symlinks (lstat + O_NOFOLLOW), and the root, subject dirs and files are private
-(0700 / 0600). Keep BROKER_STEER_ROOT outside the worker's writable set: a Codex workspace-write sandbox can write
-/tmp and $TMPDIR, so the default root under $TMPDIR is fine for a single-user try-out but not a sandbox boundary
+(0700 / 0600). Bubblewrap grants only the current subject's delivery directory (inbox + log), never the steer
+root or other broker state. With WORKER_SANDBOX=off, keep BROKER_STEER_ROOT outside the worker's broader writable
+set: a Codex workspace-write sandbox can write /tmp and $TMPDIR, so the default root under $TMPDIR is fine for
+a single-user try-out but not a sandbox boundary
 (the systemd unit uses /var/lib/eph-broker; see docs/security-residual-same-uid.md).
 
 Env:
@@ -33,7 +35,9 @@ Env:
 
 stdlib only. The hook mode never fails a tool call: any error exits 0 with no output.
 """
-import hashlib, json, os, re, stat, sys, time, unicodedata, uuid
+import hashlib, json, logging, os, re, stat, sys, time, unicodedata, uuid
+
+log = logging.getLogger("eph-broker.steer")
 
 LOG_MAX_BYTES = 1 << 20      # log.jsonl is trimmed to its newest half past this (queued/delivered records only)
 TEXT_MAX_CHARS = 4000        # same cap as a forwarded comment (coalescer.COMMENT_MAX_CHARS)
@@ -145,6 +149,26 @@ def _inbox(key):
     return os.path.join(subject_dir(key), "inbox")
 
 
+def sandbox_paths(key):
+    """Prepare this subject's delivery path before launch, even before its first message.
+
+    Bind only this subject, not BROKER_STEER_ROOT or the events directory. Its log must be
+    writable too: reclaim() uses delivered records to avoid a second turn-boundary
+    delivery. A directory bind also follows the broker's atomic log replacements.
+    Preparation is best-effort: unavailable storage leaves turn-boundary delivery intact.
+    """
+    if not enabled():
+        return ()
+    try:
+        for d in (root(), subject_dir(key), _inbox(key)):
+            _private_dir(d)
+    except OSError as e:                 # includes _private_dir's symlink rejection
+        log.warning("steer: cannot prepare mid-turn storage for %s (%s: %s); "
+                    "using turn-boundary delivery", key, type(e).__name__, e)
+        return ()
+    return (subject_dir(key),)
+
+
 def enqueue(key, mid, text, doer=None):
     """Drop one message (raw text; the hook frames it) for the hook. Atomic (write a dotfile, rename into place).
     False on any OS error, a symlinked dir included: the message then waits for the turn boundary."""
@@ -250,8 +274,11 @@ def deliver(sdir, now=None):
         got = src[:-4] + ".delivered"
         try:
             os.rename(src, got)
-        except OSError:
+        except FileNotFoundError:
             continue                       # reclaimed at a turn boundary, or another hook call took it
+        except OSError as e:
+            log.warning("steer inbox claim failed (%s); leaving message for turn boundary", type(e).__name__)
+            continue
         try:
             with os.fdopen(_open(got, os.O_RDONLY), encoding="utf-8") as f:
                 msg = json.load(f)

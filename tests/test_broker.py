@@ -8,6 +8,9 @@ charter-strip; the HELD guard; and one full spawn end-to-end through the seam wi
 """
 import hashlib, json, os, pathlib, re, stat, subprocess, sys, tempfile, threading, time, shutil, importlib
 
+# Fake CLI tests verify harness behavior, not the host's namespace support (test_sandbox.py does).
+os.environ.setdefault("WORKER_SANDBOX", "off")
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)

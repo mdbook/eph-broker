@@ -34,6 +34,7 @@ from gitlab_mr import open_mr   # open the MR for a code proposer's pushed featu
 import gitlab_mr                      # break_refs for GitLab-bound worker text
 import events                         # outbound mr.opened (EVENTS_WEBHOOK_URL; no-op when unset)
 import test_environment
+import sandbox
 from worktree import PushTargetRefused   # fail-closed push target (BROKER_PUSH_HOSTS only)
 import tickets                        # ticket ref grammar (ref_from_key, vikunja_ref, vikunja_id)
 from trackers import Registry         # ticket reads and write-back by ref (docs/trackers.md)
@@ -1850,6 +1851,9 @@ class Worker:
         self.key = key
         self.run_id = run_id
         self.worktree = worktree
+        # Snapshot the trusted cut once; off must preserve the old launch behavior.
+        self.sandbox_gitdir = (sandbox.gitdir(worktree)
+                               if os.getenv("WORKER_SANDBOX", "bwrap").strip().lower() != "off" else None)
         self.session_id = None      # claude session id, once known (for --resume)
         self.stream_session = None  # Uuid4 we passed as --session-id (stream ON only) -> transcript file
         self.last_output = None      # Most recent raw worker output (wrapped UNTRUSTED on escalate)
@@ -4683,11 +4687,15 @@ class CCAdapter(Adapter):
         worker.turn_wall_clock = wall_clock_s            # the liveness backstop scales with it (turn_deadline_extra)
         site_env.require_model_allowed(eff_model, env)
         record_launch(worker, eff_model, _backend, "cc")  # dash Worker view: the model this process gets
+        claude_state = [os.path.expanduser(p) for p in ("~/.claude", "~/.claude.json")
+                        if os.path.exists(os.path.expanduser(p))]
+        launch_argv = sandbox.wrap(argv, worker.worktree, worker.sandbox_gitdir,
+                                   writable_paths=(*claude_state, worker.test_tmpdir, *steer.sandbox_paths(worker.key)))
         worker.in_turn = True                            # turn-completion signal (liveness consumer)
         worker.turn_started = time.time()                # force-close timing (turn_age)
         worker.hard_killed = False                       # Reset before this turn; set True only below
         try:                                             # prompt rides STDIN, never argv (E2BIG)
-            proc = subprocess.Popen(argv, cwd=worker.worktree, env=env, stdin=subprocess.PIPE,
+            proc = subprocess.Popen(launch_argv, cwd=worker.worktree, env=env, stdin=subprocess.PIPE,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         except OSError as e:                             # exec failed: the worker never ran
             worker.in_turn = False

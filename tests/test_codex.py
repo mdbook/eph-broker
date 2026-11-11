@@ -7,6 +7,8 @@ CODEX_HOME's hooks.json + config.toml trust entries (like the real one: untruste
 calls, and prints `--json` events. No real Codex, model, login or network.
 """
 import gc, hashlib, json, os, shlex, signal, stat, subprocess, sys, tempfile, threading, time
+
+os.environ.setdefault("WORKER_SANDBOX", "off")   # fake CLI; kernel boundary is tested in test_sandbox.py
 from unittest.mock import MagicMock, patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))

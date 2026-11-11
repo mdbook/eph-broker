@@ -14,6 +14,7 @@ python3 tests/test_companions.py
 python3 tests/test_hermes.py
 python3 tests/test_hermes_gate.py
 python3 tests/test_codex.py
+python3 tests/test_sandbox.py
 # codex OFFLINE real-binary probe: skips (and passes) with no codex binary on PATH / CODEX_BIN, so it runs safely
 # here with nothing installed; ops / a CI host with the binary present gets it exercised for real.
 python3 tests/test_codex_probe.py

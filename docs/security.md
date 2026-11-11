@@ -74,6 +74,41 @@ Every worker gets these, whichever harness runs it ([adapters.md](adapters.md)).
 - A tool grant built from its row's `capability`. The allow and deny lists live in `adapters/cc.py`, and both
   harnesses enforce the same lists. A deny entry always wins.
 
+### OS boundary (on by default)
+
+`sandbox.py` wraps Claude Code, hermes and Codex launches in bubblewrap. `WORKER_SANDBOX` is `bwrap` by default;
+`off` is the only opt-out. An unknown value or missing `bwrap` fails startup closed, and every launch checks
+again. Install the `bubblewrap` package (an RPM requirement). Namespace/mount failures fail the worker; there
+is no unsandboxed retry. Hosts must permit bubblewrap user/PID namespaces.
+
+The wrapper read-only binds `/`, read-write binds the worktree and its base repo's common `.git` directory,
+uses a new PID namespace with a fresh `/proc`, a private `/dev` and `/tmp`, and dies with its parent. Only
+broker-created per-worker scratch and the harness's state are additionally writable: Claude Code's existing
+`~/.claude` and `~/.claude.json` (login/session state is deliberately kept), or the private hermes/Codex home.
+When mid-turn steering is enabled, Claude Code and Codex also get a writable bind of **only their subject's
+delivery directory** (inbox and delivery log), created before launch. Neither the steer root, other subjects'
+inboxes nor the events/state directory is made writable. This works with the default private `/tmp` too.
+The common git directory is snapshotted before the first turn, never re-resolved from a worker-edited pointer.
+
+`~/.git-credentials`, `~/.config/eph-broker`, `/etc/eph-broker` (the conventional secret env-file directory),
+and the directories containing `BROKER_SITE_ENV` and
+`BROKER_CONFIG` (including their default locations) are hidden. Directories get empty tmpfs mounts; files get
+read-only `/dev/null` mounts, since tmpfs cannot mount on a regular file. Symlink targets are masked too,
+including env/config file symlinks whose targets lie outside their hidden parent directories.
+Missing paths are skipped, with no host placeholder files created.
+
+Set `WORKER_SANDBOX_EXTRA_RO` for explicit read-only binds and `WORKER_SANDBOX_HIDE` for additional secret
+paths (colon-separated absolute paths, `~` accepted). Hides are applied last and always win. Extra read-only
+binds cannot restore the host's `/proc` or `/dev`. The root path and relative paths are refused. If your
+systemd `EnvironmentFile=` is outside these directories, you **must** list its directory in `WORKER_SANDBOX_HIDE`;
+the broker cannot infer systemd's source from inherited environment variables. Also hide sibling bot env files,
+alternate credential stores and any other sensitive paths: this is a denylist of reads, not an allowlist.
+
+Keep secret directories separate from code, runtime homes and required MCP configs: hiding a parent hides
+those children too. Knobs are trusted operator configuration, never ticket input; restart after changes.
+The private site systemd overlay ships `WORKER_SANDBOX=off` until a canary passes; this change does not enable
+the live fleet. Validate a real turn (auth, resume, scratch, hooks and hard-kill) before removing that override.
+
 The deny lists (`_READ_DENIED`, `_WRITE_DENIED`, `_CODE_DENIED`, `_GENERAL_DENIED`) cover reading secret files,
 writing under `.git`, `git push` and other ref or remote changes, and destructive shell commands. The code
 worker's only shell access is its test runner, chosen from a fixed table by key, never a command from the
@@ -150,12 +185,14 @@ It uses host networking and is not a worker sandbox. A worker-enabled deployment
 account with only the repo and login state it needs. Putting the whole broker in a container limits host
 filesystem exposure, but does not separate workers from credentials mounted into that same container.
 
-Workers run as the same OS user as the broker. The tool grants control what the harness will do on the worker's
-behalf (Claude Code's permission flags, hermes' `eph-gate`); they aren't a sandbox. A worker with any shell access
-(a test runner, or the general worker) can read anything the broker user can, including the broker's environment
-file, `/proc/<pid>/environ` and git credentials, and it can write repo-local git config that the broker's later
-git calls will load.
+Workers still run as the same OS user as the broker. With `WORKER_SANDBOX=off`, any shell access can read that
+user's secret files and `/proc/<broker-pid>/environ`; harness tool grants alone are not an OS boundary.
+With bubblewrap on, hidden files and the broker process are inaccessible, but other host-readable files remain
+readable. Writable `.git` still permits planted repo-local config that later broker git calls may execute.
+Egress is unrestricted: the worker can contact network services (including host services), and a read-only bind
+does not stop connections to visible Unix sockets. Hide sensitive socket paths too. Model login credentials
+intentionally accessible to the harness are not broker credentials and are not protected from that worker.
 
-The fix is a deployment choice: run workers as a separate, unprivileged user or in a container that can't
-read the broker's secrets. [security-residual-same-uid.md](security-residual-same-uid.md) lists each vector,
-the git hardening already in place, and how to roll out HMAC.
+A separate worker uid/container with a filesystem and network allowlist remains stronger isolation.
+[security-residual-same-uid.md](security-residual-same-uid.md) details the planted-config risk, opt-out exposure,
+git hardening and HMAC rollout.

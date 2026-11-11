@@ -1,6 +1,7 @@
 {
   "settings": {
     "CONFIG_DIR": "config/demo",
+    "WORKER_SANDBOX": "off",
     "EVENTS_LOG": "demo-state/events.jsonl",
     "BROKER_PUSH_HOSTS": "",
     "ISSUE_AUTHOR_ALLOWLIST": ""

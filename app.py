@@ -19,6 +19,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import site_env         # load config/site.env BEFORE any module reads env at import time
+import sandbox
 import coalescer as C
 from coalescer import Coalescer
 from dispatch import PrioritySlots
@@ -1883,6 +1884,7 @@ def _reload_on_hup():
 
 def main():
     global BROKER
+    sandbox.check()                         # fail closed before any broker threads or HTTP listener start
     host = modhost.Host()   # validate optional module config before dispatch threads start
     BROKER = Broker()
     # item N1: sweep stale inbox-chat-mcp-*.json ONCE, here at real process startup,

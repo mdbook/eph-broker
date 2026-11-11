@@ -10,6 +10,7 @@ That setup needs a funded Claude Code login, GitLab credentials and a webhook; i
 |---|---|
 | Linux, Python 3.9 or newer | The broker is standard library only. The only non-stdlib imports are the optional `tools/laya_pick_daemon.py` (a local model that helps repo inference pick a repo; experimental, see [repo-push-cred.md](repo-push-cred.md#repo-inference-experimental)) and a PyYAML test that skips itself when PyYAML is missing. |
 | `git` | Worktrees, commits and pushes. |
+| `bubblewrap` | Default worker OS sandbox. The broker refuses startup without it unless `WORKER_SANDBOX=off` explicitly disables isolation. Hosts must permit user/PID namespaces; see [security.md](security.md#os-boundary-on-by-default). |
 | `tmux` | A `Recommends` of the RPM; only the interactive-agent row and its duplicate check use it. |
 | The `claude` CLI | The default harness for every built-in row. On the broker's `PATH`, already logged in for the user the broker runs as. Workers use that stored login (`~/.claude`); `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` in the broker's environment are deliberately not passed to them. Tested with Claude Code 2.1. The broker passes `-p`, `--system-prompt`, `--model`, `--max-turns`, `--output-format json`, `--setting-sources`, `--permission-mode` (`acceptEdits`, `auto`), `--allowedTools`, `--disallowedTools`, `--mcp-config` with `--strict-mcp-config`, `--settings`, `--resume`, `--session-id`, and in some setups `--effort`, `--add-dir`, `--plugin-dir` or `--dangerously-skip-permissions`, so an older CLI that lacks one of these won't work. |
 | GitLab and a token that can open MRs | `gitlab_mr.py`. |
@@ -31,6 +32,9 @@ environment when you start it:
 set -a; . /etc/eph-broker/eph-broker.env; set +a   # GITLAB_MR_TOKEN=..., GITLAB_WEBHOOK_TOKEN=..., ...
 EVENTS_LOG=$PWD/events.jsonl python3 app.py
 ```
+
+The sandbox hides `/etc/eph-broker` by default. If your secret env file lives elsewhere, add its directory
+to `WORKER_SANDBOX_HIDE` (colon-separated absolute paths). See [security.md](security.md#os-boundary-on-by-default).
 
 The user you run it as needs the same things as the RPM's service user below: a Claude Code login, a git
 identity for worker commits, a push credential for each repo ([repo-push-cred.md](repo-push-cred.md)), and

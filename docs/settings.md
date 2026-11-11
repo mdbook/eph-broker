@@ -33,6 +33,9 @@ Flags count as on for `1`, `true`, `yes` or `on`, unless the row says otherwise.
 | `PENDING_MAX_AGE` | `3600` | Seconds. Legacy JSON pending entries older than this are dropped during import. Journaled pending work has no age expiry. |
 | `WORKTREES_ROOT` | `$TMPDIR/eph-broker-worktrees` | Where worktrees for rows without their own base go. |
 | `WORKER_ENV_PASSTHROUGH` | unset | Comma list of extra environment variable names a worker keeps from the broker env, on top of the fixed allowlist. Names containing `TOKEN`, `SECRET`, `KEY` or `PASSWORD` are refused. Read at import. |
+| `WORKER_SANDBOX` | `bwrap` | Bubblewrap OS boundary for every worker harness. Missing bwrap or an unknown value refuses startup; `off` explicitly disables isolation. Restart after changes. See [security.md](security.md#os-boundary-on-by-default). |
+| `WORKER_SANDBOX_EXTRA_RO` | unset | Colon-separated absolute paths to bind read-only (also accepts `~`). Cannot restore host `/proc` or `/dev`. |
+| `WORKER_SANDBOX_HIDE` | unset | Colon-separated absolute paths to hide in addition to the default secret paths. Hides always win; files become empty read-only files, directories empty tmpfs mounts. Include any external systemd env-file directory and sibling secrets. |
 | `TURN_CAPTURE_DIR` | `turn-captures/` next to `EVENTS_LOG` | Size-capped stdout and stderr of failed turns, for debugging. Off when `EVENTS_LOG` isn't set. |
 | `TURN_CAPTURE_KEEP` | `200` | Captures kept. |
 | `TURN_CAPTURE_MAX_AGE_S` | 7 days | Captures older than this are removed. |

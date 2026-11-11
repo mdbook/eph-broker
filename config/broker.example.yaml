@@ -18,6 +18,11 @@ settings:
   GENERAL_REPO_ALLOWLIST: "/srv/git/app:/srv/git/docs-site"
   CODE_REPO_ALLOWLIST: "/srv/git/app:/srv/git/docs-site"
   CONCURRENCY: 5
+  # OS isolation (requires bubblewrap). "off" is an explicit, unsafe rollout/rollback override.
+  WORKER_SANDBOX: "bwrap"
+  # Colon-separated absolute paths; hides always win over read-only or writable binds.
+  WORKER_SANDBOX_EXTRA_RO: ""
+  WORKER_SANDBOX_HIDE: ""
   # Reviewed non-secret filename exceptions for eph-gate (Hermes/Codex), empty by default.
   # Exact catalog repo keys, repo-relative globs. Dotfiles and escaping symlinks stay denied.
   # EPH_GATE_NONSECRET_PATHS: '{"example/module-box":["modules/*/module.env"]}'

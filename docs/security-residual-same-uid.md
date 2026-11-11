@@ -1,14 +1,21 @@
-# eph-broker security residual: same-uid secret reads (and the optional HMAC layer)
+# eph-broker security residual: same-uid workers and writable git state
 
-Status: **a known limit that code alone can't fix.** This documents a residual that the broker's code-level hardening
-**cannot** close on its own, plus the HMAC transport layer.
+Status: **bubblewrap is on by code default; residuals remain.** `WORKER_SANDBOX=bwrap` hides the broker's PID
+namespace and selected secret paths, makes the host read-only, and leaves the worktree, base `.git` and harness
+runtime state writable. See [security.md](security.md#os-boundary-on-by-default) for knobs and mount semantics.
+The private site overlay keeps `WORKER_SANDBOX=off` until a canary passes; no live rollout is part of this change.
 
-## 1. The residual: a bypass worker can read secrets as the same uid
+Even with bubblewrap, **rw `.git` permits planted config** (section below) and **egress is unrestricted**.
+Unhidden files and Unix sockets remain accessible; alternate stores and sibling secrets must be hidden by
+operator configuration. Harness model login state is intentionally kept. Bubblewrap is not a separate uid,
+does not isolate the broker's later git operations, and is not a complete credential/egress allowlist.
+
+## 1. With `WORKER_SANDBOX=off`: a bypass worker can read secrets as the same uid
 
 The capability enforcement in `adapters/cc.py` (`_READ_DENIED` / `_WRITE_DENIED` / `_GENERAL_DENIED`) gates the
 worker's **Read/Edit/Write/Bash tool grants**. The Claude Code harness enforces it through its permission flags,
 and the hermes harness through the `eph-gate` plugin, which imports the same lists. It is real and load-bearing
-for the *tool surface*. But it is **not a sandbox**, on either harness. A Claude Code worker that runs with
+for the *tool surface*. But the tool gate is **not a sandbox**, on either harness. Without bubblewrap, a worker that runs with
 `--dangerously-skip-permissions` (the general/bypass tier on a non-Anthropic backend), a hermes worker with the
 `terminal` toolset, or any worker that otherwise gets shell access runs as **the same OS uid as the broker
 process**. The deny floor covers the Read *tool* only; it does nothing about what that uid

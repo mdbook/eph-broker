@@ -42,7 +42,8 @@ after `--`, which must stay in-tree. No other device path is exempt. Denied outr
 (git pathspec magic such as `:(icase)`), any candidate starting with `@` (pytest/argparse response files). git: global options before the
 subcommand, GIT_DENY_LONG prefixes, `--paths*`, short F/t/O/S, `git add -f/--force`; after `--` every word is a
 plain existing regular file for inspection commands (no directories or wildcard pathspecs). Forms without
-`--` retain the imported grants. Exact `diff --no-index <a> <b>` is an exception, with directory tree checks too. `log -L` ranges have
+`--` retain the imported grants, but content-producing whole-tree diffs deny tracked secret-floor files.
+Exact `diff --no-index <a> <b>` is an exception, with directory tree checks too. `log -L` ranges have
 their file extracted before path checking (colon-bearing addresses/filenames remain denied as ambiguous).
 sed: only `-n '<range>p' <files>` (numeric/$
 print addresses). Test env assignments may wrap only the policy's reviewed runner, with an explicit allow-list
@@ -58,7 +59,7 @@ Residual it cannot see: what an ALLOWED program does with its arguments (e.g. py
 same exposure CC has), and functions/aliases the shell snapshot sources from the user's login profile
 (hermes sources it like CC's own shell snapshot; the config turns off the extra ~/.bashrc auto-source).
 """
-import os, re, sys
+import os, re, subprocess, sys
 
 PROBE_TOOL = "__eph_gate_probe__"
 # capabilities that may only READ: write_file / patch / terminal are denied outright for these (fail-closed)
@@ -642,7 +643,7 @@ def _git_inspection_paths(policy, argv, cwd):
     if argv[1] not in ("diff", "log", "show", "status") or _no_index_paths(argv) is not None:
         return None
     if "--" not in argv[2:]:
-        return None                     # existing grants without explicit pathspecs are unchanged
+        return _git_unfiltered_diff(policy, argv, cwd)
     paths = argv[argv.index("--", 2) + 1:]
     if not paths:
         return "git inspection requires a nonempty -- <file> list"
@@ -654,6 +655,32 @@ def _git_inspection_paths(policy, argv, cwd):
             return why
         if not os.path.isfile(real):
             return "git inspection path %r must name an existing regular file" % path
+    return None
+
+
+def _git_unfiltered_diff(policy, argv, cwd):
+    """Keep bare diff grants, but deny content output when the index or HEAD tracks a secret.
+
+    Checking Git's NUL-delimited names is smaller than rewriting shell segments and translating the
+    policy's absolute globs into Git pathspecs. Include cached deletions: ls-files alone misses secrets
+    removed from the index whose old contents a cached/HEAD diff can still print. Untracked secrets do
+    not restrict everyday diffs. Exact names-only forms need no content floor; mixed patch/stat forms do.
+    No content is read, and metadata errors fail closed through decide().
+    """
+    if argv[1] != "diff" or tuple(argv[2:]) in (
+            ("--stat",), ("--cached", "--stat"), ("--name-only",), ("--cached", "--name-only")):
+        return None
+    top = os.fsdecode(subprocess.check_output(
+        ["git", "rev-parse", "--show-toplevel"], cwd=cwd, stderr=subprocess.DEVNULL, timeout=10)).rstrip("\n")
+    if not _inside(top, policy.read_root):
+        return "unfiltered git diff reaches outside the worktree"
+    for command in (["git", "ls-files", "--cached", "--full-name", "-z"],
+                    ["git", "diff", "--cached", "--name-only", "-z", "--no-renames",
+                     "--no-ext-diff", "--no-textconv"]):
+        names = subprocess.check_output(command, cwd=top, stderr=subprocess.DEVNULL, timeout=10)
+        for name in names.split(b"\0"):
+            if name and _secret(policy, *_resolve(os.fsdecode(name), top)):
+                return "unfiltered git diff may print a tracked secret-floor file; use explicit safe files"
     return None
 
 

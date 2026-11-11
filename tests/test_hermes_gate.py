@@ -226,6 +226,58 @@ def test_git_inspection_cannot_expand_to_tracked_secrets():
     ok("eph-gate: explicit pathspecs cannot select tracked secrets via directories or wildcards")
 
 
+def test_git_unfiltered_diff_tracked_secret_floor():
+    for secret in (".env", "sec/.db-env", ".pii-store/data", "private.txt"):
+        f = Fixture()
+        try:
+            git = lambda *args: subprocess.run(["git", "-C", f.wt] + list(args), check=True,
+                                               capture_output=True, text=True)
+            commit = lambda: git("-c", "user.name=Test", "-c", "user.email=test@example.com",
+                                 "commit", "-qm", "synthetic fixture")
+            git("add", "f.txt")
+            commit()
+            path = os.path.join(f.wt, secret)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            open(path, "w").write("synthetic secret canary\n")
+            open(os.path.join(f.wt, "f.txt"), "w").write("public change\n")
+            # A policy addition must work too, without a second hard-coded list in the diff check.
+            policies = [G.Policy(dict(H.gate_policy(cap, f.wt),
+                                      secret_globs=list(CC._SECRET_FILE_GLOBS) + ["//**/private.txt"]))
+                        for cap in ("code", "write")]
+            for policy in policies:
+                v = G.decide("terminal", T("git diff"), policy)
+                assert v.allowed, v.reason  # untracked secret files do not restrict the command
+                out = subprocess.run(v.modified_args.get("command", "git diff"), shell=True,
+                                     cwd=v.modified_args["workdir"], capture_output=True, text=True, check=True)
+                assert "public change" in out.stdout and "synthetic secret canary" not in out.stdout
+            git("add", "--", secret)
+            for stage in ("added", "committed", "modified", "deleted"):
+                if stage == "committed":
+                    commit()
+                elif stage == "modified":
+                    open(path, "w").write("changed synthetic canary\n")
+                elif stage == "deleted":
+                    git("rm", "-f", "--", secret)
+                for policy in policies:
+                    for cmd in ("git diff", "git diff --cached", "git diff HEAD", "git diff --check"):
+                        v = G.decide("terminal", T(cmd), policy)
+                        assert not v.allowed and "tracked secret-floor" in v.reason, (stage, cmd, v.reason)
+                    # Workdir changes cannot hide a secret elsewhere in the same Git tree.
+                    assert not G.decide("terminal", T("git diff", workdir=os.path.join(f.wt, "src")),
+                                        policy).allowed
+                    for cmd in ("git diff --stat", "git diff --cached --stat", "git log", "git status",
+                                "git diff -- f.txt", "git diff HEAD -- f.txt"):
+                        v = G.decide("terminal", T(cmd), policy)
+                        assert v.allowed, (stage, cmd, v.reason)
+            # Once the secret is absent from both HEAD and the index, ordinary diffs work again.
+            commit()
+            for policy in policies:
+                assert G.decide("terminal", T("git diff"), policy).allowed
+        finally:
+            f.close()
+    ok("eph-gate: whole-tree diffs deny tracked secrets including staged deletions; clean diffs stay usable")
+
+
 def test_search_file_glob_floor():
     with tempfile.TemporaryDirectory() as wt:
         os.makedirs(os.path.join(wt, "nested"))

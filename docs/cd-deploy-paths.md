@@ -111,9 +111,12 @@ read on every MR, no restart needed).
   are marked `(hermes verdict)`.
 - `CD_ANSIBLE_HANDLE` (site overlay; unset = hand-off DM fails and the escalation target is told) and `CD_WORKER_BRANCH_PREFIX` (default `eph/`).
 - `config/cd-tier.json` adds tier patterns. It is hot-reloaded and can only **add** to the built-in lists in
-  `cd.py`; it can never remove a Full glob or make a path Light.
+  `cd.py`; it can never remove a Full glob or make a path Light. It also extends the reviewer's Quick allowlist.
   - `{"repo_patterns": {"<ns/name>": {"<category>": [globs]}}}` adds per-repo Full categories.
   - `{"extra_patterns": {"<category>": ["glob", ...]}}` and `{"full_patterns": {...}}` add global Full globs.
+  - `{"quick_patterns": ["glob", ...]}` adds reviewer Quick-allowlist globs to `MR_REVIEW_QUICK_PATHS`.
+    Missing or empty leaves the allowlist unchanged; a non-list fails closed to Standard review.
+    Full-path rules, Quick exclusions, size and diff-safety guards still win. This does not change CD's merge tier.
   - `{"default_full_repos": {"<ns/name>": ["light glob", ...]}}` makes another repo default-Full with that
     Light list. It cannot change the Light list of a repo built into `cd.DEFAULT_FULL_REPOS`.
 

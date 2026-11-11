@@ -3,7 +3,8 @@
 
 Today a Vikunja `task.comment.created` that @mentions dev (`<mention-user data-id="dev" ...>`) on a ticket NOT
 assigned to dev has no row, so ingest drops it ("INGEST REJECT (allowlist)") and the ping goes nowhere. With
-MENTION_HANDOFF_ENABLED=1 the broker instead ASSIGNS dev (Vikunja user MENTION_HANDOFF_UID, default 13) through
+MENTION_HANDOFF_ENABLED=1 the broker instead ASSIGNS dev (Vikunja user MENTION_HANDOFF_UID, falling back to
+DEV_VIKUNJA_UID only for DEV_ASSIGNEE, otherwise default 0: no handoff) through
 its existing Vikunja write path (poster.assign_user -> mcp.sh as svc-agent). That assignment emits a svc-agent
 `task.updated` carrying the dev assignee, which the normal agent-handoff path (provenance.is_agent_handoff +
 echo_guard) admits and spawns. This module never spawns anything itself.

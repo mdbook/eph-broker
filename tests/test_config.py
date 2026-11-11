@@ -4,7 +4,8 @@
 stdlib assert only, same runner shape as test_routes.py. Import-time behaviour (settings precedence, refusing a bad
 file) runs in a subprocess with its own environment; everything else patches site_env.CONFIG and restores it.
 """
-import hashlib, json, logging, os, shutil, subprocess, sys, tempfile
+import ast, hashlib, json, logging, os, re, shutil, subprocess, sys, tempfile
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -458,6 +459,81 @@ def test_provenance_and_inbox_sections_parity():
                 assert "exactly" in str(e)
     ok("provenance and inbox-accounts: a broker.yaml section loads like the json file, same checks; an explicit "
        "path env var still wins")
+
+
+def test_settings_environment_inventory():
+    """Keep literal environment reads (including the small typed wrappers) in the settings reference.
+
+    Parse source without importing optional tools or reading deployment configuration. Dynamic row/module
+    names are documented as templates; pass-through/runtime names are deliberately outside this inventory.
+    """
+    root = Path(ROOT)
+    paths = list(root.glob("*.py"))
+    for directory in ("adapters", "hooks", "trackers", "tools", "scripts"):
+        paths.extend((root / directory).rglob("*.py"))
+    trees = [(p, ast.parse(p.read_text(encoding="utf-8"))) for p in paths]
+
+    def dotted(node):
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return dotted(node.value) + "." + node.attr
+        return ""
+
+    def env_read(node, path):
+        if not isinstance(node, ast.Call):
+            return False
+        name = dotted(node.func)
+        return name in ("os.getenv", "os.environ.get") or (
+            "hermes_gate/providers" in path.as_posix() and name == "env.get")
+
+    wrappers = set()
+    for path, tree in trees:
+        for fn in ast.walk(tree):
+            if isinstance(fn, ast.FunctionDef) and fn.args.args:
+                parameter = fn.args.args[0].arg
+                if any(env_read(n, path) and n.args and isinstance(n.args[0], ast.Name)
+                       and n.args[0].id == parameter for n in ast.walk(fn)):
+                    wrappers.add(fn.name)
+
+    names = set()
+    for path, tree in trees:
+        for node in ast.walk(tree):
+            key = None
+            if isinstance(node, ast.Call) and node.args and (
+                    env_read(node, path) or dotted(node.func).split(".")[-1] in wrappers):
+                key = node.args[0]
+            elif (isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load)
+                  and dotted(node.value) == "os.environ"):
+                key = node.slice
+                if isinstance(key, ast.Index):   # Python 3.9-compatible AST handling
+                    key = key.value
+            if isinstance(key, ast.Constant) and isinstance(key.value, str) and re.fullmatch(r"[A-Z][A-Z0-9_]*", key.value):
+                names.add(key.value)
+
+    reference = (root / "docs/settings.md").read_text(encoding="utf-8")
+    documented = set(re.findall(r"`([A-Z][A-Z0-9_]*)`", reference))
+    assert not names - documented, "missing settings: " + ", ".join(sorted(names - documented))
+    for suffix in ("CMD", "UPSTREAM", "SOCKET", "MAX_STREAMS", "LABEL", "GROUP", "VERSION_FILE", "DISABLED_FILE"):
+        assert "`BROKER_MODULE_<NAME>_" + suffix + "`" in reference
+    for suffix in ("NAME", "EMAIL", "IDENTITY_ENABLED"):
+        assert "`<ROW>_GIT_" + suffix + "`" in reference
+    ok("settings reference covers literal environment reads, typed wrappers and dynamic module/identity templates")
+
+
+def test_settings_row_defaults():
+    """Each formerly ambiguous row has its own code-matching default."""
+    reference = Path(ROOT, "docs/settings.md").read_text(encoding="utf-8")
+    tree = ast.parse(Path(ROOT, "routing.py").read_text(encoding="utf-8"))
+    for name in ("DEV_ASSIGNEE", "INFRA_AGENT", "INFRA_MR_TARGET_REF", "INBOX_AGENT"):
+        defaults = {n.args[1].value for n in ast.walk(tree)
+                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "getenv" and len(n.args) > 1
+                    and isinstance(n.args[0], ast.Constant) and n.args[0].value == name
+                    and isinstance(n.args[1], ast.Constant)}
+        assert len(defaults) == 1, (name, defaults)
+        assert "| `" + name + "` | `" + defaults.pop() + "` |" in reference, name
+    ok("documented code, infrastructure and mail row defaults match routing source")
 
 
 if __name__ == "__main__":

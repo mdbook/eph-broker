@@ -8,6 +8,7 @@ Most people need the first few sections. Everything from [Other built-in rows](#
 belongs to features that are off by default, and several were built for the original deployment.
 
 Variables the broker only passes through to workers (`PATH`, `HOME`, `LANG`, `TMPDIR` and so on) aren't listed.
+Harness-owned runtime variables such as `HERMES_HOME` are not operator settings either.
 Flags count as on for `1`, `true`, `yes` or `on`, unless the row says otherwise.
 
 ## Process and files
@@ -24,6 +25,7 @@ Flags count as on for `1`, `true`, `yes` or `on`, unless the row says otherwise.
 | `BROKER_PROVENANCE_PATH` | `CONFIG_DIR/provenance.json` | Which accounts are agents ([configuration.md](configuration.md#who-counts-as-an-agent)). |
 | `BROKER_PROVENANCE_NEUTRAL` | unset | `1` lets the broker start without a provenance file, with only built-in agent names. |
 | `ROUTES_PATH` | `CONFIG_DIR/routes.json` | Your own agent types ([routes.md](routes.md)). |
+| `ROUTING_OVERRIDES_FILE` | `CONFIG_DIR/routing-overrides.json` | Atomic, last-good dashboard routing overrides. |
 | `REPO_COMPANIONS_FILE` | `config/repo-companions.json` beside the broker | Optional per-code-repo read-only source checkouts. Re-read on each cut; an explicit missing file refuses the run. See [configuration.md](configuration.md#companion-source-repositories). |
 | `EVENTS_LOG` | `$TMPDIR/eph-broker/events.jsonl` | Every accepted event, one JSON line each. Its directory also holds the state files below. |
 | `COMPLETED_PATH` | `completed.json` next to `EVENTS_LOG` | Tickets that finished a run. In memory only when `EVENTS_LOG` isn't set. |
@@ -40,6 +42,7 @@ Flags count as on for `1`, `true`, `yes` or `on`, unless the row says otherwise.
 | `TURN_CAPTURE_KEEP` | `200` | Captures kept. |
 | `TURN_CAPTURE_MAX_AGE_S` | 7 days | Captures older than this are removed. |
 | `TURN_CAPTURE_MAX_CHARS` | `65536` | Characters kept per stream. |
+| `GIT_CONFIG_GLOBAL` | Git's default | Ambient global Git config path. Setting it to `/dev/null` skips global safe-directory registration; worktree Git operations disable ambient config separately. |
 
 ## Batching and limits
 
@@ -64,6 +67,8 @@ Turn caps and time limits per capability are in `config/constraints.json`, not h
 | Variable | Default | Meaning |
 |---|---|---|
 | `BROKER_MCP_SH` | unset | The tracker script ([tracker-script.md](tracker-script.md)). Unset: no tracker ticket can start a worker. |
+| `VIKUNJA_URL` | unset | API root used by the optional `tools/vikunja_bridge.py` tracker bridge. Required when using that bridge. |
+| `VIKUNJA_TOKEN` | unset | Token used by that bridge. Required, secret: provision only through the environment. |
 | `TICKET_URL_TEMPLATE` | unset | Ticket link, `{}` is the id. Unset: plain `#<id>`. |
 | `DASH_INSTANCE_NAME` | unset | Label shown next to the logo on the dashboard. |
 | `PARKED_LABEL_ID` | unset | Tracker label id added when a worker returns `blocked`. Its title also belongs in `handoff_parked_labels`. |
@@ -122,6 +127,9 @@ Replace `<ROW>` below with the routing row key, uppercased with punctuation repl
 | `<ROW>_GIT_NAME` | `eph-<row-slug>` | Both `GIT_AUTHOR_NAME` and `GIT_COMMITTER_NAME`. |
 | `<ROW>_GIT_EMAIL` | `eph-<row-slug>@noreply.invalid` | Both `GIT_AUTHOR_EMAIL` and `GIT_COMMITTER_EMAIL`. Use a server-approved bot address if push rules require one. |
 | `<ROW>_GIT_IDENTITY_ENABLED` | on | Explicit per-row compatibility opt-out. Set off only if the existing push credential/server rules cannot accept bot metadata. Off preserves the previous identity behavior, including host Git config. Invalid boolean/identity values refuse the run, rather than silently using the operator. |
+| `CODE_GIT_NAME` | `eph-code` | Code row's Git author and committer name. |
+| `CODE_GIT_EMAIL` | `eph-code@noreply.invalid` | Code row's Git author and committer email. |
+| `CODE_GIT_IDENTITY_ENABLED` | on | Code row's identity override; same validation and opt-out rules as above. |
 
 These settings are operator configuration, not ticket fields. They override ambient, route and backend
 identity environment variables. They are read at worker launch; restart after changing a settings file.
@@ -143,14 +151,21 @@ on your server; a local transport test cannot check server-specific author/email
 | `ISSUE_CODE_BRANCH_PREFIX` | `eph/issue` | Branch name prefix. |
 | `ISSUE_CODE_WORKTREE_BASE` | `~/.cache/ew/i` | Short root for issue worktrees; keep overrides short. Nested paths such as pytest `tmp_path` can still exceed AF_UNIX limits. |
 | `ISSUE_CODE_BACKEND` | unset | Pins a registry backend for issue workers. Unset: `FLEET_MODEL_SH` decides. |
-| `ISSUE_CODE_REPO`, `ISSUE_CODE_REPO_PATH` | unset | Not used: each issue's repo comes from `ISSUE_REPO_MAP`. |
 | `ISSUE_CODE_ZBUS_ENV` | unset | Chat identity file handed to the worker (zbus only). |
 
 ## Code worker
 
+`CODE_REPO`, `CODE_REPO_PATH`, `ISSUE_CODE_REPO` and `ISSUE_CODE_REPO_PATH` are unused for tracker
+code tickets: they are not fallback repositories. A tracker ticket must name a `repo:` token (unless the
+explicitly enabled experimental repo-inference flow resolves it). GitLab/GitHub issues use `ISSUE_REPO_MAP`.
+These four retired variables are no longer read, even when set. MR-note iterations also resolve through
+`ISSUE_REPO_MAP`; `routes.json` code rows use their configured repo. Infra and general rows retain their
+own separate repo settings.
+
 | Variable | Default | Meaning |
 |---|---|---|
-| `CODE_ROW_LABEL`, `DEV_ASSIGNEE` | `eph:code-change`, `eph-code` | The label and assignee that start it. Empty turns that trigger off. |
+| `CODE_ROW_LABEL` | `eph:code-change` | Label that starts the code row. Empty turns that trigger off. |
+| `DEV_ASSIGNEE` | `eph-code` | Assignee that starts the code row. Empty turns that trigger off. |
 | `CODE_REPO_ALLOWLIST` | unset | Colon list of repo paths it may work in. Unset: none. |
 | `CODE_REPO_RUNNER_SEEDS` | unset | Test runner per repo, `<path>=<runner>,...` (`repo-test` runs the repo's own `./run-tests.sh`). The key must be the repo's real absolute path: a key on a path that does not exist as a directory never applies (the broker warns at startup and the repo falls through to the route default `CODE_TEST_RUNNER`). |
 | `CONTINUE_MR_PREFIXES` | `eph/` | Colon list of branch prefixes a `continue-mr:` line may name. Each must end in `/`. Empty: nothing can be continued. |
@@ -165,7 +180,10 @@ on your server; a local transport test cannot check server-specific author/email
 | `CODE_AGENT` | `code-worker` | Agent name passed to `FLEET_MODEL_SH`. |
 | `CODE_CHANGE_BACKEND` | unset | Pins a registry backend. Unset: `FLEET_MODEL_SH` decides. |
 | `CODE_NONCLAUDE_OK` | off | Lets a code worker run on a non-Anthropic backend or on hermes. |
-| `CODE_REPO`, `CODE_REPO_PATH` | unset | Not a fallback: a tracker code ticket has to name its repo. |
+| `CODE_BROWSER_MCP_CONFIG` | unset | Isolated, validated Playwright stdio MCP config for code workers; unset leaves browser tools off. |
+| `CODE_JUDGED_BASH_ENABLED` | off | Opt into adjudicated code shell calls instead of the legacy allowlist. See the same-UID security tradeoffs in [security-residual-same-uid.md](security-residual-same-uid.md). |
+| `CODE_PORTCULLIS_HOOK` | unset | Hook command for code shell adjudication. Set together with the gate directory; missing/invalid configuration retains the legacy allowlist. |
+| `CODE_PORTCULLIS_GATE_DIR` | unset | Absolute worker-only gate state directory, armed with `mode=enforce` and `full=on`; required with the hook. |
 | `CODE_ZBUS_ENV` | unset | Chat identity file handed to the worker (zbus only). |
 
 ## General worker
@@ -225,6 +243,7 @@ change the binding. Notes also carry the MR title and description as context, in
 | `MR_REVIEW_QUICK_MAX_DIFF_LINES` | `20` | Changed-line ceiling for the quick tier. |
 | `MR_REVIEW_FULL_PATHS` | `CLAUDE*.md,AGENTS*.md,FLEET.md,GEMINI.md,.claude/*,*/.claude/*,.codex/*,*/.codex/*,prompts/*,*/prompts/*,SKILL.md,commands/*.md,*/commands/*.md`, plus cd.py's own Full-path glob categories (generic sensitive/deploy categories and any repo-specific one for the MR's own repo), read fresh per review | Comma globs; any changed path matching one forces the full tier (add-only; a site may widen, never narrow). |
 | `MR_REVIEW_FULL_DIFF_LINES` | `400` | Changed-line floor above which the diff forces the full tier. |
+| `MR_REVIEW_SKIP_PATHS` | `STATE.md,TASKS.md,*-archive.md,content/*.md,*/content/*.md` | Additional comma globs unioned with these built-ins. All paths must qualify to skip review; Full rules, Quick exclusions and diff-safety guards still win. |
 
 ## Models and backends
 
@@ -249,7 +268,11 @@ change the binding. Notes also carry the MR title and description as context, in
 | `CD_ACCEPT_HERMES` | off | Lets a hermes reviewer's PASS auto-merge under CD. |
 | `EXEC_GATE` | `deny` | Who judges a general worker's shell and write calls: `deny`, `none`, `exec` or `portcullis` ([hermes.md](hermes.md#plugging-in-your-own-exec-gate-general-worker-only)). |
 | `EXEC_GATE_COMMAND` | unset | With `exec`: the program that gets each request as JSON on stdin. |
-| `EXEC_GATE_PORTCULLIS_WRAPPER`, `_HOOK`, `_PYTHON`, `_DIR`, `_PROJECT_DIR` | unset | With `portcullis`: the hook-mode wrapper, hook script, its interpreter and its state directory (`_PROJECT_DIR` defaults to `_DIR`). |
+| `EXEC_GATE_PORTCULLIS_WRAPPER` | unset (required) | With `portcullis`: absolute path of the hook-mode wrapper. |
+| `EXEC_GATE_PORTCULLIS_HOOK` | unset (required) | Absolute path of the hook script. |
+| `EXEC_GATE_PORTCULLIS_PYTHON` | unset (required) | Absolute path of the hook's interpreter. |
+| `EXEC_GATE_PORTCULLIS_DIR` | unset (required) | Absolute gate state directory. |
+| `EXEC_GATE_PORTCULLIS_PROJECT_DIR` | `EXEC_GATE_PORTCULLIS_DIR` | Neutral judge policy directory, outside the worker's write root. |
 | `EXEC_GATE_TIMEOUT` | `5.0` | Seconds per gate decision. |
 | `EXEC_GATE_INHERIT_ENV` | `TMPDIR,LANG,TZ` | Comma list of env names the gate process may inherit. |
 | `EXEC_GATE_PROTECTED_TERMS` | unset | Extra literal names a general terminal command may never mention. |
@@ -262,6 +285,7 @@ change the binding. Notes also carry the MR title and description as context, in
 | `CODEX_AUTH_FILE` | unset | Absolute path of the Codex login file, symlinked into each worker's home, never read. Unset refuses every Codex worker ([configuration.md](configuration.md#the-codex-harness)). |
 | `CODEX_BACKEND` | unset | Registry backend whose `codex` block gives the model when the row's backend has none. |
 | `CODEX_BIN` | `codex` | The Codex CLI. |
+| `CODEX_ALLOW_PRERELEASE` | off | Allow prerelease Codex CLI versions past the version guard. Stable minimum-version checks still apply. |
 | `CODEX_HOME_ROOT` | `~/.cache/eph-codex-homes` | Where each Codex worker's private `CODEX_HOME` is created. |
 | `CODEX_REASONING_SUMMARY` | empty | Codex `model_reasoning_summary` for every turn: `auto`, `concise`, `detailed` or `none`. Codex only reports a thought when the model returns a summary, so set this to put thoughts in the live transcript. Empty leaves the key out (Codex's default); any other value refuses every Codex turn with an error naming the knob. Check your model accepts it with one turn before rolling it out. |
 | `CODEX_SANDBOX_NETWORK` | off | Network inside Codex's workspace-write sandbox. |
@@ -298,6 +322,8 @@ do.
 | `CD_WORKER_BRANCH_PREFIX` | `eph/` | Only MRs from branches under this prefix can merge. |
 | `AUTO_MERGE_REPOS` | unset | Repos whose worker MRs merge on a green pipeline with no reviewer. |
 | `AUTO_MERGE_POLLS`, `AUTO_MERGE_POLL_S` | `12`, `10` | How many times, and how many seconds apart, the pipeline is checked. |
+| `CD_RETRY_MAX` | `2000` | FIFO cap on remembered per-MR BLOCK retry/escalation records, not the number of retries per MR. |
+| `CD_RETRY_PENDING_TTL_S` | `1800` | Seconds before an undelivered queued re-review expires and escalates. |
 
 ## Live transcripts and the dashboard
 
@@ -316,8 +342,27 @@ do.
 | `BROKER_ACTIONS_PROXY_SECRET_ENV` | `BROKER_ACTIONS_PROXY_SECRET` | Name of the variable holding the secret your proxy adds. Required when actions are on. |
 | `BROKER_ACTIONS_PROXY_HEADER` | `X-Broker-Proxy-Secret` | Header that carries the proxy secret. |
 | `BROKER_ACTIONS_AUDIT_HANDLE` | unset | Where each action is also sent as a message. |
+| `BROKER_STEER_MID_TURN` | on | Deliver dashboard messages at the next main-agent tool call on supported harnesses. `0/false/no/off` waits until the turn boundary. |
+| `BROKER_STEER_ROOT` | `steer/` next to `EVENTS_LOG` | Private per-subject message delivery state. Keep outside workers' writable paths when OS isolation is off. |
 | `FLEET_STATUS_PATH`, `FLEET_MD_PATH`, `SUPERVISOR_STATUS_PATH` | unset | Sources for the optional Fleet view ([configuration.md](configuration.md#the-dashboard)). |
 | `FLEET_STATUS_GEN` | unset | Executable the broker runs (background, at most once/60s, 30s timeout) as `FLEET_STATUS_GEN <FLEET_STATUS_PATH>` to refresh `FLEET_STATUS_PATH`; it must write argv[1], not its own default. Unset (either knob): nothing refreshes it for you. |
+
+### Optional dashboard modules
+
+Module configuration is read at startup. Replace `<NAME>` with an enabled module's uppercase name.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `BROKER_MODULES` | unset (off) | Comma list of unique lowercase module names, starting with a letter, using letters, digits and underscores. |
+| `XDG_STATE_HOME` | `~/.local/state` | Module state base when `BROKER_STATE_PATH` is unset; module state goes under `eph-broker/`. Otherwise the journal's parent is used. |
+| `BROKER_MODULE_<NAME>_CMD` | unset | Child command; configure exactly one of this or `UPSTREAM`. |
+| `BROKER_MODULE_<NAME>_UPSTREAM` | unset | External absolute Unix socket or loopback HTTP URL; mutually exclusive with `CMD`. |
+| `BROKER_MODULE_<NAME>_SOCKET` | `<state>/modules/<name>.sock` | Socket endpoint for a managed child. |
+| `BROKER_MODULE_<NAME>_MAX_STREAMS` | `8` | Positive concurrent stream limit per module. |
+| `BROKER_MODULE_<NAME>_LABEL` | title-cased name | Dashboard label. |
+| `BROKER_MODULE_<NAME>_GROUP` | unset | Auth-proxy group required to access this module; unset denies access. |
+| `BROKER_MODULE_<NAME>_VERSION_FILE` | unset | Optional file watched for version changes to restart the child. |
+| `BROKER_MODULE_<NAME>_DISABLED_FILE` | unset | Optional marker file that disables the module while present. |
 
 ## Other built-in rows
 
@@ -328,12 +373,45 @@ prompt ([configuration.md](configuration.md#built-in-rows)). Each one has `*_REP
 | Variable | Default | Meaning |
 |---|---|---|
 | `ANSIBLE_ROW_LABEL`, `ANSIBLE_REPO`, `ANSIBLE_BACKEND`, `ANSIBLE_ZBUS_ENV` | unset | A read-only report row. |
-| `WIKI_ROW_LABEL`, `WIKI_REPO`, `WIKI_REPO_PATH`, `WIKI_CONTENT_SUBDIR`, `WIKI_PUBLISH_REF`, `WIKI_WORKTREE_BASE`, `WIKI_AGENT`, `WIKI_DOCS_BACKEND`, `WIKI_ZBUS_ENV` | unset, ..., `content`, `main`, ... | A docs writer that pushes straight to `WIKI_PUBLISH_REF` with no MR. |
-| `INFRA_ASSIGNEE`, `INFRA_GENERAL_LABEL`, `INFRA_REPO`, `INFRA_REPO_PATH`, `INFRA_TEST_RUNNER`, `INFRA_MR_TARGET_REF`, `INFRA_BRANCH_PREFIX`, `INFRA_WORKTREE_BASE`, `INFRA_AGENT`, `INFRA_BACKEND`, `INFRA_GENERAL_AGENT`, `INFRA_GENERAL_BACKEND`, `INFRA_ZBUS_ENV` | unset, `infra:general`, ... | An infrastructure proposer (code grant) and an infrastructure generalist. |
+| `WIKI_ROW_LABEL` | unset | Label enabling the docs writer. |
+| `WIKI_REPO` | unset | Docs writer's repository reference. |
+| `WIKI_REPO_PATH` | unset | Local wiki checkout. |
+| `WIKI_CONTENT_SUBDIR` | `content` | Writable wiki content subtree. |
+| `WIKI_PUBLISH_REF` | `main` | Branch published directly, without an MR. |
+| `WIKI_WORKTREE_BASE` | `~/.cache/eph-wiki-worktrees` | Wiki worktree root. |
+| `WIKI_AGENT` | `wiki-agent` | Agent name passed to `FLEET_MODEL_SH`. |
+| `WIKI_DOCS_BACKEND` | unset | Pins the wiki backend. |
+| `WIKI_ZBUS_ENV` | unset | Wiki worker's chat identity file. |
+| `INFRA_ASSIGNEE` | unset | Assignee enabling the infrastructure proposer. |
+| `INFRA_GENERAL_LABEL` | `infra:general` | Label enabling the infrastructure generalist. |
+| `INFRA_REPO` | unset | Infrastructure repository reference. |
+| `INFRA_REPO_PATH` | unset | Local infrastructure checkout. |
+| `INFRA_TEST_RUNNER` | `none` | Proposer's granted test runner. |
+| `INFRA_MR_TARGET_REF` | `master` | Fallback MR target, resolved per repo at spawn. |
+| `INFRA_BRANCH_PREFIX` | `eph/infra` | Infrastructure feature branch prefix. |
+| `INFRA_WORKTREE_BASE` | `~/.cache/eph-infra-worktrees` | Infrastructure worktree root. |
+| `INFRA_AGENT` | `infra-worker` | Proposer agent name passed to `FLEET_MODEL_SH`. |
+| `INFRA_BACKEND` | unset | Pins the proposer backend. |
+| `INFRA_GENERAL_AGENT` | `INFRA_AGENT` | Generalist agent name. |
+| `INFRA_GENERAL_BACKEND` | `INFRA_BACKEND` | Generalist backend. |
+| `INFRA_ZBUS_ENV` | unset | Infrastructure workers' chat identity file. |
 | `EPH_WRITE_GRANTS_ENABLED`, `EPH_WRITE_GRANT_DIR`, `EPH_WRITE_GRANT_TTL_S` | off, `~/.local/state/eph-broker/write-grants`, `3600` | Time-limited live-write grant files for the infrastructure rows. |
-| `INBOX_ROW_SOURCE`, `INBOX_REPO`, `INBOX_MCP_CONFIG_DIR`, `INBOX_AGENT`, `INBOX_TRIAGE_BACKEND`, `INBOX_CHAT_BACKEND`, `INBOX_ZBUS_ENV`, `BROKER_INBOX_ACCOUNTS` | unset, ..., `~/.config/eph-broker/inbox-mcp`, ... | Mail triage, one MCP config per account. |
+| `INBOX_ROW_SOURCE` | unset | Event source enabling mail triage. |
+| `INBOX_REPO` | unset | Persistent mail ledger checkout. |
+| `INBOX_MCP_CONFIG_DIR` | `~/.config/eph-broker/inbox-mcp` | One MCP config per mail account. |
+| `INBOX_AGENT` | `mail-agent` | Agent name passed to `FLEET_MODEL_SH`. |
+| `INBOX_TRIAGE_BACKEND` | unset | Pins the mail triage backend. |
+| `INBOX_CHAT_BACKEND` | unset | Pins the mail chat backend. |
+| `INBOX_ZBUS_ENV` | unset | Mail workers' chat identity file. |
+| `BROKER_INBOX_ACCOUNTS` | `CONFIG_DIR/inbox-accounts.json` | Mail account configuration. |
 | `FLEET_ASSIGNEE_ALT`, `SPAWN_SH`, `TFA_BACKEND`, `TFA_CWD_BASE`, `TFA_DEDUP_S` | unset, unset, unset, `~/.cache/eph-tfa`, `300` | The external launcher row: hands a ticket to your own script instead of starting a worker. |
 | `EPH_WIKI_SKILLS_ENABLED`, `EPH_WIKI_SKILLS_DIR` | off, `~/.eph-broker/wiki-skills` | Passes a Claude Code plugin directory of skills to workers. |
+
+Harness selection uses the exact routing names below (all default to `cc` except
+`INFRA_GENERAL_ADAPTER`, which inherits `INFRA_ADAPTER`): `ANSIBLE_ADAPTER`, `WIKI_DOCS_ADAPTER`,
+`INBOX_TRIAGE_ADAPTER`, `INBOX_CHAT_ADAPTER`, `CODE_CHANGE_ADAPTER`, `ISSUE_CODE_ADAPTER`,
+`INFRA_ADAPTER`, `INFRA_GENERAL_ADAPTER`, `GENERAL_ADAPTER` and `MR_REVIEW_ADAPTER`.
+
 
 ## Chat wake
 
@@ -349,6 +427,7 @@ default.
 | `ZULIP_REGISTRY_PATH`, `ZULIP_MCP_SCRIPT`, `ZULIP_UV_BIN`, `ZULIP_STATE_DIR` | unset, unset, `uv` on `PATH`, next to `COMPLETED_PATH` | The bot registry, the listener script, its runner and the state directory. |
 | `ZULIP_WAKE_POLL`, `ZULIP_AUTOREPLY_POLL`, `ZULIP_RECONCILE_S`, `ZULIP_MAX_AGE_S`, `ZULIP_HISTORY_TIMEOUT_S`, `ZULIP_REGISTRY_TTL_S`, `ZULIP_BOT_CACHE_TTL_S` | `2`, `10`, `60`, `300`, `3`, `300`, `3600` | Timings, in seconds. |
 | `DM_HISTORY_MAX_CHARS` | `4000` | Earlier messages added to a chat worker's first turn. |
+| `ZULIP_THREAD_ROOT` | `~/.cache/eph-thread-files` | Per-subject chat thread input files. |
 
 ## Repo inference (experimental)
 

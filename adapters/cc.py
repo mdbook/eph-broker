@@ -3515,8 +3515,8 @@ class CCAdapter(Adapter):
                     # code worker. dev-spindown GH/GL issue-code: an external ISSUE resolves its LOCAL repo
                     # per-issue from ISSUE_REPO_MAP, FAIL-CLOSED: an unmapped repo raises ValueError, so NO
                     # worker is cut and an alert is sent (mirrors the general declared-repo gate + inbox unknown-account
-                    # reject). A vikunja-labelled/assigned code worker (no brief["issue"]) is UNCHANGED: it
-                    # cuts from the row default.
+                    # reject). A tracker-labelled/assigned code worker (no brief["issue"]) must declare
+                    # its repo or resolve it through the opt-in inference ladder below.
                     issue = brief.get("issue") if isinstance(brief, dict) else None
                     if getattr(route, "domain", "") == "infra":
                         # Infra row: defaults to its own repo (/srv/infra) with no `repo:` token, still
@@ -3555,8 +3555,8 @@ class CCAdapter(Adapter):
                         # `target_repo = pub["code_repo_path"]`, the hardcoded default, so a ticket about
                         # any other repo cut the wrong worktree and the worker refused it.
                         # Now: honour a `repo:<abs-path>` token in the ticket text, gated by the code
-                        # allowlist, exactly like the general row above. Nothing declared: the row default
-                        # (still allowlist-checked below, preserving the pre-existing fail-closed behaviour).
+                        # allowlist, exactly like the general row above. Nothing declared: reject below
+                        # unless the opt-in inference ladder resolves a repo.
                         declared = routing.parse_repo_token(ticket_text)
                         if routing.repo_infer_enabled():     # the inference ladder replaces the reject
                             with (self.coalescer.lock if getattr(self, "state_store", None)

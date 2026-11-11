@@ -1515,12 +1515,12 @@ CODE_BROWSER_MCP_CONFIG = os.getenv("CODE_BROWSER_MCP_CONFIG", "")
 # COUPLED SURFACE: agent="code-worker" selects the fleet-model.sh model tier. ADD a
 #   `code-worker) claude-opus-4-8` entry to fleet-model.sh AND the fleet per-agent model table
 #   (opus in normal/high, sonnet in lean/min), or it silently falls through the catch-all default.
-# The row is generic (repo and runner are env params), with per-ticket repo/runner resolution on top.
+# The repo is resolved per ticket; only the runner has an environment fallback.
 #   NO capable run until prompts/code/change-
 #   proposer.md is security-reviewed and the operator hash-signs its sha256 in approved-prompts.json.
 _CODE_ROW = Route(
     domain="code",
-    repo=os.getenv("CODE_REPO", ""),   # base repo (the publisher cuts the worktree; the checkout is provisioned out of band)
+    repo="",                           # tracker tickets must declare a repo (or resolve one via inference)
     prompt_class="change-proposer",     # prompts/code/change-proposer.md; SIGNED (hash-gated; unsigned until the operator signs)
     agent=os.getenv("CODE_AGENT", "code-worker"),   # fleet-model.sh code-worker (opus; coupled surface, see note above)
     read_only=False,
@@ -1529,7 +1529,7 @@ _CODE_ROW = Route(
     browser_mcp_config=CODE_BROWSER_MCP_CONFIG,   # OPT-IN playwright MCP; "" = no browser
     env=_zbus_env("CODE_ZBUS_ENV"),   # LITERAL path (no slug resolution)
     publish={                           # filled by the publisher; code MRs push a FEATURE BRANCH and open an MR, NEVER push to main
-        "code_repo_path": os.getenv("CODE_REPO_PATH", ""),   # local checkout the publisher cuts from and pushes
+        "code_repo_path": "",           # resolved per ticket before cutting a worktree
         "mr_target_ref": os.getenv("CODE_MR_TARGET_REF", "main"),   # MR target (worktree cut FROM this; NEVER pushed to directly)
         "branch_prefix": os.getenv("CODE_BRANCH_PREFIX", "eph/code-change"),        # feature-branch namespace for the MR
         "worktree_base": os.getenv("CODE_WORKTREE_BASE", os.path.expanduser("~/.cache/ew/c")),
@@ -1548,11 +1548,11 @@ _CODE_ROW = Route(
 # (NO new prompt, NO hash change), capability="code" (acceptEdits + git-commit + Hindsight + fail-closed
 # test-Bash), agent=code-worker (SAME as _CODE_ROW, so no new fleet-model.sh coupled surface). The publish is
 # a FEATURE-branch MR (branch_prefix "eph/issue", NEVER a default branch; the publish_mr assert holds). The
-# `repo`/publish["code_repo_path"] DEFAULT is irrelevant: cc._run_worker resolves the LOCAL repo per-issue
-# (resolve_issue_repo, fail-closed on an unmapped repo) and overrides code_repo_path with the resolved path.
+# cc._run_worker resolves the LOCAL repo per issue or MR note from ISSUE_REPO_MAP (fail-closed on an
+# unmapped repo) and overrides code_repo_path with the resolved path. Neither row has a repo fallback.
 _ISSUE_CODE_ROW = Route(
     domain="code",                      # REUSE the code lane's signed prompt (prompts/code/change-proposer.md)
-    repo=os.getenv("ISSUE_CODE_REPO", ""),   # DEFAULT only; per-issue resolution overrides
+    repo="",                           # resolved from ISSUE_REPO_MAP, never an environment fallback
     prompt_class="change-proposer",     # SAME signed prompt as _CODE_ROW (hash-gated; do NOT create a new one)
     agent=os.getenv("CODE_AGENT", "code-worker"),   # SAME agent as _CODE_ROW (fleet-model.sh code-worker, opus)
     read_only=False,
@@ -1560,8 +1560,8 @@ _ISSUE_CODE_ROW = Route(
     test_runner=os.getenv("ISSUE_CODE_TEST_RUNNER", ""),   # per-issue repos vary; empty means no test Bash (fail-closed)
     browser_mcp_config=CODE_BROWSER_MCP_CONFIG,   # OPT-IN playwright MCP; "" = no browser
     env=_zbus_env("ISSUE_CODE_ZBUS_ENV"),   # LITERAL path
-    publish={                           # feature-branch MR; code_repo_path is a DEFAULT overridden per-issue in cc
-        "code_repo_path": os.getenv("ISSUE_CODE_REPO_PATH", ""),   # irrelevant default
+    publish={                           # feature-branch MR; target repo resolved per issue in cc
+        "code_repo_path": "",
         "mr_target_ref": os.getenv("ISSUE_CODE_MR_TARGET_REF", "main"),   # MR target (worktree cut FROM it)
         "branch_prefix": os.getenv("ISSUE_CODE_BRANCH_PREFIX", "eph/issue"),   # feature-branch namespace; NEVER main
         "worktree_base": os.getenv("ISSUE_CODE_WORKTREE_BASE", os.path.expanduser("~/.cache/ew/i")),

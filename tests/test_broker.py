@@ -6036,7 +6036,8 @@ def test_code_profile_registered_label_declared():
     ns, label, row = code_entries[0][0], code_entries[0][1], code_entries[0][2]
     assert ns == "vikunja:task" and label == CODE_ROW_LABEL == "eph:code-change", (ns, label)
     assert row.domain == "code" and row.capability == "code" and row.test_runner == "pytest", row
-    assert row.publish.get("code_repo_path") and row.publish.get("mr_target_ref") == "main", row.publish
+    assert row.repo == "" and row.publish["code_repo_path"] == "", row
+    assert row.publish.get("mr_target_ref") == "main", row.publish
     # capability is label-declared: an unlabelled ticket must NOT reach the code row (fail-closed = NoRoute,
     # never a silent fallback into a write-capable route).
     rtr = Router()
@@ -10441,6 +10442,26 @@ def test_item5_worktree_make_idempotent():
         assert r.returncode == 0, r.stderr                   # a valid, usable worktree registration
     ok("worktree.make is idempotent - a stale worktree dir+registration from a killed run is "
        "pruned/removed then re-created (no exit-128)")
+
+
+def test_code_rows_ignore_retired_repo_environment():
+    """Retired repo defaults cannot influence any built-in code template, even when set."""
+    import importlib, routing
+    from unittest.mock import patch
+
+    retired = ("CODE_REPO", "CODE_REPO_PATH", "ISSUE_CODE_REPO", "ISSUE_CODE_REPO_PATH")
+    try:
+        with patch.dict(os.environ, {name: "/srv/git/unused" for name in retired}):
+            importlib.reload(routing)
+            for row in (routing._CODE_ROW, routing._ISSUE_CODE_ROW):
+                assert row.repo == "" and row.publish["code_repo_path"] == "", row
+            # Label, assignee and MR-note routes share _CODE_ROW; both forge sources share the issue row.
+            inherited = [entry for entry in routing.PROFILES
+                         if entry[2] is routing._CODE_ROW or entry[2] is routing._ISSUE_CODE_ROW]
+            assert len(inherited) == 5, inherited
+    finally:
+        importlib.reload(routing)
+    ok("built-in tracker, MR-note and issue code rows ignore all four retired repo environment defaults")
 
 
 def test_item7_code_row_no_repo_fails_closed():
@@ -18877,10 +18898,10 @@ def test_review1_config_cannot_downgrade_tier():
     for p in ("app.py", "Dockerfile", ".gitlab-ci.yml", "ticket_fetch.py"):
         assert cd.classify_paths([p], probe, eb)[0] == "full", p
     for repo in (eb, "owner/other"):
-        for p in ("config/cd-tier.json", "config/deploy-paths.json", "config/routing.json", "config/constraints.json"):
+        for p in ("config/cd-tier.json", "config/deploy-paths.json", "config/constraints.json"):
             assert cd.classify_paths(["README.md", p], probe, repo) == ("full", [("cd-config", p)]), (repo, p)
     ok("a config that tries to empty/replace the Full lists or widen the Light list changes "
-       "nothing; config/** (cd-tier.json, deploy-paths.json, routing, constraints) is itself Full")
+       "nothing; config/** (cd-tier.json, deploy-paths.json, constraints) is itself Full")
 
 
 def test_review2_engine_repo_unlisted_is_full():
@@ -22126,13 +22147,14 @@ def test_cc_rule_paths_from_site_env():
 
 def test_routing_defaults_from_site_env():
     """Row repos, repo allowlists, *_ZBUS_ENV bus identities, FLEET_MODEL_SH and the
-    ansible worktree base come from site.env. Site values unchanged; without a site file every one is empty:
+    ansible worktree base come from site.env. Code rows have no repo default; without a site file every repo is empty:
     allowlists admit nothing, rows carry NO ZBUS_ENV key (never an empty one), resolve_model never execs."""
     import routing as R
     rows = ("_ANSIBLE_ROW", "_WIKI_DOCS_ROW", "_INBOX_ROW", "_CODE_ROW", "_ISSUE_CODE_ROW", "_INFRA_ROW",
             "_GENERAL_ROW")
     assert R.GENERAL_REPO_ALLOWLIST == R.CODE_REPO_ALLOWLIST == {"/srv/git/sample-app"}
-    assert R._INFRA_ROW.repo == "/srv/infra" and R._CODE_ROW.repo == "/srv/git/sample-app"
+    assert R._INFRA_ROW.repo == "/srv/infra"
+    assert R._CODE_ROW.repo == R._ISSUE_CODE_ROW.repo == ""
     assert R._GENERAL_ROW.env == {"ZBUS_ENV": "/etc/site/bots/.eph-bot-env"}
     assert all(getattr(R, r).env.get("ZBUS_ENV", "").startswith("/etc/site/bots/.") for r in rows)
     assert R.FLEET_MODEL_SH == "/opt/site/bin/fleet-model.sh"

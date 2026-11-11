@@ -366,6 +366,44 @@ def hermes_config(system_prompt, provider, model, toolsets=(), gated=False, cwd=
 _READ_ONLY_FORBIDDEN_RULES = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit", "Bash"})
 
 
+def _nonsecret_paths(root):
+    """Site-only declarations, bound to a catalog repo by its shared Git directory, not its basename
+    or a worker-controlled origin URL. No catalog access with the default empty mapping; without
+    a catalog binding, grant no exceptions and retain the existing secret-name floor."""
+    mapping = json.loads(os.getenv("EPH_GATE_NONSECRET_PATHS", "{}"))
+    if not isinstance(mapping, dict):
+        raise ValueError("EPH_GATE_NONSECRET_PATHS must be a repo-to-globs object")
+    for repo, globs in mapping.items():
+        if not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_-][A-Za-z0-9_.-]*)+", repo):
+            raise ValueError("EPH_GATE_NONSECRET_PATHS needs exact namespace/repo keys")
+        _gate.nonsecret_globs(globs)
+    if not any(mapping.values()):
+        return []
+    import repo_catalog
+    try:
+        catalog = repo_catalog.get_catalog()
+    except Exception:
+        return []
+
+    def common_dir(path):
+        try:
+            r = subprocess.run(["git", "-C", path, "rev-parse", "--git-common-dir"],
+                               capture_output=True, text=True, timeout=30)
+            if r.returncode == 0 and r.stdout.strip():
+                return os.path.realpath(os.path.join(path, r.stdout.strip()))
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return None
+
+    shared = common_dir(root)
+    if shared:
+        for name, globs in mapping.items():
+            repo = catalog.by_path.get(name)
+            if repo and globs and common_dir(catalog.local_path(repo)) == shared:
+                return globs
+    return []
+
+
 def gate_policy(capability, cwd, test_runner=None, test_repo=None, nonce=None):
     """The CC grant for the SAME capability, plus read extensions requiring eph-gate's parsed path checks."""
     grant = _cc.capability_tool_grant(capability, test_runner=test_runner, test_repo=test_repo)
@@ -409,6 +447,7 @@ def gate_policy(capability, cwd, test_runner=None, test_repo=None, nonce=None):
         # Separate from arbitrary Bash grants: an env prefix may only wrap this turn's reviewed runner.
         pol["test_allow"] = _cc._code_test_bash(test_runner, test_repo)
     try:
+        pol["nonsecret_globs"] = _nonsecret_paths(read_root)
         if capability == "code":
             extra = [n.strip() for n in os.getenv("EPH_GATE_TEST_ENV_ALLOW", "").split(",") if n.strip()]
             pol["test_env_allow"] = sorted(_gate.test_env_names(extra))

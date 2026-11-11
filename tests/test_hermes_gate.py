@@ -7,6 +7,7 @@ symlinks. The adapter half fakes hermes AND its interpreter: the fake `python` a
 loading the copied plugin from the private HERMES_HOME exactly as hermes does (package import + register(ctx)).
 """
 import atexit, contextlib, json, os, shlex, shutil, stat, subprocess, sys, tempfile
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -276,6 +277,163 @@ def test_git_unfiltered_diff_tracked_secret_floor():
         finally:
             f.close()
     ok("eph-gate: whole-tree diffs deny tracked secrets including staged deletions; clean diffs stay usable")
+
+
+@contextlib.contextmanager
+def _nonsecret_workspace(globs=None):
+    import repo_catalog
+    f = Fixture()
+    try:
+        subprocess.run(["git", "-C", f.wt, "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                        "commit", "--allow-empty", "-qm", "fixture"], check=True)
+        wt = os.path.join(f.d, "worker")
+        subprocess.run(["git", "-C", f.wt, "worktree", "add", "--detach", "-q", wt], check=True)
+        for name in ("base", "extra"):
+            os.makedirs(os.path.join(wt, "modules", name))
+        open(os.path.join(wt, "modules/base/module.env"), "w").write("WORKDIR=/workspace\n")
+        cat = repo_catalog.Catalog([repo_catalog.Repo("example/module-box", "module-box", local=f.wt)],
+                                  tier_b=[], deny=[])
+        mapping = {"example/module-box": globs if globs is not None else ["modules/*/module.env"]}
+        with _env(EPH_GATE_NONSECRET_PATHS=json.dumps(mapping)), patch.object(
+                repo_catalog, "get_catalog", return_value=cat):
+            yield f, wt
+    finally:
+        f.close()
+
+
+def test_nonsecret_named_repo_read_write_and_search():
+    with _nonsecret_workspace() as (f, wt):
+        p = G.Policy(H.gate_policy("code", wt))
+        assert p.read_root == wt and p.nonsecret_res
+        for tool, args in (("read_file", {"path": "modules/base/module.env"}),
+                           ("write_file", {"path": "modules/base/module.env", "content": "WORKDIR=/tmp"}),
+                           ("write_file", {"path": "modules/extra/module.env", "content": "WORKDIR=/tmp"}),
+                           ("patch", {"path": "modules/base/module.env", "old_string": "/workspace",
+                                      "new_string": "/tmp"}),
+                           ("search_files", {"path": "modules", "pattern": "WORKDIR"}),
+                           ("terminal", {"command": "sed -n '1p' modules/base/module.env"}),
+                           ("terminal", {"command": "git add modules/base/module.env"})):
+            v = G.decide(tool, args, p)
+            assert v.allowed, (tool, args, v.reason)
+        # A cwd narrowed to a subtree still matches relative to the actual worktree root.
+        sub = G.Policy(H.gate_policy("code", os.path.join(wt, "modules/base")))
+        assert G.decide("read_file", {"path": "module.env"}, sub).allowed
+        assert G.decide("write_file", {"path": "module.env", "content": "x"}, sub).allowed
+    ok("nonsecret: named catalog repo worktree allows existing/new writes, patch, reads, search and terminal")
+
+
+def test_nonsecret_other_repo_and_default_remain_denied():
+    import repo_catalog
+    with _nonsecret_workspace() as (f, wt):
+        # Same spelling and even the claimed origin do not make this another repo's worktree.
+        os.makedirs(os.path.join(f.wt, "modules/base"))
+        other = Fixture()
+        try:
+            os.makedirs(os.path.join(other.wt, "modules/base"))
+            subprocess.run(["git", "-C", other.wt, "remote", "add", "origin",
+                            "https://gitlab.example.com/example/module-box.git"], check=True)
+            p = G.Policy(H.gate_policy("code", other.wt))
+            assert not p.nonsecret_res
+            for tool in ("read_file", "write_file"):
+                v = G.decide(tool, {"path": "modules/base/module.env"}, p)
+                assert not v.allowed and "secret-file" in v.reason, v.reason
+        finally:
+            other.close()
+        with _env(EPH_GATE_NONSECRET_PATHS=None), patch.object(repo_catalog, "get_catalog") as lookup:
+            p = G.Policy(H.gate_policy("code", wt))
+            lookup.assert_not_called()
+            assert not G.decide("read_file", {"path": "modules/base/module.env"}, p).allowed
+            assert not G.decide("write_file", {"path": "modules/base/module.env"}, p).allowed
+        denied = repo_catalog.Catalog([repo_catalog.Repo("example/module-box", "module-box", local=f.wt)],
+                                     tier_b=[], deny=["example/module-box"])
+        with patch.object(repo_catalog, "get_catalog", return_value=denied):
+            assert not G.Policy(H.gate_policy("code", wt)).nonsecret_res
+    ok("nonsecret: empty default, other repos (even same origin), and denied catalog repos stay denied")
+
+
+def test_nonsecret_dotfiles_and_symlink_confinement():
+    with _nonsecret_workspace(["modules/**"]) as (f, wt):
+        p = G.Policy(H.gate_policy("code", wt))
+        for name in (".env", ".env.local", ".secrets-env", ".config.env", ".pii-store/data.env",
+                     ".hidden/module.env"):
+            path = "modules/base/" + name
+            for tool in ("read_file", "write_file"):
+                v = G.decide(tool, {"path": path}, p)
+                assert not v.allowed and "secret-file" in v.reason, (path, v.reason)
+        # Symlinks on the final component and a parent, including a nonexistent new write target.
+        os.symlink(os.path.join(f.d, "x.env"), os.path.join(wt, "modules/extra/module.env"))
+        os.symlink(os.path.join(f.d, "outside"), os.path.join(wt, "modules/out"))
+        for path in ("modules/extra/module.env", "modules/out/module.env"):
+            assert not G.decide("read_file", {"path": path}, p).allowed
+            assert not G.decide("write_file", {"path": path, "content": "x"}, p).allowed
+    with _nonsecret_workspace() as (f, wt):
+        open(os.path.join(wt, "private.env"), "w").write("SYNTHETIC=1\n")
+        os.symlink("../../private.env", os.path.join(wt, "modules/extra/module.env"))
+        p = G.Policy(H.gate_policy("code", wt))
+        for tool in ("read_file", "write_file"):
+            assert not G.decide(tool, {"path": "modules/extra/module.env"}, p).allowed
+        # A safe internal parent link works only when the resolved spelling is also declared.
+        os.symlink("base", os.path.join(wt, "modules/alias"))
+        assert G.decide("read_file", {"path": "modules/alias/module.env"}, p).allowed
+    ok("nonsecret: broad globs never exempt dotfiles; final/parent escaping and undeclared target links deny")
+
+
+def test_nonsecret_preserves_other_denies_and_read_only():
+    with _nonsecret_workspace() as (f, wt):
+        args = {"path": "modules/base/module.env"}
+        pol = H.gate_policy("code", wt)
+        p = G.Policy(dict(pol, deny=pol["deny"] + ["Read(//**/modules/*/module.env)",
+                                                  "Edit(//**/modules/*/module.env)"]))
+        assert not G.decide("read_file", args, p).allowed
+        assert not G.decide("write_file", args, p).allowed
+        p = G.Policy(H.gate_policy("mr-review", wt))
+        assert G.decide("read_file", args, p).allowed
+        assert not G.decide("write_file", args, p).allowed
+    ok("nonsecret: unrelated explicit denies and read-only capabilities remain authoritative")
+
+
+def test_nonsecret_unavailable_catalog_keeps_floor():
+    import repo_catalog
+    with _nonsecret_workspace() as (f, wt):
+        open(os.path.join(wt, "f.txt"), "w").write("x\n")
+        # Exercise both a declaration for this worktree and the deployment config that triggered
+        # the regression (absent in the public export). Neither can grant an unbound exception.
+        deployment = site_env.read_config(os.path.join(ROOT, "config", "broker.json"))
+        mappings = [os.environ["EPH_GATE_NONSECRET_PATHS"],
+                    deployment.get("settings", {}).get("EPH_GATE_NONSECRET_PATHS", "{}")]
+        for mapping in mappings:
+            with _env(EPH_GATE_NONSECRET_PATHS=mapping), patch.object(
+                    repo_catalog, "get_catalog", side_effect=repo_catalog.CatalogUnavailable("fixture")):
+                for root in (wt, f.wt):
+                    p = G.Policy(H.gate_policy("code", root))
+                    assert not p.nonsecret_res
+                    assert G.decide("read_file", {"path": "f.txt"}, p).allowed
+                    assert G.decide("write_file", {"path": "new.txt", "content": "x"}, p).allowed
+                    for tool in ("read_file", "write_file"):
+                        v = G.decide(tool, {"path": "modules/base/module.env"}, p)
+                        assert not v.allowed and "secret-file" in v.reason, v.reason
+    ok("nonsecret: unavailable catalog with matching/deployment config keeps turns running, no exceptions")
+
+
+def test_nonsecret_invalid_configuration_refuses():
+    with tempfile.TemporaryDirectory() as wt:
+        for mapping in ("not json", "[]", '{"*/*":[]}', '{"box":[]}', '{"example/box":"*.env"}',
+                        '{"example/box":["/modules/*.env"]}', '{"example/box":["../*.env"]}',
+                        '{"example/box":["modules/./*.env"]}', '{"example/box":["modules//*.env"]}',
+                        '{"example/box":[null]}'):
+            with _env(EPH_GATE_NONSECRET_PATHS=mapping):
+                try:
+                    H.gate_policy("code", wt)
+                    raise AssertionError(("invalid exception accepted", mapping))
+                except H.HermesRefused:
+                    pass
+        for value in ("*.env", ["/file.env"], ["../file.env"], ["a/"], ["a\\b.env"], ["a\x00.env"]):
+            try:
+                G.Policy(dict(H.gate_policy("code", wt), nonsecret_globs=value))
+                raise AssertionError(("invalid policy exception accepted", value))
+            except ValueError:
+                pass
+    ok("nonsecret: malformed declarations/policies fail closed")
 
 
 def test_search_file_glob_floor():

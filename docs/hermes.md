@@ -39,6 +39,32 @@ exact, case-sensitive names (no wildcard patterns). These ride in the per-turn p
 list, not the worker's environment. Only add benign test flags: adding a runtime/loader configuration name
 would explicitly trust that variable to change how tests execute. Invalid names refuse the code turn.
 
+## Non-secret filename exceptions (hermes and Codex)
+
+The secret-name floor is intentionally conservative. An operator may declare reviewed, non-secret files
+with otherwise protected names in the broker's site settings, for example:
+
+```yaml
+EPH_GATE_NONSECRET_PATHS: '{"example/module-box":["modules/*/module.env"]}'
+```
+
+Core defaults to `{}`. Keys are exact full repo names in the admitted repo catalog, not basenames or repo
+globs. The broker binds the current worktree to the catalog checkout by its shared Git directory; a changed
+origin URL cannot select another repo's exceptions. If the catalog is unavailable, no exceptions are
+granted: turns still run with the existing secret-name floor.
+Malformed configuration refuses the turn. Site values belong in deployment config, never core defaults.
+
+Paths are relative to the worktree root. `*` and `?` match within one component; `**` can cross directories.
+Absolute paths, empty components and `.`/`..` components are invalid. Both the requested and resolved paths
+must match inside that worktree. Dotfiles and paths through dot-directories (including `.env`, `.secrets-env`
+and `.pii-store`) can never be excepted, even with broad globs. Escaping symlinks stay denied, including for
+new write targets. Capability grants, read-only review, write-root confinement, other explicit deny rules
+and the exec judge still apply. Non-excepted names keep their existing denial messages.
+
+This is a security boundary change: require independent Full-tier review before merging changes to this
+mechanism or expanding a deployment's exceptions. It does not change Claude Code's native grants or a
+harness's own independent file restrictions.
+
 ## Plugging in your own exec gate (general worker only)
 
 Claude Code's general worker has the auto permission mode judging each action. On hermes the general worker has no

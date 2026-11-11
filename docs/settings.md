@@ -242,6 +242,7 @@ change the binding. Notes also carry the MR title and description as context, in
 |---|---|---|
 | `HERMES_BIN` | `~/.local/share/eph-hermes/venv/bin/hermes` | The broker's own hermes install ([hermes.md](hermes.md)). |
 | `HERMES_HOME_ROOT` | `~/.cache/eph-hermes-homes` | Where each hermes worker's private config home is created. |
+| `EPH_GATE_NONSECRET_PATHS` | `{}` | JSON object of exact catalog `namespace/repo` keys to repo-relative non-secret path globs for the Hermes/Codex secret-name floor ([hermes.md](hermes.md#non-secret-filename-exceptions-hermes-and-codex)). |
 | `CD_ACCEPT_HERMES` | off | Lets a hermes reviewer's PASS auto-merge under CD. |
 | `EXEC_GATE` | `deny` | Who judges a general worker's shell and write calls: `deny`, `none`, `exec` or `portcullis` ([hermes.md](hermes.md#plugging-in-your-own-exec-gate-general-worker-only)). |
 | `EXEC_GATE_COMMAND` | unset | With `exec`: the program that gets each request as JSON on stdin. |

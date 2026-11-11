@@ -332,6 +332,15 @@ def glob_to_regex(g):
 HARD_SECRET_GLOBS = ("//**/*-env", "//**/.env", "//**/.env.*", "//**/*.env", "//**/.pii-store", "//**/.pii-store/**")
 
 
+def nonsecret_globs(value):
+    """Only repo-relative globs, using the same *, ** and ? syntax as the secret floor."""
+    if not isinstance(value, list) or any(
+            not isinstance(g, str) or not g or "\x00" in g or "\\" in g
+            or any(c in ("", ".", "..") for c in g.split("/")) for g in value):
+        raise ValueError("nonsecret_globs must be a list of repo-relative path globs")
+    return value
+
+
 class Policy(object):
     def __init__(self, d):
         if not isinstance(d, dict):
@@ -351,9 +360,13 @@ class Policy(object):
             raise ValueError("unparseable rule in policy")
         globs = list(d.get("secret_globs") or []) + list(HARD_SECRET_GLOBS)
         self.secret_res = [glob_to_regex(g) for g in globs]
-        self.read_deny_res = [glob_to_regex(s) for t, s in self.deny if t in ("Read", "Grep", "Glob") and s]
+        self.nonsecret_res = [glob_to_regex("/" + g) for g in nonsecret_globs(d.get("nonsecret_globs", []))]
+        # Imported secret-name denies duplicate _secret. Handle them there so exceptions work, while
+        # unrelated explicit Read/Edit deny rules remain authoritative.
+        self.read_deny_res = [glob_to_regex(s) for t, s in self.deny
+                              if t in ("Read", "Grep", "Glob") and s and s not in globs]
         self.edit_deny_res = [glob_to_regex(s) for t, s in self.deny
-                              if t in ("Edit", "Write", "MultiEdit") and s]
+                              if t in ("Edit", "Write", "MultiEdit") and s and s not in globs]
         self.walk_cap = int(d.get("walk_cap") or 20000)
         # the exec-gate judge (general only). Present = terminal/write_file/patch also need a judge allow.
         # which gate answers is the judge block's "provider" (providers/), never decided here.
@@ -400,11 +413,26 @@ def _resolve(raw, base):
     return os.path.normpath(p), os.path.realpath(p)
 
 
+def _nonsecret(policy, path):
+    if not policy.nonsecret_res:
+        return False
+    # Match BOTH spellings: a declared benign name cannot alias an undeclared secret, dotfile or
+    # outside file. realpath resolves every parent too, including for a not-yet-created write target.
+    for p in (path, os.path.realpath(path)):
+        if not _inside(p, policy.read_root):
+            return False
+        relative = os.path.relpath(p, policy.read_root)
+        if any(c.startswith(".") for c in relative.split("/")):
+            return False
+        if not any(rx.match("/" + relative) for rx in policy.nonsecret_res):
+            return False
+    return True
+
+
 def _secret(policy, *paths):
     for p in paths:
-        for rx in policy.secret_res:
-            if rx.match(p):
-                return True
+        if any(rx.match(p) for rx in policy.secret_res) and not _nonsecret(policy, p):
+            return True
     return False
 
 

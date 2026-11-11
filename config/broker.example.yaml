@@ -18,6 +18,9 @@ settings:
   GENERAL_REPO_ALLOWLIST: "/srv/git/app:/srv/git/docs-site"
   CODE_REPO_ALLOWLIST: "/srv/git/app:/srv/git/docs-site"
   CONCURRENCY: 5
+  # Reviewed non-secret filename exceptions for eph-gate (Hermes/Codex), empty by default.
+  # Exact catalog repo keys, repo-relative globs. Dotfiles and escaping symlinks stay denied.
+  # EPH_GATE_NONSECRET_PATHS: '{"example/module-box":["modules/*/module.env"]}'
   # Per-row commit metadata (push credentials are unchanged). Default: eph-<row>@noreply.invalid.
   CODE_GIT_NAME: "eph-code"
   CODE_GIT_EMAIL: "eph-code@example.com"

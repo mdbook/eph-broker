@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/icon/eph-broker.svg" alt="" width="96" height="96"></p>
+
 <h1 align="center">eph-broker</h1>
 
 <p align="center">

@@ -98,11 +98,23 @@ def _extract_inner(result_text):
         obj = result_text
     else:
         s = str(result_text).strip()
-        # tolerate the envelope being wrapped in prose or fenced: grab the last {...} block
-        start, end = s.find("{"), s.rfind("}")
-        if start == -1 or end == -1 or end < start:
-            raise ValueError("no JSON object in worker result")
-        obj = json.loads(s[start:end + 1])
+        # Tolerate prose, fences and multiple independent objects. The last decoded
+        # dict with a status wins, even if invalid (try_parse must fail closed).
+        decoder = json.JSONDecoder()
+        obj = None
+        start = s.find("{")
+        while start != -1:
+            try:
+                candidate, end = decoder.raw_decode(s, start)
+            except json.JSONDecodeError:
+                start = s.find("{", start + 1)
+                continue
+            if isinstance(candidate, dict) and "status" in candidate:
+                obj = candidate
+            # Never promote a nested object (or braces in a string) to an envelope.
+            start = s.find("{", end)
+        if obj is None:
+            raise ValueError("no JSON object with 'status' in worker result")
     if "status" not in obj:
         raise ValueError("worker envelope missing 'status'")
     return {

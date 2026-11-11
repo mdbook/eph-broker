@@ -1965,6 +1965,71 @@ def test_envelope_parse_and_escalate():
        "ticket comment only when task_id present, never operator)")
 
 
+def test_envelope_multiple_objects_and_prose():
+    p = EnvelopeParser()
+    first = json.dumps({"status": "blocked", "summary": "earlier", "wake": []})
+    last = json.dumps({"status": "done", "summary": "final {report}", "wake": ["ops"]})
+    for text in (
+        first + last,
+        first + "\n" + last,
+        'Prose\n```json\n' + last + '\n```\n{"detail": "trailing object"}',
+        'Context {"detail": {"nested": true}} before the envelope:\n' + last,
+        'Malformed {not JSON}\n' + last + '\n{unfinished',
+    ):
+        env = p.try_parse({"result": text}, "run-9409", _route())
+        assert env is not None, text
+        assert env["status"] == "done" and env["summary"] == "final {report}", env
+        assert env["wake"] == ["ops"], env
+    for text in ('no object', '{"summary": "no status"}', '{broken'):
+        assert p.try_parse({"result": text}, "run-9409", _route()) is None, text
+    ok("envelope scan: last status object wins amid concatenated objects, prose, fences and malformed braces")
+
+
+def test_envelope_last_status_still_fails_closed():
+    p = EnvelopeParser()
+    for route, allowed in ((_route(), "done"), (_mr_review_route(), "pass")):
+        first = json.dumps({"status": allowed, "summary": "earlier"})
+        for bad in ("unknown", "", None):
+            text = first + "\n" + json.dumps({"status": bad})
+            assert p.try_parse({"result": text}, "run-9409", route) is None, text
+    ok("last status object is validated, never replaced by an earlier allowed status")
+
+
+def test_envelope_nested_status_is_not_an_independent_envelope():
+    p = EnvelopeParser()
+    route = _mr_review_route()
+    nested = {"status": "pass"}
+    outer = {"status": "block", "summary": "Changes required", "details": nested}
+    env = p.try_parse({"result": json.dumps(outer)}, "run-9409", route)
+    assert env is not None, env
+    assert env["status"] == "block" and env["summary"] == "Changes required", env
+    for bad in ("unknown", "", None):
+        outer["status"] = bad
+        assert p.try_parse({"result": json.dumps(outer)}, "run-9409", route) is None, outer
+    # A status-less object also owns its nested objects, including when it trails
+    # a valid envelope. Only a later independent status object can replace it.
+    container = json.dumps({"details": nested})
+    assert p.try_parse({"result": container}, "run-9409", route) is None
+    blocked = json.dumps({"status": "block", "summary": "Changes required"})
+    env = p.try_parse({"result": blocked + container}, "run-9409", route)
+    assert env["status"] == "block" and env["summary"] == "Changes required", env
+    env = p.try_parse({"result": container + blocked}, "run-9409", route)
+    assert env["status"] == "block" and env["summary"] == "Changes required", env
+    ok("nested statuses never override an outer verdict or turn an invalid outer status into a pass")
+
+
+def test_envelope_ignores_cli_cost_estimates():
+    p = EnvelopeParser()
+    wrapper = {"result": {"status": "done", "summary": "s", "wake": []},
+               "session_id": "sess-9409", "usage": {"input_tokens": 0, "output_tokens": 0}}
+    expected = p.try_parse(wrapper, "run-9409", _route())
+    wrapper.update({"model": "example-local-model", "total_cost_usd": 4.26,
+                    "modelUsage": {"example-local-model": {"costUSD": 4.26}}})
+    assert p.try_parse(wrapper, "run-9409", _route()) == expected
+    assert expected["tokens"] == 0 and "total_cost_usd" not in expected, expected
+    ok("CLI cost estimates are not consumed; zero reported token usage remains zero")
+
+
 def test_hash_gate():
     with tempfile.TemporaryDirectory() as d:
         pdir = os.path.join(d, "prompts"); os.makedirs(os.path.join(pdir, "ansible"))

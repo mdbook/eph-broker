@@ -104,11 +104,20 @@ reading, so a missing reading cannot carry a prior session's size into the new s
 {"result": "<the worker's final text>", "session_id": "<id>", "usage": {"input_tokens": 0, "output_tokens": 0}}
 ```
 
-The last `{...}` block inside `result` is the worker's envelope. `status` is required; `summary`, `wake` (a list)
+The last independently decoded JSON object with a `status` key inside `result` is the worker's envelope.
+Nested objects within a decoded object are never separate envelopes. Prose, fences and other JSON objects
+are tolerated. A later object with an invalid status is still a parse miss, not a reason to
+fall back to an earlier envelope. `status` is required; `summary`, `wake` (a list)
 and `needs_operator` (only a literal `true` counts) are optional. The status has to be one the capability allows:
 `pass` or `block` for `mr-review`, `done` or `blocked` for everything else. A capability with no allowed set is a
 parse miss. The parser adds `session_id`, `tokens`, `run_id` and `harness` (the route's `adapter` value, which
 also ends up in the hidden tag on MR verdict notes).
+
+The broker does not record, display or aggregate the CLI wrapper's `total_cost_usd` as spend. Claude Code's
+price-table estimate is not actual billing for local or unrecognized models (which may emit
+`[claude-code:unrecognized_model]`). Token counts are only what the harness reports: zero or missing usage
+can mean unavailable accounting, not a free run or no work. Use the backend's own billing or metering for
+spend; do not infer it from that estimate or the broker's token count.
 
 A new harness should repack its own output into that wrapper, as hermes does with its stream-json `result`
 record (`parse_stream`), so `envelope.py` stays the one parser for every harness.

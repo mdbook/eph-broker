@@ -1459,14 +1459,17 @@ _INBOX_ALLOWED = _READ_ALLOWED + _INBOX_GIT + _GMAIL_READ + _GMAIL_WRITE_SAFE + 
 _GMAIL_DENIED = ["mcp__google-workspace__send_gmail_message",
                  "mcp__*__send_gmail_message",   # server-agnostic belt-and-suspenders (send is the worst op)
                  "mcp__google-workspace__manage_gmail_filter"]
-_INBOX_DENIED = _WRITE_DENIED + _GMAIL_DENIED
+# The same sensitive paths are off-limits for repo stewardship as for reads.
+_INBOX_DENIED = (_WRITE_DENIED + _GMAIL_DENIED
+                 + [f"{tool}({g})" for tool in ("Edit", "Write") for g in _SECRET_FILE_GLOBS])
 
 # The "inbox-chat" capability: an ephemeral worker answering a Zulip DM from the operator (zulip_wake.py
 # routes to routing._ZULIP_INBOX_ROW). Same Gmail surface as triage (read + label/archive/draft, send/filter-create
-# denied, TRASH hook) + read-only Hindsight, but NO bus and NO file edits: the BROKER posts the envelope
-# summary back to the original sender, so the worker gets no way to DM anyone. zbus is not allow-listed AND is
-# hard-denied (belt-and-suspenders; the row also carries no ZBUS_ENV), no git, no --permission-mode (Edit/
-# Write/MultiEdit/NotebookEdit denied outright).
+# denied, TRASH hook) + read-only Hindsight + triage's repo stewardship + one ops-only DM grant.
+# The BROKER posts the envelope summary back to the original sender. The row shares triage's ZBUS_ENV;
+# only `zbus dm <OPS_HANDLE>` is allow-listed (unset = none); other bus forms stay denied headless,
+# with absolute paths and `say` hard-denied. acceptEdits confines repo edits to
+# cwd (INBOX_REPO); _INBOX_GIT permits stage/commit, never push, with triage's shared deny-floor.
 # Memory is Hindsight RECALL ONLY, through a small recall wrapper that fixes the tool name to
 # "recall"; mcp-ro.sh itself is DENIED to this worker (its hindsight arm also passes retain/reflect, and its
 # other arms reach git hosting, metrics, SSO, network and ticketing tools). Env/secret files are read-denied (below).
@@ -1534,10 +1537,10 @@ _INBOX_CHAT_HOOK_SETTINGS = {
 # reused here unchanged (this row's own explicit +_SECRET_READ_DENIED below is belt-and-suspenders: it also
 # rides in via _INBOX_DENIED -> _WRITE_DENIED now, but this capability keeps its own explicit tail so it
 # reads correctly standalone).
-_INBOX_CHAT_ALLOWED = _READ_ALLOWED + _inbox_chat_gmail_allowed()
+_INBOX_CHAT_ALLOWED = _READ_ALLOWED + _INBOX_GIT + _inbox_chat_gmail_allowed()
 _INBOX_CHAT_DENIED = (_INBOX_DENIED + _inbox_chat_gmail_denied()
-                      + ["Edit", "Write", "MultiEdit", "NotebookEdit"] + _ZBUS + _ZBUS_ANY_DENIED
-                      + ["Bash(git:*)", "Bash(mcp-ro.sh:*)"] + _mcp_abs("mcp-ro.sh")
+                      + ["NotebookEdit", "MultiEdit", "Bash(zbus say:*)"] + _ZBUS[1:] + _ZBUS_ANY_DENIED
+                      + ["Bash(mcp-ro.sh:*)"] + _mcp_abs("mcp-ro.sh")
                       + _SECRET_READ_DENIED)
 # (No zulip MCP deny: --strict-mcp-config + the per-account config expose ONLY google-workspace(-<account>),
 # so there is no zulip tool to deny, a wildcard here would match nothing and fake a stronger floor, see
@@ -1769,8 +1772,12 @@ def capability_tool_grant(capability, test_runner=None, bypass_classifier=False,
                 "--allowedTools", " ".join(_INBOX_ALLOWED),
                 "--disallowedTools", " ".join(_INBOX_DENIED)]
     if capability == "inbox-chat":
-        # Gmail + Hindsight recall-only, NO permission-mode (no file edits), NO bus (see _INBOX_CHAT_*).
-        return ["--allowedTools", " ".join(_INBOX_CHAT_ALLOWED),
+        # Same cwd stewardship as triage; Gmail + Hindsight recall-only + one ops DM.
+        allowed = list(_INBOX_CHAT_ALLOWED)
+        if routing.INBOX_CHAT_OPS_DM:
+            allowed.append(f"Bash(zbus dm {routing.INBOX_CHAT_OPS_DM}:*)")
+        return ["--permission-mode", "acceptEdits",
+                "--allowedTools", " ".join(allowed),
                 "--disallowedTools", " ".join(_INBOX_CHAT_DENIED)]
     if capability == "mr-review":
         # PURE READ: identical grant to read, distinct string for routing clarity + telemetry.
@@ -2896,7 +2903,7 @@ class CCAdapter(Adapter):
                                                         # some chat lanes run acceptEdits or auto, so
                                                         # the file is only de-facto read-only there because
                                                         # nothing in those prompts asks to edit it, not because
-                                                        # --add-dir enforces it (inbox-chat IS read-only overall).
+                                                        # --add-dir enforces it.
         # An inbox worker is Gmail-mutation-capable, so it MUST load ONLY its per-account
         # MCP config (that ONE account's Gmail + Hindsight) and NOTHING from the broker host's ambient .mcp.json.
         # --strict-mcp-config (verified present on the pinned CLI 2.1.272) loads ONLY --mcp-config's servers,

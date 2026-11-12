@@ -19487,7 +19487,8 @@ def test_normalize_collapse_route_untrusted_brief():
     assert r.classify(key, evt) == "inbox"
     r.stamps[key] = "inbox"
     route = Router(stamps={key: "inbox"}).route(key, b)
-    assert route.capability == "inbox-chat" and route.prompt_class == "chat" and route.env == {}, route
+    from routing import _INBOX_ROW
+    assert route.capability == "inbox-chat" and route.prompt_class == "chat" and route.env == _INBOX_ROW.env, route
     assert Router(stamps={"gmail:owner": "inbox"}).route("gmail:owner", {}).prompt_class == "triage"
     assert C._win(key, C.INITIAL_WINDOWS, 99) == 2 and C._win(key, C.RECEIVE_WINDOWS, 99) == 180
     # a finished chat never stamps `completed` (every new DM is a fresh conversation)
@@ -19496,17 +19497,18 @@ def test_normalize_collapse_route_untrusted_brief():
     c.finish_close(key)
     assert key not in c.completed
     ok("zulip:<bot>:<sender> key; brief carries the reply target + DMs fenced UNTRUSTED (look-alike "
-       "neutralised); routes to inbox/chat, capability inbox-chat, NO ZBUS_ENV; never marked completed")
+       "neutralised); routes to inbox/chat with triage's bus identity; never marked completed")
 
 
-def test_inbox_chat_grant_no_bus_no_edits():
-    from adapters.cc import capability_tool_grant, _INBOX_CHAT_HOOK_SETTINGS
+def test_inbox_chat_grant_repo_stewardship_ops_dm_only():
+    from adapters.cc import capability_tool_grant, _INBOX_CHAT_HOOK_SETTINGS, _INBOX_GIT, _INBOX_DENIED
     g = capability_tool_grant("inbox-chat")
-    allowed = g[g.index("--allowedTools") + 1].split(" ")
+    allowed = g[g.index("--allowedTools") + 1]
     denied = g[g.index("--disallowedTools") + 1]
-    assert "--permission-mode" not in g                                  # no acceptEdits: no file edits
-    assert not any("zbus" in t for t in allowed) and not any(t.startswith("Bash(git") for t in allowed)
-    for d in ("Bash(zbus:*)", "Bash(/opt/site/bin/zbus:*)", "Edit", "Write",
+    assert g[g.index("--permission-mode") + 1] == "acceptEdits"
+    assert all(t in allowed for t in _INBOX_GIT)            # reuse triage's git stage/commit grant
+    assert all(t in denied for t in _INBOX_DENIED)         # never drop triage's deny-floor
+    for d in ("Bash(zbus say:*)", "Bash(*/zbus *)", "Bash(/opt/site/bin/zbus:*)", "Bash(git push:*)",
               "mcp__google-workspace__send_gmail_message", "mcp__*__send_gmail_message", "Bash(mcp.sh:*)"):
         assert d in denied, d
     # ALL 3 (well, test-fixture: owner/work/alt) accounts' own google-workspace-<account> connector,
@@ -19526,10 +19528,73 @@ def test_inbox_chat_grant_no_bus_no_edits():
         pass
     cfg = os.path.join(tempfile.mkdtemp(), "owner.json"); open(cfg, "w").write("{}")
     argv = a.build_argv("p", "m", "sys", capability="inbox-chat", mcp_config_path=cfg)
+    assert argv[argv.index("--permission-mode") + 1] == "acceptEdits"
     assert "--strict-mcp-config" in argv
     assert json.loads(argv[argv.index("--settings") + 1])["hooks"] == _INBOX_CHAT_HOOK_SETTINGS["hooks"]
-    ok("/inbox-chat grant = Gmail (every account's own connector) + recall-only Hindsight, no "
-       "zbus/git/edits (zbus hard-denied), send denied, strict combined MCP config (fail-closed), TRASH hook on")
+    ok("/inbox-chat grant = Gmail (every account's own connector) + recall-only Hindsight, ops DM only, "
+       "no push, triage repo edits + stage/commit, send denied, strict combined MCP config (fail-closed), TRASH hook on")
+
+
+def _cc_rule_matches(cmd, rule):
+    """Local model of CC Bash rules: `x:*` is a prefix rule, otherwise `*` matches arbitrary text."""
+    import fnmatch
+    pat = rule[len("Bash("):-1]
+    if pat.endswith(":*"):
+        pre = pat[:-2]
+        return cmd == pre or cmd.startswith(pre + " ")
+    return fnmatch.fnmatchcase(cmd, pat)
+
+
+def test_inbox_chat_ops_dm_configured_or_unset():
+    import routing as RT
+    from adapters import cc as CC
+    triage_before = CC.capability_tool_grant("inbox")
+    for handle in ("admin-bot@chat.example.test", ""):
+        with patch.object(RT, "INBOX_CHAT_OPS_DM", handle):
+            grant = CC.capability_tool_grant("inbox-chat")
+            allowed = re.findall(r"Bash\([^)]*\)", grant[grant.index("--allowedTools") + 1])
+            denied = re.findall(r"Bash\([^)]*\)", grant[grant.index("--disallowedTools") + 1])
+            assert [t for t in allowed if "zbus" in t] == ([f"Bash(zbus dm {handle}:*)"] if handle else [])
+            for cmd in ("zbus dm admin-bot@chat.example.test --stdin", "zbus dm other@chat.example.test --stdin",
+                        "zbus dm admin-bot@chat.example.test.evil --stdin", "zbus say stream --stdin",
+                        "zbus read", "/opt/site/bin/zbus dm admin-bot@chat.example.test --stdin",
+                        "/other/bin/zbus dm admin-bot@chat.example.test --stdin"):
+                permitted = (any(_cc_rule_matches(cmd, r) for r in allowed)
+                             and not any(_cc_rule_matches(cmd, r) for r in denied))
+                assert permitted == (bool(handle) and cmd == f"zbus dm {handle} --stdin"), (handle, cmd)
+            assert CC.capability_tool_grant("inbox") == triage_before
+    assert RT.INBOX_CHAT_OPS_DM == os.environ.get("OPS_HANDLE", "")
+    ok("inbox-chat grants exactly the configured OPS_HANDLE DM or none when unset; other bus forms denied; triage unchanged")
+
+
+def test_inbox_chat_repo_edits_deny_sensitive_files():
+    """acceptEdits enables cwd edits, but path-specific denies still win (as for triage)."""
+    import fnmatch
+    from routing import _ZULIP_INBOX_ROW, _INBOX_ROW
+    assert _ZULIP_INBOX_ROW.repo == _INBOX_ROW.repo == os.environ.get("INBOX_REPO", "")
+    assert not _ZULIP_INBOX_ROW.read_only
+    for cap in ("inbox", "inbox-chat"):
+        grant = capability_tool_grant(cap)
+        denied = grant[grant.index("--disallowedTools") + 1].split()
+        assert grant[grant.index("--permission-mode") + 1] == "acceptEdits"
+        assert all(t not in denied for t in ("Edit", "Write"))
+        editing_tools = ("Edit", "Write")
+        if cap == "inbox-chat":
+            assert "NotebookEdit" in denied
+            editing_tools = tuple(t for t in ("Edit", "Write", "MultiEdit", "NotebookEdit") if t not in denied)
+        # Pin the real CC root-anchored path rules, not just the shared constant's identity.
+        for tool in editing_tools:
+            for glob in ("//**/.*-env", "//**/.pii-store", "//**/.pii-store/**"):
+                assert f"{tool}({glob})" in denied
+            patterns = [t[len(tool) + 1:-1][1:] for t in denied if t.startswith(tool + "(//")]
+            # Model // as a filesystem-root anchor, using a neutral configured inbox cwd.
+            cwd = "/srv/git/inbox"
+            for path in ("rules.md", "STATE.md", "seen-owner.jsonl"):
+                assert not any(fnmatch.fnmatchcase(cwd + "/" + path, p) for p in patterns), path
+            for path in (".mail-env", "nested/.other-env", ".pii-store", ".pii-store/data"):
+                assert any(fnmatch.fnmatchcase(cwd + "/" + path, p) for p in patterns), path
+    ok("inbox-chat shares triage's configured repo stewardship: rules/STATE/ledger edits enabled, "
+       ".*-env and .pii-store edits denied")
 
 
 def test_spawn_gate_account_from_bot_map():
@@ -20085,6 +20150,14 @@ def test_chat_prompt_rendered_and_hash_gated():
     rp = _load_render_module()
     out, rendered = rp.render(pathlib.Path(os.path.join(ROOT, "workers", "inbox", "chat.json")))
     assert open(out, encoding="utf-8").read() == rendered and "{{" not in rendered
+    for token in ("Learning-ask answered", "clear yes", "Edit `rules.md` in cwd (`INBOX_REPO`)",
+                  "match existing lines", "operator-approved <date>", "commit",
+                  "Never hand edits to ops or mention worker limits", "Anything blocked or outside your lane",
+                  "directly to ops", "zbus dm <ops> --stdin", "OPS_HANDLE", "No other zbus form or recipient"):
+        assert token in rendered, token
+    for stale in ("Repo context is read-only", "harness reads only", "No edits/git",
+                  "NEVER message anyone yourself", "explain and suggest ops"):
+        assert stale not in rendered, stale
     for email in [f["email"] for f in ACCOUNTS.values()]:
         assert email not in rendered, f"chat prompt must stay account-agnostic ({email})"
     approved = json.load(open(os.path.join(ROOT, "approved-prompts.json")))

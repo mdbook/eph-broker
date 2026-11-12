@@ -50,6 +50,8 @@ INBOX_ROW_SOURCE = os.getenv("INBOX_ROW_SOURCE", "")
 # EXPOSED so per-account google-workspace (and Hindsight) OAuth configs can be filled in out of band; this code
 # NEVER authors those (secret bytes). Wired onto _INBOX_ROW.mcp_config_dir below; cc.build_argv reads it.
 INBOX_MCP_CONFIG_DIR = os.getenv("INBOX_MCP_CONFIG_DIR", os.path.expanduser("~/.config/eph-broker/inbox-mcp"))
+# Chat may escalate only to the configured ops recipient. Unset means no bus grant.
+INBOX_CHAT_OPS_DM = os.getenv("OPS_HANDLE", "")
 
 # The label that DEFINES the code change-proposer write row (same env-override pattern
 # as the ansible/wiki rows). A Vikunja ticket carrying this label routes to the code-capable profile; its
@@ -1460,20 +1462,20 @@ _INBOX_ROW = Route(
 # inbox_accounts.ACCOUNTS (not just the bot map's named one) into ONE combined --mcp-config, renaming each
 # account's server `google-workspace-<account>` so a single chat session can hold all of them at once. Its
 # OWN capability "inbox-chat" (cc.capability_tool_grant): Gmail read/label/archive/draft + read-only
-# Hindsight, NO zbus / git / edits, and NO ZBUS_ENV at all, so the worker has no bus identity to DM anyone
-# with. The BROKER posts the envelope summary back to the original sender as the DMed bot. The bot map's
+# Hindsight + cwd repo edits / git stage+commit + ops-only zbus DM using triage's bus identity.
+# The BROKER posts the envelope summary back to the original sender as the DMed bot. The bot map's
 # `account` field (zulip-wake.json) still gates admission (fail closed: an unmapped bot, or an account not in
 # ACCOUNTS, still refuses the spawn); it just no longer limits WHICH accounts the admitted worker can see.
 ZULIP_ROW_SOURCE = os.getenv("ZULIP_ROW_SOURCE", "")
 
 _ZULIP_INBOX_ROW = Route(
     domain="inbox",
-    repo=os.getenv("INBOX_REPO", ""),   # cwd (read-only here: rules.md / docs for context)
-    prompt_class="chat",            # prompts/inbox/chat.md; UNSIGNED until the operator signs its sha256
+    repo=os.getenv("INBOX_REPO", ""),   # cwd for rules.md / STATE.md / ledger stewardship, same as triage
+    prompt_class="chat",            # prompts/inbox/chat.md; sha256-signed
     agent=os.getenv("INBOX_AGENT", "mail-agent"),           # fleet-model.sh mail-agent (same tier as triage)
-    read_only=False,                # Gmail label/archive/draft (no file edits; see capability)
-    capability="inbox-chat",        # ENFORCED by cc: Gmail read/label/archive/draft + HS read; NO zbus/git/Edit
-    env={},                         # deliberately NO ZBUS_ENV: the broker, not the worker, replies on Zulip
+    read_only=False,                # Gmail label/archive/draft + repo stewardship (see capability)
+    capability="inbox-chat",        # ENFORCED by cc: Gmail + HS read + repo edits/git-commit + ops DM; NO push
+    env=_zbus_env("INBOX_ZBUS_ENV"),  # same identity as triage; broker still delivers the operator reply
     # Still the SAME per-account <dir>/<account>.json files as triage; cc merges ALL of them (not just one)
     # into a combined --mcp-config at spawn (_merge_inbox_chat_mcp_config), fail closed if any is absent.
     mcp_config_dir=INBOX_MCP_CONFIG_DIR,

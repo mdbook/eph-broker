@@ -1173,8 +1173,8 @@ PAGE = r"""<!DOCTYPE html>
   <div id="now-queue" role="tabpanel" aria-labelledby="tab-now-queue" hidden>
     <p class="sub">Preview only. Open Queue for the full lists and controls.</p>
     <div class="queue-preview">
-      <div><h2><a href="#queue/next">Next up</a></h2><div class="card rows" id="n-q"></div></div>
       <div><h2><a href="#queue/waiting">Waiting to start <span class="cnt" id="n-wait-n"></span></a></h2><div class="card rows" id="n-wait"></div></div>
+      <div><h2><a href="#queue/next">Next up</a></h2><div class="card rows" id="n-q"></div></div>
     </div>
   </div>
   <div id="now-recent" role="tabpanel" aria-labelledby="tab-now-recent" hidden>
@@ -1201,18 +1201,18 @@ PAGE = r"""<!DOCTYPE html>
   <div class="ph"><h1>Queue</h1><span class="upd"></span></div>
   <div class="card" id="q-drain"></div>
   <nav class="subtabs" role="tablist" aria-label="Queue stages">
-    <a id="tab-queue-next" role="tab" href="#queue/next" aria-controls="queue-next">Next up <span class="cnt" id="q-n"></span></a>
     <a id="tab-queue-waiting" role="tab" href="#queue/waiting" aria-controls="queue-waiting">Waiting to start <span class="cnt" id="q-wait-n"></span></a>
+    <a id="tab-queue-next" role="tab" href="#queue/next" aria-controls="queue-next">Next up <span class="cnt" id="q-n"></span></a>
     <a id="tab-queue-source" role="tab" href="#queue/source" aria-controls="queue-source">By source <span class="cnt" id="q-src-n"></span></a>
   </nav>
-  <div id="queue-next" role="tabpanel" aria-labelledby="tab-queue-next">
+  <div id="queue-waiting" role="tabpanel" aria-labelledby="tab-queue-waiting">
+      <div class="card side" id="q-cap"></div>
+      <div class="sec"><h2>Waiting to start: admitted, no worker <span class="chip wait" id="q-wait-drain" hidden>Drain on</span></h2><div class="card rows" id="q-wait"></div></div>
+    </div>
+    <div id="queue-next" role="tabpanel" aria-labelledby="tab-queue-next" hidden>
       <div class="sec"><h2>Next up: arrived, not admitted</h2><p class="sub" id="q-sub"></p>
         <div class="card"><table class="tbl"><thead><tr><th>#</th><th>Ticket</th><th>Source</th><th>Events</th><th>Arrived</th><th>Action</th></tr></thead>
           <tbody id="q-rows"></tbody></table><div class="tfoot" id="q-foot" hidden></div></div></div>
-    </div>
-    <div id="queue-waiting" role="tabpanel" aria-labelledby="tab-queue-waiting" hidden>
-      <div class="card side" id="q-cap"></div>
-      <div class="sec"><h2>Waiting to start: admitted, no worker <span class="chip wait" id="q-wait-drain" hidden>Drain on</span></h2><div class="card rows" id="q-wait"></div></div>
     </div>
     <div id="queue-source" role="tabpanel" aria-labelledby="tab-queue-source" hidden><div class="sec"><h2>By source</h2><div class="card bars" id="q-src"></div></div></div>
 </section>
@@ -1928,7 +1928,7 @@ function paintQueue(d, D){
 
 // ---- views. Hash routes include sub-tabs; old view-only bookmarks use their default tab.
 const VIEWS = {now: 'v-now', runs: 'v-runs', queue: 'v-queue', fleet: 'fleet-view', settings: 'v-settings', run: 'v-run'};
-const SUBTABS = {now: ['running', 'queue', 'recent'], queue: ['next', 'waiting', 'source'], settings: ['workers', 'groups', 'modules']};
+const SUBTABS = {now: ['running', 'queue', 'recent'], queue: ['waiting', 'next', 'source'], settings: ['workers', 'groups', 'modules']};
 function showSubtab(view, tab){
   for(const name of SUBTABS[view] || []){
     const active = name === tab, a = $('tab-' + view + '-' + name);

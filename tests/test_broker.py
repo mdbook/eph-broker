@@ -13488,12 +13488,18 @@ def test_dash_navigation_settings_and_hash_tabs():
     for id_ in ('s-w', 's-rows', 's-caps', 's-modules'):
         assert parsed.owners[id_] == 'v-settings', id_
     for view, tabs in (('now', ('running', 'queue', 'recent')),
-                       ('queue', ('next', 'waiting', 'source')),
+                       ('queue', ('waiting', 'next', 'source')),
                        ('settings', ('workers', 'groups', 'modules'))):
+        assert [dash.PAGE.index(f'id="tab-{view}-{tab}"') for tab in tabs] == sorted(
+            dash.PAGE.index(f'id="tab-{view}-{tab}"') for tab in tabs)
+        assert [dash.PAGE.index(f'id="{view}-{tab}"') for tab in tabs] == sorted(
+            dash.PAGE.index(f'id="{view}-{tab}"') for tab in tabs)
         for tab in tabs:
             assert f'role="tab" href="#{view}/{tab}" aria-controls="{view}-{tab}"' in dash.PAGE
             assert f'id="{view}-{tab}" role="tabpanel" aria-labelledby="tab-{view}-{tab}"' in dash.PAGE or \
                 f'id="{view}-{tab}" role="tabpanel"' in dash.PAGE
+    assert 'id="queue-waiting" role="tabpanel" aria-labelledby="tab-queue-waiting">' in dash.PAGE
+    assert 'id="queue-next" role="tabpanel" aria-labelledby="tab-queue-next" hidden>' in dash.PAGE
     for rule in ('button:hover', 'button:active', ':focus-visible', '.btn.pri:hover', '.btn.pri:active',
                  '.btn.ghost:hover', '.btn.ghost:active', 'var(--onbrand)', '.seg button:hover'):
         assert rule in dash.PAGE, rule
@@ -13514,9 +13520,10 @@ function closeStream(){}
 '''
     cases = r'''
 for(const [hash, view, tab] of [['#settings/groups','settings','groups'], ['#now/queue','now','queue'],
-  ['#queue/waiting','queue','waiting'], ['#queue/source','queue','source'], ['#now/recent','now','recent'],
+  ['#queue','queue','waiting'], ['#queue/waiting','queue','waiting'], ['#queue/next','queue','next'],
+  ['#queue/source','queue','source'], ['#now/recent','now','recent'],
   ['#settings/modules','settings','modules'], ['#settings','settings','workers'],
-  ['#queue/not-a-tab','queue','next'], ['#nonsense','now','running']]){
+  ['#queue/not-a-tab','queue','waiting'], ['#nonsense','now','running']]){
   location.hash = hash; route();
   assert.equal($(VIEWS[view]).hidden, false);
   for(const t of SUBTABS[view]){
@@ -13547,6 +13554,7 @@ assert.deepEqual(selected, ['vikunja:task:9001','abc12345']);
 
 
 def test_dash_queue_preview_metadata_and_stages():
+    assert dash.PAGE.index('id="n-wait"') < dash.PAGE.index('id="n-q"')
     now = 1800000000
     event = {'title': 'Fix <unsafe> ticket'}
     assert dash._pending_view('vikunja:task:9001', {'events': [event], 'armed_at': now - 20}, now)['arrived_age'] == 20
@@ -13586,6 +13594,7 @@ assert(dom['n-wait'].innerHTML.includes('Age: 50s'));
 assert(dom['n-wait'].innerHTML.includes(WAIT_WHY.repo_lock));
 assert(dom['n-strip'].innerHTML.includes('href="#queue/waiting"'));
 assert(dom['n-strip'].innerHTML.includes('href="#queue/next"'));
+assert(dom['n-strip'].innerHTML.indexOf('href="#queue/waiting"') < dom['n-strip'].innerHTML.indexOf('href="#queue/next"'));
 assert(dom['n-q'].innerHTML.includes('href="#queue/next"'));
 // Teardown overlaps are different launches, with or without an attached worker.
 can = true;

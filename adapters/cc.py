@@ -3313,7 +3313,7 @@ class CCAdapter(Adapter):
         code_repo = code_runner = None                   # code route's resolved repo + per-repo runner key
         choice = None                                   # one-run pick; retained in this setup's durable intent
         model_override = None                            # (backend, model) a `model:` label chose, if any
-        adapter_override = None                          # "hermes"/"codex" when a harness label flipped it
+        adapter_override = None                          # model/harness choice, retained on resumed turns
         infra_grant = None                               # Deterministic live-write grant for an infra row
         attempted = False                                 # Flips True once EITHER (a) every spawn-time
                                                            # fail-closed gate (unknown account / no repo: token /
@@ -3433,6 +3433,7 @@ class CCAdapter(Adapter):
             # truncated / list-fallback / lookalike blob: then NO label is honored (default model), never a
             # description-spoofed label/creator.
             trusted = ticket is not None and ticket.creator is not None
+            selection_source = "pin" if getattr(route, "backend_pinned", False) else "row default"
             if _task_id is not None and ticket is not None and not trusted:
                 log.info("model label: key=%s run_id=%s -> ticket labels/creator untrusted (truncated/fallback/"
                          "duplicate fields) -> no model label applied", key, run_id)
@@ -3440,8 +3441,11 @@ class CCAdapter(Adapter):
                 log.warning("model choice %r ignored: key=%s row %s is pinned", choice, key, route.row_key)
             elif choice:
                 try:
-                    route = routing.apply_model_choice(route, choice, True, lambda name: load_backend(name)[0] is not None)
+                    from routing_overrides import backend_ok
+                    route = routing.apply_model_choice(route, choice, True, backend_ok)
                     model_override = (route.backend, route.model)
+                    adapter_override = route.adapter
+                    selection_source = "operator choice"
                     log.info("model choice: key=%s run_id=%s -> backend=%r model=%r", key, run_id,
                              route.backend, route.model)
                 except ValueError as e:
@@ -3450,15 +3454,17 @@ class CCAdapter(Adapter):
                     return
             if _task_id is not None and trusted:
                 try:
+                    from routing_overrides import backend_ok
                     labelled = route if choice else routing.apply_model_label(
-                        route, ticket.labels, ticket.creator,
-                        lambda name: load_backend(name)[0] is not None)
+                        route, ticket.labels, ticket.creator, backend_ok)
                     if labelled is not route:
                         route, model_override = labelled, (labelled.backend, labelled.model)
+                        adapter_override = labelled.adapter
+                        selection_source = "label"
                         log.info("model label: key=%s run_id=%s -> backend=%r model=%r", key, run_id,
                                  labelled.backend, labelled.model)
                     # A `hermes` / `codex` label flips the harness (after the model label, so its backend rides through)
-                    flipped = routing.apply_adapter_label(route, ticket.labels, ticket.creator)
+                    flipped = routing.apply_adapter_label(route, [] if choice else ticket.labels, ticket.creator)
                     if flipped is not route:
                         route, model_override = flipped, (flipped.backend, flipped.model)
                         adapter_override = flipped.adapter
@@ -3471,6 +3477,9 @@ class CCAdapter(Adapter):
                                 key, run_id, e)
                     self._alert_ops(f"eph worker {key} not spawned: {e}{self._dash_url(_ref)}", subject=f"abort:{key}")
                     return
+            log.info("model selection: key=%s run_id=%s row=%s winner=%s adapter=%s backend=%r model=%r",
+                     key, run_id, getattr(route, "row_key", route.domain), selection_source,
+                     getattr(route, "adapter", "cc"), getattr(route, "backend", ""), route.model)
             # dev-spindown GH/GL issue-code: an external issue arrives WITH its title+body in the event (no
             # Vikunja fetch: task_id is None, so the fetcher above no-ops), and collapse() carried them into
             # brief["issue"]. Inject that text into the brief's "ticket" slot (the SAME slot the ticket

@@ -823,6 +823,27 @@ def _row_adapter(name, default="cc"):
     return os.getenv(name, default).strip() or default
 
 
+def _row_pin(name, default=False):
+    """Explicit operator opt-in to ignoring per-ticket model/harness choices."""
+    value = os.getenv(name, "true" if default else "false").strip().lower()
+    if value not in ("1", "true", "yes", "on", "0", "false", "no", "off"):
+        raise ValueError(f"{name} must be a boolean")
+    return value in ("1", "true", "yes", "on")
+
+
+def _model_adapter(backend):
+    """Harness for an explicit model choice, using registry metadata only, never credentials.
+    Older CC entries need no new field; Codex-only entries already identify their harness."""
+    if backend == "claude":
+        return "cc"
+    from adapters.cc import _backend_entry
+    entry = _backend_entry(backend) or {}
+    adapter = entry.get("adapter", "codex" if "codex" in entry else "cc")
+    if adapter not in ADAPTERS:
+        raise ValueError(f"backend {backend!r} has an unknown adapter (fail-closed)")
+    return adapter
+
+
 def _is_registry_backend(name):
     """True iff `name` is a spawn-registry backend NAME (adapters/cc._backend_entry, the same lookup
     load_backend uses) despite starting with "claude-" (e.g. "claude-api"), so with_model() treats a
@@ -918,7 +939,7 @@ class Route:
     # and resolved at spawn through the same load_backend/spawn-models path an explicit backend uses (same
     # fail-closed-and-alert on an unresolvable name). Mode-name-agnostic: the broker never knows WHICH
     # mode produced the answer, only whether it is a claude model. An explicit `backend` (the row's own
-    # `<ROW>_BACKEND` pin, e.g. GENERAL_BACKEND) always wins. EVERY worker row
+    # `<ROW>_BACKEND` default, e.g. GENERAL_BACKEND) wins over fleet mode, but not ticket labels. EVERY worker row
     # sets this True; resolve_model(self.agent) is already asked on every spawn, so this just lets a
     # non-claude fleet-model.sh answer select a backend fleet-wide, not only on the general row. The TFA row
     # (_TFA_ROW) is the ONE exception: its model comes from spawn.sh's own registry (agent=""), not
@@ -929,8 +950,7 @@ class Route:
     # the Codex CLI on its own ChatGPT login, `codex exec` per turn under the eph-gate hook). Validated at LOAD
     # (__post_init__): an unknown value raises, so a typo'd row never silently runs on the wrong harness.
     adapter: str = "cc"
-    # True when `backend` came from the row's explicit `<ROW>_BACKEND` pin (set by with_model), not from
-    # FLEET_MODE. A per-ticket `model:<name>` label never overrides a pin (apply_model_label).
+    # Resolved by with_model: only explicit pin=True or model_pin ignores per-run choices.
     backend_pinned: bool = False
     # The row's ROUTING identity (the ingest stamp, classify()'s return, the dispatch/respawn sets) when
     # two rows share a `domain` (prompts/<domain>/ ... ), such as infra/stack-proposer vs infra/general. Empty means
@@ -959,12 +979,16 @@ class Route:
     # "phases": lock only shared cut/publish/remove operations; "run": single-flight the whole run.
     # Wiki opts into "run" for its shared publish branch; code/general keep independent edits parallel.
     repo_lock_scope: str = "phases"
+    # A backend/adapter is a DEFAULT unless the operator explicitly opts into a hard pin.
+    pin: bool = False
 
     @property
     def row_key(self):
         return self.row_id or self.domain
 
     def __post_init__(self):
+        if type(self.pin) is not bool:
+            raise ValueError(f"Route {self.row_key!r}: pin must be a boolean")
         if self.repo_lock_scope not in ("phases", "run"):
             raise ValueError(f"Route {self.row_key!r}: repo_lock_scope must be 'phases' or 'run'")
         if self.adapter not in ADAPTERS:
@@ -1014,14 +1038,14 @@ class Route:
                      self.read_only, dict(self.env), model, self.capability,
                      dict(self.publish), self.mcp_config_dir, self.test_runner, self.setting_sources,
                      self.mcp_config_path, backend, self.backend_from_mode, self.adapter,
-                     bool(self.backend) or bool(self.model_pin), self.row_id, self.model_pin,
-                     self.from_config, self.site_capability, self.browser_mcp_config, self.repo_lock_scope)
+                     self.pin or bool(self.model_pin), self.row_id, self.model_pin,
+                     self.from_config, self.site_capability, self.browser_mcp_config, self.repo_lock_scope, self.pin)
 
 
 # Per-ticket model selection via a `model:<name>` label. The name is either a native
 # Claude alias (passed to `--model`, native Anthropic backend) or a spawn-registry backend name resolved through
 # the SAME cc.load_backend / spawn-models.json path a <ROW>_BACKEND pin uses. Decisions:
-#   * precedence: an explicit <ROW>_BACKEND pin WINS (operator policy beats a ticket); the label beats FLEET_MODE.
+#   * precedence: pin=True or model_pin WINS; the label beats the row default and FLEET_MODE.
 #   * unknown name / two different model: labels raise ValueError (fail-closed: the spawn is refused and the operator alerted).
 #   * a NON-Anthropic name is honoured only when the ticket's creator is in MODEL_LABEL_TRUSTED_CREATORS
 #     (the same-uid residual, docs/security-residual-same-uid.md): a guest-created ticket cannot pick a
@@ -1105,7 +1129,8 @@ def apply_model_label(route, labels, creator, backend_resolvable):
         return route
     name = hits[0][0]
     if route.backend_pinned:
-        log.info("model label %r ignored: row %s backend is pinned to %r", name, route.domain, route.backend)
+        log.info("model label %r ignored: row %s pin wins (backend=%r model=%r)",
+                 name, route.row_key, route.backend, route.model)
         return route
     return apply_model_choice(route, name, trusted, backend_resolvable, creator)
 
@@ -1128,9 +1153,18 @@ def apply_model_choice(route, name, trusted, backend_resolvable, creator=None):
             raise ValueError(f"model label {name!r} picks a non-Anthropic backend, but ticket creator "
                              f"{creator!r} is not in MODEL_LABEL_TRUSTED_CREATORS (fail-closed)")
         backend, model = name, _NATIVE_FALLBACK_MODEL
-    out = Route(**{**route.__dict__, "env": dict(route.env), "publish": dict(route.publish)})
-    out.backend, out.model = backend, model
-    return out
+    adapter = _model_adapter(backend)
+    _check_site_capability_adapter(route, adapter, "model label")
+    return replace(route, env=dict(route.env), publish=dict(route.publish),
+                   backend=backend, model=model, adapter=adapter)
+
+
+def _check_site_capability_adapter(route, adapter, source):
+    """Refuse choices that would drop the site capability's cc-only allow/deny rules.
+    Call before changing the route; the caller logs the refusal and aborts the spawn."""
+    if adapter != "cc" and getattr(route, "site_capability", ""):
+        raise ValueError(f"{source}: site capability {route.site_capability!r} runs on the cc harness only "
+                         "(fail-closed)")
 
 
 def model_choice_error(name):
@@ -1153,7 +1187,7 @@ def row_pinned(row_key):
     if t is None:
         return False
     t = OVERRIDES.apply(t)
-    return bool(t.backend or t.model_pin)
+    return t.pin or bool(t.model_pin)
 
 
 # A bare `hermes` ticket label flips ONE ticket's worker onto the hermes harness
@@ -1206,9 +1240,7 @@ def apply_adapter_label(route, labels, creator, capabilities=None):
         return route
     allowed = ADAPTER_LABELS[harness] if capabilities is None else capabilities
     cap = getattr(route, "capability", "read")
-    if getattr(route, "site_capability", ""):   # neither harness has allow/deny lists to add the site rules to
-        raise ValueError(f"{harness} label: site capability {route.site_capability!r} runs on the cc harness only "
-                         "(fail-closed)")
+    _check_site_capability_adapter(route, harness, f"{harness} label")
     if cap not in allowed:
         raise ValueError(f"{harness} label: capability {cap!r} is not enabled for the {harness} harness "
                          f"(enabled: {sorted(allowed) or 'none'}) (fail-closed)")
@@ -1241,6 +1273,7 @@ _ANSIBLE_ROW = Route(
     # Per-row inference backend override, SAME pattern/resolution path as GENERAL_BACKEND (cc.load_backend
     # / spawn-models registry, cc._one_turn). Empty (default) = native Claude, UNCHANGED.
     backend=os.getenv("ANSIBLE_BACKEND", ""),
+    pin=_row_pin("ANSIBLE_PIN"),
     backend_from_mode=True,             # every row follows FLEET_MODE; a pin wins
     adapter=_row_adapter("ANSIBLE_ADAPTER"),   # harness knob, default cc (see ADAPTERS / _row_adapter)
 )
@@ -1296,6 +1329,7 @@ _WIKI_DOCS_ROW = Route(
     # Per-row inference backend override (same pattern/resolution path as GENERAL_BACKEND). Empty
     # (default) = native Claude, UNCHANGED.
     backend=os.getenv("WIKI_DOCS_BACKEND", ""),
+    pin=_row_pin("WIKI_DOCS_PIN"),
     backend_from_mode=True,             # every row follows FLEET_MODE; a pin wins
     adapter=_row_adapter("WIKI_DOCS_ADAPTER"),
 )
@@ -1451,6 +1485,7 @@ _INBOX_ROW = Route(
     # Per-row inference backend override (same pattern/resolution path as GENERAL_BACKEND). Empty
     # (default) = native Claude, UNCHANGED.
     backend=os.getenv("INBOX_TRIAGE_BACKEND", ""),
+    pin=_row_pin("INBOX_TRIAGE_PIN"),
     backend_from_mode=True,             # every row follows FLEET_MODE; a pin wins
     adapter=_row_adapter("INBOX_TRIAGE_ADAPTER"),   # hermes and codex both refuse inbox today (fail-closed)
 )
@@ -1482,6 +1517,7 @@ _ZULIP_INBOX_ROW = Route(
     # Per-row inference backend override (same pattern/resolution path as GENERAL_BACKEND). Empty
     # (default) = native Claude, UNCHANGED.
     backend=os.getenv("INBOX_CHAT_BACKEND", ""),
+    pin=_row_pin("INBOX_CHAT_PIN"),
     backend_from_mode=True,             # every row follows FLEET_MODE; a pin wins
     adapter=_row_adapter("INBOX_CHAT_ADAPTER"),
 )
@@ -1539,6 +1575,7 @@ _CODE_ROW = Route(
     # Per-row inference backend override (same pattern/resolution path as GENERAL_BACKEND). Empty
     # (default) = native Claude, UNCHANGED.
     backend=os.getenv("CODE_CHANGE_BACKEND", ""),
+    pin=_row_pin("CODE_CHANGE_PIN"),
     backend_from_mode=True,             # every row follows FLEET_MODE; a pin wins
     adapter=_row_adapter("CODE_CHANGE_ADAPTER"),
 )
@@ -1571,6 +1608,7 @@ _ISSUE_CODE_ROW = Route(
     # Per-row inference backend override (same pattern/resolution path as GENERAL_BACKEND). Empty
     # (default) = native Claude, UNCHANGED.
     backend=os.getenv("ISSUE_CODE_BACKEND", ""),
+    pin=_row_pin("ISSUE_CODE_PIN"),
     backend_from_mode=True,             # every row follows FLEET_MODE; a pin wins
     adapter=_row_adapter("ISSUE_CODE_ADAPTER"),
 )
@@ -1604,6 +1642,7 @@ _INFRA_ROW = Route(
         "mr_notify_handle": os.getenv("INFRA_MR_NOTIFY_HANDLE", ""),   # from site.env; "" means no DM
     },
     backend=os.getenv("INFRA_BACKEND", ""),
+    pin=_row_pin("INFRA_PIN"),
     backend_from_mode=True,
     adapter=_row_adapter("INFRA_ADAPTER"),
 )
@@ -1631,6 +1670,7 @@ _INFRA_GENERAL_ROW = Route(
     env=dict(_INFRA_ROW.env),
     publish=dict(_INFRA_ROW.publish),
     backend=os.getenv("INFRA_GENERAL_BACKEND", _INFRA_ROW.backend),
+    pin=_row_pin("INFRA_GENERAL_PIN", _INFRA_ROW.pin),
     backend_from_mode=True,
     adapter=_row_adapter("INFRA_GENERAL_ADAPTER", _INFRA_ROW.adapter),
     row_id="infra/general",
@@ -1687,6 +1727,7 @@ _MR_REVIEW_ROW = Route(
     # Per-row inference backend override (same pattern/resolution path as GENERAL_BACKEND). Empty
     # (default) = native Claude, UNCHANGED.
     backend=os.getenv("MR_REVIEWER_BACKEND", ""),
+    pin=_row_pin("MR_REVIEWER_PIN"),
     backend_from_mode=True,             # every row follows FLEET_MODE; a pin wins
     # Worker harness for this row. Default "cc" = inert (unchanged native Claude Code review). "hermes"
     # ALSO requires MR_REVIEWER_BACKEND set to a non-native backend; hermes_provider refuses "" / "claude"
@@ -2112,7 +2153,7 @@ def resolve_mr_review_tier(route, diff_text, paths=None, repo=None, tier_cfg=Non
     `--model haiku`/`--model opus`."""
     tier, reason = select_mr_review_tier(diff_text, paths, repo=repo, tier_cfg=tier_cfg)
     model, backend, backend_pinned = route.model, route.backend, route.backend_pinned
-    if not (_MR_REVIEW_ROW.model_pin or _MR_REVIEW_ROW.backend):   # the legacy pin always wins, every tier
+    if not route.backend_pinned:          # only an explicit pin wins every tier
         mode_resolved = _MR_REVIEW_ROW.with_model()   # the FLEET_MODE lookup, same as the single-model path
         tier_model = _mr_review_tier_model(tier, route.adapter)
         if tier_model and not mode_resolved.backend:
@@ -2168,6 +2209,7 @@ _GENERAL_ROW = Route(
     #   misconfig: a value that won't resolve (typo / missing registry entry) FAILS CLOSED: the turn is
     #            refused and the operator alerted, never silently re-run on native Anthropic. "claude" = native.
     backend=os.getenv("GENERAL_BACKEND", ""),
+    pin=_row_pin("GENERAL_PIN"),
     backend_from_mode=True,             # unset GENERAL_BACKEND means FLEET_MODE decides (see with_model)
     adapter=_row_adapter("GENERAL_ADAPTER"),
 )
@@ -2185,6 +2227,7 @@ _TFA_ROW = Route(
     prompt_class="n/a",                                   # unused (no prompt render for a tfa row)
     agent="",                                             # unused (model/effort come from spawn.sh's registry)
     backend=os.getenv("TFA_BACKEND", ""),                 # spawn.sh --<backend>; unset = no flag (spawn.sh default)
+    pin=_row_pin("TFA_PIN"),
 )
 
 # Every row now carries a per-row inference backend override, resolved through the SAME path as
@@ -2509,7 +2552,7 @@ def load_config_routes(path=None, prompts_dir=None, approved_path=None, site_cap
         # agent + backend pin come from the template row, so fleet-model.sh and an operator's <ROW>_BACKEND pin
         # apply as they do to the built-in worker of that capability
         fields = dict(domain=domain, repo=repo, prompt_class=prompt_class, agent=row.get("agent", tmpl.agent),
-                      capability=cap, row_id=rid, model_pin=row.get("model", ""), backend=tmpl.backend,
+                      capability=cap, row_id=rid, model_pin=row.get("model", ""), backend=tmpl.backend, pin=tmpl.pin,
                       backend_from_mode=True, from_config=True, site_capability=site_cap,
                       repo_lock_scope=row.get("repo_lock_scope", tmpl.repo_lock_scope))
         if cap != "read":

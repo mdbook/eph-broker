@@ -8,9 +8,12 @@ different path. Unlike `routes.json`, it changes existing rows only, not trigger
 The file accepts three optional top-level keys:
 
 - `rows`: an object keyed by an existing route's row key (`row_id` when set, otherwise its `domain`, such
-  as `code`). Each entry accepts only string fields `backend`, `adapter`, `model_pin` and `repo_lock_scope`. Adapters are
+  as `code`). Each entry accepts string fields `backend`, `adapter`, `model_pin` and `repo_lock_scope`, and boolean `pin`. Adapters are
   `cc`, `hermes` or `codex`; a nonempty backend other than `claude` must resolve in the spawn registry.
-  `model_pin` pins the model (for example `opus`) and skips fleet-mode model selection. Existing harness
+  `backend` and `adapter` are overridable defaults: ticket model labels or a dashboard one-run model pick
+  replace them, including switching harnesses to match the model. Set `pin:true` to ignore ticket choices;
+  absent `pin` keeps the environment's `<ROW>_PIN` (false by default). Existing backend/adapter-only rows
+  need no file migration. `model_pin` still pins the model (for example `opus`) and skips fleet-mode model selection. Existing harness
   and capability restrictions still apply; selecting a harness here does not grant new tools.
   `repo_lock_scope` is `phases` (code/general default: serialize fetch/worktree cut, publish and removal,
   but allow independent edit/test turns up to the global cap) or `run` (whole-run single-flight).
@@ -39,7 +42,9 @@ busy, the signal defers that reread to the next access rather than waiting on it
 the updated routing; already-running workers, including resumed turns, retain their launch route.
 
 With [dashboard actions](configuration.md#dashboard-actions) on, **Settings > Workers** edits
-`backend`, `model_pin` and `row_concurrency` in this file for you. It validates the whole result the same way,
+`backend`, `model_pin`, `pin` and `row_concurrency` in this file for you. The worker table identifies defaults
+versus pins; `GET /actions/settings` reports `pin`, effective `pinned`, and environment `default_pin`.
+It validates the whole result the same way,
 writes a temporary file next to the target and renames it over, so the broker needs write access to the file
 and its directory. A symlinked file is followed, and the temporary file goes next to the real target. Every other key in the file is kept as it is.
 

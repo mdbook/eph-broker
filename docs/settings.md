@@ -157,7 +157,7 @@ on your server; a local transport test cannot check server-specific author/email
 | `ISSUE_CODE_MR_TARGET_REF` | `main` | Fallback MR target; the repo's own default branch is used when known. |
 | `ISSUE_CODE_BRANCH_PREFIX` | `eph/issue` | Branch name prefix. |
 | `ISSUE_CODE_WORKTREE_BASE` | `~/.cache/ew/i` | Short root for issue worktrees; keep overrides short. Nested paths such as pytest `tmp_path` can still exceed AF_UNIX limits. |
-| `ISSUE_CODE_BACKEND` | unset | Pins a registry backend for issue workers. Unset: `FLEET_MODEL_SH` decides. |
+| `ISSUE_CODE_BACKEND` | unset | Default registry backend for issue workers. Unset: `FLEET_MODEL_SH` decides. |
 | `ISSUE_CODE_ZBUS_ENV` | unset | Chat identity file handed to the worker (zbus only). |
 
 ## Code worker
@@ -185,7 +185,7 @@ own separate repo settings.
 | `CODE_BRANCH_PREFIX` | `eph/code-change` | Branch name prefix. |
 | `CODE_WORKTREE_BASE` | `~/.cache/ew/c` | Short root for code worktrees. Each code worker gets a private writable sibling `TMPDIR`, cleaned up at exit. Keep overrides short; nested paths such as pytest `tmp_path` can still exceed AF_UNIX limits. |
 | `CODE_AGENT` | `code-worker` | Agent name passed to `FLEET_MODEL_SH`. |
-| `CODE_CHANGE_BACKEND` | unset | Pins a registry backend. Unset: `FLEET_MODEL_SH` decides. |
+| `CODE_CHANGE_BACKEND` | unset | Default registry backend. Unset: `FLEET_MODEL_SH` decides. |
 | `CODE_NONCLAUDE_OK` | off | Lets a code worker run on a non-Anthropic backend or on hermes. |
 | `CODE_BROWSER_MCP_CONFIG` | unset | Isolated, validated Playwright stdio MCP config for code workers; unset leaves browser tools off. |
 | `CODE_JUDGED_BASH_ENABLED` | off | Opt into adjudicated code shell calls instead of the legacy allowlist. See the same-UID security tradeoffs in [security-residual-same-uid.md](security-residual-same-uid.md). |
@@ -206,7 +206,7 @@ own separate repo settings.
 | `GENERAL_BRANCH_PREFIX` | `eph/general` | Branch name prefix. |
 | `GENERAL_WORKTREE_BASE` | `~/.cache/eph-general-worktrees` | Where its worktrees go. |
 | `GENERAL_AGENT` | `general-worker` | Agent name passed to `FLEET_MODEL_SH`. |
-| `GENERAL_BACKEND` | unset | Pins a registry backend. Keep it unset ([security-residual-same-uid.md](security-residual-same-uid.md)). |
+| `GENERAL_BACKEND` | unset | Default registry backend, overridable by ticket model labels. |
 | `GENERAL_ZBUS_ENV` | unset | Chat identity file handed to the worker (zbus only). |
 
 ## MR comment iteration
@@ -241,7 +241,7 @@ change the binding. Notes also carry the MR title and description as context, in
 | `MR_REVIEW_REPO` | unset | Default repo; the MR's own repo wins. |
 | `MR_REVIEW_WORKTREE_BASE` | `~/.cache/eph-mr-worktrees` | Where review checkouts go. |
 | `MR_REVIEW_AGENT` | `mr-reviewer` | Agent name passed to `FLEET_MODEL_SH`. |
-| `MR_REVIEWER_MODEL`, `MR_REVIEWER_BACKEND`, `MR_REVIEW_ADAPTER` | unset, unset, `cc` | The reviewer's model, backend and harness (`cc`, `hermes` or `codex`; [configuration.md](configuration.md#choosing-the-reviewers-model)). Set, either one overrides every review tier below. |
+| `MR_REVIEWER_MODEL`, `MR_REVIEWER_BACKEND`, `MR_REVIEW_ADAPTER` | unset, unset, `cc` | The reviewer's model pin, backend default and harness default (`cc`, `hermes` or `codex`; [configuration.md](configuration.md#choosing-the-reviewers-model)). A model pin overrides every review tier. |
 | `MR_REVIEW_QUICK_MODEL`, `MR_REVIEW_QUICK_MODEL_CODEX` | `haiku`, unset | Quick-tier reviewer model; the codex one is used instead on the Codex harness. |
 | `MR_REVIEW_STANDARD_MODEL` | unset | Standard-tier reviewer model; unset keeps the row's existing resolution. |
 | `MR_REVIEW_FULL_MODEL` | `opus` | Full-tier reviewer model. |
@@ -289,6 +289,7 @@ change the binding. Notes also carry the MR title and description as context, in
 | Variable | Default | Meaning |
 |---|---|---|
 | `<ROW>_ADAPTER` | `cc` | A built-in row's harness: `cc`, `hermes` or `codex` ([configuration.md](configuration.md#choosing-a-rows-harness)). |
+| `<ROW>_PIN` | `false` | Explicit hard pin: ignore per-ticket model/harness labels and refuse dashboard rerun model picks. Settings: `ANSIBLE_PIN`, `WIKI_DOCS_PIN`, `INBOX_TRIAGE_PIN`, `INBOX_CHAT_PIN`, `CODE_CHANGE_PIN`, `ISSUE_CODE_PIN`, `INFRA_PIN`, `INFRA_GENERAL_PIN`, `MR_REVIEWER_PIN`, `GENERAL_PIN`, `TFA_PIN`. `INFRA_GENERAL_PIN` inherits `INFRA_PIN`. Accepts `1/true/yes/on` and `0/false/no/off`; invalid values stop startup. A row's `model_pin` remains pinned regardless. |
 | `CODEX_AUTH_FILE` | unset | Absolute path of the Codex login file, symlinked into each worker's home, never read. Unset refuses every Codex worker ([configuration.md](configuration.md#the-codex-harness)). |
 | `CODEX_BACKEND` | unset | Registry backend whose `codex` block gives the model when the row's backend has none. |
 | `CODEX_BIN` | `codex` | The Codex CLI. |
@@ -387,7 +388,7 @@ prompt ([configuration.md](configuration.md#built-in-rows)). Each one has `*_REP
 | `WIKI_PUBLISH_REF` | `main` | Branch published directly, without an MR. |
 | `WIKI_WORKTREE_BASE` | `~/.cache/eph-wiki-worktrees` | Wiki worktree root. |
 | `WIKI_AGENT` | `wiki-agent` | Agent name passed to `FLEET_MODEL_SH`. |
-| `WIKI_DOCS_BACKEND` | unset | Pins the wiki backend. |
+| `WIKI_DOCS_BACKEND` | unset | Default wiki backend. |
 | `WIKI_ZBUS_ENV` | unset | Wiki worker's chat identity file. |
 | `INFRA_ASSIGNEE` | unset | Assignee enabling the infrastructure proposer. |
 | `INFRA_GENERAL_LABEL` | `infra:general` | Label enabling the infrastructure generalist. |
@@ -398,7 +399,7 @@ prompt ([configuration.md](configuration.md#built-in-rows)). Each one has `*_REP
 | `INFRA_BRANCH_PREFIX` | `eph/infra` | Infrastructure feature branch prefix. |
 | `INFRA_WORKTREE_BASE` | `~/.cache/eph-infra-worktrees` | Infrastructure worktree root. |
 | `INFRA_AGENT` | `infra-worker` | Proposer agent name passed to `FLEET_MODEL_SH`. |
-| `INFRA_BACKEND` | unset | Pins the proposer backend. |
+| `INFRA_BACKEND` | unset | Default proposer backend. |
 | `INFRA_GENERAL_AGENT` | `INFRA_AGENT` | Generalist agent name. |
 | `INFRA_GENERAL_BACKEND` | `INFRA_BACKEND` | Generalist backend. |
 | `INFRA_ZBUS_ENV` | unset | Infrastructure workers' chat identity file. |
@@ -407,8 +408,8 @@ prompt ([configuration.md](configuration.md#built-in-rows)). Each one has `*_REP
 | `INBOX_REPO` | unset | Persistent mail ledger checkout. |
 | `INBOX_MCP_CONFIG_DIR` | `~/.config/eph-broker/inbox-mcp` | One MCP config per mail account. |
 | `INBOX_AGENT` | `mail-agent` | Agent name passed to `FLEET_MODEL_SH`. |
-| `INBOX_TRIAGE_BACKEND` | unset | Pins the mail triage backend. |
-| `INBOX_CHAT_BACKEND` | unset | Pins the mail chat backend. |
+| `INBOX_TRIAGE_BACKEND` | unset | Default mail triage backend. |
+| `INBOX_CHAT_BACKEND` | unset | Default mail chat backend. |
 | `INBOX_ZBUS_ENV` | unset | Mail workers' chat identity file. |
 | `BROKER_INBOX_ACCOUNTS` | `CONFIG_DIR/inbox-accounts.json` | Mail account configuration. |
 | `FLEET_ASSIGNEE_ALT`, `SPAWN_SH`, `TFA_BACKEND`, `TFA_CWD_BASE`, `TFA_DEDUP_S` | unset, unset, unset, `~/.cache/eph-tfa`, `300` | The external launcher row: hands a ticket to your own script instead of starting a worker. |

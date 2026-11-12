@@ -1241,7 +1241,7 @@ PAGE = r"""<!DOCTYPE html>
   <div id="s-w" hidden>
   <div class="sec" id="settings-workers" role="tabpanel" aria-labelledby="tab-settings-workers"><h2>Worker settings</h2>
     <p class="sub" id="s-sub">Applies to new runs. Running work keeps the model it started with. Blue outline = changed here; Default puts it back.</p>
-    <div class="card"><table class="tbl set-tbl"><thead><tr><th>Row</th><th class="m-hide">Harness</th><th>Backend</th><th>Model</th></tr></thead>
+    <div class="card"><table class="tbl set-tbl"><thead><tr><th>Row</th><th class="m-hide">Harness</th><th>Default backend</th><th>Model pin</th><th>Policy</th></tr></thead>
       <tbody id="s-rows"></tbody></table></div>
   </div>
   <div class="sec" id="settings-groups" role="tabpanel" aria-labelledby="tab-settings-groups" hidden><h2>Group limits</h2>
@@ -3097,15 +3097,19 @@ function paintSettings(){
   const off = s.writable ? '' : ' disabled';
   $('s-sub').textContent = !s.writable ? 'Read-only: the broker cannot write its routing overrides file, so changes here cannot be saved.'
     : s.rejected ? 'The routing overrides file on disk is invalid, so the broker is using its last good copy. Fix the file by hand before editing here.'
-    : 'Applies to new runs. Running work keeps the model it started with. Blue outline = changed here; Default puts it back.';
+    : 'Applies to new runs. Backend and harness are defaults: ticket labels can override them unless pinned. Blue outline = changed here; Default puts it back.';
   $('s-rows').innerHTML = s.rows.map(r => {
     const sel = (f, list, dflt) => '<label><span class="control-label">' + (f === 'backend' ? 'Backend' : 'Model')
       + '</span><select class="pick-sel' + (r.overridden.includes(f) ? ' set' : '') + '"' + off
       + ' data-set-row="' + esc(r.row) + '" data-field="' + f + '" aria-label="' + esc(r.row + ' ' + (f === 'backend' ? 'backend' : 'model')) + '">'
       + opts(list, r.overridden.includes(f) ? r[f] : null, dflt) + '</select></label>';
-    return '<tr><td><div class="t">' + esc(r.row) + '</div></td><td class="m-hide">' + esc(HARNESS[r.adapter] || r.adapter) + '</td>'
+    return '<tr><td><div class="t">' + esc(r.row) + '</div><div class="sub">' + (r.pinned ? 'Pinned' : 'Overridable default') + '</div></td><td class="m-hide">' + esc(HARNESS[r.adapter] || r.adapter) + '</td>'
       + '<td data-l="Backend">' + sel('backend', backends, r.default_backend || 'by fleet mode') + '</td>'
-      + '<td data-l="Model">' + sel('model_pin', s.models, r.default_model_pin || 'by fleet mode') + '</td></tr>';
+      + '<td data-l="Model pin">' + sel('model_pin', s.models, r.default_model_pin || 'none') + '</td>'
+      + '<td data-l="Policy"><label><span class="control-label">Pin row</span><select class="pick-sel' + (r.overridden.includes('pin') ? ' set' : '') + '"' + off
+      + ' data-set-row="' + esc(r.row) + '" data-field="pin" aria-label="' + esc(r.row + ' pin') + '">'
+      + opts(['false', 'true'], r.overridden.includes('pin') ? String(r.pin) : null, r.default_pin ? 'pinned' : 'overridable')
+      + '</select></label></td></tr>';
   }).join('');
   $('s-caps').innerHTML = s.groups.map(g => '<tr><td><div class="t">' + esc(g.group) + '</div></td><td>'
     + '<label><span class="control-label">Max at once</span><input class="pick-sel num' + (g.overridden ? ' set' : '') + '" type="number" min="0" step="1" inputmode="numeric"' + off
@@ -3128,8 +3132,9 @@ $('s-rows').addEventListener('change', e => {
   const t = e.target.closest('[data-set-row]');
   if(!t) return;
   const row = t.dataset.setRow, f = t.dataset.field;
-  saveSetting({rows: {[row]: {[f]: t.value || null}}},
-    row + ' ' + (f === 'backend' ? 'backend' : 'model') + ': ' + (t.value || 'back to default') + '. New runs use it.');
+  const value = t.value === '' ? null : f === 'pin' ? t.value === 'true' : t.value;
+  saveSetting({rows: {[row]: {[f]: value}}},
+    row + ' ' + f + ': ' + (t.value || 'back to default') + '. New runs use it.');
 });
 $('s-caps').addEventListener('change', e => {
   const t = e.target.closest('[data-cap]');

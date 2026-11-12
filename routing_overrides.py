@@ -24,6 +24,7 @@ def backend_ok(name):
     from adapters.cc import _backend_entry
     entry = _backend_entry(name)
     return isinstance(entry, dict) and bool(
+        isinstance(entry.get("codex"), dict) and entry["codex"].get("model") or
         entry.get("kind") == "local" and entry.get("env") or
         entry.get("kind") == "cloud" and entry.get("model") and entry.get("base_url"))
 
@@ -42,7 +43,7 @@ def model_choices():
 
 # The dashboard may change these and nothing else. adapter and repo_lock_scope change what a row's worker can
 # do or how it locks; trusted_creators widens who may pick a non-Anthropic backend. Those stay file-only.
-EDITABLE_ROW_FIELDS = ("backend", "model_pin")
+EDITABLE_ROW_FIELDS = ("backend", "model_pin", "pin")
 CHANGE_AUDIT_MAX = 240                 # actions.audit's target width; a bigger change list is refused, not truncated
 _CLAUDE_ID = re.compile(r"claude-[a-z0-9][a-z0-9.\-\[\]]*")
 
@@ -70,9 +71,10 @@ class RoutingOverrides:
         for name, fields in rows.items():
             if name not in rows_by_key:
                 raise ValueError("unknown row")
-            if (not isinstance(fields, dict) or set(fields) - {"backend", "adapter", "model_pin", "repo_lock_scope"}
-                    or any(not isinstance(v, str) for v in fields.values())):
-                raise ValueError("row overrides must contain backend, adapter, model_pin and/or repo_lock_scope strings")
+            if (not isinstance(fields, dict) or set(fields) - {"backend", "adapter", "model_pin", "repo_lock_scope", "pin"}
+                    or any(type(v) is not bool if k == "pin" else not isinstance(v, str)
+                           for k, v in fields.items())):
+                raise ValueError("row overrides accept backend, adapter, model_pin, repo_lock_scope strings and pin boolean")
             route = replace(rows_by_key[name], **fields)  # Route validates the harness.
             if route.backend and route.backend != "claude" and not backend_ok(route.backend):
                 raise ValueError("unresolvable backend")
@@ -175,7 +177,7 @@ class RoutingOverrides:
         return parts
 
     def edit(self, rows=None, row_concurrency=None):
-        """Merge a dashboard edit into the file and publish it. `rows` = {row_key: {field: str or None}} for
+        """Merge a dashboard edit into the file and publish it. `rows` = {row_key: {field: str/bool or None}} for
         EDITABLE_ROW_FIELDS; `row_concurrency` = {group: int or None}. None removes the entry (back to the
         environment default). The whole result goes through _validate, is written to a temp file next to the
         real target (a symlink is followed, never replaced) and renamed over it, then reloaded. Returns the
@@ -194,6 +196,11 @@ class RoutingOverrides:
                 for field, value in fields.items():
                     if value is None:
                         new_rows.get(name, {}).pop(field, None)
+                        continue
+                    if field == "pin":
+                        if type(value) is not bool:
+                            raise ValueError("pin must be a boolean or null")
+                        new_rows.setdefault(name, {})[field] = value
                         continue
                     if not isinstance(value, str):
                         raise ValueError(f"{field} must be a string or null")
@@ -258,7 +265,7 @@ class RoutingOverrides:
             return changes
 
     def view(self):
-        """What the dashboard's Settings card shows: each row's harness and its current backend/model pin
+        """What the dashboard's Settings card shows: each row's harness, backend default and explicit pins
         (template default plus overrides), the per-group concurrency caps, the model names it may pick and
         whether an edit can be saved. Names and values only; never credential paths."""
         import coalescer
@@ -268,6 +275,7 @@ class RoutingOverrides:
         for key, t in sorted(templates().items()):
             eff = self.apply(t)
             rows.append({"row": key, "adapter": eff.adapter, "backend": eff.backend, "model_pin": eff.model_pin,
+                         "pin": eff.pin, "pinned": eff.pin or bool(eff.model_pin), "default_pin": t.pin,
                          "default_backend": t.backend, "default_model_pin": t.model_pin,
                          "overridden": sorted(f for f in overridden.get(key, {}) if f in EDITABLE_ROW_FIELDS)})
         groups = sorted({r["row"].split("/")[0].lower() for r in rows})

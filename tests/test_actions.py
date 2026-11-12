@@ -188,6 +188,25 @@ class ActionTests(T.DrainTests):
         assert code == 409 and "pins" in out["error"], out
         assert b.adapter._pop_model_choice("vikunja:task:9611") is None
 
+    def test_web_rerun_model_overrides_backend_default_but_not_pin(self):
+        b = self.broker()
+        self.settings_file()
+        with patch.dict(os.environ, ON), patch("routing.comment_respawn_domain", return_value="code"):
+            assert self.post(b, "settings", {"rows": {"code": {"backend": "claude"}}})[0] == 200
+            code, view = self.handler(b, "/actions/settings", headers=GOOD).do_GET()
+            row = next(r for r in view["rows"] if r["row"] == "code")
+            assert code == 200 and row["backend"] == "claude" and not row["pinned"]
+            code, out = self.post(b, "settings", {"rows": {"code": {"pin": True}}})
+            row = next(r for r in out["settings"]["rows"] if r["row"] == "code")
+            assert code == 200 and row["pin"] and row["pinned"]
+            assert self.post(b, "rerun", {"task_id": 9611, "model": "sonnet"})[0] == 409
+            for bad in ("true", 1, []):
+                assert self.post(b, "settings", {"rows": {"code": {"pin": bad}}})[0] == 400
+            assert self.post(b, "settings", {"rows": {"code": {"pin": False}}})[0] == 200
+            b.set_drain(True)
+            assert self.post(b, "rerun", {"task_id": 9610, "model": "opus"})[0] == 202
+            assert b.state.head()[2]["model"] == "opus"
+
     def settings_file(self):
         path = os.path.join(self.tmp.name, "routing-overrides.json")
         self.patchers.append(patch.object(RO.OVERRIDES, "path", path))
@@ -326,6 +345,16 @@ class ActionTests(T.DrainTests):
         h._reply(200, {"ok": True})
         for pair in (("X-Frame-Options", "DENY"), ("Content-Security-Policy", "frame-ancestors 'none'")):
             assert sent.count(pair) == 2, sent
+
+
+def test_backend_default_rerun_and_pin_settings():
+    # Also expose this acceptance case to pytest; the script runner below runs the class method.
+    fixture = ActionTests()
+    fixture.setUp()
+    try:
+        fixture.test_web_rerun_model_overrides_backend_default_but_not_pin()
+    finally:
+        fixture.tearDown()
 
 
 if __name__ == "__main__":

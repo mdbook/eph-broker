@@ -13330,11 +13330,13 @@ def test_dash_rerun_options_use_current_ticket_row():
         assert replies.pop() == (200, {'row': 'code', 'pinned': False, 'model': 'gpt-example'})
         classify.assert_called_with(ticket.assignees, ticket.labels)
         from dataclasses import replace
-        for fields, expected in (({'backend': 'sol'}, 'sol'), ({'model_pin': 'opus'}, 'opus'),
-                                 ({'backend': 'claude', 'model_pin': 'haiku'}, 'haiku')):
+        for fields, expected, pinned in (({'backend': 'sol'}, 'sol', False),
+                                        ({'backend': 'sol', 'pin': True}, 'sol', True),
+                                        ({'model_pin': 'opus'}, 'opus', True),
+                                        ({'backend': 'claude', 'model_pin': 'haiku'}, 'haiku', True)):
             with patch.object(RO.OVERRIDES, 'apply', side_effect=lambda t: replace(t, **fields)):
                 actions.rerun_view(h, b, '9610')
-                assert replies.pop() == (200, {'row': 'code', 'pinned': True, 'model': expected})
+                assert replies.pop() == (200, {'row': 'code', 'pinned': pinned, 'model': expected})
         b.adapter.repo_parked = lambda key: 'general'
         actions.rerun_view(h, b, '9610')
         assert replies.pop()[1]['row'] == 'general', 'parked row takes precedence, as in ops_rerun'
@@ -16997,7 +16999,11 @@ def test_run_worker_uses_a_queued_model_choice_once():
     assert run(free, None).model == "haiku", "no pick: the label applies"
     got = run(free, "opus")
     assert (got.backend, got.model) == ("claude", "opus"), "the pick beats the label"
-    pinned = _with_answer("claude-opus-5-5", _general_tmpl("qwen-moe").with_model)
+    defaulted = _with_answer("claude-opus-5-5", _general_tmpl("qwen-moe").with_model)
+    defaulted.adapter = "codex"
+    got = run(defaulted, "opus")
+    assert (got.backend, got.model, got.adapter) == ("claude", "opus", "cc"), "pick beats row default and switches adapter"
+    pinned = Route(**{**defaulted.__dict__, "pin": True}).with_model()
     got = run(pinned, "opus")
     assert got.backend == "qwen-moe", "a pinned row ignores the pick"
     assert R.model_choice_error("opus") is None and R.model_choice_error("local") is None
@@ -17011,6 +17017,49 @@ def test_run_worker_uses_a_queued_model_choice_once():
     a._run_worker("vikunja:task:9354", {"task_id": 9354}, "r2")     # ticket fetch fails: the spawn aborts
     assert a._pop_model_choice("vikunja:task:9354") is None, "an aborted spawn still drops the pick"
     ok("_run_worker applies a queued model choice once (beats the label, pinned row wins, an abort drops it)")
+
+
+def test_run_worker_refuses_site_capability_model_switch():
+    """Ticket labels and queued dashboard picks share the harness-label fail-closed site guard."""
+    import routing as R
+
+    class _Stop(Exception):
+        pass
+
+    for site_capability in ("docs-writer", ""):
+        for dashboard in (False, True):
+            route = Route("code", "", "code-change", "code", capability="code", model="sonnet",
+                          backend="claude", site_capability=site_capability)
+            class _R:
+                def route(self, key, brief): return route
+            seen = []
+            def stop(picked, *args):
+                seen.append(picked)
+                raise _Stop()
+            a = CCAdapter(router=_R(), worktree_mgr=None, prompt_loader=None, envelope_parser=EnvelopeParser(),
+                          ticket_fetcher=lambda tid: _respawn_blob(labels=["model:hermes-cloud"], creator="owner"))
+            key = "vikunja:task:9355"
+            if dashboard:
+                a.queue_model_choice(key, "hermes-cloud")
+            with patch.object(cc, "_backend_entry", lambda name: {
+                    "kind": "cloud", "model": "test", "adapter": "hermes", "base_url": "https://llm.example.com"
+                    } if name == "hermes-cloud" else None), \
+                    patch.object(R, "model_label_trusted_creators", lambda: {"owner"}), \
+                    patch.object(R, "apply_adapter_label", stop), \
+                    patch.object(a, "_alert_ops") as alert, patch.object(cc.log, "warning") as warning:
+                a._run_worker(key, {"task_id": 9355}, "r1")
+            assert a._pop_model_choice(key) is None
+            assert (route.backend, route.adapter) == ("claude", "cc")
+            if site_capability:
+                assert not seen, "the refused choice must abort before the harness-label/spawn steps"
+                assert alert.call_count == 1 and "cc harness only" in alert.call_args.args[0]
+                reason = "model choice" if dashboard else "model label"
+                assert any("spawn REJECT" in str(call) and reason in str(call) and
+                           "cc harness only" in str(call) for call in warning.call_args_list)
+            else:
+                assert len(seen) == 1 and (seen[0].backend, seen[0].adapter) == ("hermes-cloud", "hermes")
+    ok("ticket model labels and queued dashboard picks log and refuse a hermes site-capability switch, "
+       "keep the route unchanged, and still switch unrestricted routes")
 
 
 def test_comment_respawn_broker_ingest():
@@ -20636,13 +20685,15 @@ def test_apply_model_label():
                 assert "fail-closed" in str(e), e
     with _Env(MODEL_LABEL_TRUSTED_CREATORS="someguest"):
         assert R.apply_model_label(r, ["model:deepseek"], "someguest", resolvable).backend == "deepseek"
-    # an explicit <ROW>_BACKEND pin wins over the label (label ignored, even an unknown one)
-    rp = _with_answer("claude-opus-5-5", _general_tmpl("qwen-moe").with_model)
+    # Only an explicit pin wins over the label (even an unknown one).
+    defaulted = _general_tmpl("qwen-moe")
+    defaulted.pin = True
+    rp = _with_answer("claude-opus-5-5", defaulted.with_model)
     assert rp.backend_pinned is True
     assert R.apply_model_label(rp, ["model:opus"], "owner", resolvable) is rp
     assert R.apply_model_label(rp, ["model:gpt9"], "someguest", resolvable) is rp
     ok("apply_model_label - native alias for anyone; registry backend only for a trusted creator; "
-       "unknown name fails closed; label beats FLEET_MODE; <ROW>_BACKEND pin wins")
+       "unknown name fails closed; label beats FLEET_MODE; explicit pin wins")
 
 
 def test_model_label_spawn_argv():
@@ -20751,7 +20802,9 @@ def test_apply_adapter_label():
         # already on hermes -> unchanged; pinned row -> ignored (no raise)
         rh = R.Route(**{**r.__dict__, "adapter": "hermes"})
         assert R.apply_adapter_label(rh, ["hermes"], "owner") is rh
-        rp = _with_answer("claude-opus-5-5", _general_tmpl("qwen-moe").with_model)
+        pinned = _general_tmpl("qwen-moe")
+        pinned.pin = True
+        rp = _with_answer("claude-opus-5-5", pinned.with_model)
         assert rp.backend_pinned and R.apply_adapter_label(rp, ["hermes"], "owner") is rp
     ok("hermes label - shipped allow-set == {general}; empty set refuses every row; untrusted/pinned/"
        "already-hermes ignored; enabled row -> adapter=hermes on a registry backend; native/claude-* refused")

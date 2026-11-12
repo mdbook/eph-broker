@@ -366,6 +366,36 @@ stops the worker from starting (logged and escalated). Empty output, an error, a
 `FLEET_MODEL_SH` gives `NATIVE_FALLBACK_MODEL`. A `model` pinned on a config row skips the script and goes to
 `--model` as it is, so an alias works there.
 
+### Row defaults and explicit pins
+
+A row's `backend` and `adapter` in `routing-overrides.json` (or its `<ROW>_BACKEND` and
+`<ROW>_ADAPTER` environment settings) are defaults, not pins. Precedence is:
+
+1. Explicit row `"pin": true`, or a nonempty `model_pin`.
+2. An operator's one-run model pick on dashboard **Run again**.
+3. A ticket's `model:<name>` or supported bare model label.
+4. The row's backend/harness default, then `FLEET_MODEL_SH` when no backend is set.
+
+`opus`, `sonnet` and `haiku` labels select native Claude Code (`cc`), even when the row defaults to
+another harness. Registry backend choices select the entry's `adapter` if present (`cc`, `hermes` or
+`codex`); otherwise a `codex` block selects Codex and other entries select `cc`. An explicit ticket
+harness label can still select a different harness after a model label. An operator's model pick
+takes precedence over both ticket model and harness labels. Existing capability checks and
+`CODE_NONCLAUDE_OK` still apply at spawn. Non-Anthropic model labels still require a creator in
+`MODEL_LABEL_TRUSTED_CREATORS`; untrusted bare non-Anthropic labels are ignored as before.
+
+To ignore ticket choices, set `"pin": true` on the row, or `<ROW>_PIN=true` alongside its backend
+environment setting (for example `CODE_CHANGE_PIN=true`, `GENERAL_PIN=true`, `MR_REVIEWER_PIN=true`).
+The prefix matches the backend setting, including `INFRA_GENERAL_PIN` (inherits `INFRA_PIN`).
+Environment pins are read at startup. File pins reload like other routing overrides.
+`pin:false` allows choices again unless `model_pin` is still set. No migration edit is needed:
+existing backend/adapter rows without `pin` remain their defaults and now accept labels.
+
+Dashboard Settings and `GET /actions/settings` expose the effective `pin`, `pinned` (including
+`model_pin`) and `default_pin` alongside the backend and model pin. Each spawn logs a
+`model selection` line naming the winner (`label`, `operator choice`, `row default` or `pin`),
+backend, model and adapter. Ignored model labels also log that the pin won.
+
 `SPAWN_MODELS_JSON` names the registry file. Each backend is an entry under `backends`:
 
 ```json
@@ -391,6 +421,7 @@ stops the worker from starting (logged and escalated). Empty output, an error, a
 | `env` | Optional path to a `KEY=VALUE` file the broker reads at spawn. Only `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_API_KEY` are passed on to the worker. A `local` backend also reads its base URL and model from this file (or from `VLLM_CC_ENV`). |
 | `context_tokens` | Optional. Sets `CLAUDE_CODE_MAX_CONTEXT_TOKENS`. |
 | `effort` | Optional. Passed as `--effort`. |
+| `adapter` | Optional harness for an explicit model/backend choice: `cc`, `hermes` or `codex`. Without it, a `codex` block selects Codex; otherwise `cc`. Does not change a row's default harness. |
 
 `claude` always means native Claude Code and can't be redefined. A `cloud` backend whose `base_url` is exactly
 `https://api.anthropic.com` counts as first-party: the code worker may run on it and the general worker keeps
@@ -405,7 +436,7 @@ needs a non-Anthropic backend for the reviewer; the Codex harness needs a Codex 
 ([The Codex harness](#the-codex-harness)).
 
 By default the reviewer asks `FLEET_MODEL_SH` for agent `mr-reviewer`, so a non-Claude answer runs it on that
-backend. `MR_REVIEWER_BACKEND` pins a backend instead (`claude` means native Claude Code on the default model).
+backend. `MR_REVIEWER_BACKEND` sets a backend default instead (`claude` means native Claude Code on the default model).
 
 To review on native Claude Code with a model you pick, whatever `FLEET_MODEL_SH` says:
 
@@ -434,9 +465,9 @@ or `MR_REVIEW_FULL_MODEL`; widen the path lists with `MR_REVIEW_QUICK_PATHS` / `
 `MR_REVIEW_FULL_PATHS` (comma-separated globs, matched against the full path and the basename,
 case-insensitively; each env var only ADDS onto its built-in list, never replaces it); adjust the size
 cutoffs with `MR_REVIEW_QUICK_MAX_DIFF_LINES` / `MR_REVIEW_FULL_DIFF_LINES`. `MR_REVIEWER_MODEL` or
-`MR_REVIEWER_BACKEND`, if set, overrides every tier's model unconditionally (today's single-model behaviour,
-unchanged) - the tier is still computed and still named on the MR note, it just doesn't pick a different
-model while the pin holds. A per-ticket `model:`/`hermes`/`codex` label on the MR's source ticket also wins
+`MR_REVIEWER_PIN=true`, if set, overrides every tier's model unconditionally. A backend default keeps
+its backend instead of using a tier's native model, but still accepts ticket labels. The tier is still
+computed and named on the MR note. A per-ticket `model:`/`hermes`/`codex` label on the MR's source ticket also wins
 over a tier's model pick, same precedence as everywhere else (an explicit choice beats a computed one). These
 are read at startup, so restart the broker after changing them.
 
@@ -681,10 +712,11 @@ What each action does:
   inside a Claude Code subagent never takes it, so it waits for the main agent's next tool call or the next turn.
 - **Run again**, **pause new runs** and **retry / abandon** use the same code as `/rerun`, `/drain` and
   `/reconcile`. The model menu next to **Run again** runs that one run on the model or backend you pick, ahead
-  of any `model:` label on the ticket. A row that pins its model (a `<ROW>_BACKEND` or `model_pin`) refuses
+  of any `model:` label on the ticket. A row that pins its model (`pin:true`, `<ROW>_PIN` or `model_pin`) refuses
   the pick; change the row instead.
 - **Settings > Workers** (header gear, or phone hamburger) edits the [routing overrides file](routing-overrides.md): each row's
-  `backend` and `model_pin`. **Settings > Groups** edits the `row_concurrency` cap per group. **Default** removes your change and puts
+  default `backend`, `model_pin` and explicit `pin` policy. It distinguishes **Overridable default** from **Pinned**.
+  **Settings > Groups** edits the `row_concurrency` cap per group. **Default** removes your change and puts
   back the environment value. New runs pick the change up; running ones keep what they started with. The
   broker needs write access to that file and its directory, otherwise the card says so and stays read-only.
   The harness, the repository lock scope and `trusted_creators` can only be changed in the file itself,

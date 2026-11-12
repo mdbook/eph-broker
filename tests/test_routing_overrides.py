@@ -10,6 +10,8 @@ import pathlib
 import sys
 import tempfile
 import threading
+from dataclasses import replace
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -103,11 +105,94 @@ def test_next_spawn_and_existing_route():
     ok("a routing-overrides.json write lands on the NEXT spawn only; an already-routed/building row is untouched")
 
 
+def test_backend_defaults_labels_and_explicit_pins():
+    with _Overrides() as (path, loader):
+        entries = {
+            "sol": {"kind": "codex", "codex": {"model": "test-codex"}},
+            "cloud": {"kind": "cloud", "model": "test", "base_url": "https://llm.example.com"},
+            "hermes-cloud": {"kind": "cloud", "model": "test", "base_url": "https://llm.example.com",
+                             "adapter": "hermes"},
+        }
+        with patch.object(cc, "_backend_entry", entries.get):
+            # Migration: the existing backend+adapter shape loads as a default, without rewriting the file.
+            data = {"rows": {"code": {"backend": "sol", "adapter": "codex"}}, "trusted_creators": ["operator"]}
+            save(path, data)
+            defaulted = routing._CODE_ROW.with_model()
+            assert (defaulted.backend, defaulted.adapter, defaulted.backend_pinned) == ("sol", "codex", False)
+            assert not routing.row_pinned("code") and loader.reload() == data
+            view = next(r for r in loader.view()["rows"] if r["row"] == "code")
+            assert not view["pin"] and not view["pinned"]
+            for alias in ("opus", "sonnet", "haiku"):
+                for label in (alias, "model:" + alias):
+                    picked = routing.apply_model_label(defaulted, [label], "guest", routing_overrides.backend_ok)
+                    assert (picked.backend, picked.model, picked.adapter) == ("claude", alias, "cc")
+            for name, adapter in (("sol", "codex"), ("cloud", "cc"), ("hermes-cloud", "hermes")):
+                picked = routing.apply_model_label(defaulted, ["model:" + name], "Operator", routing_overrides.backend_ok)
+                assert (picked.backend, picked.adapter) == (name, adapter)
+                try:
+                    routing.apply_model_label(defaulted, ["model:" + name], "guest", routing_overrides.backend_ok)
+                    raise AssertionError("an untrusted creator must not pick a registry backend")
+                except ValueError as e:
+                    assert "not in MODEL_LABEL_TRUSTED_CREATORS" in str(e)
+            assert routing.apply_model_label(defaulted, ["deepseek"], "guest", lambda n: True) is defaulted
+            assert (defaulted.backend, defaulted.adapter) == ("sol", "codex"), "choices never mutate the default"
+            # An env-backed template has exactly the same semantics; explicit pin opts back into the old policy.
+            template = replace(routing._GENERAL_ROW, backend="sol", adapter="codex")
+            assert not template.with_model().backend_pinned
+            with _Env(GENERAL_PIN="true"):
+                template = replace(template, pin=routing._row_pin("GENERAL_PIN"))
+            assert template.with_model().backend_pinned
+            assert loader.edit(rows={"code": {"pin": True}}) == ["code.pin:True"]
+            pinned = routing._CODE_ROW.with_model()
+            assert pinned.backend_pinned and routing.row_pinned("code")
+            assert routing.apply_model_label(pinned, ["opus"], "guest", lambda n: False) is pinned
+            assert routing.apply_model_label(pinned, ["model:missing"], "guest", lambda n: False) is pinned
+            view = next(r for r in loader.view()["rows"] if r["row"] == "code")
+            assert view["pin"] and view["pinned"] and not view["default_pin"]
+            loader.edit(rows={"code": {"pin": False}})
+            assert not routing.row_pinned("code")
+            loader.edit(rows={"code": {"pin": None, "model_pin": "opus"}})
+            assert routing.row_pinned("code"), "model_pin remains a hard pin even without pin:true"
+    ok("backend/adapter are defaults; native and trusted registry labels select their harness; only pin/model_pin block labels")
+
+
+def test_model_choices_preserve_site_capability_rules():
+    with _Overrides() as (path, _):
+        save(path, {"trusted_creators": ["operator"]})
+        entries = {name: {"kind": "cloud", "model": "test", "adapter": adapter,
+                          "base_url": "https://llm.example.com"}
+                   for name, adapter in (("hermes-cloud", "hermes"), ("codex-cloud", "codex"))}
+        with patch.object(cc, "_backend_entry", entries.get):
+            route = replace(routing._CODE_ROW.with_model(), backend="cloud", adapter="cc",
+                            site_capability="docs-writer")
+            for name, entry in entries.items():
+                for choose in (lambda r: routing.apply_model_label(r, ["model:" + name], "operator",
+                                                                  routing_overrides.backend_ok),
+                               lambda r: routing.apply_model_choice(r, name, True, routing_overrides.backend_ok),
+                               lambda r: routing.apply_adapter_label(r, [entry["adapter"]], "operator")):
+                    before = dict(route.__dict__)
+                    try:
+                        choose(route)
+                        raise AssertionError("accepted a non-cc harness on a site capability")
+                    except ValueError as e:
+                        assert "site capability 'docs-writer' runs on the cc harness only" in str(e), e
+                    assert route.__dict__ == before, "refusal must not change the adapter/backend or other fields"
+                    unrestricted = replace(route, site_capability="")
+                    picked = choose(unrestricted)
+                    assert picked.adapter == entry["adapter"]
+            native = routing.apply_model_choice(route, "opus", True, routing_overrides.backend_ok)
+            assert (native.adapter, native.backend, native.model) == ("cc", "claude", "opus")
+    ok("model labels, dashboard choices and harness labels refuse non-cc site capabilities; "
+       "the same choices without a site capability still switch")
+
+
 def test_bad_file_is_atomic_and_alerted_once():
     bad_cases = (
         {"rows": {"code": {"repo_lock_scope": "publish"}}},
         {"rows": {"wiki": {"repo_lock_scope": ""}}},
         {"rows": {"code": {"adapter": "typo"}}},
+        {"rows": {"code": {"pin": "true"}}},
+        {"rows": {"code": {"pin": 1}}},
         {"rows": {"code": {"backend": "missing"}}},
         {"rows": {"unknown-row": {"adapter": "cc"}}},
         {"rows": {"code": {"capability": "general"}}},

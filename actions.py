@@ -29,7 +29,7 @@ Verbs (JSON bodies):
   move-to-front {"subject_key"}                  select the next eligible waiting subject (one-shot)
   reconcile  {"subject_key", "decision", "note"?} Broker.reconcile_recovery, the same path as POST /reconcile
   settings   {"rows"?, "row_concurrency"?}       edit the routing overrides file (routing_overrides.edit): per-row
-                                                 backend / model_pin, per-group concurrency caps; null = default.
+                                                 backend / model_pin / pin, per-group concurrency caps; null = default.
                                                  GET /actions/settings (same proxy + identity check) reads them.
 
 Audit: every authorised request logs one `WEB-ACTION user=.. verb=.. target=.. result=..` line, emits an

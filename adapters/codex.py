@@ -35,8 +35,8 @@ SIGNED PROMPT: written to <home>/eph-instructions.md and named by `model_instruc
 
 SANDBOX + APPROVALS (Codex's own OS sandbox; approval_policy = "never": nobody can answer an ask):
     mr-review          read-only
-    write / code       workspace-write, writable root = the worktree, network off (CODEX_SANDBOX_NETWORK=1 turns
-                       it on, e.g. for mcp-ro.sh; the gate still decides every command). code also needs
+    write / code       workspace-write, writable root = the worktree, network off unless CODEX_SANDBOX_NETWORK=1
+                       or an explicit MCP wrapper allow rule enables it; the gate still decides every command. code also needs
                        CODE_NONCLAUDE_OK=1, the same opt-in a non-Claude code turn needs on cc and hermes.
     general            workspace-write, same network rule; every effectful call also needs the exec gate's allow
                        (EXEC_GATE, unset = deny), as on hermes.
@@ -1102,8 +1102,11 @@ class CodexHarness:
             env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
         self._write_new(os.path.join(home, CONFIG_FILE),
                         codex_config(model, effort, sandbox, instructions,
-                                     network=_cc._env_flag("CODEX_SANDBOX_NETWORK"),
-                                     writable_roots=git_writable_roots(cwd) if sandbox == "workspace-write" else (),
+                                     network=(_cc._env_flag("CODEX_SANDBOX_NETWORK") or
+                                              _cc._worker_mcp_granted(route, explicit_only=True)),
+                                     writable_roots=(git_writable_roots(cwd) +
+                                                     ([worker.ssh_control_dir] if worker.ssh_control_dir else []))
+                                     if sandbox == "workspace-write" else (),
                                      shell_path=env["PATH"], companion_env=_cc.repo_companions.environment(worker),
                                      git_identity=_cc.routing.worker_git_identity(route)))
         self._install_gate(home, policy, env, cwd,         # CodexRefused unless the hook is proven live
@@ -1114,7 +1117,9 @@ class CodexHarness:
         _cc.site_env.require_model_allowed(model)
         _cc.record_launch(worker, model, backend, "codex")   # dash Worker view: the model this process gets
         argv = _cc.sandbox.wrap(argv, worker.worktree, worker.sandbox_gitdir,
-                                writable_paths=(home, worker.test_tmpdir, *steer.sandbox_paths(worker.key)))
+                                writable_paths=(home, worker.test_tmpdir, *steer.sandbox_paths(worker.key)),
+                                readonly_paths=(worker.ssh_tmpdir,) if worker.ssh_config else (),
+                                ssh_config=worker.ssh_config, ssh_control_dir=worker.ssh_control_dir)
         worker.in_turn = True
         worker.turn_started = time.time()
         worker.hard_killed = False

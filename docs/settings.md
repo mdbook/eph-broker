@@ -38,6 +38,10 @@ Flags count as on for `1`, `true`, `yes` or `on`, unless the row says otherwise.
 | `WORKER_SANDBOX` | `bwrap` | Bubblewrap OS boundary for every worker harness. Missing bwrap or an unknown value refuses startup; `off` explicitly disables isolation. Restart after changes. See [security.md](security.md#os-boundary-on-by-default). |
 | `WORKER_SANDBOX_EXTRA_RO` | unset | Colon-separated absolute paths to bind read-only (also accepts `~`). Cannot restore host `/proc` or `/dev`. |
 | `WORKER_SANDBOX_HIDE` | unset | Colon-separated absolute paths to hide in addition to the default secret paths. Hides always win; files become empty read-only files, directories empty tmpfs mounts. Include any external systemd env-file directory and sibling secrets. |
+| `WORKER_MCP_SSH_CONFIG` | `~/.ssh/config` | Broker user's SSH config for MCP-granted workers. The managed launcher uses `ssh -F` with this file, or `/dev/null` when absent. Absolute path, `~` accepted. |
+| `WORKER_MCP_SSH_CONTROL_BASE` | `/tmp` | Existing absolute parent directory (`~` accepted) for broker-owned per-worker `eph-ssh-*` directories, mode `0700`. Independent of `TMPDIR`. Keep this path short: the expanded socket path (40-byte `%C` hash), OpenSSH's temporary suffix and terminating NUL must fit in 104 bytes. An unavailable or overlong location disables multiplexing (`ControlMaster=no`, `ControlPath=none`), without removing SSH/resolver binds or network access. |
+| `WORKER_MCP_SSH_FILES` | `known_hosts`, `id_ed25519`, `id_rsa` beside that config | Colon-separated individual files to bind read-only for MCP-granted workers. Set this to the actual known-hosts, identity, certificate and Include files your SSH config needs. Missing files are skipped. Directories, `.env`, `.*-env`, and broker config/env files are refused, including symlink targets. |
+| `WORKER_MCP_RESOLVER_FILES` | `/etc/resolv.conf:/etc/hosts:/etc/nsswitch.conf` | Colon-separated resolver files restored read-only for MCP-granted workers, including symlink targets under private `/tmp`. Same file restrictions as `WORKER_MCP_SSH_FILES`. |
 | `TURN_CAPTURE_DIR` | `turn-captures/` next to `EVENTS_LOG` | Size-capped stdout and stderr of failed turns, for debugging. Off when `EVENTS_LOG` isn't set. |
 | `TURN_CAPTURE_KEEP` | `200` | Captures kept. |
 | `TURN_CAPTURE_MAX_AGE_S` | 7 days | Captures older than this are removed. |
@@ -291,7 +295,7 @@ change the binding. Notes also carry the MR title and description as context, in
 | `CODEX_ALLOW_PRERELEASE` | off | Allow prerelease Codex CLI versions past the version guard. Stable minimum-version checks still apply. |
 | `CODEX_HOME_ROOT` | `~/.cache/eph-codex-homes` | Where each Codex worker's private `CODEX_HOME` is created. |
 | `CODEX_REASONING_SUMMARY` | empty | Codex `model_reasoning_summary` for every turn: `auto`, `concise`, `detailed` or `none`. Codex only reports a thought when the model returns a summary, so set this to put thoughts in the live transcript. Empty leaves the key out (Codex's default); any other value refuses every Codex turn with an error naming the knob. Check your model accepts it with one turn before rolling it out. |
-| `CODEX_SANDBOX_NETWORK` | off | Network inside Codex's workspace-write sandbox. |
+| `CODEX_SANDBOX_NETWORK` | off | `1` enables network inside Codex's workspace-write sandbox. An explicit MCP wrapper allow rule also enables it; auto grants and recall-only grants do not. |
 
 A Codex reviewer's PASS never auto-merges under CD: only `cc` verdicts (and hermes ones with `CD_ACCEPT_HERMES`)
 do.

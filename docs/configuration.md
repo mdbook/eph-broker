@@ -480,7 +480,7 @@ worktree, branch, MR, test runner and result envelope are the same as on `cc`. H
 | `CODEX_BACKEND` | The registry backend whose `codex` block gives the model when the row's own backend has none (see below). | The row's backend must have one |
 | `CODEX_BIN` | The `codex` executable. | `codex` on `PATH` |
 | `CODEX_HOME_ROOT` | Where the per-worker private `CODEX_HOME` directories go. Local disk: Codex keeps its thread files there. | `~/.cache/eph-codex-homes` |
-| `CODEX_SANDBOX_NETWORK` | `1` gives write, code and general workers network access inside Codex's sandbox (for example to reach `mcp-ro.sh`). The gate still judges every command. | Network off |
+| `CODEX_SANDBOX_NETWORK` | `1` gives write, code and general workers network access inside Codex's sandbox (for example to reach `mcp-ro.sh`). An explicit `Bash(mcp-ro.sh:*)`, `Bash(mcp-rw.sh:*)` or `Bash(mcp.sh:*)` allow rule also enables it unless denied. Auto grants and recall-only grants do not. The gate still judges every command. | Network off without an explicit MCP wrapper allow rule |
 
 The model and reasoning effort come from a `codex` block on a backend in the registry file
 ([Models and backends](#models-and-backends)):

@@ -1030,7 +1030,8 @@ def test_codex_model_denylist_at_launch():
 
 
 def test_codex_happy_path_and_resume():
-    with tempfile.TemporaryDirectory() as d, _Codex(d) as c:
+    # Exercise the network-off code route without its optional explicit MCP wrapper grant.
+    with tempfile.TemporaryDirectory() as d, _Codex(d) as c, patch.object(CC, "_CODE_MEMORY", []):
         wt = _git_repo(os.path.join(d, "wt"))
         rec = os.path.join(d, "rec.jsonl")
         a = _adapter(d, wall_clock_s=60)
@@ -1082,6 +1083,34 @@ def test_codex_happy_path_and_resume():
         assert not os.path.exists(home) and os.path.exists(c.auth), "home goes with the Worker; auth source stays"
     ok("codex: happy path - exec --json argv, brief on stdin, signed prompt as model instructions, auth symlink, "
        "scrubbed env (no OPENAI_*/CODEX_* leak), gate trusted and live, denials reported, resume + token delta")
+
+
+def test_codex_sandbox_network_requires_opt_in():
+    auto = ["--permission-mode", "auto"]
+    cases = [(auto, None, False),
+             (auto, "0", False),
+             (auto, "1", True),
+             (auto + ["--allowedTools", f"Bash({CC._HS_RECALL}:*)"], None, False)]
+    for wrapper in ("mcp-ro.sh", "mcp-rw.sh", "mcp.sh"):
+        rule = f"Bash({wrapper}:*)"
+        cases.extend([(auto + ["--allowedTools", rule], None, True),
+                      (auto + ["--allowedTools", rule, "--disallowedTools", rule], None, False)])
+    with tempfile.TemporaryDirectory() as d, _Codex(d):
+        wt = _git_repo(os.path.join(d, "wt"))
+        rec = os.path.join(d, "rec.jsonl")
+        a = _adapter(d, wall_clock_s=60)
+        for i, (grant, knob, expected) in enumerate(cases):
+            w = Worker("vikunja:task:9519", "network-" + str(i), wt)
+            with patch.object(CC, "capability_tool_grant", return_value=grant), \
+                    _Env(CODEX_SANDBOX_NETWORK=knob):
+                assert a._one_turn(w, _route(capability="general", FAKE_RECORD=rec), "SYS", "P", resume=False)
+            cfg = _records(rec)[-1]["config"]
+            assert f"network_access = {str(expected).lower()}" in cfg, (grant, knob, cfg)
+            # SSH/resolver preparation is independent of Codex network opt-in.
+            if grant == auto:
+                assert w.ssh_config
+            del w; gc.collect()
+    ok("codex: network requires the knob or an explicit, non-denied MCP wrapper rule; auto/recall alone stay off")
 
 
 def test_codex_model_and_sandbox_selection():

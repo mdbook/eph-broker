@@ -905,7 +905,9 @@ class HermesHarness:
         _cc.site_env.require_model_allowed(model)
         _cc.record_launch(worker, model, backend, "hermes")   # dash Worker view: the model this process gets
         argv = _cc.sandbox.wrap(argv, worker.worktree, worker.sandbox_gitdir,
-                                writable_paths=(home, worker.test_tmpdir))
+                                writable_paths=(home, worker.test_tmpdir),
+                                readonly_paths=(worker.ssh_tmpdir,) if worker.ssh_config else (),
+                                ssh_config=worker.ssh_config, ssh_control_dir=worker.ssh_control_dir)
         worker.in_turn = True
         worker.turn_started = time.time()
         worker.hard_killed = False                          # reset before this turn; set True only below

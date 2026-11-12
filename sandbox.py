@@ -39,6 +39,47 @@ def _paths(knob):
     return [_path(p) for p in os.getenv(knob, "").split(os.pathsep) if p]
 
 
+def mcp_ssh_config(home):
+    """The managed launcher's config, from broker-owned settings, never a ticket."""
+    config = os.path.expanduser(os.getenv("WORKER_MCP_SSH_CONFIG", os.path.join(home, ".ssh", "config")))
+    _path(config)                        # validate, retaining the original path for ssh -F
+    return config
+
+
+def _mcp_files(config):
+    import site_env
+
+    secrets = {_path(site_env.SITE_ENV), _path(site_env.BROKER_CONFIG)}
+    directory = os.path.dirname(config)
+    defaults = os.pathsep.join(os.path.join(directory, name) for name in
+                               ("known_hosts", "id_ed25519", "id_rsa"))
+    files = [config]
+    for knob, default in (("WORKER_MCP_SSH_FILES", defaults),
+                          ("WORKER_MCP_RESOLVER_FILES",
+                           "/etc/resolv.conf:/etc/hosts:/etc/nsswitch.conf")):
+        files.extend(p for p in os.getenv(knob, default).split(os.pathsep) if p)
+    for original in dict.fromkeys(files):
+        original = os.path.expanduser(original)
+        path = _path(original)
+        if path in secrets:
+            raise SandboxError("MCP SSH binds must not include broker configuration")
+        # Do not let a convenience bind expose an env file (including a symlink to one),
+        # directory of credentials, or the old broker's multiplexing socket.
+        for name in (original, path):
+            if any(part == ".env" or (part.startswith(".") and part.endswith("-env"))
+                   for part in name.split(os.sep)):
+                raise SandboxError("MCP SSH binds must not include secret env files")
+            if name == "/proc" or name.startswith("/proc/") or name == "/dev" or name.startswith("/dev/"):
+                raise SandboxError("MCP SSH files must not be under /proc or /dev")
+        if not os.path.exists(path):
+            continue                    # optional default identities/config may not exist
+        if not os.path.isfile(path):
+            raise SandboxError("MCP SSH binds must be individual regular files")
+        yield path, original
+        if path != original:             # restore symlink targets masked by private /tmp too
+            yield path, path
+
+
 def gitdir(worktree):
     """Snapshot the common git dir BEFORE a worker runs; never execute repo config.
 
@@ -69,13 +110,17 @@ def gitdir(worktree):
     return _path(os.path.join(directory, common))
 
 
-def wrap(argv, worktree, base_repo_gitdir, *, writable_paths=()):
+def wrap(argv, worktree, base_repo_gitdir, *, writable_paths=(), readonly_paths=(),
+         ssh_config=None, ssh_control_dir=None):
     """Return a launch argv (off: an unchanged copy), without mutating the host.
 
-    writable_paths are broker-created per-worker runtime state, not arbitrary
-    operator/ticket grants. EXTRA_RO/HIDE are colon-separated absolute paths.
+    writable_paths/readonly_paths are broker-created per-worker runtime state,
+    not arbitrary operator/ticket grants. EXTRA_RO/HIDE are colon-separated paths.
     Hides always win, including over a worktree or an EXTRA_RO entry. Files are
     masked by /dev/null (tmpfs mounts require directories); directories by tmpfs.
+    ssh_config marks an MCP bridge grant. ssh_control_dir is broker-created,
+    per-run state, omitted when multiplexing is unavailable. Only individual
+    SSH/resolver files are restored read-only.
     """
     binary = check()
     if binary is None:
@@ -84,12 +129,16 @@ def wrap(argv, worktree, base_repo_gitdir, *, writable_paths=()):
 
     out = [binary, "--die-with-parent", "--new-session", "--unshare-user", "--unshare-pid",
            "--cap-drop", "ALL", "--ro-bind", "/", "/", "--tmpfs", "/tmp"]
-    for path in dict.fromkeys(_path(p) for p in (worktree, base_repo_gitdir, *writable_paths) if p):
+    for path in dict.fromkeys(_path(p) for p in (worktree, base_repo_gitdir, *writable_paths,
+                                               ssh_control_dir) if p):
         if path == "/proc" or path.startswith("/proc/") or path == "/dev" or path.startswith("/dev/"):
             raise SandboxError("runtime paths must not be under /proc or /dev")
         out += ["--bind", path, path]
-    for path in _paths("WORKER_SANDBOX_EXTRA_RO"):
+    for path in [*(_path(p) for p in readonly_paths), *_paths("WORKER_SANDBOX_EXTRA_RO")]:
         out += ["--ro-bind", path, path]
+    if ssh_config:
+        for source, target in _mcp_files(ssh_config):
+            out += ["--ro-bind", source, target]
     # Mount these AFTER any configured bind so EXTRA_RO cannot restore host /proc.
     out += ["--dev", "/dev", "--proc", "/proc"]
     hidden = [os.path.expanduser("~/.git-credentials"), os.path.expanduser("~/.config/eph-broker"),

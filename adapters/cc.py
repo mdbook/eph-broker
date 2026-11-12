@@ -690,7 +690,48 @@ def scrub_worker_env(base, route_env=None, backend_env=None, mcp_dir=None, passt
     return env
 
 
-def _worker_ssh(env, base, worker):
+def _worker_mcp_granted(route, explicit_only=False):
+    """Use the enforced grant; explicit_only excludes recall and classifier-judged Bash."""
+    capability = getattr(route, "capability", "read")
+    grant = capability_tool_grant(capability)
+    site_capability = getattr(route, "site_capability", "")
+    if site_capability:
+        grant = _with_site_rules(grant, capability, site_capability)
+    allowed = grant[grant.index("--allowedTools") + 1] if "--allowedTools" in grant else ""
+    denied = grant[grant.index("--disallowedTools") + 1] if "--disallowedTools" in grant else ""
+    wrappers = ("Bash(mcp-ro.sh:*)", "Bash(mcp-rw.sh:*)", "Bash(mcp.sh:*)")
+    if any(rule in allowed and rule not in denied for rule in wrappers):
+        return True
+    if explicit_only:
+        return False
+    if _HS_RECALL and _HS_RECALL in allowed:
+        return True
+    return ("auto" in grant and "Bash" not in denied.split()
+            and "Bash(mcp-ro.sh:*)" not in denied)
+
+
+def _worker_ssh_control_dir():
+    """Private multiplexing state, independent of TMPDIR and Unix socket path limits."""
+    directory = None
+    try:
+        parent = os.path.expanduser(os.getenv("WORKER_MCP_SSH_CONTROL_BASE", "/tmp"))
+        if not os.path.isabs(parent):
+            raise ValueError("control base must be absolute")
+        directory = tempfile.mkdtemp(prefix="eph-ssh-", dir=os.path.realpath(parent))
+        os.chmod(directory, 0o700)
+        # %C expands to 40 hex bytes. Use the smaller common sun_path capacity (104),
+        # including NUL, and reserve OpenSSH's temporary '.<16 hex>' listener suffix.
+        if len(os.fsencode(directory)) + 1 + 40 + 17 >= 104:
+            raise ValueError("expanded control socket path is too long")
+        return directory
+    except (OSError, ValueError):
+        if directory:
+            shutil.rmtree(directory, ignore_errors=True)
+        log.warning("MCP SSH control directory unavailable or too long; disabling multiplexing")
+        return None
+
+
+def _worker_ssh(env, base, worker, mcp_granted=False):
     """Own the SSH configuration choice, not just the broker's accidental PATH (ticket 2268).
 
     OpenSSH's implicit system config can fail ownership checks in a uid-mapped sandbox. An explicit
@@ -704,13 +745,26 @@ def _worker_ssh(env, base, worker):
         worker.ssh_tmpdir = tempfile.mkdtemp(prefix="s-", dir=parent)
         weakref.finalize(worker, shutil.rmtree, worker.ssh_tmpdir, ignore_errors=True)
         os.chmod(worker.ssh_tmpdir, 0o700)
-        config = os.path.abspath(os.path.join(base.get("HOME") or os.path.expanduser("~"), ".ssh", "config"))
+        home = base.get("HOME") or os.path.expanduser("~")
+        config = (sandbox.mcp_ssh_config(home) if mcp_granted else
+                  os.path.abspath(os.path.join(home, ".ssh", "config")))
+        options = ""
+        if mcp_granted:
+            # A fresh private directory avoids connecting to the broker's existing
+            # socket across a user namespace. Never make ~/.ssh writable.
+            worker.ssh_control_dir = _worker_ssh_control_dir()
+            worker.ssh_config = config
+            if worker.ssh_control_dir:
+                weakref.finalize(worker, shutil.rmtree, worker.ssh_control_dir, ignore_errors=True)
+                options = " -o " + shlex.quote("ControlPath=" + worker.ssh_control_dir + "/%C")
+            else:
+                options = " -o ControlMaster=no -o ControlPath=none"
         path = os.path.join(worker.ssh_tmpdir, "ssh")
         with open(path, "x", encoding="utf-8") as f:
             f.write("#!/bin/sh\n"
                     f"config={shlex.quote(config)}\n"
                     'if [ ! -f "$config" ]; then config=/dev/null; fi\n'
-                    'exec /usr/bin/ssh -F "$config" "$@"\n')
+                    f'exec /usr/bin/ssh -F "$config"{options} "$@"\n')
         os.chmod(path, 0o700)
     env["PATH"] = worker.ssh_tmpdir + os.pathsep + env["PATH"]
 
@@ -720,7 +774,7 @@ def worker_env(base, route, backend_env=None, worker=None):
     env = scrub_worker_env(base, route_env=route.env, backend_env=backend_env)
     env.update(routing.worker_git_identity(route))
     if worker is not None:
-        _worker_ssh(env, base, worker)
+        _worker_ssh(env, base, worker, mcp_granted=_worker_mcp_granted(route))
     return env
 
 
@@ -1875,6 +1929,8 @@ class Worker:
         self.test_runner = None      # code worker's per-repo runner KEY (routing.resolve_test_runner)
         self.test_tmpdir = None      # private test scratch directory, reused across turns and removed at exit
         self.ssh_tmpdir = None       # shared SSH launcher, independent of the harness's private home
+        self.ssh_control_dir = None  # only MCP-granted workers get a writable multiplexing directory
+        self.ssh_config = None
         self.companions = []         # broker-pinned, read-only source snapshots (never ticket input)
         self.inbox_account = None    # Inbox account resolved at spawn (zulip keys carry no account)
         self.write_grant = None      # Infra live-write grant dict {ticket, bundles, nonce, expires}, if any
@@ -4174,6 +4230,8 @@ class CCAdapter(Adapter):
                 shutil.rmtree(worker.test_tmpdir, ignore_errors=True)
             if getattr(worker, "ssh_tmpdir", None):
                 shutil.rmtree(worker.ssh_tmpdir, ignore_errors=True)
+            if getattr(worker, "ssh_control_dir", None):
+                shutil.rmtree(worker.ssh_control_dir, ignore_errors=True)
             if repo_lock_held:                           # whole-run route: release AFTER teardown
                 repo_lock.release()
             self._dispatch_followup.pop(key, None)
@@ -4698,7 +4756,9 @@ class CCAdapter(Adapter):
         claude_state = [os.path.expanduser(p) for p in ("~/.claude", "~/.claude.json")
                         if os.path.exists(os.path.expanduser(p))]
         launch_argv = sandbox.wrap(argv, worker.worktree, worker.sandbox_gitdir,
-                                   writable_paths=(*claude_state, worker.test_tmpdir, *steer.sandbox_paths(worker.key)))
+                                   writable_paths=(*claude_state, worker.test_tmpdir, *steer.sandbox_paths(worker.key)),
+                                   readonly_paths=(worker.ssh_tmpdir,) if worker.ssh_config else (),
+                                   ssh_config=worker.ssh_config, ssh_control_dir=worker.ssh_control_dir)
         worker.in_turn = True                            # turn-completion signal (liveness consumer)
         worker.turn_started = time.time()                # force-close timing (turn_age)
         worker.hard_killed = False                       # Reset before this turn; set True only below

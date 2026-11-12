@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Sandbox argv contracts and real kernel canaries; no model calls or third-party deps."""
+import errno
 import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -35,7 +37,9 @@ class SandboxTests(unittest.TestCase):
         env = patch.dict(os.environ)
         env.start()
         self.addCleanup(env.stop)
-        for key in ("WORKER_SANDBOX", "WORKER_SANDBOX_EXTRA_RO", "WORKER_SANDBOX_HIDE"):
+        for key in ("WORKER_SANDBOX", "WORKER_SANDBOX_EXTRA_RO", "WORKER_SANDBOX_HIDE",
+                    "WORKER_MCP_SSH_CONFIG", "WORKER_MCP_SSH_FILES", "WORKER_MCP_RESOLVER_FILES",
+                    "WORKER_MCP_SSH_CONTROL_BASE"):
             os.environ.pop(key, None)
         directory = tempfile.TemporaryDirectory(prefix="sandbox-test-")
         self.addCleanup(directory.cleanup)
@@ -94,6 +98,156 @@ class SandboxTests(unittest.TestCase):
         result = sandbox.wrap(["worker"], self.wt, self.git)
         self.assertGreater(result.index(str(target)), max(i for i, v in enumerate(result) if v == str(self.wt)))
         self.assertEqual(result[-5:-2], ["--ro-bind", "/dev/null", str(target)])
+
+    def mcp_files(self):
+        directory = self.home / ".ssh"
+        directory.mkdir()
+        config, key, known, resolver = (directory / "config", directory / "bridge-key",
+                                        directory / "known_hosts", self.root / "resolver")
+        config.write_text("Host bridge-test\n  HostName ssh.example.test\n"
+                          "  ControlMaster auto\n  ControlPath /inaccessible/broker-socket\n")
+        for path in (key, known, resolver):
+            path.touch()                # no credentials needed for an argv contract
+        os.environ["WORKER_MCP_SSH_FILES"] = os.pathsep.join(map(str, (key, known)))
+        os.environ["WORKER_MCP_RESOLVER_FILES"] = str(resolver)
+        return config, key, known, resolver
+
+    def test_mcp_files_are_readonly_and_env_files_are_refused(self):
+        self.fake_bwrap()
+        files = self.mcp_files()
+        control = self.root / "control"
+        control.mkdir()
+        result = sandbox.wrap(["worker"], self.wt, self.git,
+                              ssh_config=str(files[0]), ssh_control_dir=str(control))
+        triples = list(zip(result, result[1:], result[2:]))
+        for path in files:
+            self.assertIn(("--ro-bind", str(path), str(path)), triples)
+            self.assertNotIn(("--bind", str(path), str(path)), triples)
+        self.assertIn(("--bind", str(control), str(control)), triples)
+        self.assertNotIn(("--bind", str(self.home / ".ssh"), str(self.home / ".ssh")), triples)
+        self.assertNotIn("--unshare-net", result)
+        os.environ["WORKER_SANDBOX_HIDE"] = str(files[1])
+        hidden = sandbox.wrap(["worker"], self.wt, self.git,
+                              ssh_config=str(files[0]), ssh_control_dir=str(control))
+        self.assertIn(("--ro-bind", "/dev/null", str(files[1])), list(zip(hidden, hidden[1:], hidden[2:])))
+        self.assertGreater(hidden.index("/dev/null"), hidden.index(str(files[1])))
+        for forbidden in (self.home / ".env", self.home / ".bridge-env", self.home / ".ssh",
+                          Path(site_env.SITE_ENV), Path(site_env.BROKER_CONFIG)):
+            with self.subTest(forbidden=forbidden):
+                os.environ["WORKER_MCP_SSH_FILES"] = str(forbidden)
+                with self.assertRaises(sandbox.SandboxError):
+                    sandbox.wrap(["worker"], self.wt, self.git,
+                                 ssh_config=str(files[0]), ssh_control_dir=str(control))
+        alias = self.home / "identity"
+        alias.symlink_to(self.home / ".bridge-env")
+        os.environ["WORKER_MCP_SSH_FILES"] = str(alias)
+        with self.assertRaises(sandbox.SandboxError):
+            sandbox.wrap(["worker"], self.wt, self.git,
+                         ssh_config=str(files[0]), ssh_control_dir=str(control))
+
+    def test_mcp_grants_get_private_controlpath_and_configurable_files(self):
+        from adapters import cc
+        from routing import Route
+        config, key, known, resolver = self.mcp_files()
+        os.environ["WORKER_MCP_SSH_CONFIG"] = str(config)
+        for capability, granted in (("code", True), ("inbox", True), ("general", True),
+                                    ("inbox-chat", True), ("read", False), ("write", False),
+                                    ("mr-review", False), ("unknown", False)):
+            with self.subTest(capability=capability):
+                worker = cc.Worker("vikunja:task:9251", "run", str(self.wt))
+                route = Route(domain="test", repo=str(self.wt), prompt_class="p", agent="a",
+                              capability=capability)
+                env = cc.worker_env(os.environ, route, worker=worker)
+                self.assertEqual(bool(worker.ssh_control_dir), granted)
+                if not granted:
+                    continue
+                self.addCleanup(shutil.rmtree, worker.ssh_control_dir, True)
+                control = worker.ssh_control_dir
+                self.assertEqual(os.stat(control).st_mode & 0o777, 0o700)
+                result = subprocess.run(["ssh", "-G", "bridge-test"], env=env,
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("hostname ssh.example.test\n", result.stdout)
+                self.assertIn("controlpath " + control + "/", result.stdout)
+                self.assertNotIn("/inaccessible/broker-socket", result.stdout)
+                cc.worker_env(os.environ, route, worker=worker)
+                self.assertEqual(worker.ssh_control_dir, control)
+
+    def test_control_socket_binds_with_long_tmpdir(self):
+        from adapters import cc
+        from routing import Route
+        self.mcp_files()
+        long_tmp = self.root / ("long-tmp-" * 16)
+        long_tmp.mkdir()
+        os.environ["TMPDIR"] = str(long_tmp)
+        # tempfile caches its default; force the long TMPDIR to exercise the regression.
+        with patch.object(tempfile, "tempdir", str(long_tmp)):
+            worker = cc.Worker("vikunja:task:9251", "run", str(self.wt))
+            route = Route(domain="test", repo=str(self.wt), prompt_class="p", agent="a",
+                          capability="code")
+            env = cc.worker_env(os.environ, route, worker=worker)
+        self.assertEqual(Path(worker.ssh_control_dir).parent, Path("/tmp").resolve())
+        self.addCleanup(shutil.rmtree, worker.ssh_control_dir, True)
+        result = subprocess.run(["ssh", "-G", "bridge-test"], env=env,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        path = next(line.split(" ", 1)[1] for line in result.stdout.splitlines()
+                    if line.startswith("controlpath "))
+        self.assertEqual(len(Path(path).name), 40)
+        # Bind the expanded path, not merely ssh -G's printable configuration.
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                listener.bind(path)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                listener.bind(path + "." + "0" * 16)   # OpenSSH's temporary listener name
+        except OSError as exc:
+            if exc.errno != errno.EPERM:
+                raise
+            self.skipTest("host disallows Unix socket binding: " + str(exc))
+
+    def test_control_base_is_configurable_and_private(self):
+        from adapters import cc
+        with tempfile.TemporaryDirectory(prefix="s-", dir="/tmp") as parent:
+            os.environ["WORKER_MCP_SSH_CONTROL_BASE"] = parent
+            directory = cc._worker_ssh_control_dir()
+            self.assertIsNotNone(directory)
+            self.addCleanup(shutil.rmtree, directory, True)
+            self.assertEqual(Path(directory).parent, Path(parent).resolve())
+            self.assertEqual(os.stat(directory).st_mode & 0o777, 0o700)
+
+    def test_invalid_control_base_disables_multiplexing_but_keeps_mcp_files(self):
+        from adapters import cc
+        from routing import Route
+        files = self.mcp_files()
+        long_base = self.root / ("long-base-" * 12)
+        long_base.mkdir()
+        with tempfile.TemporaryDirectory(prefix="s-", dir="/tmp") as short:
+            unicode_base = Path(short) / ("é" * 10)
+            unicode_base.mkdir()
+            for parent in (str(long_base), str(unicode_base), str(self.root / "missing"), "relative"):
+                with self.subTest(parent=parent):
+                    os.environ["WORKER_MCP_SSH_CONTROL_BASE"] = parent
+                    worker = cc.Worker("vikunja:task:9251", "run", str(self.wt))
+                    route = Route(domain="test", repo=str(self.wt), prompt_class="p", agent="a",
+                                  capability="code")
+                    env = cc.worker_env(os.environ, route, worker=worker)
+                    self.assertIsNone(worker.ssh_control_dir)
+                    result = subprocess.run(["ssh", "-G", "bridge-test"], env=env,
+                                            capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("controlmaster false\n", result.stdout)
+                    self.assertNotIn("controlpath ", result.stdout)
+                    with patch.object(sandbox, "check", return_value="/usr/bin/bwrap"):
+                        argv = sandbox.wrap(["worker"], self.wt, self.git,
+                                            readonly_paths=(worker.ssh_tmpdir,),
+                                            ssh_config=worker.ssh_config, ssh_control_dir=worker.ssh_control_dir)
+                    triples = list(zip(argv, argv[1:], argv[2:]))
+                    for path in files:
+                        self.assertIn(("--ro-bind", str(path), str(path)), triples)
+                        self.assertNotIn(("--bind", str(path), str(path)), triples)
+                    self.assertNotIn("--unshare-net", argv)
+                    if Path(parent).is_dir():
+                        self.assertEqual(list(Path(parent).iterdir()), [])
 
     def test_symlinked_site_files_hide_targets_outside_parent(self):
         self.fake_bwrap()
@@ -188,14 +342,19 @@ class SandboxTests(unittest.TestCase):
         from routing import Route
         os.environ["BROKER_STEER_ROOT"] = str(self.root / "steer")
         os.environ["BROKER_STEER_MID_TURN"] = "1"
+        os.environ["CODE_NONCLAUDE_OK"] = "1"     # permit the fake hermes code launch
         real_which = shutil.which
         self.patched(shutil, "which", lambda name, **kw:
                      "/usr/bin/bwrap" if name == "bwrap" else real_which(name, **kw))
-        for harness in ("cc", "hermes", "codex"):
-            with self.subTest(harness=harness):
-                worker = cc.Worker("key", "run", str(self.wt))
+        files = self.mcp_files()
+        for harness, capability, multiplexing in ((h, c, m) for h in ("cc", "hermes", "codex")
+                                                 for c in ("mr-review", "code")
+                                                 for m in ((True, False) if c == "code" else (False,))):
+            with self.subTest(harness=harness, capability=capability, multiplexing=multiplexing):
+                os.environ["WORKER_MCP_SSH_CONTROL_BASE"] = "/tmp" if multiplexing else str(self.root / "missing")
+                worker = cc.Worker(harness + capability + str(multiplexing), "run", str(self.wt))
                 route = Route(domain="test", repo=str(self.wt), prompt_class="p", agent="a",
-                              capability="mr-review", adapter=harness)
+                              capability=capability, adapter=harness)
                 adapter = cc.CCAdapter(router=None, worktree_mgr=None, prompt_loader=None,
                                        envelope_parser=EnvelopeParser(), claude_bin="/bin/true")
                 launches = []
@@ -208,7 +367,7 @@ class SandboxTests(unittest.TestCase):
                 if harness == "cc":
                     turn = lambda: adapter._one_turn(worker, route, "SYS", "P", resume=False)
                 elif harness == "hermes":
-                    home = self.wt / "hermes-home"
+                    home = self.wt / ("hermes-home-" + capability + str(multiplexing))
                     home.mkdir()
                     runner = hermes.HermesHarness.__new__(hermes.HermesHarness)
                     runner.hermes_bin = "/bin/true"
@@ -217,7 +376,7 @@ class SandboxTests(unittest.TestCase):
                     self.patched(hermes, "hermes_provider", lambda _: ("provider", "model", "token", {}))
                     turn = lambda: runner.one_turn(adapter, worker, route, "SYS", "P", None)
                 else:
-                    home = self.wt / "codex-home"
+                    home = self.wt / ("codex-home-" + capability + str(multiplexing))
                     home.mkdir()
                     runner = codex.CodexHarness.__new__(codex.CodexHarness)
                     runner.codex_bin = "/bin/true"
@@ -239,6 +398,26 @@ class SandboxTests(unittest.TestCase):
                 delivery = steer.subject_dir(worker.key)
                 self.assertEqual((delivery, delivery) in binds, harness in ("cc", "codex"))
                 self.assertNotIn((steer.root(), steer.root()), binds)
+                readonly = [(a, b) for flag, a, b in zip(launches[0], launches[0][1:], launches[0][2:])
+                            if flag == "--ro-bind"]
+                self.assertEqual(bool(worker.ssh_control_dir), multiplexing)
+                self.assertNotIn("--unshare-net", launches[0])
+                if capability == "code":
+                    if multiplexing:
+                        self.assertIn((worker.ssh_control_dir,) * 2, binds)
+                    self.assertIn((worker.ssh_tmpdir,) * 2, readonly)
+                    for path in files:
+                        self.assertIn((str(path),) * 2, readonly)
+                    self.assertNotIn((str(self.home / ".ssh"),) * 2, binds)
+                    self.assertNotIn((site_env.SITE_ENV,) * 2, readonly)
+                    if harness == "codex":
+                        config = (home / codex.CONFIG_FILE).read_text()
+                        self.assertIn("network_access = true", config)
+                        if multiplexing:
+                            self.assertIn(worker.ssh_control_dir, config)
+                else:
+                    for path in files:
+                        self.assertNotIn((str(path),) * 2, readonly)
                 if harness in ("cc", "codex"):
                     self.assertTrue(Path(delivery, "inbox").is_dir())
                 self.assertFalse(worker.in_turn)

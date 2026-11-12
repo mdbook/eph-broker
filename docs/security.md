@@ -91,6 +91,18 @@ delivery directory** (inbox and delivery log), created before launch. Neither th
 inboxes nor the events/state directory is made writable. This works with the default private `/tmp` too.
 The common git directory is snapshotted before the first turn, never re-resolved from a worker-edited pointer.
 
+Workers granted MCP bridges (including the recall-only helper and classifier-judged bridge calls) also get
+a private per-run SSH ControlPath directory, reused across warm turns and removed at teardown. The managed
+SSH launcher overrides the host ControlPath so it never connects to the broker's existing multiplexing socket.
+Only that directory is writable, not `~/.ssh` or the launcher directory. The launcher, SSH config, configured
+identity/known-hosts files and resolver files are bound read-only. Set `WORKER_MCP_SSH_CONFIG`,
+`WORKER_MCP_SSH_FILES` and `WORKER_MCP_RESOLVER_FILES` for your installation; no bridge hostname or account
+is built in. List any custom identities, certificates and SSH Include files explicitly, not their directories.
+Env files and broker configuration cannot be added through these binds. Hides still win over every bind.
+Bubblewrap continues to share host networking; Codex's inner sandbox also enables networking and permits
+the private ControlPath directory for these grants. Workers without a bridge grant keep their existing mounts
+and network policy.
+
 `~/.git-credentials`, `~/.config/eph-broker`, `/etc/eph-broker` (the conventional secret env-file directory),
 and the directories containing `BROKER_SITE_ENV` and
 `BROKER_CONFIG` (including their default locations) are hidden. Directories get empty tmpfs mounts; files get

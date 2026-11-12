@@ -47,7 +47,8 @@ class DrainTests:
         C.RECEIVE_WINDOWS.clear()
         # These acceptance tests exercise the configurable strict-FIFO policy. Reviews-first
         # admission and the same durable safety boundaries are covered in test_dispatch_priority.py.
-        self.patchers = [patch.dict(os.environ, {'DISPATCH_PRIORITY': 'fifo', 'ROW_CONCURRENCY': '', 'MENTION_HANDOFF_ENABLED': '0'}), patch.object(C, 'EVENTS_LOG', os.path.join(self.tmp.name, 'synthetic-events.jsonl')), patch.object(C, 'COMPLETED_PATH', ''), patch.object(app, 'SPAWN_SH', '/synthetic/not-executed')]
+        # Workers are stubbed; startup-order checks must not depend on host sandbox tools.
+        self.patchers = [patch.dict(os.environ, {'DISPATCH_PRIORITY': 'fifo', 'ROW_CONCURRENCY': '', 'MENTION_HANDOFF_ENABLED': '0', 'WORKER_SANDBOX': 'off'}), patch.object(C, 'EVENTS_LOG', os.path.join(self.tmp.name, 'synthetic-events.jsonl')), patch.object(C, 'COMPLETED_PATH', ''), patch.object(app, 'SPAWN_SH', '/synthetic/not-executed')]
         for p in self.patchers:
             p.start()
         self.brokers = []

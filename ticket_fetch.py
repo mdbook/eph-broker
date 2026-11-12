@@ -25,9 +25,8 @@ MCP_SH = os.getenv("BROKER_MCP_SH", "")   # from site.env; unset means the fetch
 TOOL_NAME = "vikunja_task_crud"   # confirmed live via `mcp.sh vikunja-bridge tools/call`:
                                   # operation "get" + id returns the rendered ticket text (see fetch_ticket).
 
-# Limitation: the rendered ticket text (title + HTML description) can run long on a ticket with lots of
-# history/related-tasks rendering inline. Cap it so a pathological ticket can't blow up the worker's first
-# prompt; if a real worker ever needs more, raise this rather than adding structured parsing.
+# Cap the rendered ticket text so a pathological description can't blow up the worker's first prompt.
+# Related-task embeds are summarized before this cap; they must not crowd out the ticket's own fields.
 MAX_TICKET_TEXT = 20_000
 
 
@@ -200,6 +199,7 @@ def fetch_ticket(task_id, mcp_sh=MCP_SH):
         # only on the return). Detection before correction: log the mismatch loudly.
         blob_id = _extract_blob_id(text)
         if blob_id == tid:
+            text = _summarize_related_tasks(text)
             log.info("ticket_fetch: fetched task_id=%s via get len=%d", tid, len(text))
             return text[:MAX_TICKET_TEXT]
         log.warning("ticket_fetch: get blob id-mismatch requested task_id=%s but blob id=%r "
@@ -229,6 +229,32 @@ _USERNAME_RE = re.compile(r'"username":\s*"([^"]*)"')
 def _field_starts(text, name):
     """Offsets of every line-anchored `**<name>:**` field line in `text` (case-insensitive). Pure."""
     return [m.start() for m in re.finditer(r'(?im)^\*\*%s:\*\*' % re.escape(name), text)]
+
+
+def _summarize_related_tasks(text):
+    """Keep relation kind + id/title/done, not full embedded tasks, before the prompt cap.
+
+    Only rewrite a unique, complete JSON field AFTER the ticket's own done field, using the same
+    ordering/duplicate guards as ticket_meta. Description lookalikes and malformed/truncated embeds
+    are left untouched so shortening them cannot bypass the fail-closed length check. Pure.
+    """
+    desc, done = _field_starts(text, "description"), _field_starts(text, "done")
+    related = _field_starts(text, "related_tasks")
+    if (len(done) != 1 or len(desc) > 1 or len(related) != 1
+            or (desc and desc[0] > done[0]) or related[0] < done[0]):
+        return text
+    match = re.search(_FIELD_RE.format("related_tasks"), text)
+    try:
+        relations = json.loads(match.group(1))
+    except (ValueError, RecursionError):
+        return text
+    if not isinstance(relations, dict) or any(
+            not isinstance(tasks, list) or any(not isinstance(task, dict) for task in tasks)
+            for tasks in relations.values()):
+        return text
+    summary = {kind: [{key: task[key] for key in ("id", "title", "done") if key in task}
+                      for task in tasks] for kind, tasks in relations.items()}
+    return text[:match.start(1)] + " " + json.dumps(summary, indent=2) + "\n" + text[match.end(1):]
 
 
 def ticket_meta(text):

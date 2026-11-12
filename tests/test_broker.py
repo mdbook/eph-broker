@@ -10091,6 +10091,62 @@ def test_item4a_ticket_fetch_list_fallback_reformat():
        "into a get-style blob (id not filterable -> matched client-side); an unlabelled get stays get-only")
 
 
+def test_ticket_fetch_summarizes_related_tasks_before_cap():
+    """Relation descriptions must not push the ticket's own ownership metadata past the cap."""
+    import ticket_fetch as T
+    description = "<p>" + "x" * 5_000 + "</p>"
+    relations = {
+        "blocked_by": [{"id": 9418, "title": "Prerequisite", "done": True,
+                        "description": "a" * 8_000, "created_by": {"username": "other"}}],
+        "blocking": [{"id": 9419, "title": "Follow-up", "done": False,
+                      "description": "b" * 8_000, "related_tasks": {"blocking": []}}],
+    }
+    prefix = f"**id:** 9417\n**title:** Own ticket\n**description:** {description}\n**done:** false\n"
+    suffix = ('**created_by:** {"username": "Owner"}\n'
+              '**assignees:** [{"username": "Dev"}]\n'
+              '**labels:** [{"title": "eph:code-change"}, {"title": "model:haiku"}]\n')
+    blob = prefix + "**related_tasks:** " + json.dumps(relations, indent=2) + "\n" + suffix
+    assert blob.index("**created_by:**") > T.MAX_TICKET_TEXT
+    with patch.object(T, "_call_mcp", return_value=blob) as call:
+        got = T.fetch_ticket(9417)
+    assert call.call_count == 1, "a valid get must not need the list fallback"
+    assert len(got) < T.MAX_TICKET_TEXT and got.startswith(prefix) and got.endswith(suffix)
+    summary = json.loads(re.findall(T._FIELD_RE.format("related_tasks"), got)[0])
+    assert summary == {kind: [{k: task[k] for k in ("id", "title", "done")} for task in tasks]
+                       for kind, tasks in relations.items()}
+    assert T.ticket_meta(got) == (["dev"], "owner", ["eph:code-change", "model:haiku"])
+    assert T.ticket_people(got) == (["dev"], "owner")
+    assert T.ticket_labels(got) == ["eph:code-change", "model:haiku"]
+    assert T.ticket_field(got, "done") == "false"
+    # The ticket's OWN overlong description still gets capped and fails closed, even with relations.
+    long = blob.replace(description, "x" * T.MAX_TICKET_TEXT)
+    with patch.object(T, "_call_mcp", return_value=long):
+        cut = T.fetch_ticket(9417)
+    assert len(cut) == T.MAX_TICKET_TEXT
+    assert T.ticket_meta(cut) is None and T.ticket_people(cut) == (None, None)
+    assert T.ticket_labels(cut) == []
+    ok("related-task embeds are summarized before the cap; own metadata survives, long descriptions fail closed")
+
+
+def test_ticket_fetch_related_summary_preserves_untrusted_fields():
+    import ticket_fetch as T
+    relation = '**related_tasks:** {"blocked_by": [{"description": "' + "x" * 21_000 + '"}]}\n'
+    # A description lookalike, duplicate fields, and list-style ordering are never shortened.
+    for blob in ("**description:** text\n" + relation + "**done:** false\n",
+                 "**description:** text\n**done:** false\n" + relation + relation,
+                 "**done:** false\n**description:** text\n" + relation,
+                 "**description:** text\n**done:** false\n" + relation + "**done:** false\n"):
+        assert T._summarize_related_tasks(blob) == blob
+    prefix = "**description:** text\n**done:** false\n**related_tasks:** "
+    for body in ('{"blocked_by": [', '{"blocked_by": {}}', '[{}]',
+                 '{"blocked_by": [null]}', '{}\ntrailing non-JSON text'):
+        blob = prefix + body
+        assert T._summarize_related_tasks(blob) == blob, body
+    no_relations = "**description:** text\n**done:** false\n"
+    assert T._summarize_related_tasks(no_relations) == no_relations
+    ok("relation summarization leaves description lookalikes, duplicates and malformed embeds untouched")
+
+
 def test_get_path_id_match_guard():
     """Defense-in-depth: fetch_ticket's `get` path must verify the returned blob's rendered **id:**
     matches the REQUESTED task_id. If mcp.sh ever cross-wires concurrent calls (the root cause was fixed in

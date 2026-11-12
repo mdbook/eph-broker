@@ -126,10 +126,28 @@ def run_hook(tool, ti):
 rec = os.environ.get("FAKE_RECORD")
 if rec:
     cd = "cd " + shlex.quote(os.getcwd()) + " || exit 1; "   # the workdir-bypass fix: every Bash command needs this exact prefix now
+    cfg = open(os.path.join(home, "config.toml")).read()
+    # Apply the generated tool-shell env, not just the fake Codex parent's env.
+    # Values in this table are JSON-compatible TOML strings (Python 3.9 has no tomllib).
+    tool_env = {k: v for k, v in os.environ.items() if k != "CODEX_HOME"}
+    section = ""
+    for line in cfg.splitlines():
+        if line.startswith("["):
+            section = line
+        elif section == "[shell_environment_policy.set]" and " = " in line:
+            key, value = line.split(" = ", 1)
+            tool_env[key] = json.loads(value)
+    # A shell/snapshot may reset PATH after the config was applied. Managed startup
+    # must restore the launcher even in that case, including inside mcp.sh's child.
+    tool_env["PATH"] = os.defpath
+    tool_ssh = subprocess.run(["/bin/bash", "-c", "command -v ssh"], env=tool_env,
+                              capture_output=True, text=True, check=True).stdout.strip()
+    tool_config = subprocess.run(["/bin/bash", "-c", "exec ssh -G eph-ssh-regression"], env=tool_env,
+                                 capture_output=True, text=True, check=True).stdout
     with open(rec, "a") as f:
         f.write(json.dumps({
             "argv": args, "prompt": prompt, "env_keys": sorted(os.environ), "home": home, "cwd": os.getcwd(),
-            "config": open(os.path.join(home, "config.toml")).read(),
+            "config": cfg, "tool_ssh": tool_ssh, "tool_ssh_config": tool_config,
             "instructions": open(os.path.join(home, "eph-instructions.md")).read(),
             "auth_link": os.readlink(os.path.join(home, "auth.json")), "home_names": sorted(os.listdir(home)),
             "pythonpath": os.environ.get("PYTHONPATH"),
@@ -964,7 +982,7 @@ def test_gate_hook_deadline():
 
 def _check_codex_ssh_config(row):
     from dataclasses import replace
-    from ssh_fixture import ssh_home, assert_ssh_config
+    from ssh_fixture import ssh_home, assert_ssh_config, assert_ssh_launcher
     old_umask = os.umask(0o077)
     try:
         with tempfile.TemporaryDirectory(dir=ROOT) as d, _Codex(d):
@@ -980,13 +998,21 @@ def _check_codex_ssh_config(row):
                     assert a._one_turn(w, route, "SYS", "P", resume=resume)
             for r in _records(rec):
                 assert r["ssh"] == os.path.join(w.ssh_tmpdir, "ssh"), r
+                assert r["tool_ssh"] == r["ssh"], r
+                assert "hostname ssh.example.test\n" in r["tool_ssh_config"], r
+                assert "controlpath " + w.ssh_control_dir + "/" in r["tool_ssh_config"], r
+                assert "/.ssh/cm-" not in r["tool_ssh_config"], r
+                assert "network_access = true" in r["config"], r
                 assert r["git_identity"] == R.worker_git_identity(route)
                 for name, value in r["git_identity"].items():
                     assert f"{name} = {X.toml_str(value)}" in r["config"]
                 assert 'allow_login_shell = false' in r["config"]
                 assert 'shell_snapshot = false' in r["config"]
                 assert '[shell_environment_policy.set]\nPATH = ' + X.toml_str(r["path"]) in r["config"]
+                assert 'BASH_ENV = ' + X.toml_str(os.path.join(w.ssh_tmpdir, ".zshenv")) in r["config"]
+                assert 'ZDOTDIR = ' + X.toml_str(w.ssh_tmpdir) in r["config"]
                 assert_ssh_config(env={"PATH": r["path"]})
+                assert_ssh_launcher(CC.worker_env(dict(os.environ, HOME=home), route, worker=w), w.ssh_tmpdir)
     finally:
         os.umask(old_umask)
     ok("Codex shared SSH config: " + row.row_key + ", parent/tool shell, seed and resume")

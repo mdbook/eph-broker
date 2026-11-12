@@ -8,7 +8,11 @@ def ssh_home(root):
     directory = os.path.join(home, ".ssh")
     os.makedirs(directory, mode=0o700)
     with open(os.path.join(directory, "config"), "w") as f:
-        f.write("Host eph-ssh-regression\n  HostName ssh.example.test\n  User regression\n")
+        f.write("Host eph-ssh-regression\n  HostName ssh.example.test\n  User regression\n"
+                "Host *\n  ControlMaster auto\n  ControlPath ~/.ssh/cm-%C\n")
+    # Even non-login zsh reads this. A harness-level PATH setting alone is not enough.
+    with open(os.path.join(home, ".zshenv"), "w") as f:
+        f.write("export PATH=/usr/bin:/bin\n")
     return home
 
 
@@ -22,3 +26,20 @@ def assert_ssh_config(argv=None, env=None):
     assert "stricthostkeychecking ask\n" in r.stdout, r.stdout
     assert "Reading configuration data /etc/ssh/" not in r.stderr, r.stderr
     assert "/etc/ssh/ssh_config.d" not in r.stderr, r.stderr
+
+
+def assert_ssh_launcher(env, directory):
+    """Exercise shell startup, not just the harness parent's PATH lookup (ticket 2522)."""
+    import shutil
+    shells = ["/bin/bash"]
+    zsh = shutil.which("zsh")
+    if zsh:
+        shells.append(zsh)
+    for shell in shells:
+        # Model a harness/snapshot resetting PATH before starting the tool shell.
+        tool_env = dict(env, PATH=os.defpath)
+        r = subprocess.run([shell, "-c", "command -v ssh"], env=tool_env,
+                           capture_output=True, text=True, timeout=10)
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.strip() == os.path.join(directory, "ssh"), (shell, r.stdout)
+        assert_ssh_config([shell, "-c", 'exec ssh "$@"', "sh"], tool_env)

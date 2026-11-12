@@ -312,7 +312,7 @@ def _check_hermes_ssh_config(row):
     from dataclasses import replace
     from unittest.mock import patch
     import routing
-    from ssh_fixture import ssh_home, assert_ssh_config
+    from ssh_fixture import ssh_home, assert_ssh_config, assert_ssh_launcher
     old_umask = os.umask(0o077)
     try:
         with tempfile.TemporaryDirectory(dir=ROOT) as d, _Registry(d):
@@ -326,6 +326,8 @@ def _check_hermes_ssh_config(row):
             with patch.dict(os.environ, {"HOME": home, "PATH": os.defpath, "CODE_NONCLAUDE_OK": "1"}):
                 for resume in (False, True):
                     assert a._one_turn(w, route, "SYS", "P", resume=resume)
+                    env = CC.worker_env(os.environ, route, worker=w)
+                    assert_ssh_launcher(env, w.ssh_tmpdir)
             for r in _records(rec):
                 assert r["ssh"] == os.path.join(w.ssh_tmpdir, "ssh"), r
                 assert r["git_identity"] == routing.worker_git_identity(route)

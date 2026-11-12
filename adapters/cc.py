@@ -766,7 +766,16 @@ def _worker_ssh(env, base, worker, mcp_granted=False):
                     'if [ ! -f "$config" ]; then config=/dev/null; fi\n'
                     f'exec /usr/bin/ssh -F "$config"{options} "$@"\n')
         os.chmod(path, 0o700)
+        # Non-login zsh still reads .zshenv and can replace PATH after the harness
+        # has applied its shell environment. Bash has the analogous BASH_ENV hook.
+        # Use a private, portable init file so bare `ssh` in mcp.sh always finds us.
+        init = os.path.join(worker.ssh_tmpdir, ".zshenv")
+        with open(init, "x", encoding="utf-8") as f:
+            f.write(f'export PATH={shlex.quote(worker.ssh_tmpdir)}"${{PATH:+:$PATH}}"\n')
+        os.chmod(init, 0o600)
     env["PATH"] = worker.ssh_tmpdir + os.pathsep + env["PATH"]
+    env["BASH_ENV"] = os.path.join(worker.ssh_tmpdir, ".zshenv")
+    env["ZDOTDIR"] = worker.ssh_tmpdir
 
 
 def worker_env(base, route, backend_env=None, worker=None):
@@ -1351,7 +1360,7 @@ def _code_portcullis_entries(portcullis, write_grant=False):
 # ADJUDICATES: a benign edit/Bash runs (classifier-allowed) while `git push` is VETOED at the harness layer
 # (permission_denials), so auto is NEITHER block-all NOR fail-open. `claude auto-mode config` shows the
 # effective ruleset (27 environment rules incl a fleet trust block, 17 allow, 70 soft_deny + hard_deny).
-# We therefore grant NO allow-list: an allow-list entry AUTO-APPROVES (bypasses the classifier) under auto, so
+# We therefore grant no broad allow-list: an entry AUTO-APPROVES (bypasses the classifier) under auto, so
 # a broad allow would DEFEAT "classifier is the guardrail". Instead the classifier judges the whole open
 # surface and the deny-floor is the hard override (disallow WINS over any classifier verdict).
 #
@@ -1365,12 +1374,12 @@ def _code_portcullis_entries(portcullis, write_grant=False):
 # write/deploy creds gated only by the classifier. Network is NOT floored; it is classifier-judged like
 # every other command (deliberately loosened: network is how the worker reaches the fleet bridges).
 # ⚠️ Raw `mcp.sh` (a BROAD, write-capable-per-bridge gateway) is HARD-DENIED; the general
-# worker has NO allow-list, so this deny is what actually closes its raw-mcp.sh hole (a classifier "allow"
+# worker has no raw-gateway allow, so this deny closes its raw-mcp.sh hole (a classifier "allow"
 # verdict cannot override an explicit deny). The general worker still reaches memory + read-only bridges via
 # `mcp-ro.sh` (see _MCP_RO above): that is a DIFFERENT command token this deny does not match, and it stays
-# classifier-judged like any other Bash call, deliberately NOT allow-listed here, because an allow-list
-# entry would auto-approve it and bypass the classifier (the general-worker invariant this whole class rests
-# on). The account-connector surface stays contained by --strict-mcp-config + Hindsight-only --mcp-config in
+# explicitly allow-listed: this reviewed read-only wrapper is the sole classifier exception, and lets
+# Codex enable network by the explicit-grant rule (ticket 2522). The account-connector surface stays
+# contained by --strict-mcp-config + Hindsight-only --mcp-config in
 # build_argv (no direct Gmail-send / credentialed connector tools). git-escape vectors (-C / --git-dir reach
 # another repo, bypassing the "git push:*" prefix) + rm-substitutes (dd/shred/truncate) are floored too.
 _GENERAL_DENIED = ["Bash(git push:*)", "Bash(git remote:*)", "Bash(git config:*)", "Bash(git reset:*)",
@@ -1378,7 +1387,7 @@ _GENERAL_DENIED = ["Bash(git push:*)", "Bash(git remote:*)", "Bash(git config:*)
                    "Bash(git -C:*)", "Bash(git --git-dir:*)",   # git-escape: reach ANOTHER repo (evades git push:*)
                    "Bash(rm:*)", "Bash(sudo:*)",
                    "Bash(dd:*)", "Bash(shred:*)", "Bash(truncate:*)",   # rm-substitutes (destructive)
-                   "Bash(mcp.sh:*)",   # Raw broad gateway denied; mcp-ro.sh stays classifier-judged
+                   "Bash(mcp.sh:*)",   # Raw broad gateway denied; only mcp-ro.sh is explicitly allowed
                    ] + _GITDIR_EDIT_DENIED + _MCP_RW + _MCP_ABS_DENIED + [   # live-write wrapper + absolute-path gateway forms
                    # secret-read floor (belt under the user-level rules' refusal + classifier credential rules,
                    # both verified live to block a secret read): deny the Read tool on env/secret files.
@@ -1800,9 +1809,9 @@ def capability_tool_grant(capability, test_runner=None, bypass_classifier=False,
                 "--allowedTools", " ".join(allowed),
                 "--disallowedTools", " ".join(denied)]
     if capability == "general":
-        # general-purpose worker: broad tools adjudicated by the AUTO-CLASSIFIER, NOT an allow-list. NO
-        # --allowedTools (an allow entry auto-approves and bypasses the classifier under auto; verified), so
-        # the classifier judges the whole surface; the deny-floor is the hard override (disallow WINS). See
+        # Broad tools remain classifier-judged, except the reviewed read-only MCP wrapper.
+        # Its explicit allow also enables Codex network without widening auto grants.
+        # The deny-floor is the hard override (disallow WINS). See
         # the _GENERAL_DENIED note above. The worker loads the user-level rules via route.setting_sources="user"
         # (threaded in build_argv) so it self-enforces proportional-security / no-secret / propose-don't-deploy.
         #
@@ -1815,8 +1824,10 @@ def capability_tool_grant(capability, test_runner=None, bypass_classifier=False,
         # keeps auto (the classifier works there). Deny-floor is identical in both arms.
         if bypass_classifier:
             return ["--dangerously-skip-permissions",
+                    "--allowedTools", " ".join(_MCP_RO),
                     "--disallowedTools", " ".join(_GENERAL_DENIED)]
         return ["--permission-mode", "auto",
+                "--allowedTools", " ".join(_MCP_RO),
                 "--disallowedTools", " ".join(_GENERAL_DENIED)]
     if capability == "inbox":
         # Gmail-mutation triage worker. acceptEdits so it can edit the seen-ledger + rules.md within its
@@ -2944,10 +2955,10 @@ class CCAdapter(Adapter):
         # Wiki skills (EPH_WIKI_SKILLS_ENABLED, default OFF). An allow-listed capability does NOT include
         # the Skill tool, so a headless -p worker would be refused it -> append `Skill` to THAT capability's
         # --allowedTools only when the plugin dir is actually passed. The deny-floor is untouched (deny wins);
-        # `general` has no allow-list (classifier-judged) so it just gets the --plugin-dir.
+        # `general` keeps Skill classifier-judged; its only explicit allow is the MCP wrapper.
         plugin_dir = _wiki_skills_plugin_dir()
         if plugin_dir:
-            if "--allowedTools" in grant:
+            if "--allowedTools" in grant and capability != "general":
                 i = grant.index("--allowedTools") + 1
                 grant[i] = grant[i] + " Skill"
             grant += ["--plugin-dir", plugin_dir]
@@ -2969,8 +2980,8 @@ class CCAdapter(Adapter):
         # is per-account, passed IN by the caller (_one_turn), never hard-coded here.
         # inbox = per-account (Gmail+Hindsight); general = a minimal Hindsight-ONLY config. BOTH need
         # --strict-mcp-config for the SAME reason: without it a -p worker inherits the full
-        # account-connector surface (security REJECT 2026-09-15). The general worker has NO --allowedTools
-        # (its Bash is classifier-judged), so strict-mcp-config is the ONLY thing keeping credentialed MCP
+        # account-connector surface (security REJECT 2026-09-15). The general worker has broad tools
+        # (only mcp-ro.sh bypasses the classifier), so strict-mcp-config keeps credentialed MCP
         # tools (the write-capable connectors) out of its callable surface, hence fail-closed here, no ambient fallback.
         # The general config file is non-secret (unauthenticated Hindsight) and is authored/placed by
         # hand at deploy (same as the inbox config, which is hand-authored); the repo only points and gates.
@@ -4757,7 +4768,7 @@ class CCAdapter(Adapter):
                         if os.path.exists(os.path.expanduser(p))]
         launch_argv = sandbox.wrap(argv, worker.worktree, worker.sandbox_gitdir,
                                    writable_paths=(*claude_state, worker.test_tmpdir, *steer.sandbox_paths(worker.key)),
-                                   readonly_paths=(worker.ssh_tmpdir,) if worker.ssh_config else (),
+                                   readonly_paths=(worker.ssh_tmpdir,),
                                    ssh_config=worker.ssh_config, ssh_control_dir=worker.ssh_control_dir)
         worker.in_turn = True                            # turn-completion signal (liveness consumer)
         worker.turn_started = time.time()                # force-close timing (turn_age)

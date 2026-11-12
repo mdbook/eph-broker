@@ -109,7 +109,7 @@ def _route(model="claude-sonnet-5"):
 # =====================================================================================
 def _check_cc_ssh_config(row):
     from dataclasses import replace
-    from ssh_fixture import ssh_home
+    from ssh_fixture import ssh_home, assert_ssh_launcher
     old_umask = os.umask(0o077)
     try:
         with tempfile.TemporaryDirectory(dir=ROOT) as d:
@@ -137,6 +137,8 @@ def _check_cc_ssh_config(row):
             with patch.dict(os.environ, {"HOME": home, "PATH": os.defpath}):
                 for resume in (False, True):
                     assert a._one_turn(w, route, "SYS", "P", resume=resume)
+                    env = cc.worker_env(os.environ, route, worker=w)
+                    assert_ssh_launcher(env, w.ssh_tmpdir)
     finally:
         os.umask(old_umask)
     ok("CC shared SSH config: " + row.row_key + ", seed and resume")
@@ -282,6 +284,7 @@ def test_worker_ssh_missing_config_and_cleanup():
             directory = w.ssh_tmpdir
             assert stat.S_IMODE(os.stat(directory).st_mode) == 0o700
             assert stat.S_IMODE(os.stat(os.path.join(directory, "ssh")).st_mode) == 0o700
+            assert stat.S_IMODE(os.stat(os.path.join(directory, ".zshenv")).st_mode) == 0o600
             assert "GITLAB_MR_TOKEN" not in env
             r = subprocess.run(["ssh", "-vvv", "-G", "ssh.example.test"], env=env,
                                capture_output=True, text=True, timeout=10)
@@ -6820,7 +6823,8 @@ def test_build_argv_wiki_skills_plugin_dir_env_gated():
         with open(cfgp, "w") as f:
             f.write("{}")
         argv = a.build_argv("P", "m", "SYS", capability="general", mcp_config_path=cfgp)
-        assert argv[argv.index("--plugin-dir") + 1] == d and "--allowedTools" not in argv
+        assert argv[argv.index("--plugin-dir") + 1] == d
+        assert argv[argv.index("--allowedTools") + 1] == "Bash(mcp-ro.sh:*)", argv
     env.stop()
     ok("wiki-skills --plugin-dir + Skill allow are env-gated (default off, missing dir -> no-op), "
        "deny-floor and charter-blind --setting-sources unchanged")
@@ -8547,7 +8551,7 @@ def test_mr_review_prompt_signed_and_loads():
 
 
 # General-purpose ephemeral worker: the FIRST class whose posture is the
-# INVERSE of the narrow workers - broad tools judged by the auto-classifier (NO allow-list) + a hard
+# INVERSE of the narrow workers - broad tools judged by the auto-classifier (except mcp-ro.sh) + a hard
 # deny-FLOOR + the user-level rules loaded via setting-sources="user" + cred-free broker-only feature-branch MR
 # + a spawn-time repo allowlist. These prove the guardrail is the floor + classifier (not tool-narrowing),
 # that the floor's contents are exactly the never-do set (network DELIBERATELY left to the classifier),
@@ -8562,17 +8566,15 @@ def _general_grant():
     return capability_tool_grant("general")
 
 
-def test_general_capability_grants_auto_floor_and_no_allowlist():
-    """capability=general -> --permission-mode auto + the deny-FLOOR, and CRUCIALLY no --allowedTools:
-    an allow entry auto-approves + bypasses the classifier under auto, so granting one would defeat
-    'the classifier is the guardrail'. The classifier judges the whole open surface; the floor overrides."""
+def test_general_capability_grants_auto_floor_and_mcpro_only():
+    """Only the reviewed MCP wrapper bypasses the classifier; the deny-floor stays intact."""
     g = _general_grant()
     assert "--permission-mode" in g and g[g.index("--permission-mode") + 1] == "auto", g
-    assert "--allowedTools" not in g, "general must grant NO allow-list (would bypass the classifier under auto)"
+    assert g[g.index("--allowedTools") + 1].split() == ["Bash(mcp-ro.sh:*)"], g
     assert "--disallowedTools" in g, "general must still carry the hard deny-floor"
     disallowed = g[g.index("--disallowedTools") + 1]
     assert "Bash(git push:*)" in disallowed and "Bash(sudo:*)" in disallowed, disallowed
-    ok("general: capability=general -> --permission-mode auto + deny-floor, NO allow-list (classifier judges all)")
+    ok("general: auto + deny-floor, with only the explicit read-only MCP wrapper allow")
 
 
 def test_general_deny_floor_contents_incl_escapes_not_network():
@@ -8590,7 +8592,7 @@ def test_general_deny_floor_contents_incl_escapes_not_network():
         assert verb in floor, ("missing never-do floor entry", verb)
     # network is DELIBERATELY NOT floored; it is classifier-judged (a deliberate loosening). This
     # PINS that so a re-add is caught. Distinct from raw mcp.sh, which IS floored above:
-    # the general worker still reaches read-only bridges/memory via the classifier-judged mcp-ro.sh wrapper.
+    # the general worker still reaches read-only bridges/memory via the explicitly allowed mcp-ro.sh wrapper.
     for net in ("Bash(curl:*)", "Bash(wget:*)", "Bash(ssh:*)", "WebFetch", "WebSearch"):
         assert net not in floor, ("network must NOT be floored (loosening); if re-added, re-surface", net)
     for secret in ("Read(//**/*-env)", "Read(//**/.*-env)", "Read(//**/.*-*-env)", "Read(//**/.pii-store)", "Read(//**/.pii-store/**)"):
@@ -8599,23 +8601,20 @@ def test_general_deny_floor_contents_incl_escapes_not_network():
        "(network NOT floored)")
 
 
-def test_general_capability_denies_raw_mcp_no_mcpro_allowlist():
-    """General-worker half: raw `mcp.sh` is hard-denied (closes the raw-gateway hole for the
-    ONE class with no allow-list at all; a classifier 'allow' verdict cannot override this), and CRITICALLY
-    no `--allowedTools`/`_MCP_RO` entry is added for general: an allow-list entry would auto-approve under
-    `--permission-mode auto` and bypass the classifier, which is the general-worker invariant this whole
-    class rests on. The worker still reaches mcp-ro.sh itself (classifier-judged, allowed case-by-case);
-    that's enforced by absence from the deny-floor, not presence in an allow-list that doesn't exist."""
-    g = capability_tool_grant("general")
-    assert "--allowedTools" not in g, "general must carry NO allow-list at all (would bypass the classifier)"
-    disallowed = g[g.index("--disallowedTools") + 1]
-    assert "Bash(mcp.sh:*)" in disallowed, disallowed
-    assert "Bash(mcp-ro.sh:*)" not in disallowed, "mcp-ro.sh must stay classifier-judged, not hard-denied"
-    ok("general -> raw mcp.sh denied, no mcp-ro.sh allow-list entry (classifier still judges it)")
+def test_general_capability_denies_raw_mcp_allows_mcpro():
+    """Both native and bypass backends explicitly allow only the read-only wrapper."""
+    for bypass in (False, True):
+        g = capability_tool_grant("general", bypass_classifier=bypass)
+        assert g[g.index("--allowedTools") + 1].split() == ["Bash(mcp-ro.sh:*)"], g
+        disallowed = g[g.index("--disallowedTools") + 1]
+        assert "Bash(mcp.sh:*)" in disallowed, disallowed
+        assert "Bash(mcp-rw.sh:*)" in disallowed, disallowed
+        assert "Bash(mcp-ro.sh:*)" not in disallowed, disallowed
+    ok("general -> raw/live-write MCP denied, explicit mcp-ro.sh only on native and bypass backends")
 
 
 def test_general_capability_requires_strict_mcp_config_fail_closed():
-    """THE v1-REJECT FIX: a general worker has NO --allowedTools, so --strict-mcp-config + a minimal
+    """THE v1-REJECT FIX: a general worker has broad tools, so --strict-mcp-config + a minimal
     Hindsight-only --mcp-config is the ONLY thing keeping the full ambient account-connector
     tool surface (many of them write-capable) out of its callable tools. build_argv MUST add both when given a config,
     and MUST fail closed (never spawn with the ambient surface) when the config is absent/missing."""
@@ -8626,7 +8625,7 @@ def test_general_capability_requires_strict_mcp_config_fail_closed():
         argv = a.build_argv("P", "m", "SYS", capability="general", mcp_config_path=cfg, setting_sources="user")
         assert "--strict-mcp-config" in argv, "general MUST run --strict-mcp-config (ambient-MCP containment)"
         assert argv[argv.index("--mcp-config") + 1] == cfg, argv
-        assert "--allowedTools" not in argv, "general has NO allow-list -> strict-mcp-config is load-bearing"
+        assert argv[argv.index("--allowedTools") + 1] == "Bash(mcp-ro.sh:*)", argv
     finally:
         os.unlink(cfg)
     # FAIL-CLOSED: absent/None/missing config -> refuse to spawn (never fall back to the ambient surface)

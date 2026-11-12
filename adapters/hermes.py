@@ -52,7 +52,7 @@ hermes unchanged, plus hard denies of its own (worktree confinement, git file-re
                   venv runner: <worktree>/src reaches PYTHONPATH of the terminal shell only (an init file in
                   terminal.shell_init_files), never the hermes process (see TERMINAL_ENV_FILE).
     general    -> `-t file,terminal` under eph-gate + the configured exec gate. CC's general has no
-                  allow-list (auto classifier + deny floor), and a prefix deny-floor alone is not enforceable, so
+                  broad allow-list (auto classifier + deny floor, except mcp-ro.sh), and a prefix floor alone is not enforceable, so
                   eph-gate runs its floors FIRST (secret floor, worktree-confined edits, no .git writes, imported
                   _GENERAL_DENIED on any segment the lexer can split) and then every terminal / write_file / patch
                   needs an allow from the exec gate EXEC_GATE selects (hermes_gate/providers/; unset = deny). No web
@@ -456,8 +456,8 @@ def gate_policy(capability, cwd, test_runner=None, test_repo=None, nonce=None):
     except ValueError as e:
         raise HermesRefused(f"hermes adapter: gate misconfigured ({e}), refusing the turn (fail-closed)")
     if general:
-        # CC's general grant is `--permission-mode auto` plus a deny list and NO allow list (the
-        # classifier decides). Here: reads/searches are the gate's own (repo-confined + secret floor + the imported
+        # CC's general grant is auto + a deny floor, with only mcp-ro.sh explicitly allowed.
+        # Here: reads/searches are the gate's own (repo-confined + secret floor + the imported
         # Read denies), edits stay inside the worktree, and every terminal / write_file / patch ALSO needs a
         # exec-gate allow (policy.judge). read_root stays the repo: CC general reads outside it (14/29 reads in
         # the 10-16 inventory) are a known narrowing, widened only on evidence.
@@ -906,7 +906,7 @@ class HermesHarness:
         _cc.record_launch(worker, model, backend, "hermes")   # dash Worker view: the model this process gets
         argv = _cc.sandbox.wrap(argv, worker.worktree, worker.sandbox_gitdir,
                                 writable_paths=(home, worker.test_tmpdir),
-                                readonly_paths=(worker.ssh_tmpdir,) if worker.ssh_config else (),
+                                readonly_paths=(worker.ssh_tmpdir,),
                                 ssh_config=worker.ssh_config, ssh_control_dir=worker.ssh_control_dir)
         worker.in_turn = True
         worker.turn_started = time.time()

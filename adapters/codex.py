@@ -302,7 +302,7 @@ def git_writable_roots(cwd):
 
 
 def codex_config(model, effort, sandbox, instructions_path, network=False, writable_roots=(), shell_path=None,
-                 companion_env=None, git_identity=None):
+                 companion_env=None, git_identity=None, shell_init_dir=None):
     """The private config.toml for one turn (no secrets). Hook trust is appended by the gate install.
     `writable_roots` (workspace-write only): extra absolute dirs, in practice the worktree's git dirs."""
     lines = ["# written by eph-broker adapters/codex.py before every turn; edits are lost",
@@ -340,11 +340,14 @@ def codex_config(model, effort, sandbox, instructions_path, network=False, writa
     lines += ["", "[shell_environment_policy]", 'exclude = ["CODEX_HOME"]']
     # Pin the shared launcher's PATH in tool shells, not just the codex parent. Login profiles and
     # shell snapshots must not substitute /usr/bin/ssh for the managed SSH launcher (ticket 2104).
-    if shell_path is not None or companion_env:
+    if shell_path is not None or companion_env or shell_init_dir:
         lines += ["", "[shell_environment_policy.set]"]
         if shell_path is not None:
             lines.append(f"PATH = {toml_str(shell_path)}")
             lines += [f"{k} = {toml_str(v)}" for k, v in (git_identity or {}).items()]
+        if shell_init_dir:
+            lines += [f"BASH_ENV = {toml_str(os.path.join(shell_init_dir, '.zshenv'))}",
+                      f"ZDOTDIR = {toml_str(shell_init_dir)}"]
         lines += [f"{k} = {toml_str(v)}" for k, v in (companion_env or {}).items()]
     return "\n".join(lines) + "\n"
 
@@ -1108,7 +1111,8 @@ class CodexHarness:
                                                      ([worker.ssh_control_dir] if worker.ssh_control_dir else []))
                                      if sandbox == "workspace-write" else (),
                                      shell_path=env["PATH"], companion_env=_cc.repo_companions.environment(worker),
-                                     git_identity=_cc.routing.worker_git_identity(route)))
+                                     git_identity=_cc.routing.worker_git_identity(route),
+                                     shell_init_dir=worker.ssh_tmpdir))
         self._install_gate(home, policy, env, cwd,         # CodexRefused unless the hook is proven live
                            steer.hook_command(worker.key) if steer.enabled() else None)
         argv = build_argv(self.codex_bin, model, sandbox, resume_session)
@@ -1118,7 +1122,7 @@ class CodexHarness:
         _cc.record_launch(worker, model, backend, "codex")   # dash Worker view: the model this process gets
         argv = _cc.sandbox.wrap(argv, worker.worktree, worker.sandbox_gitdir,
                                 writable_paths=(home, worker.test_tmpdir, *steer.sandbox_paths(worker.key)),
-                                readonly_paths=(worker.ssh_tmpdir,) if worker.ssh_config else (),
+                                readonly_paths=(worker.ssh_tmpdir,),
                                 ssh_config=worker.ssh_config, ssh_control_dir=worker.ssh_control_dir)
         worker.in_turn = True
         worker.turn_started = time.time()

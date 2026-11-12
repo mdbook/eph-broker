@@ -498,8 +498,9 @@ names, so a row can be on `codex` while `FLEET_MODEL_SH` answers with a Claude m
 malformed block, or no block at all, refuses the worker. A `codex`-only entry isn't usable by `cc` or hermes.
 
 What each capability gets: `mr-review` runs in Codex's read-only sandbox; `write`, `code` and `general` run in
-the workspace-write sandbox (writes confined to the worktree plus `/tmp` and `$TMPDIR`, network off unless
-`CODEX_SANDBOX_NETWORK=1`).
+the workspace-write sandbox (writes confined to the worktree plus `/tmp` and `$TMPDIR`, network enabled
+by an explicit MCP wrapper allow or `CODEX_SANDBOX_NETWORK=1`). Code and general explicitly allow
+`Bash(mcp-ro.sh:*)`; auto/classifier grants alone still leave network off.
 Approvals are always off (`never`), since nobody could answer one. `code` also needs `CODE_NONCLAUDE_OK=1`, and
 `general` sends every effectful call to the exec gate (`EXEC_GATE`), exactly as on hermes ([hermes.md](hermes.md)).
 Anything else is refused. Codex has no per-turn tool-call cap, so the capability's time limit is the only hard cap.

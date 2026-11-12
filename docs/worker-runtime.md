@@ -95,6 +95,9 @@ The tool shell must preserve that PATH too. Claude Code gets `CLAUDE_BASH_NO_LOG
 explicit shell-environment PATH with login shells and shell snapshots disabled; Hermes restores PATH
 through its managed terminal init file after the login snapshot. These settings are rebuilt on resumed
 turns as well. Hermes' venv-runner PYTHONPATH remains terminal-only.
+All three also use a private shell init file (`BASH_ENV` and `ZDOTDIR/.zshenv`) to put the managed SSH
+launcher first after shell startup. Non-login zsh still reads `.zshenv`, so pinning the environment PATH
+alone does not prevent a user startup file from replacing it.
 
 The regression matrix launches each of the four rows on each harness, on seed and resumed turns,
 without a site shim. Offline `ssh -vvv -G` checks assert that user host settings survive, host-key checking

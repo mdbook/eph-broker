@@ -347,14 +347,16 @@ class SandboxTests(unittest.TestCase):
         self.patched(shutil, "which", lambda name, **kw:
                      "/usr/bin/bwrap" if name == "bwrap" else real_which(name, **kw))
         files = self.mcp_files()
+        mcp = self.root / "mcp.json"
+        mcp.write_text('{"mcpServers": {}}')
         for harness, capability, multiplexing in ((h, c, m) for h in ("cc", "hermes", "codex")
-                                                 for c in ("mr-review", "code")
-                                                 for m in ((True, False) if c == "code" else (False,))):
+                                                 for c in ("mr-review", "code", "general")
+                                                 for m in ((True, False) if c != "mr-review" else (False,))):
             with self.subTest(harness=harness, capability=capability, multiplexing=multiplexing):
                 os.environ["WORKER_MCP_SSH_CONTROL_BASE"] = "/tmp" if multiplexing else str(self.root / "missing")
                 worker = cc.Worker(harness + capability + str(multiplexing), "run", str(self.wt))
                 route = Route(domain="test", repo=str(self.wt), prompt_class="p", agent="a",
-                              capability=capability, adapter=harness)
+                              capability=capability, adapter=harness, mcp_config_path=str(mcp))
                 adapter = cc.CCAdapter(router=None, worktree_mgr=None, prompt_loader=None,
                                        envelope_parser=EnvelopeParser(), claude_bin="/bin/true")
                 launches = []
@@ -402,10 +404,10 @@ class SandboxTests(unittest.TestCase):
                             if flag == "--ro-bind"]
                 self.assertEqual(bool(worker.ssh_control_dir), multiplexing)
                 self.assertNotIn("--unshare-net", launches[0])
-                if capability == "code":
+                self.assertIn((worker.ssh_tmpdir,) * 2, readonly)
+                if capability != "mr-review":
                     if multiplexing:
                         self.assertIn((worker.ssh_control_dir,) * 2, binds)
-                    self.assertIn((worker.ssh_tmpdir,) * 2, readonly)
                     for path in files:
                         self.assertIn((str(path),) * 2, readonly)
                     self.assertNotIn((str(self.home / ".ssh"),) * 2, binds)

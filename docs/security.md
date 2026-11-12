@@ -134,9 +134,10 @@ use it only for repos whose dependencies you already trust.
 - No user or project Claude Code settings (`--setting-sources ''`). The general worker is the exception and
   loads user-level settings by default (`GENERAL_SETTING_SOURCES=user`).
 - The allowlist and the deny list are passed as `--allowedTools` and `--disallowedTools`.
-- The general worker has no allowlist. On native Claude it runs in Claude Code's `auto` permission mode, where a
-  classifier judges each action, with the deny list on top. On a non-Anthropic backend that classifier doesn't
-  work, so the worker runs with `--dangerously-skip-permissions` and only the deny list. Treat a general worker
+- The general worker explicitly allows only `Bash(mcp-ro.sh:*)`. On native Claude it runs in Claude Code's
+  `auto` permission mode, where a classifier judges other actions, with the deny list on top. On a
+  non-Anthropic backend that classifier doesn't work, so the worker runs with `--dangerously-skip-permissions`
+  and the same grants and deny list. Treat a general worker
   on another backend as having shell access, and see the residual below.
 - The general worker loads only the MCP config named by `GENERAL_MCP_CONFIG` (`--strict-mcp-config`), and
   refuses to start without it.

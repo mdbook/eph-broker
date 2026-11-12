@@ -40,6 +40,7 @@ import tickets                        # ticket ref grammar (ref_from_key, vikunj
 from trackers import Registry         # ticket reads and write-back by ref (docs/trackers.md)
 # The done predicate lives in the Vikunja tracker now; re-exported here, where the tests import it from
 from trackers.gitlab import GitLabTracker   # GitLab issue notes (write-back only; intake is forge.py)
+from trackers.github import GitHubTracker   # native opened-issue intake and issue comments
 from trackers.vikunja import VikunjaTracker, _TICKET_DONE_RE, _ticket_text_is_done   # noqa: F401
 from worktree import CutShaMismatch      # Review worktree could not be cut at the MR head
 import inbox_accounts   # spawn-time fail-closed account gate (inbox_fact_block / UnknownInboxAccount)
@@ -376,11 +377,11 @@ def _gate_denials_html(denials, cap=20):
         len(denials), more, "".join(rows))
 
 
-def _gitlab_issue_ref(worker):
-    """The `gitlab:group/app#7` ref when this worker's subject is a GitLab issue, else None. GitLab issue briefs
-    carry no task_id, so their ticket is the subject key itself."""
+def _forge_issue_ref(worker):
+    """The ref when this worker's subject is a forge issue, else None. Forge issue briefs carry no
+    task_id, so their ticket is the subject key itself."""
     key = getattr(worker, "key", None)
-    return key if tickets.tracker_of(key) == "gitlab" else None
+    return key if tickets.tracker_of(key) in ("gitlab", "github") else None
 
 
 def _ops_ref(key):
@@ -2083,7 +2084,7 @@ class CCAdapter(Adapter):
         self._trackers = Registry([VikunjaTracker(
             post_comment=lambda tid, body, run_id: self._comment_poster(tid, body, run_id),
             fetch_text=lambda tid: self._ticket_fetcher(tid),
-            apply_label=lambda tid: self._label_poster(tid)), GitLabTracker()])
+            apply_label=lambda tid: self._label_poster(tid)), GitLabTracker(), GitHubTracker()])
         # Fleet CD: post-verdict hook on_mr_verdict(mr, env, run_id) (the real one is cd.on_review_verdict,
         # itself a no-op unless CD_ENABLED). None means nothing runs.
         self._on_mr_verdict = on_mr_verdict
@@ -2386,7 +2387,7 @@ class CCAdapter(Adapter):
             return                                        # parse-miss: nothing to post (escalation path
                                                             # already covers this in _turn_with_envelope)
         task_id = brief.get("task_id") if isinstance(brief, dict) else None
-        ref = tickets.vikunja_ref(task_id) or _gitlab_issue_ref(worker)
+        ref = tickets.vikunja_ref(task_id) or _forge_issue_ref(worker)
         if worker is not None and env.get("summary"):
             worker.last_summary = env["summary"]           # the MR description quotes the latest one
         if ref is None:

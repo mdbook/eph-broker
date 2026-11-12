@@ -192,15 +192,20 @@ def test_non_vikunja_ref_writes_nothing():
     calls = []
     a = _adapter(comment_poster=lambda *x: calls.append(x), label_poster=lambda *x: calls.append(x),
                  ticket_fetcher=lambda *x: calls.append(x))
-    for ref in (None, "github:o/r#45"):
+    for ref in (None, "mr:g/a!3"):
         assert a._tracker_comment(ref, "<p>x</p>", "r") is False and a._tracker_label(ref, "parked") is False
         assert a._tracker_fetch(ref) is None and a._ticket_link(ref) == "" and a.tracker(ref) is None
+    # GitHub now has its own tracker; it must never reach the injected Vikunja sinks.
+    a.tracker("github:o/r#45").comment = lambda *args: False
+    assert a._tracker_comment("github:o/r#45", "<p>x</p>", "r") is False
+    assert a._tracker_fetch("github:o/r#45") is None
+    assert a._ticket_link("github:o/r#45") == " ticket https://github.com/o/r/issues/45"
     a._post_ticket_note("github:o/r#45", "<p>x</p>", "r", parked=True)
     a._post_ticket_note("zulip:bot:9", "<p>x</p>", "r", parked=True)
     assert calls == []
     a._ticket_fetcher = lambda tid: calls.append(tid) or "late"          # swapped after construction
     assert a._tracker_fetch("vikunja:task:5").text == "late" and calls == [5]
-    ok("a None or non-Vikunja ref makes no call; the adapter's sinks are late-bound (swap after construction works)")
+    ok("non-Vikunja refs never reach Vikunja sinks; those sinks stay late-bound (swap after construction works)")
 
 
 class _Resp:

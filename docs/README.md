@@ -7,6 +7,8 @@ how it works first.
 
 - [docker.md](docker.md): the local Docker preview, state, security limits and worker-image release work.
 - [first-merge-request.md](first-merge-request.md): the manual GitLab setup and optional Vikunja integration.
+- [github-issues.md](github-issues.md): native signed GitHub opened-issue intake and summary comments,
+  setup, limits and the tracker adapter inventory.
 - [install.md](install.md): requirements, running from source, the RPM and systemd unit, and wiring webhooks.
 - [tracker-script.md](tracker-script.md): the script you write so the broker can read tracker tickets and
   post comments (`BROKER_MCP_SH`), and the events your tap sends.
@@ -64,7 +66,8 @@ how it works first.
 
 ## Design notes
 
-- [trackers.md](trackers.md): the plan for native tracker adapters (GitHub Issues first). Ticket refs and the Vikunja adapter are built; the other trackers are not.
+- [trackers.md](trackers.md): the native tracker design and remaining migration. Ticket refs, Vikunja's wrapper,
+  GitLab issues and a first GitHub Issues increment are built; PRs and Jira remain planned.
   These are about where tickets come from, not the harness a worker runs on.
 
 ## FAQ

@@ -271,8 +271,11 @@ The broker validates the file when the route loads and again on every spawn, and
 
 ## GitHub issues
 
-There's no GitHub endpoint and no GitHub tap ships. A GitHub issue can start the code worker only through a tap
-you write that sends a signed `POST /event` like this one:
+[Native GitHub opened-issue intake](github-issues.md) uses `/webhooks/github`, with HMAC-SHA256 verification
+and summary comments. PRs and comment intake are not supported. Follow that guide for configuration,
+permissions, the shared author allowlist and the GitLab mirror requirement.
+
+An existing tap can still send a signed normalized `POST /event` like this one:
 
 ```json
 {"source": "github", "event_name": "issues.opened", "repo": "owner/app", "issue": 45,
@@ -286,7 +289,7 @@ you write that sends a signed `POST /event` like this one:
 - `repo` and `issue` make the subject (`github:owner/app#45`), and `ISSUE_REPO_MAP` needs a
   `github:owner/app=/srv/git/app` entry for it.
 - The worker works from `title` and `body`. The change comes back as a GitLab merge request, so the local
-  checkout needs a GitLab https origin, and nothing is posted to the GitHub issue.
+  checkout needs a GitLab https origin. With `GITHUB_TOKEN` configured, summaries are posted on the GitHub issue.
 
 ## Notifications
 
@@ -314,6 +317,8 @@ You can rename any of them with the `*_ENV` variable in parentheses.
 |---|---|
 | `BROKER_HMAC_SECRET` (`HMAC_SECRET_ENV`) | Checking `/event` signatures |
 | `GITLAB_WEBHOOK_TOKEN` (`GITLAB_WEBHOOK_TOKEN_ENV`) | Checking `/webhooks/gitlab` calls |
+| `GITHUB_WEBHOOK_SECRET` (`GITHUB_WEBHOOK_SECRET_ENV`) | Checking native `/webhooks/github` HMAC-SHA256 signatures |
+| `GITHUB_TOKEN` (`GITHUB_TOKEN_ENV`) | Posting summary comments; repo-scoped fine-grained PAT with Issues: write |
 | `BROKER_RERUN_TOKEN` (`RERUN_TOKEN_ENV`) | Checking `/rerun` calls |
 | `NOTIFY_WEBHOOK_SECRET` (`NOTIFY_WEBHOOK_SECRET_ENV`) | Signing notification webhooks (optional) |
 | `NOTIFY_SMTP_PASSWORD` (`NOTIFY_SMTP_PASSWORD_ENV`) | Logging in to the SMTP server (optional) |
@@ -599,7 +604,7 @@ wants, so trusting a username header alone isn't enough. Your proxy also sends a
 proves the request came through the proxy's SSO-protected route.
 
 That last part matters. The secret only tells the broker "this came through the proxy", not "this person logged
-in". Webhooks (`/event`, `/webhooks/gitlab`) can't sit behind SSO, so if the same proxy fronts them:
+in". Webhooks (`/event`, `/webhooks/gitlab`, `/webhooks/github`) can't sit behind SSO, so if the same proxy fronts them:
 
 - Add the secret ONLY on the route that runs your SSO check. Never on a route that skips it.
 - On every route that skips SSO, strip the username and groups headers a client might send.

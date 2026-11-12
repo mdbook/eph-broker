@@ -32,6 +32,7 @@ from worktree import WorktreeManager
 from adapters.cc import (CCAdapter, scrub_worker_env, _sweep_stale_inbox_chat_mcp_configs,
                           _sweep_stale_thread_dirs)
 from trackers.vikunja import VikunjaTracker
+from trackers.github import GitHubTracker
 from liveness import LivenessDriver, resolve_progress_timeout
 import poster
 import notify
@@ -1580,6 +1581,8 @@ class Handler(BaseHTTPRequestHandler):
             return modhost.serve(self, BROKER.module_host)
         if path == "/webhooks/gitlab":
             return self._forge_gitlab()
+        if path == "/webhooks/github":
+            return self._forge_github()
         if path == "/drain":
             return self._drain()
         if path == "/forge/gitlab":
@@ -1598,7 +1601,7 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/actions/"):
             return actions.serve(self, BROKER, path[len("/actions/"):])
         if path != "/event":
-            return self._reply(404, {"error": "POST /event, /webhooks/gitlab, /rerun, /reconcile, /drain or "
+            return self._reply(404, {"error": "POST /event, /webhooks/gitlab, /webhooks/github, /rerun, /reconcile, /drain or "
                                               "/catalog/refresh only"})
         raw = self._body()
         if raw is None:
@@ -1714,6 +1717,27 @@ class Handler(BaseHTTPRequestHandler):
         log.info("OPS-CATALOG-REFRESH result=%s repos=%s added=%s removed=%s",
                  "ok" if ok else "FAIL", out.get("repos"), len(out.get("added") or []), len(out.get("removed") or []))
         self._reply(200 if ok else 503, out)
+
+    def _forge_github(self):
+        """Signed GitHub issue webhooks; existing forge author/repo gates still apply."""
+        raw = self._body()
+        if raw is None:
+            return
+        tracker = GitHubTracker()
+        if not tracker.verify(self.headers, raw):
+            return self._reply(401, {"error": "bad or missing X-Hub-Signature-256"})
+        try:
+            payload = json.loads(raw)
+        except (ValueError, TypeError):
+            return self._reply(400, {"error": "bad json"})
+        keys = []
+        for evt in tracker.normalize(self.headers, payload):
+            if forge.author_allowed(evt.get("doer")):
+                keys.append(BROKER.ingest(evt))
+            else:
+                log.info("webhooks/github IGNORE author=%s (not in ISSUE_AUTHOR_ALLOWLIST%s)", evt.get("doer"),
+                         "" if routing.ISSUE_AUTHOR_ALLOWLIST else ", which is empty: issue intake is off")
+        self._reply(200, {"ok": True, "subject_keys": keys})
 
     def _forge_gitlab(self):
         """Raw GitLab Issue Hook, through forge.normalize_gitlab_issue, into BROKER.ingest.

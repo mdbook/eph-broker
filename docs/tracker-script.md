@@ -1,11 +1,11 @@
 # The tracker script (`BROKER_MCP_SH`)
 
-The broker never talks to a ticket tracker's API itself. It runs a script you write, named by `BROKER_MCP_SH`,
+For legacy tracker tickets, the broker runs a script, named by `BROKER_MCP_SH`,
 to read a ticket and to post comments and labels. For Vikunja one ships: set
 `BROKER_MCP_SH=/abs/path/to/eph-broker/tools/mcp.sh` (not `vikunja_bridge.py` directly: the worker deny floor matches the name `mcp.sh`) and put `VIKUNJA_URL` and `VIKUNJA_TOKEN` (an API token) in
 the broker's secrets environment. For another tracker, write your own to the contract below. Without a script,
 no tracker ticket can start a worker: the ticket fetch fails and the spawn is dropped. The GitLab issue path
-doesn't use this script.
+doesn't use this script. Neither does [native GitHub Issues intake](github-issues.md).
 
 The calls are shaped for [Vikunja](https://vikunja.io), because that's the tracker the broker grew up with.
 Until native tracker adapters land ([trackers.md](trackers.md)), a script for another tracker pretends to be

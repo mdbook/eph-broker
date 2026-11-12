@@ -11,16 +11,16 @@ can't change underneath you.
 ## Does it work with GitHub?
 
 Not for pull requests. Pushing branches is plain git, but opening the MR, posting the review note and the
-optional auto-merge all use the GitLab API, and the only forge webhook endpoint is `/webhooks/gitlab`.
+optional auto-merge all use the GitLab API.
 
-GitHub issues can start a code worker, but only through a tap you write that sends `POST /event` with
-`source: "github"` ([configuration.md](configuration.md#github-issues)). The change still comes back as a GitLab
-merge request, so the repo's checkout needs a GitLab origin.
+GitHub opened issues can start a code worker through the signed native `/webhooks/github` endpoint and
+receive summary comments. See [GitHub Issues setup and limits](github-issues.md). Existing normalized
+`POST /event` taps still work. The change comes back as a GitLab MR, so the checkout needs a GitLab origin.
 
 ## Do I need Vikunja?
 
-No, but the tracker glue was written against it, and until native tracker adapters land
-([trackers.md](trackers.md)) another tracker has to pretend to be Vikunja. You need two pieces:
+No: native GitLab and GitHub issue intake need no tracker script. For trackers without a native adapter,
+the legacy glue was written against Vikunja and another tracker has to pretend to be Vikunja. You need two pieces:
 
 - a tap that sends `/event` calls with `source: "vikunja"` and an integer `task_id`, whatever your tracker
   really is;

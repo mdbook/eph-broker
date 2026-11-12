@@ -101,7 +101,7 @@ back to another model. Invalid lists stop broker startup.
 - **Built-in review.** A second agent session reviews each MR. Merging stays manual unless you turn on the optional [auto-merge path](docs/cd-deploy-paths.md).
 - **Burst batching.** Saving a ticket fires several webhooks. The broker waits a few seconds so they become one worker with one brief, and follow-up comments reach the same worker.
 - **Pluggable agents.** Claude Code by default, [hermes-agent](docs/hermes.md) and other CLIs through [adapters](docs/adapters.md), with [custom worker types](docs/routes.md).
-- **Your tracker.** GitLab issues work natively. [Vikunja](https://vikunja.io) and others plug in through a [small script](docs/tracker-script.md) and [n8n](https://n8n.io) workflows ([ready-made](docs/n8n.md)).
+- **Your tracker.** GitLab issues and [GitHub opened issues](docs/github-issues.md) work natively (signed intake and summary comments; no GitHub PR support yet). [Vikunja](https://vikunja.io) and others plug in through a [small script](docs/tracker-script.md) and [n8n](https://n8n.io) workflows ([ready-made](docs/n8n.md)).
 - **Dashboard and events.** Tabbed worker and queue views, a separate Settings page and phone hamburger navigation
   ([dashboard guide](docs/operations.md#health-and-the-dashboard)), plus [signed run events](docs/events.md) for your own automation.
 - **Optional UI modules.** [Add a tab](docs/modules.md#try-it-in-ten-minutes) without embedding another app in the broker.
@@ -116,7 +116,7 @@ Run it isolated, with only the repos and credentials it needs, not your everyday
 
 ## Limits
 
-- Merge requests and native issue webhooks are GitLab only.
+- Merge requests are GitLab only. Native issue webhooks support GitLab and [GitHub opened issues](docs/github-issues.md); there is no GitHub PR support yet.
 - One host runs the broker. Durable maintenance queues use local SQLite; other state is memory and JSON files.
 
 ## Docs
@@ -128,6 +128,7 @@ The full index is [docs/README.md](docs/README.md). Highlights:
 - [Operations](docs/operations.md): logs, `/health`, reloads, re-running a ticket, upgrading.
 - [Agent CLIs](docs/adapters.md) and [prompt architecture](docs/prompts.md).
 - [Maintenance drain](docs/drain.md), [live routing overrides](docs/routing-overrides.md), [test runners and worktrees](docs/worker-runtime.md).
+- [GitHub Issues intake](docs/github-issues.md) and [other trackers](docs/tracker-script.md).
 - [FAQ and costs](docs/faq.md).
 
 ## Contributing

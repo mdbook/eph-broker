@@ -3,12 +3,18 @@
 Status: steps 1 and 2 of the migration plan (ticket refs, the interface and the Vikunja adapter) are built. The
 rest is the plan for letting the broker talk to more ticket trackers without each user writing their own glue.
 
+Incremental implementation note (global ticket 1151): GitLab issue write-back is now built, and the first
+[native GitHub Issues increment](github-issues.md) adds signed `issues.opened` intake and summary comments
+using the existing forge route/settings. That page lists adapter main SHAs and exact setup/limits. The
+configured registry, generic endpoint, GitHub PR workflow and Jira/direct Vikunja intake below remain a
+design, not shipped configuration. GitHub PR payloads are explicitly ignored until the safe review route exists.
+
 ## Why
 
 Today the broker really knows two trackers. Vikunja tickets arrive through a tap at `POST /event` and every
 write goes through one script (`BROKER_MCP_SH`) with Vikunja tool names and integer ids. GitLab issues
-arrive at `POST /webhooks/gitlab`, and the broker only comments on them (`trackers/gitlab.py`). There's also a GitHub issue shape
-in `coalescer.py` and `routing.py` with no way in. Adding a tracker means touching a dozen files, because
+arrive at `POST /webhooks/gitlab`, and the broker only comments on them (`trackers/gitlab.py`). GitHub opened issues arrive at
+`POST /webhooks/github` ([github-issues.md](github-issues.md)). Adding a tracker means touching a dozen files, because
 the ticket id is an `int` almost everywhere.
 
 The fix is one seam: a `Tracker` interface, tickets addressed by a string ref, and a registry of enabled

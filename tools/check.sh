@@ -23,6 +23,7 @@ python3 tests/test_routes.py
 python3 tests/test_routing_overrides.py
 python3 tests/test_tickets.py
 python3 tests/test_trackers.py
+python3 tests/test_github_tracker.py
 python3 tests/test_vikunja_bridge.py
 python3 tests/test_notify.py
 python3 tests/test_events.py

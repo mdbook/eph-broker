@@ -98,6 +98,7 @@ and the dashboard.
 |---|---|---|
 | `POST /event` | Your tracker, as a normalised event: `source`, `event_name`, `task_id`, `doer`, `labels`, `assignees`, ... | `X-Broker-HMAC: <hex sha256 HMAC of the raw body>` keyed by `BROKER_HMAC_SECRET` (a `sha256=` prefix is optional); enforced by default, so every call is refused until the secret is set and your tap signs |
 | `POST /webhooks/gitlab` | A GitLab Issue Hook (`forge.py`); a Pipeline Hook too if `CD_ENABLED` is on (`cd.py`) | `X-Gitlab-Token` must equal `GITLAB_WEBHOOK_TOKEN`; refused while unset |
+| `POST /webhooks/github` | A GitHub `issues` webhook (opened only), JSON content type; see [github-issues.md](github-issues.md) | `X-Hub-Signature-256` HMAC-SHA256 of the raw body keyed by `GITHUB_WEBHOOK_SECRET`; refused while unset |
 | `POST /forge/gitlab` | Deprecated alias for `/webhooks/gitlab`, kept for one release ([operations.md](operations.md#upgrade-notes)) | Same as `/webhooks/gitlab` |
 | `POST /rerun` | You, to re-run a ticket by hand | `X-Broker-Rerun-Token` must equal `BROKER_RERUN_TOKEN`; refused while unset |
 

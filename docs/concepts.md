@@ -12,6 +12,7 @@ Work arrives over HTTP on `127.0.0.1:8787`, at two endpoints.
   `comment`, `comment_id` and, for comments the broker itself posted, a `run_id`. Until native tracker
   adapters land, the tap pretends to be Vikunja whatever your tracker is: `source` is `"vikunja"` and
   `task_id` is an integer. [tracker-script.md](tracker-script.md#events-your-tap-sends) lists every field.
+- `POST /webhooks/github` takes a signed GitHub `issues` webhook (opened only), with the same author allowlist; see [github-issues.md](github-issues.md).
 - `POST /webhooks/gitlab` takes a raw GitLab Issue Hook. `forge.py` turns it into the same kind of event. Only a
   newly opened issue starts work (`ISSUE_TRIGGERING_EVENTS`), and only when its author is listed in
   `ISSUE_AUTHOR_ALLOWLIST`. That list is empty by default, so issue intake is off until you fill it in.

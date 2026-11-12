@@ -260,6 +260,7 @@ JSON config (a directory of your own with every `config/*.json` you use), `BROKE
 
 ### Upgrade notes
 
+- GitHub Issues intake adds `POST /webhooks/github` (off until `GITHUB_WEBHOOK_SECRET` is set). Summary comments use `GITHUB_TOKEN` by default (rename with `GITHUB_TOKEN_ENV`). If a GitHub tap of yours already exports `GITHUB_TOKEN`, the broker will start posting summary comments on those issues after you upgrade; set `GITHUB_TOKEN_ENV` to another name first if you don't want that.
 - The GitLab webhook endpoint is now `POST /webhooks/gitlab`. The old path, `POST /forge/gitlab`, still works
   for one more release and logs a `DEPRECATED POST /forge/gitlab` warning on every call. Point your GitLab
   project webhook (or your forwarder) at the new path before then. The token check and everything after it are

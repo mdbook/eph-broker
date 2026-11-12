@@ -92,6 +92,9 @@ The secrets themselves are in [configuration.md](configuration.md#secrets). Thes
 | `HMAC_SECRET_ENV` | `BROKER_HMAC_SECRET` | Name of the variable holding the `/event` secret. |
 | `BROKER_MAX_BODY` | `1048576` | Largest POST body in bytes; a bigger one gets 413, a bad `Content-Length` gets 400. |
 | `GITLAB_WEBHOOK_TOKEN_ENV` | `GITLAB_WEBHOOK_TOKEN` | Name of the variable holding the GitLab webhook token. |
+| `GITHUB_WEBHOOK_SECRET_ENV` | `GITHUB_WEBHOOK_SECRET` | Name of the HMAC-SHA256 secret for native `/webhooks/github`; unset secret refuses every delivery. |
+| `GITHUB_TOKEN_ENV` | `GITHUB_TOKEN` | Name of the GitHub Issues write token; unset secret skips summary comments. |
+| `GITHUB_BOT_LOGIN` | unset | Extra GitHub echo guard for a normal-user bot account (case-insensitive). GitHub Bot senders are always ignored. See [GitHub Issues](github-issues.md). |
 | `RERUN_TOKEN_ENV` | `BROKER_RERUN_TOKEN` | Name of the variable holding the `/rerun` token. |
 | `GITLAB_MR_TOKEN_ENV` | `GITLAB_MR_TOKEN` | Name of the variable holding the GitLab API token. |
 | `GITLAB_ISSUE_TOKEN_ENV` | `GITLAB_ISSUE_TOKEN` | Name of the variable holding the GitLab issue-comment token (optional). |

@@ -776,7 +776,7 @@ def test_decision_table():
         check = dict(repo, allow=["Bash(tools/check.sh:*)"], test_allow=["Bash(tools/check.sh:*)"])
         for raw, runner in ((repo, "./run-tests.sh"), (check, "tools/check.sh")):
             pol = G.Policy(json.loads(json.dumps(raw)))
-            for assignment in ("PORTCULLIS_PYTHON=tools/python", "PYTHONDONTWRITEBYTECODE=1", "NO_COLOR=1",
+            for assignment in ("PYTHONDONTWRITEBYTECODE=1", "NO_COLOR=1",
                                "CI=1", "CI=", "TERM=xterm", "LANG=C.UTF-8", "LC_ALL=C.UTF-8",
                                "LC_MESSAGES=C", "NO_COLOR=1 CI=1"):
                 v = G.decide("terminal", T(assignment + " " + runner), pol)
@@ -785,7 +785,7 @@ def test_decision_table():
                                "ENV=local", "PERL5OPT=local", "PYTHONSTARTUP=local", "NODE_OPTIONS=local",
                                "LD_PRELOAD=local", "UNKNOWN_TEST_FLAG=1", "CI=1 UNKNOWN_TEST_FLAG=1",
                                "ci=1", "LC_=C", "CI=/etc/passwd", "CI=sec/.db-env",
-                               "PORTCULLIS_PYTHON=lnk_out"):
+                               "PORTCULLIS_PYTHON=lnk_out", "PORTCULLIS_PYTHON=tools/python"):
                 v = G.decide("terminal", T(assignment + " " + runner), pol)
                 assert not v.allowed, (assignment, runner, v)
         for bad in ("SITE_TEST_MODE", None, ["SITE_*"], ["bad-name"], [1]):
@@ -812,6 +812,132 @@ def test_decision_table():
             assert "test_env_allow" in str(e), e
     ok(f"eph-gate: decision table - {na} allow rows + {nd} deny rows over write/code/code(bash-n)/wiki/"
        "mr-review policies built from cc.capability_tool_grant + a broad no-imported-rules policy")
+
+
+def test_portcullis_parser_runners():
+    """Parser evidence uses edited scripts, with only the reviewed venv outside the tree."""
+    f = Fixture()
+    try:
+        os.makedirs(os.path.join(f.wt, "tools"))
+        for path in ("run-tests.sh", "tools/parser_diff.py", "tier0.py", "decider.py"):
+            open(os.path.join(f.wt, path), "w").write("# synthetic runner\n")
+        prefix = "PORTCULLIS_PYTHON=" + G.PORTCULLIS_PYTHON + " "
+        allowed = ["./run-tests.sh", "./run-tests.sh --verbose"]
+        helpers = ["tools/parser_diff.py", "./tools/parser_diff.py --json results.json",
+                   "tier0.py --selftest", "./tier0.py --selftest",
+                   "decider.py --selftest", "./decider.py --selftest --evals"]
+        for python in ("python", "python3", G.PORTCULLIS_PYTHON):
+            for script in helpers:
+                cmd = python + " " + script
+                allowed += [cmd, "PARSER=shfmt " + cmd, "PARSER=bashlex " + cmd]
+        allowed += ["./tools/parser_diff.py", "./tier0.py --selftest",
+                    "./decider.py --selftest --evals"]
+        for cmd in allowed:
+            for wrapped in (cmd, prefix + cmd):
+                v = G.decide("terminal", T(wrapped), f.code_repo)
+                assert v.allowed, (wrapped, v.reason)
+                for other in (f.write, f.code, f.code_bashn, f.mr, f.mr_widened):
+                    assert not G.decide("terminal", T(wrapped), other).allowed, wrapped
+
+        denied = ["python3 -c print", "python3 -m tools.parser_diff",
+                  "python3 -I tools/parser_diff.py", "python3 other.py --selftest",
+                  "python3 tier0.py", "python3 tier0.py --evals",
+                  "python3 decider.py --selftest --other", "tier0.py --selftest",
+                  "python3 ../tier0.py --selftest", "python3 /tmp/tier0.py --selftest",
+                  "python3 " + f.wt + "/tools/parser_diff.py",
+                  "python3 tools/parser_diff.py --output=/tmp/out",
+                  "python3 tools/parser_diff.py --corpus=sec/.db-env",
+                  "python3 tools/parser_diff.py @f.txt",
+                  "python3 tools/parser_diff.py --corpus=lnk_out",
+                  "python3 tools/parser_diff.py --limit 10",
+                  "python3 tools/parser_diff.py --limit=10",
+                  "python3 tier0.py --selftest --limit 10",
+                  "python3 decider.py --selftest --limit=10",
+                  "PARSER=shadow python3 tier0.py --selftest",
+                  "PARSER=shfmt ./run-tests.sh", "PARSER=shfmt git status"]
+        for assignment in ("PORTCULLIS_PYTHON=", "PORTCULLIS_PYTHON=tools/python",
+                           "PORTCULLIS_PYTHON=/usr/bin/python3",
+                           "PORTCULLIS_PYTHON=" + G.PORTCULLIS_PYTHON + "/",
+                           "PORTCULLIS_PYTHON=/opt/portcullis-test/venv/bin/../bin/python",
+                           "LD_PRELOAD=local", "PATH=tools", "OTHER=1"):
+            denied += [assignment + " " + cmd for cmd in
+                       ("./run-tests.sh", "python3 tools/parser_diff.py", "python3 tier0.py --selftest")]
+        for cmd in denied:
+            for wrapped in (cmd, prefix + cmd):
+                assert not G.decide("terminal", T(wrapped), f.code_repo).allowed, wrapped
+        # Imported deny rules still win, including rules against the original env-prefixed form.
+        for rule in ("Bash(python3 tools/parser_diff.py:*)", "Bash(PORTCULLIS_PYTHON=*:*)"):
+            pol = G.Policy(dict(H.gate_policy("code", f.wt, test_runner="repo-test"), deny=[rule]))
+            assert not G.decide("terminal", T(prefix + "python3 tools/parser_diff.py"), pol).allowed
+        # No runner means no new command/env grant, even on a code row.
+        no_runner = G.Policy(H.gate_policy("code", f.wt, test_runner="none"))
+        assert not G.decide("terminal", T(prefix + "python3 tools/parser_diff.py"), no_runner).allowed
+        # Symlink aliases must not turn a relative script word into an outside/secret-file execution.
+        for path, target in (("tools/parser_diff.py", "../lnk_out"),
+                             ("tier0.py", "lnk_secret"), ("run-tests.sh", "lnk_out")):
+            os.unlink(os.path.join(f.wt, path))
+            os.symlink(target, os.path.join(f.wt, path))
+        for cmd in ("python3 tools/parser_diff.py", "./tools/parser_diff.py",
+                    "python3 tier0.py --selftest", "./run-tests.sh"):
+            assert not G.decide("terminal", T(prefix + cmd), f.code_repo).allowed, cmd
+    finally:
+        f.close()
+    ok("eph-gate: portcullis repo-test parser suites and exact venv prefix allowed; other env values, "
+       "capabilities, interpreters/scripts, escaping paths and deny-rule matches remain denied")
+
+
+def test_portcullis_parser_json_write_paths():
+    f = Fixture()
+    try:
+        os.makedirs(os.path.join(f.wt, "tools"))
+        open(os.path.join(f.wt, "tools/parser_diff.py"), "w").write("# synthetic runner\n")
+        os.symlink(".git", os.path.join(f.wt, "git_alias"))
+        os.symlink(".git/config", os.path.join(f.wt, "git_file_alias"))
+        os.symlink("f.txt", os.path.join(f.wt, ".git/output_alias"))
+        unsafe = ["../out.json", os.path.join(f.d, "outside/out.json"), "/dev/null",
+                  ".git/hooks/new-hook", ".git/output_alias", "git_alias/hooks/new-hook",
+                  "git_file_alias", "content/dirlink_out/new.json", "lnk_out", "lnk_secret",
+                  "sec/.db-env"]
+        prefix = "PORTCULLIS_PYTHON=" + G.PORTCULLIS_PYTHON + " PARSER=shfmt "
+        for runner in ("./tools/parser_diff.py", "python tools/parser_diff.py",
+                       "python3 ./tools/parser_diff.py", G.PORTCULLIS_PYTHON + " tools/parser_diff.py"):
+            for env in ("", prefix):
+                for flag in ("--json ", "--json=", "--j ", "--jso="):
+                    for path in ("out.json", "tools/new.json", "lnk_ok", os.path.join(f.wt, "out.json")):
+                        cmd = env + runner + " " + flag + path
+                        v = G.decide("terminal", T(cmd), f.code_repo)
+                        assert v.allowed, (cmd, v)
+                    for path in unsafe:
+                        cmd = env + runner + " " + flag + path
+                        v = G.decide("terminal", T(cmd), f.code_repo)
+                        assert not v.allowed, (cmd, v)
+                for args in ("--json", "--json=", "--json --corpus f.txt",
+                             "--json=.git/hooks/x --json=out.json",
+                             "--json=out.json --json=.git/hooks/x"):
+                    cmd = env + runner + " " + args
+                    assert not G.decide("terminal", T(cmd), f.code_repo).allowed, cmd
+        # A readable output is not necessarily writable. Resolve relative to terminal workdir,
+        # while enforcing the policy's (potentially narrower) write root.
+        pol = G.Policy(dict(H.gate_policy("code", f.wt, test_runner="repo-test"),
+                            write_root=os.path.join(f.wt, "tools")))
+        cmd = "python3 tools/parser_diff.py --json "
+        assert G.decide("terminal", T(cmd + "tools/out.json"), pol).allowed
+        assert not G.decide("terminal", T(cmd + "out.json"), pol).allowed
+        # An allowed ./tools spelling under another workdir uses that directory for the JSON path.
+        os.makedirs(os.path.join(f.wt, "content/tools"))
+        open(os.path.join(f.wt, "content/tools/parser_diff.py"), "w").write("# synthetic runner\n")
+        content = G.Policy(dict(H.gate_policy("code", f.wt, test_runner="repo-test"),
+                                write_root=os.path.join(f.wt, "content")))
+        cmd = "python3 tools/parser_diff.py --json out.json"
+        assert G.decide("terminal", T(cmd, workdir="content"), content).allowed
+        assert not G.decide("terminal", T(cmd), content).allowed
+        cmd = "python3 tools/parser_diff.py --json ../out.json"
+        assert not G.decide("terminal", T(cmd, workdir="content"), pol).allowed
+        assert G.decide("terminal", T(cmd, workdir="content"), f.code_repo).allowed
+    finally:
+        f.close()
+    ok("eph-gate: parser JSON outputs obey write confinement and .git/secret/symlink floors, "
+       "including equals, abbreviated, repeated and env-wrapped options")
 
 
 def test_patch_edit_rule_matches_gate():

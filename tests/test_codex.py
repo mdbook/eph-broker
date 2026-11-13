@@ -382,13 +382,23 @@ def test_gate_mapping_code():
                     "cat $(echo README.md)", "sed -i 1p README.md"):
             assert not _allowed(p, _bash(wt, cmd)), cmd
         repo_runner = _policy("code", wt, test_runner="repo-test")
+        os.makedirs(os.path.join(wt, "tools"))
+        for script in ("run-tests.sh", "tools/parser_diff.py", "tier0.py", "decider.py"):
+            open(os.path.join(wt, script), "w").write("# synthetic runner\n")
         for tool in ("Bash", "exec_command"):
+            for cmd in ("./run-tests.sh", "python3 tools/parser_diff.py",
+                        GATE.PORTCULLIS_PYTHON + " tools/parser_diff.py",
+                        "PARSER=shfmt python3 tier0.py --selftest",
+                        "PARSER=bashlex python3 decider.py --selftest --evals"):
+                assert _allowed(repo_runner, _exec(wt, tool, cmd)), cmd
+                assert _allowed(repo_runner, _exec(wt, tool, "PORTCULLIS_PYTHON=" +
+                                                 GATE.PORTCULLIS_PYTHON + " " + cmd)), cmd
             with _Env(EPH_GATE_TEST_ENV_ALLOW=None):
                 repo = H.gate_policy("code", wt, test_runner="repo-test")
                 check = dict(repo, allow=["Bash(tools/check.sh:*)"], test_allow=["Bash(tools/check.sh:*)"])
                 for raw, runner in ((repo, "./run-tests.sh"), (check, "tools/check.sh")):
                     pol = GATE.Policy(json.loads(json.dumps(raw)))
-                    for assignment in ("PORTCULLIS_PYTHON=tools/python", "PYTHONDONTWRITEBYTECODE=1",
+                    for assignment in ("PYTHONDONTWRITEBYTECODE=1",
                                        "NO_COLOR=1", "CI=1", "CI=", "TERM=xterm", "LANG=C.UTF-8",
                                        "LC_ALL=C.UTF-8", "LC_MESSAGES=C", "NO_COLOR=1 CI=1"):
                         v = G.evaluate(_exec(wt, tool, assignment + " " + runner), pol)[2]
@@ -397,7 +407,7 @@ def test_gate_mapping_code():
                                        "ENV=local", "PERL5OPT=local", "PYTHONSTARTUP=local", "NODE_OPTIONS=local",
                                        "LD_PRELOAD=local", "UNKNOWN_TEST_FLAG=1", "CI=1 UNKNOWN_TEST_FLAG=1",
                                        "ci=1", "LC_=C", "CI=/etc/passwd", "CI=.env",
-                                       "PORTCULLIS_PYTHON=../escape"):
+                                       "PORTCULLIS_PYTHON=../escape", "PORTCULLIS_PYTHON=tools/python"):
                         v = G.evaluate(_exec(wt, tool, assignment + " " + runner), pol)[2]
                         assert not v.allowed, (assignment, runner, v)
             with _Env(EPH_GATE_TEST_ENV_ALLOW=" SITE_TEST_MODE, SITE_TEST_SHARD "):

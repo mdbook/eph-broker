@@ -48,7 +48,8 @@ their file extracted before path checking (colon-bearing addresses/filenames rem
 sed: only `-n '<range>p' <files>` (numeric/$
 print addresses). Test env assignments may wrap only the policy's reviewed runner, with an explicit allow-list
 of benign names (plus site-reviewed additions); the unwrapped command still passes all rules and argument checks.
-pytest: PYTEST_DENY_LONG prefixes and `-o`. bash/sh: only `-n <file>`.
+pytest: PYTEST_DENY_LONG prefixes and `-o`. bash/sh: only `-n <file>`. Parser-diff `--json`
+outputs also pass the write-path floor (including `.git/` and write_root confinement).
 NOT checked: what a program reads from a word the candidate split doesn't model (e.g. an option value in a
 syntax other than `=` / `,` / `:`), and where an allowed program WRITES: it is confined to read_root (the repo),
 not write_root (the cwd), apart from the pytest writers denied above. Those pytest denies are defence in depth
@@ -96,6 +97,8 @@ ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 # Site additions are exact, case-sensitive names, never wildcard patterns. Values remain path-checked.
 TEST_ENV_ALLOW = frozenset({"PORTCULLIS_PYTHON", "PYTHONDONTWRITEBYTECODE", "NO_COLOR", "CI", "TERM", "LANG"})
 TEST_ENV_LOCALE = re.compile(r"LC_[A-Za-z0-9_]+\Z")
+# The root-owned test venv is the sole out-of-tree value exception, never a general path exemption.
+PORTCULLIS_PYTHON = "/opt/portcullis-test/venv/bin/python"
 
 
 def test_env_names(extra):
@@ -812,6 +815,57 @@ def _is_pytest(argv):
     return prog in ("pytest", "py.test") or (prog.startswith("python") and argv[1:3] == ["-m", "pytest"])
 
 
+def _portcullis_test(policy, argv, cwd):
+    """Extra parser suites for code rows with the repo-test runner, not a general Python grant.
+
+    Match script words literally (optionally ./), never absolute paths, interpreter flags or -m/-c.
+    All remaining operands still go through the ordinary argument/secret/deny floors.
+    """
+    if policy.capability != "code" or ("Bash", "./run-tests.sh:*") not in policy.test_allow or not argv:
+        return False
+    script_at = 1 if argv[0] in ("python", "python3", PORTCULLIS_PYTHON) else 0
+    if len(argv) <= script_at:
+        return False
+    script = argv[script_at]
+    if script_at == 0 and "/" not in script:
+        return False                    # bare names execute from PATH, not necessarily the worktree
+    name = script[2:] if script.startswith("./") else script
+    if name == "tools/parser_diff.py":
+        pass
+    elif name in ("tier0.py", "decider.py") and argv[script_at + 1:] in (
+            ["--selftest"], ["--selftest", "--evals"]):
+        pass
+    else:
+        return False
+    real, why = _check_read_path(policy, script, cwd)
+    return why is None and os.path.isfile(real)
+
+
+def _portcullis_parser_hard(policy, argv, cwd):
+    script_at = 1 if argv[0] in ("python", "python3", PORTCULLIS_PYTHON) else 0
+    if argv[script_at].removeprefix("./") != "tools/parser_diff.py":
+        return None
+    args = argv[script_at + 1:]
+    for i, arg in enumerate(args):
+        if arg == "--":
+            break
+        flag, sep, value = arg.partition("=")
+        # --limit was an unverified sample, not part of the reviewed parser/selftest grant.
+        if flag == "--limit":
+            return "parser_diff: --limit is not a reviewed test flag"
+        # argparse accepts unambiguous long-option prefixes too. Check every occurrence, not just
+        # the last one, so repeated options cannot hide an unsafe output target.
+        if flag.startswith("--") and len(flag) > 2 and "--json".startswith(flag):
+            if not sep:
+                value = args[i + 1] if i + 1 < len(args) else ""
+            if not value or value.startswith("-"):
+                return "parser_diff: --json requires an output path"
+            _, why = _check_write_path(policy, os.path.join(cwd, value))
+            if why:
+                return why
+    return None
+
+
 def check_segment(policy, argv, cwd):
     """Return None if the segment is allowed, else a reason."""
     original = argv
@@ -819,23 +873,42 @@ def check_segment(policy, argv, cwd):
     while argv and ENV_ASSIGN.match(argv[0]):
         assignments.append(argv[0])
         argv = argv[1:]
+    parser_test = _portcullis_test(policy, argv, cwd)
     if assignments:
-        if policy.capability != "code" or not argv or not any(
-                t == "Bash" and bash_rule_matches(s, argv, for_allow=True) for t, s in policy.test_allow):
+        if policy.capability != "code" or not argv or not (parser_test or any(
+                t == "Bash" and bash_rule_matches(s, argv, for_allow=True) for t, s in policy.test_allow)):
             return "environment assignments may only prefix the granted test runner"
+        checked_assignments = []
         for a in assignments:
             name = a.split("=", 1)[0]
+            if name == "PORTCULLIS_PYTHON":
+                if a != "PORTCULLIS_PYTHON=" + PORTCULLIS_PYTHON:
+                    return "PORTCULLIS_PYTHON must name the reviewed test venv exactly"
+                if ("Bash", "./run-tests.sh:*") not in policy.test_allow:
+                    return "PORTCULLIS_PYTHON is only granted for repo-test rows"
+                if not parser_test:
+                    _, why = _check_read_path(policy, argv[0], cwd)
+                    if why:
+                        return why
+                continue
+            if parser_test and a in ("PARSER=shfmt", "PARSER=bashlex"):
+                continue
             if name not in policy.test_env_allow and not TEST_ENV_LOCALE.fullmatch(name):
                 return "test environment variable %r is not on the allow-list" % name
-        why = _check_args_paths(policy, ["env"] + assignments, cwd, set())
+            checked_assignments.append(a)
+        why = _check_args_paths(policy, ["env"] + checked_assignments, cwd, set())
         if why:
             return why
     for t, s in policy.deny:
         if t == "Bash" and (bash_rule_matches(s, argv, for_allow=False) or
                             bash_rule_matches(s, original, for_allow=False)):
             return "matches deny rule Bash(%s)" % s if s is not None else "Bash is denied for this capability"
-    if not any(t == "Bash" and bash_rule_matches(s, argv, for_allow=True) for t, s in policy.allow):
+    if not parser_test and not any(t == "Bash" and bash_rule_matches(s, argv, for_allow=True) for t, s in policy.allow):
         return "%r is not on the allow-list" % " ".join(argv)[:200]
+    if parser_test:
+        why = _portcullis_parser_hard(policy, argv, cwd)
+        if why:
+            return why
     skip = set()
     prog = os.path.basename(argv[0])
     if prog == "git":

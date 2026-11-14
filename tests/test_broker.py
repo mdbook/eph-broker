@@ -24790,6 +24790,273 @@ def test_mr_note_publish_iteration_fast_forward_only():
     ok("iteration publish checks ancestry and refuses missing, deleted or moved branches using an exact-tip lease")
 
 
+def _inbox_guardrail_setup(d, **kwargs):
+    pathlib.Path(d, "test.json").write_text('{"mcpServers": {}}')
+    route = Route(domain="inbox", repo=d, prompt_class="triage", agent="mail-agent",
+                  capability="inbox", read_only=False, mcp_config_dir=d, env={}, model="claude-sonnet-5")
+    adapter = CCAdapter(router=None, worktree_mgr=None, prompt_loader=None,
+                        envelope_parser=EnvelopeParser(), **kwargs)
+    return adapter, Worker("gmail:test", "run-9650", d), route
+
+
+def _inbox_stream_result(tokens=10, cost=0.1, **extra):
+    return json.dumps({"type": "result", "session_id": "session-9650", "total_cost_usd": cost,
+                       "usage": {"input_tokens": tokens},
+                       "result": json.dumps({"status": "done", "summary": "complete", "wake": []}),
+                       **extra}) + "\n"
+
+
+def test_inbox_stream_usage_counts_requests_not_context_or_content_blocks():
+    usage = cc._InboxUsage()
+    def record(mid, **tokens):
+        return json.dumps({"type": "assistant", "message": {"id": mid, "usage": tokens}}) + "\n"
+    first = record("a", input_tokens=20, cache_read_input_tokens=30, cache_creation_input_tokens=10,
+                   output_tokens=999)
+    second = record("b", input_tokens=25)
+    assert usage.update(first[:15].encode()) == 0
+    assert usage.update(first.encode()) == 60
+    assert usage.update((first + first + second[:5]).encode()) == 60
+    raw = first + first + second
+    assert usage.update(raw) == 85
+    assert usage.update(raw + _inbox_stream_result(tokens=85), final=True) == 85
+    assert usage.result["session_id"] == "session-9650"
+    assert cc._InboxUsage().update(_inbox_stream_result(tokens=90), final=True) == 90
+    ok("inbox streaming counts all input/cache usage once per request, tolerates partial bytes, not output")
+
+
+def test_inbox_token_ceiling_kills_live_tool_use_and_returns_failure_envelope():
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        fake = _write_fake_claude(d)
+        pathlib.Path(fake).write_text('''#!/usr/bin/env python3
+import json, sys, time
+assert sys.argv[sys.argv.index('--output-format') + 1] == 'stream-json'
+assert '--max-budget-usd' in sys.argv and '--verbose' in sys.argv
+sys.stderr.write('diagnostic' * 20000)
+sys.stderr.flush()
+print(json.dumps({'type': 'assistant', 'message': {'id': 'm1', 'stop_reason': 'tool_use',
+      'usage': {'input_tokens': 30}}}), flush=True)
+sys.stdout.buffer.write(bytes([0xc3]))  # Simulate termination halfway through a UTF-8 character.
+sys.stdout.buffer.flush()
+time.sleep(20)
+''')
+        a, w, r = _inbox_guardrail_setup(d, claude_bin=fake, inbox_max_input_tokens=20)
+        with patch.object(cc, "USAGE_CAP_FALLBACK_ENABLED", False):
+            env = a._turn_with_envelope(w, r, "SYS", "{}", False, w.run_id)
+        assert env["status"] == "blocked" and "input-token ceiling" in env["summary"], env
+        assert "changes may already have occurred" in env["summary"]
+        assert w.done and w.turns == 1 and w.proc.poll() is not None and not w.in_turn
+        assert w.inbox_input_tokens == 30 and env["run_id"] == w.run_id
+    ok("inbox live mid-tool-use input cap drains stderr, kills/reaps, returns blocked with no warm re-prompt")
+
+
+def test_inbox_cumulative_input_and_cost_survive_forward_and_rotation():
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        seen = []
+        class P:
+            returncode = 0
+            def __init__(self, argv, **kwargs): seen.append(argv)
+            def communicate(self, input=None, timeout=None): return _inbox_stream_result(40, 0.6), ""
+        for limit, expected in ((100, "input-token ceiling"), (1000, "cost ceiling")):
+            a, w, r = _inbox_guardrail_setup(d, inbox_max_input_tokens=limit, inbox_max_cost_usd=1.5,
+                                            rotate_turns=1)
+            seen.clear()
+            with patch.object(cc.subprocess, "Popen", P):
+                for n in range(3):
+                    w.forwards = n
+                    env = a._one_turn(w, r, "SYS", "{}", resume=n > 0)
+                    assert env["status"] == ("done" if n < 2 else "blocked"), env
+            assert expected in env["summary"], env
+            assert w.inbox_input_tokens == 120 and abs(w.inbox_cost_usd - 1.8) < 1e-8
+            budgets = [float(argv[argv.index("--max-budget-usd") + 1]) for argv in seen]
+            assert all(abs(x - y) < 1e-8 for x, y in zip(budgets, [1.5, 0.9, 0.3])), budgets
+            assert all("--resume" not in argv for argv in seen), "rotation must not reset the run budget"
+    ok("inbox input/cost ceilings accumulate over rotated forwards; each CLI gets only remaining dollars")
+
+
+def test_inbox_budget_wrapper_and_preflight_cannot_launch_recovery():
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        seen = []
+        class P:
+            returncode = 1
+            def __init__(self, argv, **kwargs): seen.append(argv)
+            def communicate(self, input=None, timeout=None):
+                return _inbox_stream_result(tokens=0, cost=0, result="", subtype="error_max_budget_usd"), ""
+        a, w, r = _inbox_guardrail_setup(d)
+        with patch.object(cc.subprocess, "Popen", P), patch.object(cc, "USAGE_CAP_FALLBACK_ENABLED", False):
+            env = a._turn_with_envelope(w, r, "SYS", "{}", False, w.run_id)
+        assert len(seen) == 1 and env["status"] == "blocked" and "cost ceiling" in env["summary"]
+        a, w, r = _inbox_guardrail_setup(d)
+        w.inbox_input_tokens = a.inbox_max_input_tokens
+        with patch.object(cc.subprocess, "Popen", side_effect=AssertionError("must not launch")):
+            assert a._one_turn(w, r, "SYS", "{}", False)["status"] == "blocked"
+    ok("CC budget error wrapper and exhausted preflight produce failure envelopes without another CLI")
+
+
+def test_inbox_turn_and_time_caps_are_terminal_not_another_full_allotment():
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        seen = []
+        class P:
+            returncode = 1
+            def __init__(self, argv, **kwargs): seen.append(argv)
+            def communicate(self, input=None, timeout=None):
+                return json.dumps({"type": "result", "subtype": "error_max_turns"}), ""
+        a, w, r = _inbox_guardrail_setup(d)
+        with patch.object(cc.subprocess, "Popen", P), patch.object(cc, "USAGE_CAP_FALLBACK_ENABLED", False):
+            env = a._turn_with_envelope(w, r, "SYS", "{}", False, w.run_id)
+        assert len(seen) == 1 and "--max-turns limit" in env["summary"] and w.done
+        fake = _write_fake_claude(d)
+        pathlib.Path(fake).write_text('#!/usr/bin/env python3\nimport time\ntime.sleep(20)\n')
+        a, w, r = _inbox_guardrail_setup(d, claude_bin=fake, wall_clock_by_capability={"inbox": 0.1})
+        with patch.object(cc, "_is_local_backend", return_value=True), \
+                patch.object(cc, "USAGE_CAP_FALLBACK_ENABLED", False):
+            env = a._turn_with_envelope(w, r, "SYS", "{}", False, w.run_id)
+        assert w.hard_killed and w.turn_wall_clock == 0.1 and w.turns == 1
+        assert env["status"] == "blocked" and "wall-clock limit" in env["summary"] and w.done
+    ok("inbox turn/time caps produce terminal blocked envelopes; local time isn't multiplied or re-prompted")
+
+
+def test_inbox_usage_cap_at_run_ceiling_cannot_fall_back():
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        seen = []
+        class P:
+            returncode = 1
+            def __init__(self, argv, **kwargs): seen.append(argv)
+            def communicate(self, input=None, timeout=None):
+                return _inbox_stream_result(tokens=20, cost=0.5,
+                                            result="You've hit your weekly limit."), ""
+        for limits, reason in (({"inbox_max_input_tokens": 20}, "input-token ceiling"),
+                               ({"inbox_max_cost_usd": 0.5}, "cost ceiling")):
+            a, w, r = _inbox_guardrail_setup(d, **limits)
+            seen.clear()
+            with patch.object(cc.subprocess, "Popen", P), \
+                    patch.object(cc, "USAGE_CAP_FALLBACK_ENABLED", True), \
+                    patch.object(a, "_usage_cap_chain", return_value=["", "fallback"]), \
+                    patch.object(cc, "load_backend", return_value=("fallback-model", {}, None)), \
+                    patch.object(a, "_loud_fail_all_backends", side_effect=AssertionError("must not escalate")):
+                env = a._turn_with_envelope(w, r, "SYS", "{}", False, w.run_id)
+                assert cc._detect_usage_cap(w.last_output)
+                assert env["status"] == "blocked" and reason in env["summary"] and w.done
+                assert len(seen) == 1, "terminal run ceiling must beat backend fallback"
+                assert a._one_turn(w, r, "SYS", "{}", True) is None
+                assert len(seen) == 1, "an already-done inbox worker must not launch again"
+    ok("fallback enabled: simultaneous usage cap and run input/cost ceiling returns the blocked envelope once")
+
+
+def test_usage_cap_fallback_respects_envelopes_and_done_workers():
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        for result, done in (({"status": "done", "summary": "complete"}, False),
+                             ({"status": "blocked", "summary": "stopped"}, False),
+                             (None, True)):
+            a, w, r = _inbox_guardrail_setup(d)
+            def turn(worker, *args, **kwargs):
+                worker.last_output = _capped_output()
+                worker.done = done
+                return result
+            with patch.object(cc, "USAGE_CAP_FALLBACK_ENABLED", True), \
+                    patch.object(a, "_usage_cap_chain", return_value=["", "fallback"]), \
+                    patch.object(a, "_one_turn", side_effect=turn) as launch, \
+                    patch.object(a, "_loud_fail_all_backends", side_effect=AssertionError("must not escalate")):
+                assert a._turn_with_envelope(w, r, "SYS", "{}", False, w.run_id) == result
+                assert launch.call_count == 1
+                w.done = True
+                assert a._dispatch_with_fallback(w, r, "SYS", "{}", True, w.run_id) == (None, False)
+                assert launch.call_count == 1
+    ok("a parsed envelope or done worker stops fallback even when output also signals a usage cap")
+
+
+def test_done_worker_preflight_blocks_every_row_and_harness():
+    from dataclasses import replace
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        a, w, r = _inbox_guardrail_setup(d)
+        w.done = True
+        w.turns = a.rotate_turns
+        w.session_id = "retired-session"
+        with patch.object(cc.subprocess, "Popen", side_effect=AssertionError("must not launch")):
+            for capability in ("inbox", "read", "write", "code", "general", "mr-review", "inbox-chat"):
+                for harness in ("cc", "codex", "hermes"):
+                    route = replace(r, capability=capability, adapter=harness)
+                    assert a._one_turn(w, route, "SYS", "{}", True) is None
+        assert w.turns == a.rotate_turns and w.session_id == "retired-session"
+        assert a.codex is None and a.hermes is None
+    ok("done-worker preflight precedes rotation and all row/harness launch paths")
+
+
+def test_inbox_parse_miss_recovery_is_bounded_and_can_still_return_envelope():
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        seen = []
+        class P:
+            returncode = 0
+            def __init__(self, argv, **kwargs): self.argv = argv
+            def communicate(self, input=None, timeout=None):
+                seen.append((self.argv, timeout))
+                return (_inbox_stream_result(result="no JSON") if len(seen) == 1 else _inbox_stream_result()), ""
+        a, w, r = _inbox_guardrail_setup(d)
+        with patch.object(cc.subprocess, "Popen", P), patch.object(cc, "USAGE_CAP_FALLBACK_ENABLED", False):
+            env = a._turn_with_envelope(w, r, "SYS", "{}", False, w.run_id)
+        assert env["status"] == "done" and len(seen) == 2 and not w.done
+        assert seen[1][0][seen[1][0].index("--max-turns") + 1] == "1"
+        assert w.turn_wall_clock == min(600, cc.HARDKILL_REPROMPT_CAP_S)
+        assert w.turns == 1 and w.inbox_input_tokens == 20
+    ok("ordinary inbox parse miss can recover; recovery is one CLI turn with short time cap and charged usage")
+
+
+def test_inbox_guardrails_do_not_change_other_rows_and_are_configurable():
+    a = CCAdapter(router=None, worktree_mgr=None, prompt_loader=None, envelope_parser=EnvelopeParser(),
+                  max_turns=50, wall_clock_s=1800, max_turns_by_capability={"code": 100},
+                  wall_clock_by_capability={"code": 3600})
+    assert a.max_turns_by_capability == {"code": 100, "inbox": 15}
+    assert a.wall_clock_by_capability == {"code": 3600, "inbox": 600}
+    for cap, turns in (("read", 50), ("code", 100), ("inbox-chat", 50)):
+        with tempfile.TemporaryDirectory(dir=ROOT) as d:
+            mcp = pathlib.Path(d, "mcp.json"); mcp.write_text('{"mcpServers": {}}')
+            argv = a.build_argv("{}", "model", "SYS", capability=cap, mcp_config_path=str(mcp))
+        assert argv[argv.index("--max-turns") + 1] == str(turns)
+        assert argv[argv.index("--output-format") + 1] == "json" and "--max-budget-usd" not in argv
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        a, w, r = _inbox_guardrail_setup(d, inbox_max_cost_usd=3.5, inbox_max_input_tokens=1234,
+                                        max_turns_by_capability={"inbox": 7},
+                                        wall_clock_by_capability={"inbox": 25})
+        assert a.inbox_max_cost_usd == 3.5 and a.inbox_max_input_tokens == 1234
+        assert a.max_turns_by_capability["inbox"] == 7 and a.wall_clock_by_capability["inbox"] == 25
+        for options in ({"inbox_max_cost_usd": 0}, {"inbox_max_input_tokens": -1},
+                        {"inbox_max_cost_usd": float("nan")}):
+            try:
+                _inbox_guardrail_setup(d, **options)
+                assert False, options
+            except ValueError:
+                pass
+    ok("inbox-only defaults/overrides and positive ceiling validation; other rows keep their argv and limits")
+
+
+def test_envelope_escalation_once_per_run_concurrent_and_after_reload():
+    from broker_state import BrokerState
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        path = os.path.join(d, "state.sqlite")
+        comments, dms = [], []
+        state = BrokerState(path)
+        try:
+            p = EnvelopeParser(ticket_comment=lambda *args: comments.append(args),
+                               wake_ops=lambda *args, **kwargs: dms.append(args), state_store=state)
+            threads = [threading.Thread(target=p.escalate, args=("run-9650", _route(), "missing"),
+                                        kwargs={"task_id": 9650}) for _ in range(10)]
+            for thread in threads: thread.start()
+            for thread in threads: thread.join()
+            assert len(comments) == len(dms) == 1
+        finally:
+            state.close()
+        state = BrokerState(path)
+        try:
+            p = EnvelopeParser(ticket_comment=lambda *args: comments.append(args),
+                               wake_ops=lambda *args, **kwargs: dms.append(args), state_store=state)
+            p.escalate("run-9650", _route(), "different failure", task_id=9650)
+            assert len(comments) == len(dms) == 1
+            p.escalate("run-9651", _route(), "missing", task_id=9650)
+            assert len(comments) == len(dms) == 2, "same subject's new run may escalate"
+        finally:
+            state.close()
+    ok("envelope escalation reserves run id once across concurrent forwards and durable state reload")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     print(f"running {len(tests)} broker self-tests...")

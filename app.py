@@ -437,7 +437,7 @@ class Broker:
             # poster.post_comment (value-free; mcp.sh owns auth; called only when a task_id is present, and
             # it swallows every failure so a lost comment can never wedge the worker).
             envelope_parser=EnvelopeParser(wake_ops=notify.wake_ops,
-                                           ticket_comment=poster.post_comment),
+                                           ticket_comment=poster.post_comment, state_store=self.state),
             run_registry=self.run_registry,
             semaphore=self.semaphore,
             # pinned_cli plumbing removed: the CLI-version pin is no longer enforced.
@@ -449,6 +449,8 @@ class Broker:
             # Per-capability wall-clock override (e.g. code=1200), else the global wall_clock_s.
             wall_clock_by_capability={k: int(v) for k, v in
                                       (constraints.get("wall_clock_by_capability") or {}).items()},
+            inbox_max_input_tokens=int(constraints.get("inbox_max_input_tokens", 200_000)),
+            inbox_max_cost_usd=float(constraints.get("inbox_max_cost_usd", 2.0)),
             max_forwards=int(constraints.get("max_forwards", 10)),
             rotate_turns=int(constraints.get("rotate_turns", 20)),
             rotate_tokens=int(constraints.get("rotate_tokens", 120_000)),

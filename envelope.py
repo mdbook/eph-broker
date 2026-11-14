@@ -24,7 +24,7 @@ plugin's own record, never from worker text): list of {kind, tool, reason, sha?,
 
 Value-free: no secrets; the ticket-comment and wake sinks are injected callables.
 """
-import html, json, logging
+import html, json, logging, threading
 from site_env import ticket_url
 
 log = logging.getLogger("eph-broker.envelope")
@@ -138,7 +138,7 @@ def parse_cli_json(raw):
 
 
 class EnvelopeParser:
-    def __init__(self, ticket_comment=None, wake_ops=None):
+    def __init__(self, ticket_comment=None, wake_ops=None, state_store=None):
         # Sinks (value-free, injected). The worker NEVER DMs the operator.
         #   ticket_comment(task_id, html, run_id) -> the real sink is poster.post_comment:
         #       posts the escalation onto the originating Vikunja ticket. Called ONLY when task_id is set.
@@ -147,6 +147,9 @@ class EnvelopeParser:
         self.ticket_comment = ticket_comment or (
             lambda task_id, html, run_id: log.info("TICKET-COMMENT: task_id=%s %s", task_id, html))
         self.wake_ops = wake_ops or (lambda text, subject=None: log.info("WAKE-OPS: %s", text))
+        self._escalation_lock = threading.Lock()
+        self._state_store = state_store
+        self._escalated = set(state_store.get("envelope_escalated_runs", []) if state_store else [])
 
     # The old __call__ did an internal "retry-once" that re-parsed the SAME bytes (a no-op). The REAL
     # retry is a warm-worker RE-PROMPT driven by the CC adapter (adapters/cc._turn_with_envelope), not a
@@ -192,6 +195,16 @@ class EnvelopeParser:
         `worker_text` (the worker-derived output that failed to parse) is wrapped as UNTRUSTED
         (truncated) so it can't be mistaken for instructions; the broker's own framing (run_id/domain/reason
         + ticket link) stays OUTSIDE the wrapper as trusted prose."""
+        # A warm worker keeps its run_id across forwards. Subject throttling only
+        # suppresses a burst, then flushes another DM; it is NOT run-level dedupe.
+        # Reserve before either sink, including concurrent callers. With a journal,
+        # persist before sending: at-most-once attempts, even across broker restart.
+        with self._escalation_lock:
+            if run_id in self._escalated:
+                return
+            if self._state_store is not None:
+                self._state_store.put("envelope_escalated_runs", sorted(self._escalated | {run_id}))
+            self._escalated.add(run_id)
         domain = getattr(route, "domain", "?")
         msg = (f"worker run_id={run_id} domain={domain} produced an "
                f"unparseable result envelope: {reason}")

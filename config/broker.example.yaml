@@ -62,9 +62,11 @@ settings:
 # Turn caps and wall-clock limits (config/constraints.json). Read at startup.
 constraints:
   max_turns: 50
-  max_turns_by_capability: {code: 100}
+  max_turns_by_capability: {code: 100, inbox: 15}
   wall_clock_s: 1800
-  wall_clock_by_capability: {code: 3600}
+  wall_clock_by_capability: {code: 3600, inbox: 600}
+  inbox_max_input_tokens: 200000
+  inbox_max_cost_usd: 2.0
   max_forwards: 10
   rotate_turns: 20
   rotate_tokens: 120000

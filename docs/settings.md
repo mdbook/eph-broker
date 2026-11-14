@@ -52,6 +52,43 @@ Flags count as on for `1`, `true`, `yes` or `on`, unless the row says otherwise.
 
 Turn caps and time limits per capability are in `config/constraints.json`, not here.
 
+### Inbox run guardrails (Claude Code)
+
+The `inbox` triage capability defaults to 15 CLI turns and 600 seconds per
+invocation, independent of other rows. Override these with
+`max_turns_by_capability.inbox` and `wall_clock_by_capability.inbox`.
+`LOCAL_WALL_CLOCK_MULT` does not multiply the inbox time limit. `inbox-chat` and
+all other rows retain their existing limits.
+
+`inbox_max_input_tokens` (default `200000`) and `inbox_max_cost_usd` (default `2.0`)
+are positive per-worker-run ceilings in the constraints section of
+`config/constraints.json` or `broker.yaml`. Restart to apply changes. Usage is
+cumulative across forwards, retries and session rotation. Input includes uncached
+input, cache reads and cache creation, not output tokens or context-window size.
+The broker polls CC stream-json usage once a second, without needing dashboard
+streaming. CC's `--max-budget-usd` receives the remaining dollar allowance on
+each invocation; this uses CC's reported/estimated pricing, not a provider invoice.
+Limits can overshoot by an in-flight API response and polling delay. The input
+ceiling remains useful on backends with missing/zero dollar pricing.
+
+Previously inbox inherited the raised global 50-turn/1800-second limits (7200
+seconds on a local backend with the default multiplier). A turn cap emits a CLI
+error wrapper, not the worker's final envelope; SIGKILL can stop mid-tool-use with
+no wrapper at all. Asking that capped session for JSON cannot guarantee recovery.
+Inbox now ends on a turn, time or usage limit with a broker-generated `blocked`
+envelope, no further model calls, and a warning to check partially applied mail
+and ledger changes. Ordinary parse misses still get one recovery invocation,
+limited to one CLI turn and `HARDKILL_REPROMPT_CAP_S` seconds.
+
+Envelope escalations are reserved once per run id before either notification
+sink. This is at-most-once notification *attempts*, not guaranteed delivery; a
+failed sink or crash after reservation is not retried. Reservations survive
+restart when the broker state journal is enabled; otherwise dedupe lasts for the
+broker process. Subject rate limits remain separate and do not create duplicate
+run escalations or suppression-tail DMs for duplicate calls.
+
+### Batching environment settings
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `INITIAL_DEFAULT` | `3` | Seconds to collect a burst before a worker starts, when `windows.json` has no entry. |

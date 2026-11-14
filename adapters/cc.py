@@ -1918,6 +1918,44 @@ def transcript_context_tokens(session_id, tail_bytes=262144):
         return None
 
 
+class _InboxUsage:
+    """Read complete stream-json records from communicate's cumulative stdout.
+
+    No transcript/dashboard dependency. CC may repeat an assistant message id for
+    separate content blocks; charge its input once, including cache reads/writes.
+    The final result's aggregate usage is a fallback, never an additional charge.
+    """
+    def __init__(self):
+        self.offset = 0
+        self.messages = {}
+        self.result = None
+
+    @staticmethod
+    def input_tokens(usage):
+        return sum(v for k, v in (usage or {}).items() if k in (
+            "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+            and isinstance(v, int) and v >= 0)
+
+    def update(self, raw, final=False):
+        raw = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else (raw or "")
+        end = len(raw) if final else raw.rfind("\n") + 1
+        for line in raw[self.offset:end].splitlines():
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            if rec.get("type") == "assistant":
+                msg = rec.get("message") or {}
+                key = msg.get("id") or rec.get("uuid") or str(self.offset)
+                self.messages[key] = max(self.messages.get(key, 0), self.input_tokens(msg.get("usage")))
+            elif rec.get("type") == "result" or "result" in rec or "subtype" in rec:
+                self.result = rec
+        self.offset = end
+        return max(sum(self.messages.values()), self.input_tokens((self.result or {}).get("usage")))
+
+
 class Worker:
     """State for one live ephemeral worker."""
     def __init__(self, key, run_id, worktree):
@@ -1936,6 +1974,9 @@ class Worker:
         self.turn_wall_clock = None  # The CURRENT turn's effective wall-clock (per-capability), used for the liveness check
         self.hard_killed = False     # Set True iff the turn JUST ENDED was the wall-clock hard-kill path;
                                       # consumed (and reset) only by the warm-re-prompt cap in _turn_with_envelope
+        self.inbox_input_tokens = 0  # Run-wide, not reset by session rotation or a warm forward
+        self.inbox_cost_usd = 0.0
+        self.inbox_limit_reason = None
         self.repo = None             # code worker's resolved BASE repo (venv runner's interpreter lives there)
         self.test_runner = None      # code worker's per-repo runner KEY (routing.resolve_test_runner)
         self.test_tmpdir = None      # private test scratch directory, reused across turns and removed at exit
@@ -2052,7 +2093,7 @@ class CCAdapter(Adapter):
     def __init__(self, *, router, worktree_mgr, prompt_loader, envelope_parser,
                  run_registry=None, semaphore=None,
                  max_turns=15, wall_clock_s=600, max_forwards=10, max_turns_by_capability=None,
-                 wall_clock_by_capability=None,
+                 wall_clock_by_capability=None, inbox_max_input_tokens=200_000, inbox_max_cost_usd=2.0,
                  rotate_turns=20, rotate_tokens=120_000,
                  setting_sources="", claude_bin="claude",
                  cmd_poll_s=1.0, teardown_join_s=30.0, alert_ops=None,
@@ -2074,12 +2115,16 @@ class CCAdapter(Adapter):
         # Hard-kill constraint values (hot-reload-tunable):
         self.max_turns = max_turns
         # Per-capability --max-turns override (constraints.json max_turns_by_capability, e.g.
-        # {"code": 40}); a capability absent from it keeps the global max_turns.
-        self.max_turns_by_capability = dict(max_turns_by_capability or {})
+        # {"code": 40}); inbox has a bounded default, other absent capabilities keep max_turns.
+        self.max_turns_by_capability = {"inbox": 15, **(max_turns_by_capability or {})}
         self.wall_clock_s = wall_clock_s
         # Per-capability wall-clock override (constraints.json wall_clock_by_capability, e.g.
-        # {"code": 1200}); a 40-turn code turn needs more than 600s. An absent capability keeps the global wall_clock_s.
-        self.wall_clock_by_capability = dict(wall_clock_by_capability or {})
+        # {"code": 1200}); inbox has a bounded default, other absent capabilities keep wall_clock_s.
+        self.wall_clock_by_capability = {"inbox": 600, **(wall_clock_by_capability or {})}
+        self.inbox_max_input_tokens = int(inbox_max_input_tokens)
+        self.inbox_max_cost_usd = float(inbox_max_cost_usd)
+        if self.inbox_max_input_tokens <= 0 or not 0 < self.inbox_max_cost_usd < float("inf"):
+            raise ValueError("inbox run ceilings must be positive and finite")
         self.max_forwards = max_forwards
         self.rotate_turns = rotate_turns
         self.rotate_tokens = rotate_tokens
@@ -4329,6 +4374,9 @@ class CCAdapter(Adapter):
                 return None
         else:
             result = self._one_turn(worker, route, system_prompt, prompt_text, resume)
+        failure = self._inbox_failure(worker, route, run_id)
+        if failure is not None:
+            return failure
         if result is not None:
             return result
         # A turn killed by teardown() is a parse miss, but NEVER re-prompt it: the re-prompt
@@ -4387,7 +4435,7 @@ class CCAdapter(Adapter):
         # Only passed when actually hard-killed (else omitted) so a test/harness that stubs _one_turn without
         # this kwarg keeps working unchanged in the (overwhelmingly common) non-hard-kill re-prompt case.
         reprompt_kwargs = dict(sticky)
-        if getattr(worker, "hard_killed", False):
+        if getattr(worker, "hard_killed", False) or getattr(route, "capability", "") == "inbox":
             reprompt_kwargs["wall_clock_override"] = HARDKILL_REPROMPT_CAP_S
         turns = getattr(worker, "turns", None)
         try:
@@ -4396,6 +4444,9 @@ class CCAdapter(Adapter):
             # Harnesses count every CLI invocation; an envelope-only recovery is not a rotation turn.
             if turns is not None:
                 worker.turns = turns
+        failure = self._inbox_failure(worker, route, run_id)
+        if failure is not None:
+            return failure
         if result is None:
             escalate = getattr(self.envelope_parser, "escalate", None)
             if escalate is not None:
@@ -4414,6 +4465,30 @@ class CCAdapter(Adapter):
                 self._alert_ops(f"worker {worker.key} run_id={run_id}: no envelope after warm re-prompt",
                                 subject=f"worker:{worker.key}")
         return result
+
+    def _inbox_failure(self, worker, route, run_id):
+        """A cap is terminal, not permission to spend another full turn asking for JSON.
+
+        Synthesize a truthful broker envelope even if SIGKILL interrupted tool_use.
+        Do not claim rollback: an inbox tool may already have changed mail/ledger state.
+        """
+        if getattr(route, "capability", "") != "inbox" or getattr(worker, "done", False):
+            return None
+        reason = getattr(worker, "inbox_limit_reason", None)
+        if not reason and getattr(worker, "turn_capped", False):
+            reason = "--max-turns limit"
+        if not reason and getattr(worker, "hard_killed", False):
+            reason = "wall-clock limit"
+        if not reason:
+            return None
+        worker.inbox_limit_reason = reason
+        worker.done = True
+        return {"status": "blocked", "summary": (
+            "<p>Inbox run stopped by the broker: " + html.escape(reason) +
+            ". Work is incomplete; mail or ledger changes may already have occurred. "
+            "Review existing state before retrying.</p>"), "wake": [], "needs_operator": False,
+            "session_id": worker.session_id, "tokens": worker.inbox_input_tokens,
+            "run_id": run_id, "harness": getattr(route, "adapter", "cc")}
 
     def _api_overload_giveup(self, worker, run_id):
         """Every 429/529 back-off retry failed. Flag the worker (so _run_worker exits WITHOUT stamping the
@@ -4486,6 +4561,8 @@ class CCAdapter(Adapter):
         exhausted=True means every candidate was capped/unresolvable AND we have ALREADY loud-failed
         (caller must NOT re-prompt/re-escalate). detection-before-correction: the log shows the cap was
         DETECTED, not just that a retry happened."""
+        if getattr(worker, "done", False):
+            return None, False
         chain = self._usage_cap_chain(route)
         tried, last, ran = [], None, 0
         for be in chain:
@@ -4499,9 +4576,12 @@ class CCAdapter(Adapter):
             tried.append(label)
             last = self._one_turn(worker, route, system_prompt, prompt_text, use_resume,
                                   backend_override=be)
-            if not _detect_usage_cap(getattr(worker, "last_output", None)):
+            # A parsed envelope or teardown/run-limit stop wins over a usage-cap signal in
+            # the same output. Neither authorizes another backend (or an exhaustion alert).
+            if (last is not None or getattr(worker, "done", False)
+                    or not _detect_usage_cap(getattr(worker, "last_output", None))):
                 worker.last_backend = be                   # the backend that owns the session (re-prompt sticks to it)
-                return last, False                         # NOT usage-capped -> this backend's result stands
+                return last, False                         # result/stop/no cap -> this backend's result stands
             log.warning("usage-cap DETECTED on backend=%s key=%s run_id=%s -> falling through to next",
                         label, worker.key, run_id)
         self._loud_fail_all_backends(worker, route, run_id, tried)
@@ -4526,6 +4606,10 @@ class CCAdapter(Adapter):
 
     def _one_turn(self, worker, route, system_prompt, prompt_text, resume, backend_override=_NO_OVERRIDE,
                   wall_clock_override=None):
+        # All harnesses/rows share this preflight: a retired worker cannot launch again,
+        # even when _inbox_failure has already consumed its terminal limit reason.
+        if getattr(worker, "done", False):
+            return None
         try:
             delta = json.loads(prompt_text)
         except (TypeError, ValueError):
@@ -4569,6 +4653,14 @@ class CCAdapter(Adapter):
         # EXCEPT for the "inbox" (triage) capability, whose signed prompt requires the posture/fact block in EVERY
         # wake's payload, not just a fresh-session one. "inbox-chat" forwards only re-attach on a fresh session.
         capability = getattr(route, "capability", "read")   # used here and below
+        if capability == "inbox":
+            if worker.inbox_input_tokens >= self.inbox_max_input_tokens:
+                worker.inbox_limit_reason = "input-token ceiling"
+            elif worker.inbox_cost_usd >= self.inbox_max_cost_usd:
+                worker.inbox_limit_reason = "cost ceiling (USD)"
+            failure = self._inbox_failure(worker, route, worker.run_id)
+            if failure is not None:
+                return failure
         if (not is_reprompt and worker.forwards >= 1 and getattr(worker, "inbox_posture", None)
                 and (resume_session is None or capability == "inbox")):
             try:
@@ -4730,6 +4822,13 @@ class CCAdapter(Adapter):
                                worktree_root=worker.worktree,   # F5: realpath anchor for the guard, never payload cwd
                                thread_dir=getattr(worker, "thread_dir", None),
                                steer_hook=steer.hook_command(worker.key) if steer.enabled() else None, **stream_kw)
+        if capability == "inbox":
+            # JSON-only output hides usage until exit. stream-json exposes each API
+            # response while communicate drains BOTH pipes (including noisy stderr).
+            argv[argv.index("--output-format") + 1] = "stream-json"
+            argv += ["--verbose", "--max-budget-usd", str(self.inbox_max_cost_usd - worker.inbox_cost_usd)]
+            if is_reprompt:
+                argv[argv.index("--max-turns") + 1] = "1"
         # Build the worker env from an ALLOWLIST (scrub_worker_env), NOT os.environ.copy(),
         # since the broker's full env carries GITLAB_MR_TOKEN and BROKER_HMAC_SECRET, an exfil risk under an
         # untrusted-ticket / bypass worker; the worker needs neither. route.env (ZBUS_ENV) + backend_env (a
@@ -4762,7 +4861,7 @@ class CCAdapter(Adapter):
         # measurably slower, so it gets LOCAL_WALL_CLOCK_MULT x the per-capability allotment). Checked on
         # `_backend` (the name actually dispatching this turn), never the row's unresolved default.
         local_turn = _is_local_backend(_backend)
-        if local_turn:
+        if local_turn and capability != "inbox":
             wall_clock_s = wall_clock_s * LOCAL_WALL_CLOCK_MULT
         if wall_clock_override is not None:
             # Bound the ONE warm-re-prompt turn after a wall-clock hard-kill so a dead-ended
@@ -4784,14 +4883,35 @@ class CCAdapter(Adapter):
         worker.hard_killed = False                       # Reset before this turn; set True only below
         try:                                             # prompt rides STDIN, never argv (E2BIG)
             proc = subprocess.Popen(launch_argv, cwd=worker.worktree, env=env, stdin=subprocess.PIPE,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                    **({"errors": "replace"} if capability == "inbox" else {}))
         except OSError as e:                             # exec failed: the worker never ran
             worker.in_turn = False
             worker.turn_started = None
             raise WorkerSpawnFailed(f"could not start {os.path.basename(argv[0])}: {e}") from e
         worker.proc = proc
+        inbox_usage = _InboxUsage() if capability == "inbox" else None
         try:
-            out, err = proc.communicate(prompt_text, timeout=wall_clock_s)   # wall-clock hard-kill (per-capability)
+            if inbox_usage is None:
+                out, err = proc.communicate(prompt_text, timeout=wall_clock_s)
+            else:
+                deadline = time.monotonic() + wall_clock_s
+                stdin = prompt_text
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(argv, wall_clock_s)
+                    try:
+                        out, err = proc.communicate(stdin, timeout=min(1.0, remaining))
+                        break
+                    except subprocess.TimeoutExpired as e:
+                        stdin = None  # communicate must receive input only on its first call
+                        used = inbox_usage.update(e.output)
+                        if worker.inbox_input_tokens + used >= self.inbox_max_input_tokens:
+                            worker.inbox_limit_reason = "input-token ceiling"
+                            proc.kill()
+                            out, err = proc.communicate()
+                            break
         except subprocess.TimeoutExpired:
             proc.kill()
             # Limitation: this second communicate() reaps the SIGKILLed child. In the pathological case where
@@ -4803,12 +4923,26 @@ class CCAdapter(Adapter):
             out, err = proc.communicate()
             worker.hard_killed = True                    # _turn_with_envelope caps the warm re-prompt
             log.warning("HARD-KILL key=%s wall-clock %ss exceeded", worker.key, wall_clock_s)
-            self._alert_ops(f"worker {worker.key} hard-killed: wall-clock {wall_clock_s}s",
-                            subject=f"worker:{worker.key}")
+            if capability != "inbox":  # inbox reports ONE terminal blocked envelope instead
+                self._alert_ops(f"worker {worker.key} hard-killed: wall-clock {wall_clock_s}s",
+                                subject=f"worker:{worker.key}")
         finally:
             worker.in_turn = False                       # turn complete: the signal fires here
             worker.turn_started = None                   # between turns
         worker.turns += 1
+        if inbox_usage is not None:
+            worker.inbox_input_tokens += inbox_usage.update(out, final=True)
+            wrapper = inbox_usage.result or {}
+            cost = wrapper.get("total_cost_usd", 0) or 0
+            if isinstance(cost, (int, float)) and cost >= 0:
+                worker.inbox_cost_usd += cost
+            if worker.inbox_input_tokens >= self.inbox_max_input_tokens:
+                worker.inbox_limit_reason = "input-token ceiling"
+            elif (worker.inbox_cost_usd >= self.inbox_max_cost_usd or
+                  wrapper.get("subtype") in ("error_max_budget_usd", "error_max_budget")):
+                worker.inbox_limit_reason = "cost ceiling (USD)"
+            if wrapper:
+                out = json.dumps(wrapper)  # existing envelope/session/cap handling consumes one result
         worker.last_output = out          # keep the raw output so escalate() can wrap it UNTRUSTED
         if _detect_turn_cap(out):         # sticky: _run_worker saves a WIP branch at teardown (no MR)
             worker.turn_capped = True
@@ -4845,7 +4979,7 @@ class CCAdapter(Adapter):
                     worker.session_id = session_id
             except Exception:
                 pass                                     # malformed output -> leave session_id unchanged
-        return result
+        return self._inbox_failure(worker, route, worker.run_id) or result
 
     # ---- primitive: forward (enqueue a warm --resume turn onto the worker's command loop) ----
     # The LivenessDriver calls this at a turn boundary with the COLLAPSED buffered forwards

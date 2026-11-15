@@ -25011,6 +25011,74 @@ def test_inbox_mixed_model_prices_use_stream_identities_and_final_breakdown():
     ok("mixed-model tokens use each model's rates; final breakdown fills gaps without duplicate charges")
 
 
+def test_inbox_zero_usage_synthetic_placeholders_need_no_price_entry():
+    prices = {"paid-model": _inbox_test_prices()}
+    for counts in ({}, {k: 0 for k in cc._InboxUsage.TOKEN_FIELDS},
+                   {k: 0 for k in cc._InboxUsage.MODEL_USAGE_FIELDS.values()}):
+        usage = cc._InboxUsage()
+        raw = json.dumps({"type": "assistant", "message": {
+            "id": "placeholder", "model": "<synthetic>", "usage": counts}}) + "\n"
+        assert usage.update(raw) == 0
+        assert not usage.observed_models and not usage.messages
+        assert usage.cost_usd(prices, "paid-model") == 0
+        raw += _inbox_stream_result(tokens=0, modelUsage={"<synthetic>": counts})
+        assert usage.update(raw, final=True) == 0
+        assert not usage.observed_models
+        assert usage.cost_usd(prices, "paid-model") == 0
+        assert cc._detect_usage_cap(json.dumps(usage.result)), "preserve existing sentinel cap detection"
+        # A sentinel-only breakdown must not hide aggregate or unattributed usage.
+        raw += json.dumps({"type": "assistant", "message": {
+            "id": "legacy", "usage": {"input_tokens": 10}}}) + "\n"
+        raw += _inbox_stream_result(tokens=20, modelUsage={"<synthetic>": counts})
+        assert usage.update(raw, final=True) == 20
+        assert abs(usage.cost_usd(prices, "paid-model") - 0.3) < 1e-10
+        raw += _inbox_stream_result(tokens=40, modelUsage={
+            "<synthetic>": counts, "paid-model": {"inputTokens": 40}})
+        assert usage.update(raw, final=True) == 40
+        assert usage.observed_models == {"paid-model"}
+        assert abs(usage.cost_usd(prices, "paid-model") - 0.6) < 1e-10
+    ok("zero-usage synthetic assistant/final placeholders need no pricing and do not hide real usage")
+
+
+def test_inbox_nonzero_synthetic_usage_fails_loud_and_reaps_live_process():
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        for source in ("assistant", "result"):
+            fields = cc._InboxUsage.TOKEN_FIELDS if source == "assistant" else (
+                *cc._InboxUsage.TOKEN_FIELDS, *cc._InboxUsage.MODEL_USAGE_FIELDS.values())
+            for field in fields:
+                for live in (True, False):
+                    # Even a previously configured fake free rate cannot hide nonzero usage.
+                    a, w, r = _inbox_guardrail_setup(d, model_prices={
+                        "claude-sonnet-5": _inbox_test_prices(),
+                        "<synthetic>": {k: 0 for k in cc._InboxUsage.TOKEN_FIELDS}})
+                    counts = {field: 1}
+                    if source == "assistant":
+                        raw = json.dumps({"type": "assistant", "message": {
+                            "id": "placeholder", "model": "<synthetic>", "usage": counts}}) + "\n"
+                    else:
+                        raw = _inbox_stream_result(modelUsage={"<synthetic>": counts})
+                    raw += _inbox_stream_result()  # A later result must not erase the bad sentinel.
+                    killed, reads = [], []
+                    class P:
+                        returncode = 0
+                        def __init__(self, argv, **kwargs): pass
+                        def communicate(self, input=None, timeout=None):
+                            reads.append(input)
+                            if live and len(reads) == 1:
+                                raise subprocess.TimeoutExpired("claude", timeout, output=raw.encode())
+                            return raw, ""
+                        def kill(self): killed.append(True)
+                    with patch.object(cc.subprocess, "Popen", P):
+                        try:
+                            a._one_turn(w, r, "SYS", "{}", False)
+                            assert False, "nonzero synthetic usage must refuse"
+                        except ValueError as exc:
+                            assert "<synthetic>" in str(exc) and "nonzero" in str(exc), exc
+                    assert killed == ([True] if live else [])
+                    assert len(reads) == (2 if live else 1) and not w.in_turn
+    ok("nonzero synthetic input/output/cache tokens refuse live and final usage, killing and reaping live children")
+
+
 def test_inbox_free_launch_internal_paid_usage_trips_live_and_final_cost_caps():
     from dataclasses import replace
     with tempfile.TemporaryDirectory(dir=ROOT) as d:

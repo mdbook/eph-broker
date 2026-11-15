@@ -1991,6 +1991,15 @@ class _InboxUsage:
         return {k: sum(msg["usage"].get(k, 0) for msg in self.messages.values())
                 for k in self.TOKEN_FIELDS}
 
+    @classmethod
+    def _ignore_synthetic(cls, model, usage):
+        # CC emits this non-model on capped/error placeholders, never real requests.
+        if model != "<synthetic>":
+            return False
+        if any(usage.get(k, 0) != 0 for k in (*cls.TOKEN_FIELDS, *cls.MODEL_USAGE_FIELDS.values())):
+            raise ValueError("model '<synthetic>' has nonzero token usage; expected a zero-usage placeholder")
+        return True
+
     @staticmethod
     def prices_for_model(prices, model):
         if model not in prices:
@@ -1999,12 +2008,13 @@ class _InboxUsage:
         return prices[model]
 
     def cost_usd(self, prices, launch_model):
-        # Validate even zero-token records and earlier result records, not only the
-        # models left in the final wrapper. Unknown internal routing must fail loud.
+        # Validate even zero-token real models and earlier result records, not only
+        # the models left in the final wrapper. Unknown internal routing must fail loud.
         for model in self.observed_models:
             self.prices_for_model(prices, model)
         by_model = {}
-        model_usage = (self.result or {}).get("modelUsage") or {}
+        model_usage = {model: usage for model, usage in ((self.result or {}).get("modelUsage") or {}).items()
+                       if not self._ignore_synthetic(model, usage)}
         for msg in self.messages.values():
             if not msg["model"] and model_usage:
                 continue  # The final breakdown supersedes unattributed stream tokens.
@@ -2043,17 +2053,20 @@ class _InboxUsage:
             if rec.get("type") == "assistant":
                 msg = rec.get("message") or {}
                 model = msg.get("model")
+                usage = msg.get("usage") or {}
+                if self._ignore_synthetic(model, usage):
+                    continue
                 if model:
                     self.observed_models.add(model)
                 key = (model, msg.get("id") or rec.get("uuid") or str(self.offset))
-                usage = msg.get("usage") or {}
                 counts = self.messages.setdefault(key, {"model": model, "usage": {}})["usage"]
                 for k, v in usage.items():
                     if k in self.TOKEN_FIELDS and isinstance(v, int) and v >= 0:
                         counts[k] = max(counts.get(k, 0), v)
             elif rec.get("type") == "result" or "result" in rec or "subtype" in rec:
-                self.observed_models.update(rec.get("modelUsage") or {})
-                self.result = rec
+                self.observed_models.update(model for model, usage in (rec.get("modelUsage") or {}).items()
+                                            if not self._ignore_synthetic(model, usage))
+                self.result = rec  # Preserve the sentinel in raw output for usage-cap detection.
         self.offset = end
         return max(self.input_tokens(self.totals()), self.input_tokens((self.result or {}).get("usage")))
 

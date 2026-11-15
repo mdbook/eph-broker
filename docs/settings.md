@@ -81,6 +81,7 @@ launch model entry raises a clear error naming the model before the CLI launches
 Every model observed in assistant messages or the final `modelUsage` breakdown is
 also validated. An unconfigured internally selected model raises a named error;
 if the CLI is still running, the broker kills and reaps it first.
+The `<synthetic>` placeholder needs no price entry when all token counts are zero; nonzero usage raises an error.
 The shipped table is an example, not a live provider catalog. Review rates and
 add every inbox model you use, including aliases and internally selected tiers,
 then restart. Existing configs

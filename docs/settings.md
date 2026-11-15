@@ -54,13 +54,13 @@ Turn caps and time limits per capability are in `config/constraints.json`, not h
 
 ### Inbox run guardrails (Claude Code)
 
-The `inbox` triage capability defaults to 15 CLI turns and 600 seconds per
+The `inbox` triage capability defaults to 15 CLI turns and 1800 seconds per
 invocation, independent of other rows. Override these with
 `max_turns_by_capability.inbox` and `wall_clock_by_capability.inbox`.
 `LOCAL_WALL_CLOCK_MULT` does not multiply the inbox time limit. `inbox-chat` and
 all other rows retain their existing limits.
 
-`inbox_max_input_tokens` (default `200000`) and `inbox_max_cost_usd` (default `2.0`)
+`inbox_max_input_tokens` (default `3000000`) and `inbox_max_cost_usd` (default `2.0`)
 are positive per-worker-run ceilings in the constraints section of
 `config/constraints.json` or `broker.yaml`. Restart to apply changes. Usage is
 cumulative across forwards, retries and session rotation. Input includes uncached
@@ -68,8 +68,20 @@ input, cache reads and cache creation, not output tokens or context-window size.
 The broker polls CC stream-json usage once a second, without needing dashboard
 streaming. CC's `--max-budget-usd` receives the remaining dollar allowance on
 each invocation; this uses CC's reported/estimated pricing, not a provider invoice.
-Limits can overshoot by an in-flight API response and polling delay. The input
-ceiling remains useful on backends with missing/zero dollar pricing.
+Limits can overshoot by an in-flight API response and polling delay.
+
+The input-token ceiling is a cost proxy, not a context-window limit. It defaults
+off for spawn-registry backends with `kind: "local"`, where cumulative context
+re-reads do not represent spend, and on for native, cloud and unknown backends.
+For a billed local endpoint or a free hosted endpoint, set the per-row
+`inbox_input_token_limit` in [routing overrides](routing-overrides.md) to `true`
+or `false` respectively. Omit it or use `null` for automatic policy. For example:
+`{"rows": {"inbox": {"inbox_input_token_limit": true}}}`.
+Automatic policy uses the backend selected for each invocation, including
+fallbacks, not the row's original default. Usage telemetry remains cumulative
+across all backends even when enforcement is off; a later priced invocation
+checks that total. Wall clock, CLI turn caps and the dollar ceiling remain active
+regardless of the token policy. No backend credential files are read for this policy.
 
 Previously inbox inherited the raised global 50-turn/1800-second limits (7200
 seconds on a local backend with the default multiplier). A turn cap emits a CLI

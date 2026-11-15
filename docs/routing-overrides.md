@@ -9,7 +9,8 @@ The file accepts three optional top-level keys:
 
 - `rows`: an object keyed by an existing route's row key (`row_id` when set, otherwise its `domain`, such
   as `code`). Each entry accepts string fields `backend`, `adapter`, `model_pin` and `repo_lock_scope`,
-  and booleans `pin`, `cc_disable_thinking_local` and `cc_fail_fast`. Adapters are
+  booleans `pin`, `cc_disable_thinking_local` and `cc_fail_fast`, and nullable boolean
+  `inbox_input_token_limit`. Adapters are
   `cc`, `hermes` or `codex`; a nonempty backend other than `claude` must resolve in the spawn registry.
   `backend` and `adapter` are overridable defaults: ticket model labels or a dashboard one-run model pick
   replace them, including switching harnesses to match the model. Set `pin:true` to ignore ticket choices;
@@ -26,6 +27,11 @@ The file accepts three optional top-level keys:
   thinking on resolved local backends, and stop on upstream 400/model rejection diagnostics rather than
   waiting for the wall clock. Set either to `false` to opt out for that row. They are file-only settings;
   see [local backend compatibility](configuration.md#claude-code-compatibility-with-local-backends).
+  `inbox_input_token_limit` controls the CC inbox cumulative input-token ceiling:
+  `true` enables it, `false` disables it, and absent/`null` disables it only for
+  resolved local backends. Use an explicit value when the backend's billing differs
+  from that default. It does not disable wall-clock, turn or dollar limits. See
+  [inbox run guardrails](settings.md#inbox-run-guardrails-claude-code).
 - `trusted_creators`: a list of ticket-creator usernames allowed to select non-Anthropic backends with
   `model:` labels. It replaces `MODEL_LABEL_TRUSTED_CREATORS`; an empty list trusts nobody. Usernames are
   matched case-insensitively.

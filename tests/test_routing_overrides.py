@@ -109,6 +109,26 @@ def test_cc_compatibility_controls_are_boolean_per_row_file_overrides():
     ok("CC compatibility switches are strict per-row booleans; default rows are not mutated")
 
 
+def test_inbox_input_token_limit_is_nullable_per_row_override():
+    with _Overrides() as (path, loader):
+        template = routing._INBOX_ROW
+        assert template.inbox_input_token_limit is None
+        for value in (True, False, None):
+            save(path, {"rows": {template.row_key: {"inbox_input_token_limit": value}}})
+            route = template.with_model()
+            assert route.inbox_input_token_limit is value
+            picked = routing.apply_model_choice(route, "sonnet", True, lambda name: True)
+            assert picked.inbox_input_token_limit is value
+            assert template.inbox_input_token_limit is None
+        for invalid in ("false", 0, 1):
+            try:
+                loader._validate({"rows": {template.row_key: {"inbox_input_token_limit": invalid}}})
+                assert False, "must reject non-boolean token policies"
+            except ValueError:
+                pass
+    ok("inbox token ceiling override survives model selection; boolean/null only, defaults unchanged")
+
+
 def test_next_spawn_and_existing_route():
     with _Overrides() as (path, loader):
         template = routing._CODE_ROW

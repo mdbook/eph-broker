@@ -64,8 +64,8 @@ constraints:
   max_turns: 50
   max_turns_by_capability: {code: 100, inbox: 15}
   wall_clock_s: 1800
-  wall_clock_by_capability: {code: 3600, inbox: 600}
-  inbox_max_input_tokens: 200000
+  wall_clock_by_capability: {code: 3600, inbox: 1800}
+  inbox_max_input_tokens: 3000000  # Defaults off for local backends; see inbox_input_token_limit row override.
   inbox_max_cost_usd: 2.0
   max_forwards: 10
   rotate_turns: 20

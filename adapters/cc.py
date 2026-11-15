@@ -2139,7 +2139,7 @@ class CCAdapter(Adapter):
     def __init__(self, *, router, worktree_mgr, prompt_loader, envelope_parser,
                  run_registry=None, semaphore=None,
                  max_turns=15, wall_clock_s=600, max_forwards=10, max_turns_by_capability=None,
-                 wall_clock_by_capability=None, inbox_max_input_tokens=200_000, inbox_max_cost_usd=2.0,
+                 wall_clock_by_capability=None, inbox_max_input_tokens=3_000_000, inbox_max_cost_usd=2.0,
                  rotate_turns=20, rotate_tokens=120_000,
                  setting_sources="", claude_bin="claude",
                  cmd_poll_s=1.0, teardown_join_s=30.0, alert_ops=None,
@@ -2166,7 +2166,7 @@ class CCAdapter(Adapter):
         self.wall_clock_s = wall_clock_s
         # Per-capability wall-clock override (constraints.json wall_clock_by_capability, e.g.
         # {"code": 1200}); inbox has a bounded default, other absent capabilities keep wall_clock_s.
-        self.wall_clock_by_capability = {"inbox": 600, **(wall_clock_by_capability or {})}
+        self.wall_clock_by_capability = {"inbox": 1800, **(wall_clock_by_capability or {})}
         self.inbox_max_input_tokens = int(inbox_max_input_tokens)
         self.inbox_max_cost_usd = float(inbox_max_cost_usd)
         if self.inbox_max_input_tokens <= 0 or not 0 < self.inbox_max_cost_usd < float("inf"):
@@ -4699,8 +4699,15 @@ class CCAdapter(Adapter):
         # EXCEPT for the "inbox" (triage) capability, whose signed prompt requires the posture/fact block in EVERY
         # wake's payload, not just a fresh-session one. "inbox-chat" forwards only re-attach on a fresh session.
         capability = getattr(route, "capability", "read")   # used here and below
+        # Resolve the policy for THIS turn, including usage-cap fallback overrides. Local
+        # context re-reads are not spend; unknown/native/cloud backends keep the cost proxy
+        # unless the operator explicitly overrides it for this row.
+        _backend = getattr(route, "backend", "") if backend_override is _NO_OVERRIDE else backend_override
+        inbox_token_limit = getattr(route, "inbox_input_token_limit", None)
         if capability == "inbox":
-            if worker.inbox_input_tokens >= self.inbox_max_input_tokens:
+            if inbox_token_limit is None:
+                inbox_token_limit = not _is_local_backend(_backend)
+            if inbox_token_limit and worker.inbox_input_tokens >= self.inbox_max_input_tokens:
                 worker.inbox_limit_reason = "input-token ceiling"
             elif worker.inbox_cost_usd >= self.inbox_max_cost_usd:
                 worker.inbox_limit_reason = "cost ceiling (USD)"
@@ -4798,7 +4805,6 @@ class CCAdapter(Adapter):
         eff_model, backend_env, effort = route.model, {}, None
         # An explicit backend_override (from the usage-cap fallback loop) forces THIS turn's backend
         # ('' / 'claude' = native Anthropic); the default sentinel keeps today's behavior (use route.backend).
-        _backend = getattr(route, "backend", "") if backend_override is _NO_OVERRIDE else backend_override
         # A "code" worker's test-runner grant is ARBITRARY EXEC AS THE BROKER UID (pytest/
         # npm/go/venv; see _code_test_bash), gated today only by the code-reviewed runner MENU + the
         # deny-floor. Routing that worker through a non-Anthropic backend ALSO flips bypass_classifier=True
@@ -4960,7 +4966,7 @@ class CCAdapter(Adapter):
                         stdin = None  # communicate must receive input only on its first call
                         upstream_error = _cc_upstream_error(e.output, e.stderr) if fail_fast else None
                         used = inbox_usage.update(e.output) if inbox_usage is not None else 0
-                        if upstream_error or (inbox_usage is not None and
+                        if upstream_error or (inbox_usage is not None and inbox_token_limit and
                                               worker.inbox_input_tokens + used >= self.inbox_max_input_tokens):
                             if not upstream_error:
                                 worker.inbox_limit_reason = "input-token ceiling"
@@ -4992,7 +4998,7 @@ class CCAdapter(Adapter):
             cost = wrapper.get("total_cost_usd", 0) or 0
             if isinstance(cost, (int, float)) and cost >= 0:
                 worker.inbox_cost_usd += cost
-            if worker.inbox_input_tokens >= self.inbox_max_input_tokens:
+            if inbox_token_limit and worker.inbox_input_tokens >= self.inbox_max_input_tokens:
                 worker.inbox_limit_reason = "input-token ceiling"
             elif (worker.inbox_cost_usd >= self.inbox_max_cost_usd or
                   wrapper.get("subtype") in ("error_max_budget_usd", "error_max_budget")):

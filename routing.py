@@ -9,6 +9,7 @@ Value-free: no secrets. ZBUS_ENV / repo path are references, not credentials.
 """
 import fnmatch, os, re, html, json, subprocess, logging
 from dataclasses import dataclass, field, replace
+from typing import Optional
 
 import provenance
 import site_env  # noqa: F401  load the site overlay before the env reads below
@@ -984,6 +985,9 @@ class Route:
     # CC-only compatibility knobs, file-configurable per row through routing overrides.
     cc_disable_thinking_local: bool = True
     cc_fail_fast: bool = True
+    # CC inbox cost-proxy ceiling: None = off for local backends, on otherwise.
+    # Explicit booleans cover billed local endpoints and free hosted endpoints.
+    inbox_input_token_limit: Optional[bool] = None
 
     @property
     def row_key(self):
@@ -995,6 +999,8 @@ class Route:
         for name in ("cc_disable_thinking_local", "cc_fail_fast"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"Route {self.row_key!r}: {name} must be a boolean")
+        if self.inbox_input_token_limit is not None and type(self.inbox_input_token_limit) is not bool:
+            raise ValueError(f"Route {self.row_key!r}: inbox_input_token_limit must be a boolean or null")
         if self.repo_lock_scope not in ("phases", "run"):
             raise ValueError(f"Route {self.row_key!r}: repo_lock_scope must be 'phases' or 'run'")
         if self.adapter not in ADAPTERS:
@@ -1046,7 +1052,7 @@ class Route:
                      self.mcp_config_path, backend, self.backend_from_mode, self.adapter,
                      self.pin or bool(self.model_pin), self.row_id, self.model_pin,
                      self.from_config, self.site_capability, self.browser_mcp_config, self.repo_lock_scope, self.pin,
-                     self.cc_disable_thinking_local, self.cc_fail_fast)
+                     self.cc_disable_thinking_local, self.cc_fail_fast, self.inbox_input_token_limit)
 
 
 # Per-ticket model selection via a `model:<name>` label. The name is either a native

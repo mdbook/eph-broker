@@ -449,7 +449,7 @@ class Broker:
             # Per-capability wall-clock override (e.g. code=1200), else the global wall_clock_s.
             wall_clock_by_capability={k: int(v) for k, v in
                                       (constraints.get("wall_clock_by_capability") or {}).items()},
-            inbox_max_input_tokens=int(constraints.get("inbox_max_input_tokens", 200_000)),
+            inbox_max_input_tokens=int(constraints.get("inbox_max_input_tokens", 3_000_000)),
             inbox_max_cost_usd=float(constraints.get("inbox_max_cost_usd", 2.0)),
             max_forwards=int(constraints.get("max_forwards", 10)),
             rotate_turns=int(constraints.get("rotate_turns", 20)),

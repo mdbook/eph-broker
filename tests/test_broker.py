@@ -24948,6 +24948,76 @@ def test_inbox_cumulative_input_and_cost_survive_forward_and_rotation():
     ok("inbox input/cost ceilings accumulate over rotated forwards; each CLI gets only remaining dollars")
 
 
+def test_inbox_token_ceiling_policy_uses_resolved_backend_and_row_override():
+    from dataclasses import replace
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        # Deliberately retain the old ceiling to verify the policy, not just a larger default.
+        a, _, inbox = _inbox_guardrail_setup(d, inbox_max_input_tokens=200_000, rotate_turns=1)
+        launched, killed = [], []
+        partial = json.dumps({"type": "assistant", "message": {"id": "m1", "usage": {
+            "input_tokens": 50_000, "cache_read_input_tokens": 150_000,
+            "cache_creation_input_tokens": 50_000}}}) + "\n"
+        class P:
+            returncode = 0
+            def __init__(self, argv, **kwargs):
+                launched.append(argv)
+                self.reads = 0
+            def communicate(self, input=None, timeout=None):
+                self.reads += 1
+                if self.reads == 1:
+                    raise subprocess.TimeoutExpired("claude", timeout, output=partial.encode())
+                return partial + _inbox_stream_result(tokens=250_000, cost=0), ""
+            def kill(self): killed.append(self)
+        entries = {"local-test": {"kind": "local"}, "cloud-test": {"kind": "cloud"}}
+        with patch.object(cc.subprocess, "Popen", P), \
+                patch.object(cc, "_backend_entry", side_effect=entries.get), \
+                patch.object(cc, "load_backend", return_value=("test-model", {}, None)):
+            for backend, override, policy, limited in (
+                    ("local-test", cc._NO_OVERRIDE, None, False),
+                    ("cloud-test", cc._NO_OVERRIDE, None, True),
+                    ("", cc._NO_OVERRIDE, None, True),
+                    ("cloud-test", "local-test", None, False),
+                    ("local-test", "claude", None, True),
+                    ("local-test", cc._NO_OVERRIDE, True, True),
+                    ("cloud-test", cc._NO_OVERRIDE, False, False)):
+                route = replace(inbox, backend=backend, inbox_input_token_limit=policy)
+                w = Worker("gmail:test", "run-9654", d)
+                launched.clear(); killed.clear()
+                for n in range(1 if limited else 3):
+                    w.forwards = n
+                    env = a._one_turn(w, route, "SYS", "{}", n > 0, backend_override=override)
+                    assert env["status"] == ("blocked" if limited else "done"), env
+                assert len(killed) == int(limited)
+                assert w.inbox_input_tokens == (250_000 if limited else 750_000)
+                assert w.done == limited and len(launched) == (1 if limited else 3)
+                assert all("--max-budget-usd" in argv for argv in launched)
+                assert w.turn_wall_clock == 1800
+                if not limited:
+                    # Over-ceiling local work can continue, but switching to a priced backend
+                    # must enforce the run-wide budget BEFORE launching another model call.
+                    route = replace(route, inbox_input_token_limit=None)
+                    before = len(launched)
+                    env = a._one_turn(w, route, "SYS", "{}", True, backend_override="claude")
+                    assert env["status"] == "blocked" and "input-token ceiling" in env["summary"]
+                    assert len(launched) == before
+    ok("inbox local re-reads exceed 200k across live polling/rotation/preflight; priced turns and row opt-ins cap")
+
+
+def test_inbox_local_token_exemption_keeps_dollar_ceiling():
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        a, w, r = _inbox_guardrail_setup(d, inbox_max_input_tokens=200_000, inbox_max_cost_usd=1)
+        class P:
+            returncode = 0
+            def __init__(self, *args, **kwargs): pass
+            def communicate(self, input=None, timeout=None):
+                return _inbox_stream_result(tokens=500_000, cost=1), ""
+        with patch.object(cc.subprocess, "Popen", P), patch.object(cc, "_is_local_backend", return_value=True):
+            env = a._one_turn(w, r, "SYS", "{}", False)
+        assert env["status"] == "blocked" and "cost ceiling" in env["summary"] and w.done
+        assert w.inbox_input_tokens == 500_000
+    ok("local token exemption retains usage telemetry and terminal dollar ceiling")
+
+
 def test_inbox_budget_wrapper_and_preflight_cannot_launch_recovery():
     with tempfile.TemporaryDirectory(dir=ROOT) as d:
         seen = []
@@ -25070,7 +25140,7 @@ def test_inbox_parse_miss_recovery_is_bounded_and_can_still_return_envelope():
             env = a._turn_with_envelope(w, r, "SYS", "{}", False, w.run_id)
         assert env["status"] == "done" and len(seen) == 2 and not w.done
         assert seen[1][0][seen[1][0].index("--max-turns") + 1] == "1"
-        assert w.turn_wall_clock == min(600, cc.HARDKILL_REPROMPT_CAP_S)
+        assert w.turn_wall_clock == min(1800, cc.HARDKILL_REPROMPT_CAP_S)
         assert w.turns == 1 and w.inbox_input_tokens == 20
     ok("ordinary inbox parse miss can recover; recovery is one CLI turn with short time cap and charged usage")
 
@@ -25080,7 +25150,12 @@ def test_inbox_guardrails_do_not_change_other_rows_and_are_configurable():
                   max_turns=50, wall_clock_s=1800, max_turns_by_capability={"code": 100},
                   wall_clock_by_capability={"code": 3600})
     assert a.max_turns_by_capability == {"code": 100, "inbox": 15}
-    assert a.wall_clock_by_capability == {"code": 3600, "inbox": 600}
+    assert a.wall_clock_by_capability == {"code": 3600, "inbox": 1800}
+    assert a.inbox_max_input_tokens == 3_000_000
+    with open(os.path.join(ROOT, "config", "constraints.json")) as f:
+        shipped = json.load(f)
+    assert shipped["inbox_max_input_tokens"] == a.inbox_max_input_tokens
+    assert shipped["wall_clock_by_capability"]["inbox"] == a.wall_clock_by_capability["inbox"]
     for cap, turns in (("read", 50), ("code", 100), ("inbox-chat", 50)):
         with tempfile.TemporaryDirectory(dir=ROOT) as d:
             mcp = pathlib.Path(d, "mcp.json"); mcp.write_text('{"mcpServers": {}}')

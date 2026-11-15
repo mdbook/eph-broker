@@ -265,6 +265,14 @@ def test_code_spawn_cuts_and_passes_provenance_to_worker():
     with workspace() as (tmp_path, patches):
         from test_broker import _run_continue_code_worker
         from unittest.mock import patch
+        # The helper stops waiting on any alert. Without a local mcp-ro.sh, the real
+        # PATH tripwire can race the fake worker's result and tear it down early.
+        # Keep the guard and PATH prepend real, but never depend on a site install.
+        mcp_ro = tmp_path / "mcp-ro.sh"
+        mcp_ro.write_text("#!/bin/sh\nexit 1\n")
+        mcp_ro.chmod(0o700)
+        patches.setattr(cc, "_MCP_DIR", str(tmp_path))
+        patches.setenv("PATH", os.defpath)
         records = [{"repo": "example/core", "ref": "main", "as": "core", "sha": "b" * 40,
                     "path": "/worker/.companions/core"}]
         launches = []
@@ -284,6 +292,8 @@ def test_code_spawn_cuts_and_passes_provenance_to_worker():
         brief = next(b for name, b in calls if name == "brief")
         assert brief["companions"] == records
         assert launches and launches[0][1]["COMPANION_CORE"] == records[0]["path"]
+        assert cc.shutil.which("mcp-ro.sh", path=launches[0][1]["PATH"]) == str(mcp_ro)
+        assert not any("silent-127" in alert for alert in alerts), alerts
         assert any("fixed" in text for _, text in comments), alerts
 
 

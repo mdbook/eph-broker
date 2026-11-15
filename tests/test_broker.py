@@ -4167,9 +4167,11 @@ def _assert_prompt_hash_gate(prompt_class, domain):
 
 
 def test_worker_prompt_file_access():
-    """Workers describe the real harness tools, in site and public renders."""
+    """Workers describe harness tools and optional repo standards, in site and public renders."""
     rp = _load_render_module()
     root = pathlib.Path(ROOT)
+    standards_workers = {"code/change-proposer", "mr-review/agent", "mr-review/quick"}
+    loader = PromptLoader(str(root / "prompts"), str(root / "approved-prompts.json"))
     guidance = (root / "modules/capabilities/file-access.md").read_text(encoding="utf-8").rstrip("\n")
     manifests = sorted((root / "workers").rglob("*.json"))
     assert manifests
@@ -4179,6 +4181,9 @@ def test_worker_prompt_file_access():
         for mf in manifests:
             out, rendered = rp.render(mf)
             assert rendered == out.read_text(encoding="utf-8"), out
+            key = mf.relative_to(root / "workers").with_suffix("").as_posix()
+            if key in standards_workers:
+                assert loader.load(mf.stem, mf.parent.name) == rendered, key
             renders.append((mf, rendered))
             # Copy only generic modules: site overrides must not be needed for the fix.
             for sec in json.loads(mf.read_text(encoding="utf-8"))["sections"]:
@@ -4197,7 +4202,13 @@ def test_worker_prompt_file_access():
         assert "1. `Read` / `Grep` / `Glob`" not in rendered, mf
         assert "You have Read/Grep/Glob and nothing else" not in rendered, mf
         assert "**Shell is `git`" not in rendered, mf
-    ok("worker file access: site prompts match render, public prompts have the same harness guidance")
+        key = mf.relative_to(root / "workers").with_suffix("").as_posix()
+        if key in standards_workers:
+            rule = "Read any `docs/STANDARDS.md` and/or `docs/DESIGN.md` present in the repo"
+            rule += " and check the diff against them." if mf.parent.name == "mr-review" else \
+                " before changing code or UI, and follow them."
+            assert rendered.count(rule) == 1, mf
+    ok("worker file access: site prompts match render and approvals, site/public workers read optional repo standards")
 
 
 def test_worker_prompt_codex_read_examples():

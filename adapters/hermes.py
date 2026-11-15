@@ -861,10 +861,10 @@ class HermesHarness:
         # Build the shared env before the terminal init file: login snapshots must use this PATH too.
         env = _cc.worker_env(os.environ, route, backend_env={KEY_ENV: token}, worker=worker)
         env.update(_cc.repo_companions.environment(worker))
-        _cc.test_environment.apply_tmpdir(env, worker, capability)
+        test_runner = getattr(worker, "test_runner", None) or getattr(route, "test_runner", "") or None
+        _cc.test_environment.apply_tmpdir(env, worker, capability, test_runner)
         init_files = []
         if gated:
-            test_runner = getattr(worker, "test_runner", None) or getattr(route, "test_runner", "") or None
             test_repo = getattr(worker, "repo", None) if test_runner == "venv" else None
             _wt_src = os.path.join(cwd, "src")             # G2 parity with the CC path (src-layout venv repos)
             shell_init = f'export PATH={shlex.quote(env["PATH"])}\n'

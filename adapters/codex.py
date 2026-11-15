@@ -1096,7 +1096,7 @@ class CodexHarness:
         self._write_new(instructions, codex_gate.worker_system_prompt(system_prompt, capability, cwd))
         env = _cc.worker_env(os.environ, route, worker=worker)
         env.update(_cc.repo_companions.environment(worker))
-        _cc.test_environment.apply_tmpdir(env, worker, capability)
+        _cc.test_environment.apply_tmpdir(env, worker, capability, test_runner)
         for k in [k for k in env if k.startswith(_POPPED_ENV_PREFIXES)]:
             del env[k]
         env["CODEX_HOME"] = home

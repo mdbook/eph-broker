@@ -64,10 +64,21 @@ def prepare(repo, runner, env):
     return runner, None
 
 
-def apply_tmpdir(env, worker, capability):
+def apply_tmpdir(env, worker, capability, test_runner=None):
     """Give each code worker a private, writable, short temp dir across all harnesses."""
     if capability != "code" or not worker.worktree:
         return
     if not getattr(worker, "test_tmpdir", None):
         worker.test_tmpdir = tempfile.mkdtemp(prefix="t-", dir=os.path.dirname(worker.worktree))
     env["TMPDIR"] = worker.test_tmpdir
+    if test_runner == "ansible-syntax":
+        # Ansible otherwise writes to ~/.ansible/tmp, outside the sandbox's writable
+        # mounts. Keep both temp locations under the existing per-run scratch mount;
+        # the normal test_tmpdir cleanup removes them with the worktree.
+        if not getattr(worker, "ansible_tmpdir", None):
+            prefix = os.getenv("WORKER_ANSIBLE_TEMP_PREFIX", "ansible-")
+            if not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*", prefix):
+                raise ValueError("WORKER_ANSIBLE_TEMP_PREFIX must be a single filename prefix")
+            worker.ansible_tmpdir = tempfile.mkdtemp(prefix=prefix, dir=worker.test_tmpdir)
+        env["ANSIBLE_LOCAL_TEMP"] = worker.ansible_tmpdir
+        env["ANSIBLE_REMOTE_TEMP"] = worker.ansible_tmpdir

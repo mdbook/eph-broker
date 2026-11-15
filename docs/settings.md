@@ -221,6 +221,7 @@ own separate repo settings.
 | `CODE_MR_TARGET_REF` | `main` | Fallback MR target; the repo's own default branch is used when known. |
 | `CODE_BRANCH_PREFIX` | `eph/code-change` | Branch name prefix. |
 | `CODE_WORKTREE_BASE` | `~/.cache/ew/c` | Short root for code worktrees. Each code worker gets a private writable sibling `TMPDIR`, cleaned up at exit. Keep overrides short; nested paths such as pytest `tmp_path` can still exceed AF_UNIX limits. |
+| `WORKER_ANSIBLE_TEMP_PREFIX` | `ansible-` | Directory-name prefix for private Ansible scratch inside a code worker's `TMPDIR` when its resolved runner is `ansible-syntax` (including `infra/general`). Must start with a letter, digit, `_` or `-` and contain only letters, digits, `_`, `-` or `.`. Both `ANSIBLE_LOCAL_TEMP` and `ANSIBLE_REMOTE_TEMP` point there, overriding inherited settings. Created before launch, reused on resume and removed with worker scratch at exit. Uses the existing scratch bind; no additional sandbox write access. |
 | `CODE_AGENT` | `code-worker` | Agent name passed to `FLEET_MODEL_SH`. |
 | `CODE_CHANGE_BACKEND` | unset | Default registry backend. Unset: `FLEET_MODEL_SH` decides. |
 | `CODE_NONCLAUDE_OK` | off | Lets a code worker run on a non-Anthropic backend or on hermes. |

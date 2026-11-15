@@ -21098,6 +21098,48 @@ def test_ansible_syntax_runner_grant():
     ok("ansible-syntax runner = exact empty-inventory syntax-check, any extra flag denied; /srv/ansible seed")
 
 
+def test_infra_general_spawn_has_writable_ansible_temp_and_cleans_up():
+    from dataclasses import replace
+    import routing as R
+    seen, mounts = [], []
+    real_popen, real_wrap = subprocess.Popen, cc.sandbox.wrap
+
+    def popen(argv, **kwargs):
+        env = kwargs.get("env", {})
+        if "ANSIBLE_LOCAL_TEMP" in env:
+            path = env["ANSIBLE_LOCAL_TEMP"]
+            assert path == env["ANSIBLE_REMOTE_TEMP"]
+            assert os.path.dirname(path) == env["TMPDIR"]
+            assert stat.S_IMODE(os.stat(path).st_mode) == 0o700
+            assert env["TMPDIR"] in mounts[-1]
+            assert path not in mounts[-1], "no additional writable mount is needed"
+            seen.append(path)
+        return real_popen(argv, **kwargs)
+
+    def wrap(*args, **kwargs):
+        mounts.append(kwargs["writable_paths"])
+        return real_wrap(*args, **kwargs)
+
+    # The child itself must be able to write before doing any work. The normal
+    # worker exit path must remove that file and directory with its worktree.
+    probe = ("import os\n"
+             "with open(os.path.join(os.environ['ANSIBLE_LOCAL_TEMP'], 'probe'), 'w') as f:\n"
+             "    f.write('writable')\n")
+    fake = FAKE_CLAUDE.replace("import json, os, sys, time\n", "import json, os, sys, time\n" + probe)
+    row = replace(R._INFRA_GENERAL_ROW, test_runner="ansible-syntax")
+    with patch.object(subprocess, "Popen", side_effect=popen), \
+            patch.object(cc.sandbox, "wrap", side_effect=wrap), \
+            patch.dict(os.environ, {"WORKER_ANSIBLE_TEMP_PREFIX": "ansible-"}), \
+            patch.object(sys.modules[__name__], "FAKE_CLAUDE", fake):
+        for _ in range(2):
+            calls, _, _, _, comments = _run_infra_worker(None, row=row)
+            assert comments and "did the thing" in comments[0][1], comments
+            assert "remove" in calls
+    assert len(seen) == 2 and seen[0] != seen[1], seen
+    assert all(not os.path.exists(path) for path in seen), seen
+    ok("infra/general ansible-syntax spawn has private writable Ansible temp, no new mounts, cleanup at exit")
+
+
 def test_infra_general_worker_cuts_default_and_dms_infra_bot():
     import routing as RT
     calls, made_kw, dms, alerts, comments = _run_infra_worker(
@@ -23341,6 +23383,39 @@ def test_worker_test_environment_short_socket_and_private_tmpdir():
         env = {"TMPDIR": "unchanged"}; T.apply_tmpdir(env, b, "read")
         assert env["TMPDIR"] == "unchanged"
     ok("worker paths bound long repo subjects; private writable TMPDIR supports real AF_UNIX sockets")
+
+
+def test_worker_ansible_temp_configuration_and_resume():
+    import test_environment as T
+    with tempfile.TemporaryDirectory() as d:
+        wt = os.path.join(d, "w"); os.mkdir(wt)
+        w = Worker("vikunja:task:9993", "ansible-temp", wt)
+        env = {"ANSIBLE_LOCAL_TEMP": "/unwritable", "ANSIBLE_REMOTE_TEMP": "/unwritable"}
+        with patch.dict(os.environ, {"WORKER_ANSIBLE_TEMP_PREFIX": "validation-"}):
+            T.apply_tmpdir(env, w, "code", "ansible-syntax")
+        path = env["ANSIBLE_LOCAL_TEMP"]
+        assert os.path.basename(path).startswith("validation-")
+        assert env["ANSIBLE_REMOTE_TEMP"] == path and os.path.dirname(path) == env["TMPDIR"]
+        resumed = {}
+        T.apply_tmpdir(resumed, w, "code", "ansible-syntax")
+        assert resumed == env, "resume reuses the same per-run directory"
+        for capability, runner in (("read", "ansible-syntax"), ("code", "pytest")):
+            untouched = {}
+            T.apply_tmpdir(untouched, w, capability, runner)
+            assert not any(k.startswith("ANSIBLE_") for k in untouched)
+        for prefix in ("", "../escape", "/absolute", "nested/dir", ".", ".."):
+            other = Worker("vikunja:task:9994", "invalid-temp", wt)
+            with patch.dict(os.environ, {"WORKER_ANSIBLE_TEMP_PREFIX": prefix}):
+                try:
+                    T.apply_tmpdir({}, other, "code", "ansible-syntax")
+                    assert False, prefix
+                except ValueError as e:
+                    assert "WORKER_ANSIBLE_TEMP_PREFIX" in str(e)
+                finally:
+                    shutil.rmtree(other.test_tmpdir)
+        shutil.rmtree(w.test_tmpdir)
+        assert not os.path.exists(path), "scratch cleanup also removes Ansible temp"
+    ok("Ansible temp prefix is configurable and contained; resume reuses it; other runners/readers unchanged")
 
 
 def test_worker_test_dependencies_provision_and_preserve_environment_gaps():

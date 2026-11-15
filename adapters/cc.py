@@ -1980,6 +1980,7 @@ class Worker:
         self.repo = None             # code worker's resolved BASE repo (venv runner's interpreter lives there)
         self.test_runner = None      # code worker's per-repo runner KEY (routing.resolve_test_runner)
         self.test_tmpdir = None      # private test scratch directory, reused across turns and removed at exit
+        self.ansible_tmpdir = None   # optional child of test_tmpdir, sharing its mount and cleanup
         self.ssh_tmpdir = None       # shared SSH launcher, independent of the harness's private home
         self.ssh_control_dir = None  # only MCP-granted workers get a writable multiplexing directory
         self.ssh_config = None
@@ -4839,7 +4840,7 @@ class CCAdapter(Adapter):
         env.update(repo_companions.environment(worker))
         # A login profile can replace PATH and silently undo the shared SSH launcher (ticket 2104).
         env["CLAUDE_BASH_NO_LOGIN"] = "1"
-        test_environment.apply_tmpdir(env, worker, capability)
+        test_environment.apply_tmpdir(env, worker, capability, test_runner)
         if stream_kw.get("write_grant"):                 # The mcp-rw.sh wrapper finds this worker's grant here
             env["EPH_WRITE_GRANT_FILE"] = grant_path
         # A src-layout repo (e.g. game-sync) would otherwise import the package the venv has INSTALLED

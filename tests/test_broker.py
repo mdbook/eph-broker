@@ -20044,7 +20044,8 @@ def test_triage_forward_reattaches_posture_every_turn_inbox_chat_does_not():
     chat_route = Route(domain="inbox", repo="/x", prompt_class="chat", agent="mail-agent",
                        read_only=False, capability="inbox-chat", env={}, model="claude-sonnet-5",
                        mcp_config_dir=d)
-    a = CCAdapter(router=None, worktree_mgr=None, prompt_loader=None, envelope_parser=EnvelopeParser())
+    a = CCAdapter(router=None, worktree_mgr=None, prompt_loader=None, envelope_parser=EnvelopeParser(),
+                  model_prices={"claude-sonnet-5": _inbox_test_prices(0)})
     o_popen = cc.subprocess.Popen
     cc.subprocess.Popen = _P
     try:
@@ -24865,10 +24866,18 @@ def test_mr_note_publish_iteration_fast_forward_only():
     ok("iteration publish checks ancestry and refuses missing, deleted or moved branches using an exact-tip lease")
 
 
+def _inbox_test_prices(input_rate=15000):
+    # Synthetic prices: 40 input tokens cost $0.60, unrelated to CC's wrapper estimate.
+    return {"input_tokens": input_rate, "output_tokens": 25000,
+            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+
+
 def _inbox_guardrail_setup(d, **kwargs):
     pathlib.Path(d, "test.json").write_text('{"mcpServers": {}}')
     route = Route(domain="inbox", repo=d, prompt_class="triage", agent="mail-agent",
                   capability="inbox", read_only=False, mcp_config_dir=d, env={}, model="claude-sonnet-5")
+    kwargs.setdefault("model_prices", {"claude-sonnet-5": _inbox_test_prices(),
+                                      "test-model": _inbox_test_prices(0)})
     adapter = CCAdapter(router=None, worktree_mgr=None, prompt_loader=None,
                         envelope_parser=EnvelopeParser(), **kwargs)
     return adapter, Worker("gmail:test", "run-9650", d), route
@@ -24884,7 +24893,8 @@ def _inbox_stream_result(tokens=10, cost=0.1, **extra):
 def test_inbox_stream_usage_counts_requests_not_context_or_content_blocks():
     usage = cc._InboxUsage()
     def record(mid, **tokens):
-        return json.dumps({"type": "assistant", "message": {"id": mid, "usage": tokens}}) + "\n"
+        return json.dumps({"type": "assistant", "message": {
+            "id": mid, "model": "paid-model", "usage": tokens}}) + "\n"
     first = record("a", input_tokens=20, cache_read_input_tokens=30, cache_creation_input_tokens=10,
                    output_tokens=999)
     second = record("b", input_tokens=25)
@@ -24899,13 +24909,198 @@ def test_inbox_stream_usage_counts_requests_not_context_or_content_blocks():
     ok("inbox streaming counts all input/cache usage once per request, tolerates partial bytes, not output")
 
 
+def test_inbox_prices_charge_all_token_types_once_without_wrapper_cost():
+    usage = cc._InboxUsage()
+    prices = dict(zip(cc._InboxUsage.TOKEN_FIELDS, (2, 10, 1, 4)))
+    counts = dict(zip(cc._InboxUsage.TOKEN_FIELDS, (100, 20, 200, 50)))
+    prices = {"paid-model": prices}
+    first = json.dumps({"type": "assistant", "message": {
+        "id": "request-1", "model": "paid-model", "usage": counts}}) + "\n"
+    # Content-block repeats and cumulative stdout polling must not double charge.
+    raw = first + first
+    usage.update(raw)
+    usage.update(raw)
+    assert abs(usage.cost_usd(prices, "paid-model") - 0.0008) < 1e-10
+    usage.update(raw + _inbox_stream_result(cost=999, usage=counts), final=True)
+    assert abs(usage.cost_usd(prices, "paid-model") - 0.0008) < 1e-10
+    fallback = cc._InboxUsage()
+    fallback.update(_inbox_stream_result(cost=999, usage=counts), final=True)
+    assert fallback.cost_usd(prices, "paid-model") == usage.cost_usd(prices, "paid-model")
+    ok("inbox prices uncached/output/cache read/write tokens, deduplicates streams and aggregate fallback")
+
+
+def test_inbox_free_model_ignores_wrapper_cost_and_paid_fallback_uses_own_rate():
+    from dataclasses import replace
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        free = {k: 0 for k in cc._InboxUsage.TOKEN_FIELDS}
+        a, w, r = _inbox_guardrail_setup(d, rotate_turns=1, inbox_max_cost_usd=1,
+            model_prices={"free-model": free, "paid-model": _inbox_test_prices(25000)})
+        r = replace(r, backend="local-test", model="not-the-resolved-model")
+        launched, killed = [], []
+        class P:
+            returncode = 0
+            def __init__(self, argv, **kwargs):
+                launched.append(argv)
+                self.model = argv[argv.index("--model") + 1]
+                self.reads = 0
+            def communicate(self, input=None, timeout=None):
+                self.reads += 1
+                raw = json.dumps({"type": "assistant", "message": {"id": "m", "model": self.model, "usage": {
+                    "input_tokens": 20}}}) + "\n"
+                if self.reads == 1:
+                    raise subprocess.TimeoutExpired("claude", timeout, output=raw.encode())
+                return raw + _inbox_stream_result(tokens=20, cost=999, costBasis="unknown"), ""
+            def kill(self): killed.append(len(launched))
+        def backend(name):
+            return ("paid-model" if name == "paid-test" else "free-model", {}, None)
+        with patch.object(cc.subprocess, "Popen", P), \
+                patch.object(cc, "_is_local_backend", return_value=True), \
+                patch.object(cc, "load_backend", side_effect=backend):
+            for n, override in enumerate((cc._NO_OVERRIDE, cc._NO_OVERRIDE, "paid-test", "paid-test")):
+                w.forwards = n
+                result = a._one_turn(w, r, "SYS", "{}", n > 0, backend_override=override)
+                assert result["status"] == ("blocked" if n == 3 else "done"), result
+                assert abs(w.inbox_cost_usd - max(0, n - 1) * 0.5) < 1e-8
+                assert killed == ([4] if n == 3 else [])
+            assert "cost ceiling" in result["summary"] and w.done
+            assert all("--max-budget-usd" not in argv for argv in launched)
+            assert len(launched) == 4 and w.inbox_input_tokens == 80
+    ok("free remapped model ignores >cap wrapper costs across rotation; paid fallback accumulates real cap")
+
+
+def test_inbox_mixed_model_prices_use_stream_identities_and_final_breakdown():
+    free = {k: 0 for k in cc._InboxUsage.TOKEN_FIELDS}
+    paid = dict(zip(cc._InboxUsage.TOKEN_FIELDS, (2, 10, 1, 4)))
+    counts = dict(zip(cc._InboxUsage.TOKEN_FIELDS, (100, 20, 200, 50)))
+    prices = {"free-model": free, "paid-model": paid}
+    def record(model, tokens):
+        return json.dumps({"type": "assistant", "message": {
+            "id": model, "model": model, "usage": tokens}}) + "\n"
+    raw = record("free-model", {k: 9999 for k in counts}) + record("paid-model", counts)
+    raw += raw
+    usage = cc._InboxUsage()
+    usage.update(raw)
+    assert abs(usage.cost_usd(prices, "free-model") - 0.0008) < 1e-10
+    # Aggregate fallback must not reprice paid tokens at the free launch rates.
+    aggregate = {k: n + 9999 for k, n in counts.items()}
+    raw += _inbox_stream_result(usage=aggregate)
+    usage.update(raw, final=True)
+    assert abs(usage.cost_usd(prices, "free-model") - 0.0008) < 1e-10
+    # Final modelUsage covers requests absent from stdout, including cache/output.
+    breakdown = {"free-model": {"inputTokens": 9999, "costUSD": 999},
+                 "paid-model": {cc._InboxUsage.MODEL_USAGE_FIELDS[k]: n * 2 for k, n in counts.items()}}
+    result = _inbox_stream_result(cost=999, usage=aggregate, modelUsage=breakdown)
+    usage.update(raw + result, final=True)
+    assert abs(usage.cost_usd(prices, "free-model") - 0.0016) < 1e-10
+    for prefix in ("", json.dumps({"type": "assistant", "message": {
+            "id": "legacy", "usage": aggregate}}) + "\n"):
+        final_only = cc._InboxUsage()
+        final_only.update(prefix + result, final=True)
+        assert abs(final_only.cost_usd(prices, "free-model") - 0.0016) < 1e-10
+    ok("mixed-model tokens use each model's rates; final breakdown fills gaps without duplicate charges")
+
+
+def test_inbox_free_launch_internal_paid_usage_trips_live_and_final_cost_caps():
+    from dataclasses import replace
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        for mode in ("live", "final", "final-only"):
+            a, w, r = _inbox_guardrail_setup(d, inbox_max_cost_usd=1,
+                model_prices={"free-model": {k: 0 for k in cc._InboxUsage.TOKEN_FIELDS},
+                              "paid-model": _inbox_test_prices(25000)})
+            raw = "".join(json.dumps({"type": "assistant", "message": {
+                "id": model, "model": model, "usage": {"input_tokens": n}}}) + "\n"
+                for model, n in (("free-model", 10), ("paid-model", 50)))
+            result = _inbox_stream_result(tokens=70, cost=0, modelUsage={
+                "free-model": {"inputTokens": 10}, "paid-model": {"inputTokens": 60}})
+            killed, reads = [], []
+            class P:
+                returncode = 0
+                def __init__(self, argv, **kwargs):
+                    assert "--max-budget-usd" not in argv
+                def communicate(self, input=None, timeout=None):
+                    reads.append(input)
+                    if mode == "live" and len(reads) == 1:
+                        raise subprocess.TimeoutExpired("claude", timeout, output=(raw + raw).encode())
+                    return ("" if mode == "final-only" else raw + raw) + result, ""
+                def kill(self): killed.append(True)
+            with patch.object(cc.subprocess, "Popen", P):
+                env = a._one_turn(w, replace(r, model="free-model"), "SYS", "{}", False)
+            assert env["status"] == "blocked" and "cost ceiling" in env["summary"], env
+            assert abs(w.inbox_cost_usd - 1.5) < 1e-8 and w.inbox_input_tokens == 70
+            assert killed == ([True] if mode == "live" else [])
+            assert w.done and not w.in_turn
+    ok("free launch model's internal paid usage triggers live and final caps at its own configured rates")
+
+
+def test_inbox_unknown_internal_model_fails_loud_and_reaps_live_process():
+    from dataclasses import replace
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        for source in ("assistant", "result"):
+            for live in (True, False):
+                a, w, r = _inbox_guardrail_setup(d,
+                    model_prices={"free-model": {k: 0 for k in cc._InboxUsage.TOKEN_FIELDS}})
+                if source == "assistant":
+                    raw = json.dumps({"type": "assistant", "message": {"id": "m",
+                        "model": "unconfigured-internal-model", "usage": {"input_tokens": 10}}}) + "\n"
+                else:
+                    # Even a zero-token entry must validate, including if another
+                    # result later in the same stdout replaces this wrapper.
+                    raw = _inbox_stream_result(modelUsage={"unconfigured-internal-model": {}})
+                raw += _inbox_stream_result()
+                killed, reads = [], []
+                class P:
+                    returncode = 0
+                    def __init__(self, argv, **kwargs): pass
+                    def communicate(self, input=None, timeout=None):
+                        reads.append(input)
+                        if live and len(reads) == 1:
+                            raise subprocess.TimeoutExpired("claude", timeout, output=raw.encode())
+                        return raw, ""
+                    def kill(self): killed.append(True)
+                with patch.object(cc.subprocess, "Popen", P):
+                    try:
+                        a._one_turn(w, replace(r, model="free-model"), "SYS", "{}", False)
+                        assert False, "unconfigured internal model must refuse"
+                    except ValueError as exc:
+                        assert "unconfigured-internal-model" in str(exc) and "model_prices" in str(exc), exc
+                assert killed == ([True] if live else [])
+                assert len(reads) == (2 if live else 1) and not w.in_turn
+    ok("unknown assistant/final models raise named errors, with live children killed and reaped")
+
+
+def test_inbox_unknown_model_and_invalid_prices_fail_loud_before_launch():
+    from dataclasses import replace
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        for table in ({}, {"claude-sonnet-5": _inbox_test_prices()}):
+            a, w, r = _inbox_guardrail_setup(d, model_prices=table)
+            with patch.object(cc.subprocess, "Popen", side_effect=AssertionError("must not launch")), \
+                    patch.object(cc, "load_backend", return_value=("unknown-resolved-model", {}, None)):
+                for route, override, model in ((replace(r, model="unknown-native-model"), cc._NO_OVERRIDE,
+                                                "unknown-native-model"),
+                                               (r, "some-backend", "unknown-resolved-model")):
+                    try:
+                        a._one_turn(w, route, "SYS", "{}", False, backend_override=override)
+                        assert False, "unknown pricing must refuse"
+                    except ValueError as exc:
+                        assert model in str(exc) and "model_prices" in str(exc), exc
+        for invalid in ([], {"bad-model": {}}, {"bad-model": {**_inbox_test_prices(), "extra": 1}},
+                        *({"bad-model": {**_inbox_test_prices(), "input_tokens": v}}
+                          for v in (-1, float("nan"), float("inf"), True, "0"))):
+            try:
+                _inbox_guardrail_setup(d, model_prices=invalid)
+                assert False, invalid
+            except ValueError as exc:
+                assert "model_prices" in str(exc), exc
+    ok("missing native/remapped/fallback models name the model before launch; invalid prices refuse startup")
+
+
 def test_inbox_token_ceiling_kills_live_tool_use_and_returns_failure_envelope():
     with tempfile.TemporaryDirectory(dir=ROOT) as d:
         fake = _write_fake_claude(d)
         pathlib.Path(fake).write_text('''#!/usr/bin/env python3
 import json, sys, time
 assert sys.argv[sys.argv.index('--output-format') + 1] == 'stream-json'
-assert '--max-budget-usd' in sys.argv and '--verbose' in sys.argv
+assert '--max-budget-usd' not in sys.argv and '--verbose' in sys.argv
 sys.stderr.write('diagnostic' * 20000)
 sys.stderr.flush()
 print(json.dumps({'type': 'assistant', 'message': {'id': 'm1', 'stop_reason': 'tool_use',
@@ -24942,17 +25137,17 @@ def test_inbox_cumulative_input_and_cost_survive_forward_and_rotation():
                     assert env["status"] == ("done" if n < 2 else "blocked"), env
             assert expected in env["summary"], env
             assert w.inbox_input_tokens == 120 and abs(w.inbox_cost_usd - 1.8) < 1e-8
-            budgets = [float(argv[argv.index("--max-budget-usd") + 1]) for argv in seen]
-            assert all(abs(x - y) < 1e-8 for x, y in zip(budgets, [1.5, 0.9, 0.3])), budgets
+            assert all("--max-budget-usd" not in argv for argv in seen)
             assert all("--resume" not in argv for argv in seen), "rotation must not reset the run budget"
-    ok("inbox input/cost ceilings accumulate over rotated forwards; each CLI gets only remaining dollars")
+    ok("inbox table-priced input/cost ceilings accumulate over rotated forwards without CC budget guesses")
 
 
 def test_inbox_token_ceiling_policy_uses_resolved_backend_and_row_override():
     from dataclasses import replace
     with tempfile.TemporaryDirectory(dir=ROOT) as d:
         # Deliberately retain the old ceiling to verify the policy, not just a larger default.
-        a, _, inbox = _inbox_guardrail_setup(d, inbox_max_input_tokens=200_000, rotate_turns=1)
+        a, _, inbox = _inbox_guardrail_setup(d, inbox_max_input_tokens=200_000, rotate_turns=1,
+            model_prices={m: _inbox_test_prices(0) for m in ("claude-sonnet-5", "test-model")})
         launched, killed = [], []
         partial = json.dumps({"type": "assistant", "message": {"id": "m1", "usage": {
             "input_tokens": 50_000, "cache_read_input_tokens": 150_000,
@@ -24990,7 +25185,7 @@ def test_inbox_token_ceiling_policy_uses_resolved_backend_and_row_override():
                 assert len(killed) == int(limited)
                 assert w.inbox_input_tokens == (250_000 if limited else 750_000)
                 assert w.done == limited and len(launched) == (1 if limited else 3)
-                assert all("--max-budget-usd" in argv for argv in launched)
+                assert all("--max-budget-usd" not in argv for argv in launched)
                 assert w.turn_wall_clock == 1800
                 if not limited:
                     # Over-ceiling local work can continue, but switching to a priced backend
@@ -25018,23 +25213,31 @@ def test_inbox_local_token_exemption_keeps_dollar_ceiling():
     ok("local token exemption retains usage telemetry and terminal dollar ceiling")
 
 
-def test_inbox_budget_wrapper_and_preflight_cannot_launch_recovery():
+def test_inbox_live_priced_cost_and_preflight_cannot_launch_recovery():
     with tempfile.TemporaryDirectory(dir=ROOT) as d:
         seen = []
         class P:
             returncode = 1
-            def __init__(self, argv, **kwargs): seen.append(argv)
+            def __init__(self, argv, **kwargs):
+                seen.append(argv)
+                self.killed = False
             def communicate(self, input=None, timeout=None):
-                return _inbox_stream_result(tokens=0, cost=0, result="", subtype="error_max_budget_usd"), ""
+                raw = json.dumps({"type": "assistant", "message": {"id": "paid-request", "usage": {
+                    "input_tokens": 10, "output_tokens": 100}}}) + "\n"
+                if not self.killed:
+                    raise subprocess.TimeoutExpired("claude", timeout, output=raw.encode())
+                return raw, ""
+            def kill(self): self.killed = True
         a, w, r = _inbox_guardrail_setup(d)
         with patch.object(cc.subprocess, "Popen", P), patch.object(cc, "USAGE_CAP_FALLBACK_ENABLED", False):
             env = a._turn_with_envelope(w, r, "SYS", "{}", False, w.run_id)
         assert len(seen) == 1 and env["status"] == "blocked" and "cost ceiling" in env["summary"]
+        assert w.proc.killed and abs(w.inbox_cost_usd - 2.65) < 1e-8
         a, w, r = _inbox_guardrail_setup(d)
         w.inbox_input_tokens = a.inbox_max_input_tokens
         with patch.object(cc.subprocess, "Popen", side_effect=AssertionError("must not launch")):
             assert a._one_turn(w, r, "SYS", "{}", False)["status"] == "blocked"
-    ok("CC budget error wrapper and exhausted preflight produce failure envelopes without another CLI")
+    ok("live table-priced output spend and exhausted preflight stop without a recovery CLI")
 
 
 def test_inbox_turn_and_time_caps_are_terminal_not_another_full_allotment():
@@ -25071,7 +25274,8 @@ def test_inbox_usage_cap_at_run_ceiling_cannot_fall_back():
                                             result="You've hit your weekly limit."), ""
         for limits, reason in (({"inbox_max_input_tokens": 20}, "input-token ceiling"),
                                ({"inbox_max_cost_usd": 0.5}, "cost ceiling")):
-            a, w, r = _inbox_guardrail_setup(d, **limits)
+            a, w, r = _inbox_guardrail_setup(d, model_prices={"claude-sonnet-5": _inbox_test_prices(25000)},
+                                            **limits)
             seen.clear()
             with patch.object(cc.subprocess, "Popen", P), \
                     patch.object(cc, "USAGE_CAP_FALLBACK_ENABLED", True), \

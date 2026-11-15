@@ -67,6 +67,11 @@ constraints:
   wall_clock_by_capability: {code: 3600, inbox: 1800}
   inbox_max_input_tokens: 3000000  # Defaults off for local backends; see inbox_input_token_limit row override.
   inbox_max_cost_usd: 2.0
+  # Inbox CC pricing: exact launch AND observed model ids, USD per million tokens. Review provider rates.
+  # Unknown launch/internal models fail loud. Include backend/fallback ids, aliases and internally routed tiers.
+  model_prices:
+    sonnet: {input_tokens: 3.0, output_tokens: 15.0, cache_read_input_tokens: 0.3, cache_creation_input_tokens: 3.75}
+    example-local-model: {input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0}
   max_forwards: 10
   rotate_turns: 20
   rotate_tokens: 120000

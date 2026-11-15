@@ -66,9 +66,32 @@ are positive per-worker-run ceilings in the constraints section of
 cumulative across forwards, retries and session rotation. Input includes uncached
 input, cache reads and cache creation, not output tokens or context-window size.
 The broker polls CC stream-json usage once a second, without needing dashboard
-streaming. CC's `--max-budget-usd` receives the remaining dollar allowance on
-each invocation; this uses CC's reported/estimated pricing, not a provider invoice.
+streaming. Dollar cost is computed by the broker from token usage and
+`constraints.model_prices`, never CC's `total_cost_usd` or default Claude rates.
+CC's wrapper-priced `--max-budget-usd` is not passed, including on local routes.
+The broker kills paid invocations when their table-priced usage reaches the cap.
 Limits can overshoot by an in-flight API response and polling delay.
+
+`model_prices` maps exact launch and observed model ids (including backend remapping,
+fallbacks and CC's internal routing) to USD per million tokens for all four fields: `input_tokens`,
+`output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`.
+Each rate must be finite and nonnegative. Configure all four as `0` for a free
+local endpoint. There is no implicit free-local policy or default rate: a missing
+launch model entry raises a clear error naming the model before the CLI launches.
+Every model observed in assistant messages or the final `modelUsage` breakdown is
+also validated. An unconfigured internally selected model raises a named error;
+if the CLI is still running, the broker kills and reaps it first.
+The shipped table is an example, not a live provider catalog. Review rates and
+add every inbox model you use, including aliases and internally selected tiers,
+then restart. Existing configs
+without a table must add one before inbox triage can run. Stream usage is deduplicated
+per request and priced at each request's model rates. Final per-model token counts
+fill gaps without double charging streamed usage; counts never decrease for an
+identified model. A free launch model cannot make internally routed paid usage free.
+For older wrappers without model identities, unattributed tokens use launch-model
+rates until a final per-model breakdown is available. Without that breakdown, only
+unaccounted aggregate tokens use launch-model rates. Use explicit model pins rather
+than aliases that change pricing over time. These estimates are not provider invoices.
 
 The input-token ceiling is a cost proxy, not a context-window limit. It defaults
 off for spawn-registry backends with `kind: "local"`, where cumulative context

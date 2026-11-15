@@ -451,6 +451,7 @@ class Broker:
                                       (constraints.get("wall_clock_by_capability") or {}).items()},
             inbox_max_input_tokens=int(constraints.get("inbox_max_input_tokens", 3_000_000)),
             inbox_max_cost_usd=float(constraints.get("inbox_max_cost_usd", 2.0)),
+            model_prices=constraints.get("model_prices", {}),
             max_forwards=int(constraints.get("max_forwards", 10)),
             rotate_turns=int(constraints.get("rotate_turns", 20)),
             rotate_tokens=int(constraints.get("rotate_tokens", 120_000)),

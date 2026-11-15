@@ -1968,11 +1968,17 @@ class _InboxUsage:
 
     No transcript/dashboard dependency. CC may repeat an assistant message id for
     separate content blocks; charge its input once, including cache reads/writes.
-    The final result's aggregate usage is a fallback, never an additional charge.
+    Retain model identities: CC can route requests away from the launch model.
+    Final per-model usage fills gaps, never an additional charge for streamed tokens.
     """
+    TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+    MODEL_USAGE_FIELDS = dict(zip(TOKEN_FIELDS, (
+        "inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens")))
+
     def __init__(self):
         self.offset = 0
         self.messages = {}
+        self.observed_models = set()
         self.result = None
 
     @staticmethod
@@ -1980,6 +1986,49 @@ class _InboxUsage:
         return sum(v for k, v in (usage or {}).items() if k in (
             "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
             and isinstance(v, int) and v >= 0)
+
+    def totals(self):
+        return {k: sum(msg["usage"].get(k, 0) for msg in self.messages.values())
+                for k in self.TOKEN_FIELDS}
+
+    @staticmethod
+    def prices_for_model(prices, model):
+        if model not in prices:
+            raise ValueError(f"no model_prices entry for model {model!r}; configure its USD per "
+                             "million token rates in constraints before running inbox triage")
+        return prices[model]
+
+    def cost_usd(self, prices, launch_model):
+        # Validate even zero-token records and earlier result records, not only the
+        # models left in the final wrapper. Unknown internal routing must fail loud.
+        for model in self.observed_models:
+            self.prices_for_model(prices, model)
+        by_model = {}
+        model_usage = (self.result or {}).get("modelUsage") or {}
+        for msg in self.messages.values():
+            if not msg["model"] and model_usage:
+                continue  # The final breakdown supersedes unattributed stream tokens.
+            model = msg["model"] or launch_model  # Older streams may omit identity.
+            counts = by_model.setdefault(model, {})
+            for k, n in msg["usage"].items():
+                counts[k] = counts.get(k, 0) + n
+        for model, usage in model_usage.items():
+            counts = by_model.setdefault(model, {})
+            for k, field in self.MODEL_USAGE_FIELDS.items():
+                n = usage.get(field, usage.get(k, 0))
+                if isinstance(n, int) and n >= 0:
+                    counts[k] = max(counts.get(k, 0), n)
+        if not model_usage:
+            # With no final breakdown, only unaccounted aggregate tokens belong to
+            # the launch model. Never reprice identified internal usage at its rates.
+            aggregate = (self.result or {}).get("usage") or {}
+            totals = {k: sum(u.get(k, 0) for u in by_model.values()) for k in self.TOKEN_FIELDS}
+            counts = by_model.setdefault(launch_model, {})
+            for k, n in aggregate.items():
+                if k in totals and isinstance(n, int) and n >= 0:
+                    counts[k] = counts.get(k, 0) + max(0, n - totals[k])
+        return sum(n * self.prices_for_model(prices, model)[k]
+                   for model, usage in by_model.items() for k, n in usage.items()) / 1_000_000
 
     def update(self, raw, final=False):
         raw = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else (raw or "")
@@ -1993,12 +2042,20 @@ class _InboxUsage:
                 continue
             if rec.get("type") == "assistant":
                 msg = rec.get("message") or {}
-                key = msg.get("id") or rec.get("uuid") or str(self.offset)
-                self.messages[key] = max(self.messages.get(key, 0), self.input_tokens(msg.get("usage")))
+                model = msg.get("model")
+                if model:
+                    self.observed_models.add(model)
+                key = (model, msg.get("id") or rec.get("uuid") or str(self.offset))
+                usage = msg.get("usage") or {}
+                counts = self.messages.setdefault(key, {"model": model, "usage": {}})["usage"]
+                for k, v in usage.items():
+                    if k in self.TOKEN_FIELDS and isinstance(v, int) and v >= 0:
+                        counts[k] = max(counts.get(k, 0), v)
             elif rec.get("type") == "result" or "result" in rec or "subtype" in rec:
+                self.observed_models.update(rec.get("modelUsage") or {})
                 self.result = rec
         self.offset = end
-        return max(sum(self.messages.values()), self.input_tokens((self.result or {}).get("usage")))
+        return max(self.input_tokens(self.totals()), self.input_tokens((self.result or {}).get("usage")))
 
 
 class Worker:
@@ -2140,6 +2197,7 @@ class CCAdapter(Adapter):
                  run_registry=None, semaphore=None,
                  max_turns=15, wall_clock_s=600, max_forwards=10, max_turns_by_capability=None,
                  wall_clock_by_capability=None, inbox_max_input_tokens=3_000_000, inbox_max_cost_usd=2.0,
+                 model_prices=None,
                  rotate_turns=20, rotate_tokens=120_000,
                  setting_sources="", claude_bin="claude",
                  cmd_poll_s=1.0, teardown_join_s=30.0, alert_ops=None,
@@ -2171,6 +2229,18 @@ class CCAdapter(Adapter):
         self.inbox_max_cost_usd = float(inbox_max_cost_usd)
         if self.inbox_max_input_tokens <= 0 or not 0 < self.inbox_max_cost_usd < float("inf"):
             raise ValueError("inbox run ceilings must be positive and finite")
+        # Exact resolved model ids only. No wildcard, alias inference or wrapper-price fallback.
+        self.model_prices = {}
+        if model_prices is not None and not isinstance(model_prices, dict):
+            raise ValueError("model_prices must be a mapping of model ids to USD per million token rates")
+        for model, prices in (model_prices or {}).items():
+            if (not isinstance(model, str) or not model or not isinstance(prices, dict)
+                    or set(prices) != set(_InboxUsage.TOKEN_FIELDS)
+                    or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                           or not 0 <= v < float("inf") for v in prices.values())):
+                raise ValueError(f"invalid model_prices entry for model {model!r}: require finite nonnegative "
+                                 f"USD per million rates for {', '.join(_InboxUsage.TOKEN_FIELDS)}")
+            self.model_prices[model] = dict(prices)
         self.max_forwards = max_forwards
         self.rotate_turns = rotate_turns
         self.rotate_tokens = rotate_tokens
@@ -4841,6 +4911,8 @@ class CCAdapter(Adapter):
             else:
                 log.warning("route backend %r not resolvable in %s -> falling back to %s / default backend",
                             _backend, SPAWN_MODELS_JSON, route.model)
+        if capability == "inbox":
+            _InboxUsage.prices_for_model(self.model_prices, eff_model)
         # With streaming ON, pin every FRESH session (seed / rotation / non-resume fallback) to a uuid we
         # choose, so the dash stream can find ~/.claude/projects/*/<uuid>.jsonl while the turn is still running
         # (session_id is otherwise only learned post-exit). A --resume turn keeps its session (and file). OFF =
@@ -4878,7 +4950,9 @@ class CCAdapter(Adapter):
             # JSON-only output hides usage until exit. stream-json exposes each API
             # response while communicate drains BOTH pipes (including noisy stderr).
             argv[argv.index("--output-format") + 1] = "stream-json"
-            argv += ["--verbose", "--max-budget-usd", str(self.inbox_max_cost_usd - worker.inbox_cost_usd)]
+            # CC guesses prices for non-catalog models. Enforce our own table-priced cap
+            # while polling instead, for both free and paid routes.
+            argv += ["--verbose"]
             if is_reprompt:
                 argv[argv.index("--max-turns") + 1] = "1"
         # Build the worker env from an ALLOWLIST (scrub_worker_env), NOT os.environ.copy(),
@@ -4966,13 +5040,21 @@ class CCAdapter(Adapter):
                         stdin = None  # communicate must receive input only on its first call
                         upstream_error = _cc_upstream_error(e.output, e.stderr) if fail_fast else None
                         used = inbox_usage.update(e.output) if inbox_usage is not None else 0
-                        if upstream_error or (inbox_usage is not None and inbox_token_limit and
-                                              worker.inbox_input_tokens + used >= self.inbox_max_input_tokens):
+                        over_cost = (inbox_usage is not None and worker.inbox_cost_usd +
+                                     inbox_usage.cost_usd(self.model_prices, eff_model) >= self.inbox_max_cost_usd)
+                        if upstream_error or over_cost or (inbox_usage is not None and inbox_token_limit and
+                                                           worker.inbox_input_tokens + used >= self.inbox_max_input_tokens):
                             if not upstream_error:
-                                worker.inbox_limit_reason = "input-token ceiling"
+                                worker.inbox_limit_reason = "cost ceiling (USD)" if over_cost else "input-token ceiling"
                             proc.kill()
                             out, err = proc.communicate()
                             break
+        except ValueError:
+            # Pricing may reject an internally selected model while CC is still
+            # running. Stop and reap it before propagating the named-model error.
+            proc.kill()
+            proc.communicate()
+            raise
         except subprocess.TimeoutExpired:
             proc.kill()
             # Limitation: this second communicate() reaps the SIGKILLed child. In the pathological case where
@@ -4995,13 +5077,10 @@ class CCAdapter(Adapter):
         if inbox_usage is not None:
             worker.inbox_input_tokens += inbox_usage.update(out, final=True)
             wrapper = inbox_usage.result or {}
-            cost = wrapper.get("total_cost_usd", 0) or 0
-            if isinstance(cost, (int, float)) and cost >= 0:
-                worker.inbox_cost_usd += cost
+            worker.inbox_cost_usd += inbox_usage.cost_usd(self.model_prices, eff_model)
             if inbox_token_limit and worker.inbox_input_tokens >= self.inbox_max_input_tokens:
                 worker.inbox_limit_reason = "input-token ceiling"
-            elif (worker.inbox_cost_usd >= self.inbox_max_cost_usd or
-                  wrapper.get("subtype") in ("error_max_budget_usd", "error_max_budget")):
+            elif worker.inbox_cost_usd >= self.inbox_max_cost_usd:
                 worker.inbox_limit_reason = "cost ceiling (USD)"
             if wrapper:
                 out = json.dumps(wrapper)  # existing envelope/session/cap handling consumes one result

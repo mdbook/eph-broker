@@ -3,6 +3,8 @@
 A guide for coding agents working on this repo. Humans start at [README.md](README.md) and
 [docs/README.md](docs/README.md).
 
+Read docs/STANDARDS.md and docs/DESIGN.md before changing code or UI.
+
 ## What this is
 
 eph-broker is a standard-library Python service. It takes a ticket assigned to a bot, has a short-lived

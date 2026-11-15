@@ -70,6 +70,13 @@ how it works first.
   GitLab issues and a first GitHub Issues increment are built; PRs and Jira remain planned.
   These are about where tickets come from, not the harness a worker runs on.
 
+## Standards
+
+- [STANDARDS.md](STANDARDS.md): the code standards this repo follows: language, layout, naming, config,
+  errors and logging, tests, commits and release.
+- [DESIGN.md](DESIGN.md): the dashboard's design system: color tokens, type, spacing, components, motion, copy
+  voice and logo use.
+
 ## FAQ
 
 - [faq.md](faq.md): GitHub, other trackers, sandboxing, cost, other models and harnesses, and why it's

@@ -71,10 +71,12 @@ class RoutingOverrides:
         for name, fields in rows.items():
             if name not in rows_by_key:
                 raise ValueError("unknown row")
-            if (not isinstance(fields, dict) or set(fields) - {"backend", "adapter", "model_pin", "repo_lock_scope", "pin"}
-                    or any(type(v) is not bool if k == "pin" else not isinstance(v, str)
+            if (not isinstance(fields, dict) or set(fields) - {"backend", "adapter", "model_pin", "repo_lock_scope", "pin",
+                                                              "cc_disable_thinking_local", "cc_fail_fast"}
+                    or any(type(v) is not bool if k in ("pin", "cc_disable_thinking_local", "cc_fail_fast") else not isinstance(v, str)
                            for k, v in fields.items())):
-                raise ValueError("row overrides accept backend, adapter, model_pin, repo_lock_scope strings and pin boolean")
+                raise ValueError("row overrides accept backend, adapter, model_pin, repo_lock_scope strings "
+                                 "and pin, cc_disable_thinking_local, cc_fail_fast booleans")
             route = replace(rows_by_key[name], **fields)  # Route validates the harness.
             if route.backend and route.backend != "claude" and not backend_ok(route.backend):
                 raise ValueError("unresolvable backend")

@@ -981,6 +981,9 @@ class Route:
     repo_lock_scope: str = "phases"
     # A backend/adapter is a DEFAULT unless the operator explicitly opts into a hard pin.
     pin: bool = False
+    # CC-only compatibility knobs, file-configurable per row through routing overrides.
+    cc_disable_thinking_local: bool = True
+    cc_fail_fast: bool = True
 
     @property
     def row_key(self):
@@ -989,6 +992,9 @@ class Route:
     def __post_init__(self):
         if type(self.pin) is not bool:
             raise ValueError(f"Route {self.row_key!r}: pin must be a boolean")
+        for name in ("cc_disable_thinking_local", "cc_fail_fast"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"Route {self.row_key!r}: {name} must be a boolean")
         if self.repo_lock_scope not in ("phases", "run"):
             raise ValueError(f"Route {self.row_key!r}: repo_lock_scope must be 'phases' or 'run'")
         if self.adapter not in ADAPTERS:
@@ -1039,7 +1045,8 @@ class Route:
                      dict(self.publish), self.mcp_config_dir, self.test_runner, self.setting_sources,
                      self.mcp_config_path, backend, self.backend_from_mode, self.adapter,
                      self.pin or bool(self.model_pin), self.row_id, self.model_pin,
-                     self.from_config, self.site_capability, self.browser_mcp_config, self.repo_lock_scope, self.pin)
+                     self.from_config, self.site_capability, self.browser_mcp_config, self.repo_lock_scope, self.pin,
+                     self.cc_disable_thinking_local, self.cc_fail_fast)
 
 
 # Per-ticket model selection via a `model:<name>` label. The name is either a native

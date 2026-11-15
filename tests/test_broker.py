@@ -25103,6 +25103,146 @@ def test_inbox_guardrails_do_not_change_other_rows_and_are_configurable():
     ok("inbox-only defaults/overrides and positive ceiling validation; other rows keep their argv and limits")
 
 
+def test_cc_local_thinking_policy_uses_resolved_backend_and_row_override():
+    from dataclasses import replace
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        a, _, inbox = _inbox_guardrail_setup(d)
+        seen = []
+        class P:
+            returncode = 0
+            def __init__(self, argv, **kwargs): seen.append(kwargs["env"])
+            def communicate(self, input=None, timeout=None): return _inbox_stream_result(), ""
+        entries = {"local-test": {"kind": "local"}, "cloud-test": {"kind": "cloud"}}
+        with patch.object(cc.subprocess, "Popen", P), \
+                patch.object(cc, "_backend_entry", side_effect=entries.get), \
+                patch.object(cc, "load_backend", return_value=("test-model", {}, None)):
+            for backend, override, disabled, expected in (
+                    ("local-test", cc._NO_OVERRIDE, True, "0"),
+                    ("local-test", cc._NO_OVERRIDE, False, "128"),
+                    ("cloud-test", cc._NO_OVERRIDE, True, "128"),
+                    ("", cc._NO_OVERRIDE, True, "128"),
+                    ("cloud-test", "local-test", True, "0"),
+                    ("local-test", "claude", True, "128")):
+                route = replace(inbox, backend=backend, cc_disable_thinking_local=disabled,
+                                env={"MAX_THINKING_TOKENS": "128"})
+                w = Worker("gmail:test", "run-9652", d)
+                w.session_id = "session-9650"
+                assert a._one_turn(w, route, "SYS", "{}", True, backend_override=override)
+                assert seen[-1]["MAX_THINKING_TOKENS"] == expected, (backend, override, seen[-1])
+            # No new thinking setting at all for native Claude without an explicit row env.
+            a._one_turn(Worker("gmail:test", "run-9653", d), inbox, "SYS", "{}", False)
+            assert "MAX_THINKING_TOKENS" not in seen[-1]
+    ok("local CC thinking disabled on resolved/resumed/fallback turns; row opt-out and Claude env unchanged")
+
+
+def test_cc_upstream_error_detection_excludes_normal_output_and_transient_errors():
+    for diagnostic in ('unrecognized_model {"model":"local-test"}',
+                       '[claude-code:unrecognized_model] {"model":"local-test"}',
+                       'API Error: 400 {"error":"Unexpected item type in content."}',
+                       'BadRequestError: rejected content'):
+        assert cc._cc_upstream_error(b"", diagnostic.encode()), diagnostic
+    assert cc._cc_upstream_error('{"is_error":true,"api_error_status":400}', "")
+    streamed = json.dumps({"type": "assistant", "error": "invalid_request", "message": {
+        "content": [{"type": "text", "text": "API Error: 400 Unexpected item type in content."}]}})
+    assert cc._cc_upstream_error(streamed + "\n", "")
+    assert cc._cc_upstream_error(streamed[:25], "") is None
+    for text in ("API Error: 400", "unrecognized_model", "Unexpected item type in content."):
+        assert cc._cc_upstream_error(json.dumps({"result": text}), "") is None
+        assert cc._cc_upstream_error(json.dumps({"type": "user", "message": text}), "") is None
+    for status in (401, 403, 404, 429, 500, 529):
+        assert cc._cc_upstream_error(json.dumps({"is_error": True, "api_error_status": status}),
+                                     "API Error: " + str(status)) is None
+    ok("CC detects 400/model diagnostics including partial byte streams, not ordinary text or 429/529")
+
+
+def test_cc_upstream_rejection_kills_and_reaps_without_warm_reprompt():
+    from dataclasses import replace
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        fake = _write_fake_claude(d)
+        for capability in ("inbox", "read", "mr-review"):
+            for channel, diagnostic in (("stderr", 'unrecognized_model {"model":"local-test"}'),
+                                        ("stderr", "API Error: 400 Unexpected item type in content."),
+                                        ("stdout", '{"is_error":true,"api_error_status":400}')):
+                pathlib.Path(fake).write_text('#!/usr/bin/env python3\nimport sys, time\n' +
+                    f'print({diagnostic!r}, file=sys.{channel}, flush=True)\n' +
+                    'time.sleep(20)\n')
+                a, w, r = _inbox_guardrail_setup(d, claude_bin=fake, wall_clock_s=10,
+                                                wall_clock_by_capability={"inbox": 10})
+                r = replace(r, capability=capability)
+                started = time.monotonic()
+                with patch.object(cc, "USAGE_CAP_FALLBACK_ENABLED", True), \
+                        patch.object(cc, "capture_failed_turn") as capture:
+                    env = a._turn_with_envelope(w, r, "SYS", "{}", False, w.run_id)
+                assert time.monotonic() - started < 5, "must not wait for wall clock"
+                assert env["status"] == ("block" if capability == "mr-review" else "blocked"), env
+                assert "upstream" in env["summary"] and "changes may already have occurred" in env["summary"]
+                assert w.done and w.turns == 1 and not w.in_turn and not w.hard_killed
+                assert w.proc.poll() is not None and capture.call_count == 1
+    ok("CC 400/model rejection kills/reaps and captures once with terminal failure, no retry/fallback/re-prompt")
+
+
+def test_cc_upstream_error_detection_preserves_oversized_record_framing():
+    padding = "x" * 100000
+    for status in (400, "400"):
+        for fields in ({"is_error": True, "api_error_status": status, "detail": padding},
+                       {"detail": padding, "api_error_status": status, "is_error": True}):
+            record = json.dumps(fields)
+            for output in (record, record.encode(), '{"type":"system"}\n' + record + "\n" +
+                           json.dumps({"result": padding}) + "\n"):
+                assert cc._cc_upstream_error(output, "") == "upstream HTTP 400 (bad request)"
+    for fields in ({"result": json.dumps({"is_error": True, "api_error_status": 400}) + padding},
+                   {"message": {"is_error": True, "api_error_status": 400}, "detail": padding},
+                   {"is_error": False, "api_error_status": 400, "detail": padding},
+                   {"is_error": True, "api_error_status": 429, "detail": padding}):
+        assert cc._cc_upstream_error(json.dumps(fields), "") is None
+    ok("CC detects oversized error records before truncation, retaining top-level flag validation")
+
+
+def test_cc_upstream_oversized_rejection_split_across_cumulative_reads():
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        a, w, r = _inbox_guardrail_setup(d)
+        prefix = b'{"type":"system"}\n'
+        record = json.dumps({"is_error": True, "api_error_status": 400,
+                             "detail": "x" * 100000}).encode()
+        reads = [prefix + record[:20], prefix + record[:70000], prefix + record + b"\n"]
+        calls, kills = [], []
+        class P:
+            returncode = 0
+            def __init__(self, *args, **kwargs): pass
+            def communicate(self, input=None, timeout=None):
+                calls.append((input, timeout))
+                if timeout is not None:
+                    assert len(calls) <= len(reads), "must stop on the complete oversized record"
+                    raise subprocess.TimeoutExpired("claude", timeout, output=reads[len(calls) - 1])
+                return reads[-1].decode(), ""
+            def kill(self): kills.append(len(calls))
+        with patch.object(cc.subprocess, "Popen", P), patch.object(cc, "capture_failed_turn") as capture:
+            env = a._turn_with_envelope(w, r, "SYS", "{}", False, w.run_id)
+        assert env["status"] == "blocked" and "upstream HTTP 400" in env["summary"]
+        assert kills == [3] and len(calls) == 4 and capture.call_count == 1
+        assert calls[0][0] is not None and all(call[0] is None for call in calls[1:])
+        assert w.done and w.turns == 1 and not w.hard_killed and not w.in_turn
+    ok("CC retries partial cumulative records, then kills/reaps on an oversized 400 without re-prompt")
+
+
+def test_cc_fail_fast_exit_detection_and_per_row_opt_out():
+    from dataclasses import replace
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        a, w, r = _inbox_guardrail_setup(d)
+        class P:
+            returncode = 0
+            def __init__(self, *args, **kwargs): pass
+            def communicate(self, input=None, timeout=None):
+                return _inbox_stream_result(), "API Error: 400 rejected"
+        with patch.object(cc.subprocess, "Popen", P):
+            result = a._turn_with_envelope(w, r, "SYS", "{}", False, w.run_id)
+            assert result["status"] == "blocked" and w.done and w.turns == 1
+            w = Worker("gmail:test", "run-9654", d)
+            result = a._turn_with_envelope(w, replace(r, cc_fail_fast=False), "SYS", "{}", False, w.run_id)
+            assert result["status"] == "done" and not w.done
+    ok("CC rejects completed processes with upstream errors too; row opt-out retains old behavior")
+
+
 def test_envelope_escalation_once_per_run_concurrent_and_after_reload():
     from broker_state import BrokerState
     with tempfile.TemporaryDirectory(dir=ROOT) as d:

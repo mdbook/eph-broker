@@ -361,6 +361,53 @@ def _detect_api_overload(raw):
         return False
 
 
+_CC_BAD_REQUEST_RE = re.compile(r"(?:API Error|BadRequestError|HTTP(?: Error)?|Error)[:\s]+400\b", re.I)
+_CC_MODEL_ERROR_RE = re.compile(r"^(?:\[claude-code:)?unrecognized_model\b", re.M)
+_CC_ERROR_FLAG_RE = re.compile(r'"is_error"\s*:\s*true\b')
+_CC_ERROR_STATUS_RE = re.compile(r'"api_error_status"\s*:\s*(?:400|"400")\s*[,}]')
+
+
+def _cc_upstream_error(out, err):
+    """Recognize harness/API diagnostics, not error phrases quoted in ordinary worker output.
+
+    TimeoutExpired streams are cumulative bytes even for text-mode Popen. Bound general inspection,
+    but check explicit error flags before truncation can lose their record's opening. An incomplete
+    JSON record is retried on the next poll. Never return raw upstream text (secrets).
+    """
+    def tail(raw):
+        return (raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw or "")[-65536:]
+    stderr = tail(err)
+    if _CC_MODEL_ERROR_RE.search(stderr):
+        return "upstream model rejected (unrecognized_model)"
+    if _CC_BAD_REQUEST_RE.search(stderr) or re.search(r"^BadRequestError\b", stderr, re.M):
+        return "upstream HTTP 400 (bad request)"
+    stdout = out.decode("utf-8", "replace") if isinstance(out, bytes) else out or ""
+    for record in stdout.splitlines():
+        if not (_CC_ERROR_FLAG_RE.search(record) and _CC_ERROR_STATUS_RE.search(record)):
+            continue
+        try:
+            w = json.loads(record)
+        except (ValueError, TypeError):
+            continue
+        # Confirm top-level flags, not nested data or diagnostics quoted by the worker.
+        if isinstance(w, dict) and w.get("is_error") is True and str(w.get("api_error_status")) == "400":
+            return "upstream HTTP 400 (bad request)"
+    stdout = tail(stdout)
+    for record in [stdout] + stdout.splitlines():
+        try:
+            w = json.loads(record)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(w, dict):
+            continue
+        if w.get("is_error") is True or w.get("terminal_reason") == "api_error" or w.get("error"):
+            if str(w.get("api_error_status")) == "400" or _CC_BAD_REQUEST_RE.search(json.dumps(w)):
+                return "upstream HTTP 400 (bad request)"
+            if w.get("error") == "unrecognized_model":
+                return "upstream model rejected (unrecognized_model)"
+    return None
+
+
 def _gate_denials_html(denials, cap=20):
     """The hermes eph-gate denials of a turn as an HTML block for the result comment. Every field is
     worker-influenced, so all of it is html-escaped; the sha is shown in full (byte-exact, from gate-hook.py) because
@@ -4862,6 +4909,10 @@ class CCAdapter(Adapter):
         # measurably slower, so it gets LOCAL_WALL_CLOCK_MULT x the per-capability allotment). Checked on
         # `_backend` (the name actually dispatching this turn), never the row's unresolved default.
         local_turn = _is_local_backend(_backend)
+        if local_turn and getattr(route, "cc_disable_thinking_local", True):
+            # CC's extended-thinking blocks are not accepted by every local Messages bridge.
+            # Apply after route/backend env layering, only for the backend actually used this turn.
+            env["MAX_THINKING_TOKENS"] = "0"
         if local_turn and capability != "inbox":
             wall_clock_s = wall_clock_s * LOCAL_WALL_CLOCK_MULT
         if wall_clock_override is not None:
@@ -4892,8 +4943,10 @@ class CCAdapter(Adapter):
             raise WorkerSpawnFailed(f"could not start {os.path.basename(argv[0])}: {e}") from e
         worker.proc = proc
         inbox_usage = _InboxUsage() if capability == "inbox" else None
+        fail_fast = getattr(route, "cc_fail_fast", True)
+        upstream_error = None
         try:
-            if inbox_usage is None:
+            if inbox_usage is None and not fail_fast:
                 out, err = proc.communicate(prompt_text, timeout=wall_clock_s)
             else:
                 deadline = time.monotonic() + wall_clock_s
@@ -4907,9 +4960,12 @@ class CCAdapter(Adapter):
                         break
                     except subprocess.TimeoutExpired as e:
                         stdin = None  # communicate must receive input only on its first call
-                        used = inbox_usage.update(e.output)
-                        if worker.inbox_input_tokens + used >= self.inbox_max_input_tokens:
-                            worker.inbox_limit_reason = "input-token ceiling"
+                        upstream_error = _cc_upstream_error(e.output, e.stderr) if fail_fast else None
+                        used = inbox_usage.update(e.output) if inbox_usage is not None else 0
+                        if upstream_error or (inbox_usage is not None and
+                                              worker.inbox_input_tokens + used >= self.inbox_max_input_tokens):
+                            if not upstream_error:
+                                worker.inbox_limit_reason = "input-token ceiling"
                             proc.kill()
                             out, err = proc.communicate()
                             break
@@ -4931,6 +4987,7 @@ class CCAdapter(Adapter):
             worker.in_turn = False                       # turn complete: the signal fires here
             worker.turn_started = None                   # between turns
         worker.turns += 1
+        upstream_error = upstream_error or (_cc_upstream_error(out, err) if fail_fast else None)
         if inbox_usage is not None:
             worker.inbox_input_tokens += inbox_usage.update(out, final=True)
             wrapper = inbox_usage.result or {}
@@ -4945,6 +5002,19 @@ class CCAdapter(Adapter):
             if wrapper:
                 out = json.dumps(wrapper)  # existing envelope/session/cap handling consumes one result
         worker.last_output = out          # keep the raw output so escalate() can wrap it UNTRUSTED
+        if upstream_error:
+            capture_failed_turn(worker, route, upstream_error, getattr(proc, "returncode", None), out, err)
+            log.warning("CC fail-fast key=%s: %s", worker.key, upstream_error)
+            if capability == "inbox":
+                worker.inbox_limit_reason = upstream_error
+                return self._inbox_failure(worker, route, worker.run_id)
+            # A deterministic request/model rejection cannot be repaired by a JSON re-prompt or fallback.
+            worker.done = True
+            return {"status": "block" if capability == "mr-review" else "blocked", "summary": (
+                "<p>Worker stopped by the broker: " + upstream_error +
+                ". Work is incomplete; changes may already have occurred. Review state before retrying.</p>"),
+                "wake": [], "needs_operator": False, "run_id": worker.run_id,
+                "session_id": worker.session_id, "harness": "cc"}
         if _detect_turn_cap(out):         # sticky: _run_worker saves a WIP branch at teardown (no MR)
             worker.turn_capped = True
             log.warning("TURN-CAP key=%s: --max-turns %s exhausted", worker.key,

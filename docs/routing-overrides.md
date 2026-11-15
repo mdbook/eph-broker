@@ -8,7 +8,8 @@ different path. Unlike `routes.json`, it changes existing rows only, not trigger
 The file accepts three optional top-level keys:
 
 - `rows`: an object keyed by an existing route's row key (`row_id` when set, otherwise its `domain`, such
-  as `code`). Each entry accepts string fields `backend`, `adapter`, `model_pin` and `repo_lock_scope`, and boolean `pin`. Adapters are
+  as `code`). Each entry accepts string fields `backend`, `adapter`, `model_pin` and `repo_lock_scope`,
+  and booleans `pin`, `cc_disable_thinking_local` and `cc_fail_fast`. Adapters are
   `cc`, `hermes` or `codex`; a nonempty backend other than `claude` must resolve in the spawn registry.
   `backend` and `adapter` are overridable defaults: ticket model labels or a dashboard one-run model pick
   replace them, including switching harnesses to match the model. Set `pin:true` to ignore ticket choices;
@@ -21,6 +22,10 @@ The file accepts three optional top-level keys:
   rebase/retry remains enabled even if you select `phases`. Every scope uses the same per-repo lock,
   so cut and publish cannot overlap one another. The dashboard and `/runs/<key>` report `waiting`
   while a subject is queued on this lock or on the global turn cap, without changing coalescer state.
+  The CC-only switches `cc_disable_thinking_local` and `cc_fail_fast` default to `true`: disable extended
+  thinking on resolved local backends, and stop on upstream 400/model rejection diagnostics rather than
+  waiting for the wall clock. Set either to `false` to opt out for that row. They are file-only settings;
+  see [local backend compatibility](configuration.md#claude-code-compatibility-with-local-backends).
 - `trusted_creators`: a list of ticket-creator usernames allowed to select non-Anthropic backends with
   `model:` labels. It replaces `MODEL_LABEL_TRUSTED_CREATORS`; an empty list trusts nobody. Usernames are
   matched case-insensitively.

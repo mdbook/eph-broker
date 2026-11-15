@@ -429,6 +429,33 @@ the auto permission mode. That's also the way to run workers on an API key inste
 other backend is non-Anthropic: the code worker refuses it unless `CODE_NONCLAUDE_OK=1`, and the general worker
 loses the auto mode classifier ([security.md](security.md)).
 
+### Claude Code compatibility with local backends
+
+For CC turns whose resolved registry backend has `kind: "local"`, the broker sets
+`MAX_THINKING_TOKENS=0`. This prevents CC from requesting extended-thinking content blocks that some
+local Messages bridges reject. It applies to resumed turns and fallback turns too. Native and hosted
+Claude turns retain their existing thinking settings; Hermes and Codex are unchanged.
+
+CC also checks both process streams once a second for upstream HTTP 400 or `unrecognized_model`
+diagnostics. It kills and reaps a stuck CLI on the first recognized rejection, captures the failed turn,
+and returns a terminal failure instead of spending the wall clock or launching a warm re-prompt.
+It does not treat ordinary assistant/tool output quoting an error as an API diagnostic. HTTP 429/529
+still use the existing overload retry path. A failure does not imply rollback of any earlier tool work.
+
+Both behaviors are configurable per row in `routing-overrides.json` (file-only, not ticket fields or
+dashboard edits), and take effect on the next spawn:
+
+```json
+{"rows": {"inbox": {"cc_disable_thinking_local": true, "cc_fail_fast": true}}}
+```
+
+Both switches default to `true`; set either to `false` to opt that row out. The thinking switch is ignored
+unless the turn actually uses a local backend, regardless of the row's default model/backend.
+
+The compatibility setting is not a diagnosis of every rejected content type. Confirm a deployment's
+specific rejection with a supervised CC verbose/debug turn and upstream request logs before declaring
+the incident resolved. Do not put raw request content or credentials in ticket comments.
+
 ## Choosing the reviewer's model
 
 `MR_REVIEW_ADAPTER` picks the reviewer's harness, `cc` (the default), `hermes` or `codex`. The hermes harness

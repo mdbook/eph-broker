@@ -292,6 +292,10 @@ change the binding. Notes also carry the MR title and description as context, in
 
 ## Models and backends
 
+CC local-thinking and upstream fail-fast switches are per-row booleans in `routing-overrides.json`:
+`cc_disable_thinking_local` and `cc_fail_fast`, both default `true`. See
+[local backend compatibility](configuration.md#claude-code-compatibility-with-local-backends).
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `FLEET_MODEL_SH` | unset | Script that prints a model id or backend name per agent ([configuration.md](configuration.md#models-and-backends)). |

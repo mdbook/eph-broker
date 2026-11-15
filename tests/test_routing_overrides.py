@@ -88,6 +88,27 @@ def test_shipped_example_is_valid():
     ok("the shipped config/routing-overrides.example.json passes RoutingOverrides._validate unchanged")
 
 
+def test_cc_compatibility_controls_are_boolean_per_row_file_overrides():
+    with _Overrides() as (path, loader):
+        template = routing._INBOX_ROW
+        save(path, {"rows": {template.row_key: {
+            "cc_disable_thinking_local": False, "cc_fail_fast": False}}})
+        route = template.with_model()
+        assert not route.cc_disable_thinking_local and not route.cc_fail_fast
+        picked = routing.apply_model_choice(route, "sonnet", True, lambda name: True)
+        assert not picked.cc_disable_thinking_local and not picked.cc_fail_fast
+        assert template.cc_disable_thinking_local and template.cc_fail_fast
+        assert loader.apply(routing._CODE_ROW).cc_fail_fast
+        for field in ("cc_disable_thinking_local", "cc_fail_fast"):
+            for invalid in ("false", 0, None):
+                try:
+                    loader._validate({"rows": {template.row_key: {field: invalid}}})
+                    assert False, "must reject non-boolean compatibility controls"
+                except ValueError:
+                    pass
+    ok("CC compatibility switches are strict per-row booleans; default rows are not mutated")
+
+
 def test_next_spawn_and_existing_route():
     with _Overrides() as (path, loader):
         template = routing._CODE_ROW

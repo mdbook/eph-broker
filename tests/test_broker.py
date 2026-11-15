@@ -25136,11 +25136,12 @@ def test_cc_local_thinking_policy_uses_resolved_backend_and_row_override():
 
 
 def test_cc_upstream_error_detection_excludes_normal_output_and_transient_errors():
-    for diagnostic in ('unrecognized_model {"model":"local-test"}',
-                       '[claude-code:unrecognized_model] {"model":"local-test"}',
-                       'API Error: 400 {"error":"Unexpected item type in content."}',
+    for diagnostic in ('API Error: 400 {"error":"Unexpected item type in content."}',
                        'BadRequestError: rejected content'):
         assert cc._cc_upstream_error(b"", diagnostic.encode()), diagnostic
+    for flags in ({"is_error": True}, {"terminal_reason": "api_error"}):
+        record = json.dumps(dict(flags, error="unrecognized_model"))
+        assert cc._cc_upstream_error(record, "") == "upstream model rejected (unrecognized_model)"
     assert cc._cc_upstream_error('{"is_error":true,"api_error_status":400}', "")
     streamed = json.dumps({"type": "assistant", "error": "invalid_request", "message": {
         "content": [{"type": "text", "text": "API Error: 400 Unexpected item type in content."}]}})
@@ -25155,12 +25156,23 @@ def test_cc_upstream_error_detection_excludes_normal_output_and_transient_errors
     ok("CC detects 400/model diagnostics including partial byte streams, not ordinary text or 429/529")
 
 
+def test_cc_upstream_error_ignores_stderr_model_notices_during_normal_streaming():
+    streamed = json.dumps({"type": "assistant", "message": {
+        "content": [{"type": "text", "text": "Working on the request."}]}}) + "\n"
+    for notice in ('unrecognized_model {"model":"local-test"}',
+                   '[claude-code:unrecognized_model] {"model":"local-test"}'):
+        for output in ("", streamed[:25], streamed, _inbox_stream_result()):
+            assert cc._cc_upstream_error(output, notice) is None
+            assert cc._cc_upstream_error(output.encode(), notice.encode()) is None
+    ok("CC ignores non-catalog model notices on stderr before, during and after normal streaming")
+
+
 def test_cc_upstream_rejection_kills_and_reaps_without_warm_reprompt():
     from dataclasses import replace
     with tempfile.TemporaryDirectory(dir=ROOT) as d:
         fake = _write_fake_claude(d)
         for capability in ("inbox", "read", "mr-review"):
-            for channel, diagnostic in (("stderr", 'unrecognized_model {"model":"local-test"}'),
+            for channel, diagnostic in (("stdout", '{"is_error":true,"error":"unrecognized_model"}'),
                                         ("stderr", "API Error: 400 Unexpected item type in content."),
                                         ("stdout", '{"is_error":true,"api_error_status":400}')):
                 pathlib.Path(fake).write_text('#!/usr/bin/env python3\nimport sys, time\n' +

@@ -362,7 +362,6 @@ def _detect_api_overload(raw):
 
 
 _CC_BAD_REQUEST_RE = re.compile(r"(?:API Error|BadRequestError|HTTP(?: Error)?|Error)[:\s]+400\b", re.I)
-_CC_MODEL_ERROR_RE = re.compile(r"^(?:\[claude-code:)?unrecognized_model\b", re.M)
 _CC_ERROR_FLAG_RE = re.compile(r'"is_error"\s*:\s*true\b')
 _CC_ERROR_STATUS_RE = re.compile(r'"api_error_status"\s*:\s*(?:400|"400")\s*[,}]')
 
@@ -372,13 +371,12 @@ def _cc_upstream_error(out, err):
 
     TimeoutExpired streams are cumulative bytes even for text-mode Popen. Bound general inspection,
     but check explicit error flags before truncation can lose their record's opening. An incomplete
-    JSON record is retried on the next poll. Never return raw upstream text (secrets).
+    JSON record is retried on the next poll. Stderr unrecognized_model notices for non-catalog
+    aliases are non-fatal. Never return raw upstream text (secrets).
     """
     def tail(raw):
         return (raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw or "")[-65536:]
     stderr = tail(err)
-    if _CC_MODEL_ERROR_RE.search(stderr):
-        return "upstream model rejected (unrecognized_model)"
     if _CC_BAD_REQUEST_RE.search(stderr) or re.search(r"^BadRequestError\b", stderr, re.M):
         return "upstream HTTP 400 (bad request)"
     stdout = out.decode("utf-8", "replace") if isinstance(out, bytes) else out or ""

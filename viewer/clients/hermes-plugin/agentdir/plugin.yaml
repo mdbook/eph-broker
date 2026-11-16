@@ -1,0 +1,24 @@
+name: agentdir
+version: 1.0.0
+description: "Registers this Hermes gateway with an eph-broker agent directory and keeps it there: enrolls once with a one-time token, stores its key in $HERMES_HOME/agentdir.key, sends signed heartbeats every ttl/3 with busy/idle from the turn hooks, and removes itself on clean shutdown. Network errors never reach the gateway."
+license: GPL-3.0-or-later
+provides_hooks:
+  - pre_llm_call
+  - post_llm_call
+config_schema:
+  url:
+    type: str
+    description: "Directory agent API, when AGENTDIR_URL is unset (default: http://127.0.0.1:8790)"
+  name:
+    type: str
+    description: "Name to register, when AGENTDIR_NAME is unset (default: the host name)"
+  ttl:
+    type: int
+    default: 30
+    description: "Seconds without a beat before the entry greys, when AGENTDIR_TTL is unset"
+  view_url:
+    type: str
+    description: "This agent's view sidecar URL, when AGENTDIR_VIEW_URL is unset; adds the view and steer caps"
+  enroll_token_file:
+    type: str
+    description: "File holding the one-time enrollment token, when AGENTDIR_ENROLL_TOKEN(_FILE) is unset"

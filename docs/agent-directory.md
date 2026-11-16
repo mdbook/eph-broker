@@ -65,6 +65,40 @@ registered name, so a Fleet row with the same name gets a Quick view. Upgrading 
 `eph-broker-viewer` package changes `viewer/VERSION`, which restarts only the module.
 Without `AGENTDIR_STATE_DIR`, state lives in `<name>-state` beside the module socket.
 
+## Hermes agents (plugin)
+
+`viewer/clients/hermes-plugin/agentdir/` is a stdlib Hermes plugin that keeps a gateway listed.
+Copy that directory into `$HERMES_HOME/plugins/agentdir/`, mint a token for the agent's name and
+give it to the gateway once, then enable the plugin:
+
+```sh
+python3 -m viewer.clients.agentdir mint --name books > /path/to/books.token   # on the directory host
+```
+
+```yaml
+# $HERMES_HOME/config.yaml
+plugins:
+  enabled:
+    - agentdir
+```
+
+| Setting | Meaning / default |
+|---|---|
+| `AGENTDIR_URL` | Directory agent API, default `http://127.0.0.1:8790` |
+| `AGENTDIR_NAME` | Name to register (must match the token), default the host name |
+| `AGENTDIR_ENROLL_TOKEN` or `AGENTDIR_ENROLL_TOKEN_FILE` | One-time token, read only when no key is stored |
+| `AGENTDIR_TTL` | Seconds, default 30; beats go out every ttl/3 |
+| `AGENTDIR_VIEW_URL` | Optional view sidecar URL; adds the `view` and `steer` caps. Viewers still need the broker actions permission to steer |
+
+Each setting can also come from the plugin's config block (`url`, `name`, `ttl`, `view_url`,
+`enroll_token_file`); the environment wins. On first start the plugin enrolls and stores its kid
+and key in `$HERMES_HOME/agentdir.key` (0600); later starts reuse it, so the token can be deleted.
+`pre_llm_call` reports busy and `post_llm_call` idle, each with an immediate beat. Unload or exit
+sends `deregister {"revoke": false}`, so the entry leaves the list and the key stays valid.
+Network errors never reach the gateway: it retries with backoff and logs once per change. A refused
+key (revoked, wrong directory) logs one error and stops; remove the key file and give it a new token.
+Check it without Hermes: `python3 viewer/clients/hermes-plugin/test_agentdir_plugin.py`.
+
 ## Listeners and authentication
 
 * Agent API: `AGENTDIR_AGENT_BIND`, default `127.0.0.1:8790`. Only POST `/v1/enroll`,

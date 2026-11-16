@@ -15,6 +15,10 @@ settings:
   TICKET_URL_TEMPLATE: "https://tracker.example.com/tasks/{}"
   GITLAB_WEB_URL: "https://gitlab.example.com"
   BROKER_PUSH_HOSTS: "gitlab.example.com"
+  # Bot DMs for workers with a bus identity. Default: *-bot@* on that bus.
+  AGENT_DM_RECIPIENTS: "*-bot@chat.example.com"
+  # Triage DMs the human directly, independently of OPS_HANDLE (which may be an ops bot).
+  OPERATOR_DM_HANDLE: "operator@chat.example.com"
   GENERAL_REPO_ALLOWLIST: "/srv/git/app:/srv/git/docs-site"
   CODE_REPO_ALLOWLIST: "/srv/git/app:/srv/git/docs-site"
   CONCURRENCY: 5

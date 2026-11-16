@@ -404,9 +404,11 @@ def _nonsecret_paths(root):
     return []
 
 
-def gate_policy(capability, cwd, test_runner=None, test_repo=None, nonce=None):
+def gate_policy(capability, cwd, test_runner=None, test_repo=None, nonce=None, bus_enabled=None):
     """The CC grant for the SAME capability, plus read extensions requiring eph-gate's parsed path checks."""
-    grant = _cc.capability_tool_grant(capability, test_runner=test_runner, test_repo=test_repo)
+    if bus_enabled is None:
+        bus_enabled = capability in _cc._LEGACY_BUS_CAPABILITIES
+    grant = _cc.capability_tool_grant(capability, test_runner=test_runner, test_repo=test_repo, bus_enabled=bus_enabled)
     if capability in _gate.READ_ONLY_CAPABILITIES and ("--permission-mode" in grant or any(
             r.split("(", 1)[0] in _READ_ONLY_FORBIDDEN_RULES for r in _gate.split_rules(
                 grant[grant.index("--allowedTools") + 1] if "--allowedTools" in grant else ""))):
@@ -426,12 +428,16 @@ def gate_policy(capability, cwd, test_runner=None, test_repo=None, nonce=None):
         top = ""
     read_root = os.path.realpath(top) if top and (cwd + "/").startswith(os.path.realpath(top).rstrip("/") + "/") \
         else cwd
+    from adapters.hermes_gate.dm import dm_denied
     pol = {"version": 1, "nonce": nonce or secrets.token_hex(16), "capability": capability,
            "cwd": cwd, "write_root": cwd, "read_root": read_root,
            "edits": _val("--permission-mode") == "acceptEdits",
            "allow": _gate.split_rules(_val("--allowedTools")),
            "deny": _gate.split_rules(_val("--disallowedTools")),
-           "secret_globs": list(_cc._SECRET_FILE_GLOBS)}
+           "secret_globs": list(_cc._SECRET_FILE_GLOBS),
+           "dm_recipients": _cc.agent_dm_recipients(capability) if bus_enabled else [],
+           "dm_deny": dm_denied(), "zbus_path": os.getenv("NOTIFY_ZBUS", "zbus"),
+           "triage_say": bus_enabled and capability == "inbox"}
     if capability in ("write", "code"):
         # CC's string patterns cannot confine no-index operands or validate sed programs. Only the
         # parsed eph-gate path (shared by hermes and codex) can safely grant these read-only forms.
@@ -889,7 +895,8 @@ class HermesHarness:
         nonce = None
         if gated:
             env["TERMINAL_CWD"] = cwd                      # hermes' terminal/file base dir == the gate's cwd
-            nonce = self._install_gate(home, gate_policy(capability, cwd, test_runner, test_repo), env, cwd, argv)
+            nonce = self._install_gate(home, gate_policy(capability, cwd, test_runner, test_repo,
+                                       bus_enabled=bool(getattr(route, "env", {}).get("ZBUS_ENV"))), env, cwd, argv)
             # The probe checks startup + hook dispatch, never starts a terminal or sources shell_init_files.
             # Let its security refusal win over a stale init file if the home sweep regresses (B2). Still create
             # exclusively BEFORE the real run: any re-plant after the sweep, even during the probe, refuses.

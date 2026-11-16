@@ -359,6 +359,11 @@ class Policy(object):
         self.deny = [parse_rule(r) for r in d.get("deny") or []]
         self.test_allow = [parse_rule(r) for r in d.get("test_allow") or []]
         self.test_env_allow = test_env_names(d.get("test_env_allow", []))
+        self.dm_recipients = d.get("dm_recipients", [])
+        from .dm import DEFAULT_DM_DENY, recipients
+        self.dm_deny = d.get("dm_deny", recipients(DEFAULT_DM_DENY))
+        self.zbus_path = d.get("zbus_path", "zbus")
+        self.triage_say = bool(d.get("triage_say"))
         if any(t is None for t, _ in self.allow + self.deny + self.test_allow):
             raise ValueError("unparseable rule in policy")
         globs = list(d.get("secret_globs") or []) + list(HARD_SECRET_GLOBS)
@@ -951,6 +956,20 @@ def check_segment(policy, argv, cwd):
 _TERMINAL_KEYS = {"command", "timeout", "workdir", "background", "pty", "notify", "heartbeat"}
 
 
+def _bus_verdict(policy, cmd, cwd):
+    from .dm import bus_call, dm_ok, triage_say_ok
+    if bus_call(cmd, policy.zbus_path):
+        if (dm_ok(cmd.strip(), policy.dm_recipients, denied=policy.dm_deny)
+                or (policy.triage_say and triage_say_ok(cmd.strip()))):
+            for argv in split_command(cmd):
+                for tool, spec in policy.deny:
+                    if tool == "Bash" and bash_rule_matches(spec, argv, for_allow=False):
+                        return _deny("terminal: fleet DM matches a deny rule")
+            return Verdict(True, "fleet bus call allowed", {"workdir": cwd})
+        return _deny("terminal: only one plain allowed bus call is permitted")
+    return None
+
+
 def _decide_terminal(policy, args):
     if any(k not in _TERMINAL_KEYS for k in args):
         return _deny("terminal: unexpected argument(s) %s" % sorted(set(args) - _TERMINAL_KEYS))
@@ -965,6 +984,9 @@ def _decide_terminal(policy, args):
         if why:
             return _deny("terminal workdir: " + why)
         cwd = wd
+    bus = _bus_verdict(policy, args.get("command"), cwd)
+    if bus is not None:
+        return bus
     try:
         segs = split_command(args.get("command"))
     except Deny as e:
@@ -1113,6 +1135,9 @@ def _decide_terminal_general(policy, args):
         if why:
             return _deny("terminal workdir: " + why)
         cwd = wd
+    bus = _bus_verdict(policy, cmd, cwd)
+    if bus is not None:
+        return bus
     try:
         segs = split_command(cmd)
     except Deny:

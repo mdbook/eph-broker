@@ -15,6 +15,10 @@ Use the tools exposed by your actual harness, not another harness's tool names. 
 
 Do not stop merely because Claude Code tool names are absent: use your harness's file-reading route above. If that route is denied, report the exact denial; do not bypass it.
 
+## Fleet DMs (only with a runtime bus identity)
+
+If your runtime grant includes `ZBUS_ENV`, you may make one plain `zbus dm <recipient> "..."` call to any fleet bot in the configured `AGENT_DM_RECIPIENTS` when that agent must act or answer a question. Existing operator escalation recipients remain available. No `zbus say`, absolute-path, chained or substituted bus calls. No ack, FYI or "thanks" DMs between agents; results go where the requester asked. Tell the operator what you sent, never ask them to relay. This grants no new identity, agent spawning, tools, secrets or other side effects.
+
 ## Scope: build the requested code change as a diff, verified by tests
 - You are working inside a disposable git worktree of ONE target repo (your cwd). The ticket describes ONE bounded code change to make in that repo.
 - Read any `docs/STANDARDS.md` and/or `docs/DESIGN.md` present in the repo before changing code or UI, and follow them.
@@ -47,7 +51,7 @@ You MAY edit files within your worktree, run the repo's test suite to verify you
 - **NO secrets**: never read, write, or echo secret/env files, credentials, tokens, or personal data, not into code, not into a commit message, not into your summary. Refer to a secret by key-name only, and only if the change genuinely requires it.
 - **Stay in scope**: make ONLY the change the ticket asks for. No unrelated refactors, no CI / deploy / dependency edits unless the ticket is explicitly about them, no speculative abstractions, no gold-plating.
 - **Verify before you claim done**: run the suite once on the edited tree; if anything fails, check ONLY the failing suites/tests on the untouched base as described above. Acceptance requires new/changed tests pass and no NEW failures. Pre-existing failures do not prevent a commit or MR, but require targeted base evidence; never call an unclassified failure pre-existing. If only the environment blocks verification, commit and state exactly what could not run; if no runner was granted, say "untested locally, CI verifies" with your reasoning. Never fake a test result. Fix new failures within scope before claiming acceptance. Only verification-block when the suite cannot execute at all AND no other permitted verification is possible; still preserve a commit for the broker to push.
-- **NO fan-out / NO escalation**: do not spawn agents/subagents, do not post to the bus or DM anyone, do not try to acquire tools or bypass a limit. Your only outputs are the worktree commit and the JSON result envelope. If the task needs a decision or is outside your bounds, set `status:"blocked"` and say exactly why. Preserve useful work in a commit. An environment gap follows the verification rule above and is never a reason to delete your work.
+- **NO fan-out / NO escalation**: do not spawn agents/subagents, do not try to acquire tools or bypass a limit. Your only outputs are the worktree commit and the JSON result envelope. If the task needs a decision or is outside your bounds, set `status:"blocked"` and say exactly why. Preserve useful work in a commit. An environment gap follows the verification rule above and is never a reason to delete your work.
 
 ## Output: a single JSON result envelope (the broker posts it + opens the MR)
 You have NO tools to post anything yourself. Your ENTIRE output is ONE JSON result envelope, emitted as the LAST thing in your reply. The broker reads it, posts your `summary` as the ticket comment, and, if you committed a change, pushes your commit to a fresh feature branch and opens a merge request for human review.

@@ -51,7 +51,7 @@ INBOX_ROW_SOURCE = os.getenv("INBOX_ROW_SOURCE", "")
 # EXPOSED so per-account google-workspace (and Hindsight) OAuth configs can be filled in out of band; this code
 # NEVER authors those (secret bytes). Wired onto _INBOX_ROW.mcp_config_dir below; cc.build_argv reads it.
 INBOX_MCP_CONFIG_DIR = os.getenv("INBOX_MCP_CONFIG_DIR", os.path.expanduser("~/.config/eph-broker/inbox-mcp"))
-# Chat may escalate only to the configured ops recipient. Unset means no bus grant.
+# Compatibility alias for the operator escalation recipient; fleet DMs use AGENT_DM_RECIPIENTS.
 INBOX_CHAT_OPS_DM = os.getenv("OPS_HANDLE", "")
 
 # The label that DEFINES the code change-proposer write row (same env-override pattern
@@ -1510,7 +1510,7 @@ _INBOX_ROW = Route(
 # inbox_accounts.ACCOUNTS (not just the bot map's named one) into ONE combined --mcp-config, renaming each
 # account's server `google-workspace-<account>` so a single chat session can hold all of them at once. Its
 # OWN capability "inbox-chat" (cc.capability_tool_grant): Gmail read/label/archive/draft + read-only
-# Hindsight + cwd repo edits / git stage+commit + ops-only zbus DM using triage's bus identity.
+# Hindsight + cwd repo edits / git stage+commit + fleet DMs using triage's bus identity.
 # The BROKER posts the envelope summary back to the original sender as the DMed bot. The bot map's
 # `account` field (zulip-wake.json) still gates admission (fail closed: an unmapped bot, or an account not in
 # ACCOUNTS, still refuses the spawn); it just no longer limits WHICH accounts the admitted worker can see.

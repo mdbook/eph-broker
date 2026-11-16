@@ -4087,6 +4087,7 @@ def test_phase2b_wiki_docs_manifest_reuses_role_and_output_adds_scope_and_capabi
     assert mf["sections"] == [
         "role/ephemeral-oneshot",       # REUSED
         "capabilities/file-access",     # REUSED: harness-specific file tools
+        "capabilities/fleet-dm",         # shared, runtime-identity-gated DMs
         "scopes/wiki-docs",             # NEW: wiki READ scope
         "capabilities/wiki-write",      # NEW: wiki WRITE capability (direct push, no MR)
         "constraints/wiki-docs",        # NEW: hard bounds
@@ -4259,8 +4260,9 @@ def test_phase2b_wiki_docs_prompt_signed_to_approved_hash():
     """builder != acceptor / owner-gated content: the wiki-docs rendered prompt must be signed to the
     EXACT owner-approved hash in approved-prompts.json; the owner signed the hash after security review."""
     approved = json.load(open(os.path.join(ROOT, "approved-prompts.json")))
-    assert approved.get("wiki/docs") == "a2843e817e5d97da524974a987fc22acb09569a62a981b514ef0cb15872a3a6e", \
-        "wiki/docs must be signed to the exact operator-approved hash"
+    body = pathlib.Path(ROOT, "prompts/wiki/docs.md").read_bytes()
+    assert approved.get("wiki/docs") == hashlib.sha256(body).hexdigest(), \
+        "wiki/docs must match the operator-approved fleet DM policy"
     ok("wiki-docs prompt signed to the operator-approved hash")
 
 
@@ -4405,7 +4407,7 @@ def test_phase2b_a_capability_reaches_build_argv_end_to_end():
                       envelope_parser=EnvelopeParser(), claude_bin=fake)
         seen = {}
         orig = a.build_argv
-        def cap(p, m, s, resume_session=None, capability="read", mcp_config_path=None, test_runner=None, setting_sources=None, effort=None, bypass_classifier=False, thread_dir=None, judged_bash=False, worktree_root=None, steer_hook=None):
+        def cap(p, m, s, resume_session=None, capability="read", mcp_config_path=None, test_runner=None, setting_sources=None, effort=None, bypass_classifier=False, thread_dir=None, judged_bash=False, worktree_root=None, steer_hook=None, bus_enabled=None):
             seen["capability"] = capability
             return orig(p, m, s, resume_session, capability=capability, mcp_config_path=mcp_config_path,
                         test_runner=test_runner, setting_sources=setting_sources)
@@ -4855,7 +4857,7 @@ def test_code_route_threads_runner_end_to_end():
                       envelope_parser=EnvelopeParser(), claude_bin=fake)
         seen = {}
         orig = a.build_argv
-        def cap(p, m, s, resume_session=None, capability="read", mcp_config_path=None, test_runner=None, setting_sources=None, effort=None, bypass_classifier=False, thread_dir=None, judged_bash=False, worktree_root=None, steer_hook=None):
+        def cap(p, m, s, resume_session=None, capability="read", mcp_config_path=None, test_runner=None, setting_sources=None, effort=None, bypass_classifier=False, thread_dir=None, judged_bash=False, worktree_root=None, steer_hook=None, bus_enabled=None):
             seen["capability"] = capability; seen["test_runner"] = test_runner
             return orig(p, m, s, resume_session, capability=capability, mcp_config_path=mcp_config_path,
                         test_runner=test_runner, setting_sources=setting_sources)
@@ -5485,7 +5487,7 @@ def test_code_judged_bash_threads_through_one_turn_real_spawn_path():
         orig = a.build_argv
         def cap(p, m, s, resume_session=None, capability="read", mcp_config_path=None, test_runner=None,
                 setting_sources=None, effort=None, bypass_classifier=False, thread_dir=None, judged_bash=False,
-                worktree_root=None, steer_hook=None):
+                worktree_root=None, steer_hook=None, bus_enabled=None):
             seen["judged_bash"] = judged_bash
             seen["worktree_root"] = worktree_root
             return orig(p, m, s, resume_session, capability=capability, test_runner=test_runner,
@@ -6661,7 +6663,7 @@ def test_phase2c_inbox_capability_grant_allows_triage_denies_send_filter():
                 "mcp__google-workspace__batch_modify_gmail_message_labels",
                 "mcp__google-workspace__draft_gmail_message",
                 "Bash(mcp-ro.sh:*)",
-                "Bash(zbus:*)", "Bash(git add:*)", "Bash(git commit -m:*)", "Read", "Grep", "Glob"):
+                "Bash(zbus dm *-bot@* *)", "Bash(git add:*)", "Bash(git commit -m:*)", "Read", "Grep", "Glob"):
         assert tok in allowed, (tok, allowed)
     # Regression guard: the OLD (broken) connector-tool-name grant must NEVER reappear. Those
     # tool ids don't exist in this worker's --strict-mcp-config surface (no `hindsight` server configured
@@ -6758,7 +6760,7 @@ def test_inbox_build_argv_wires_trash_guard_hook_inbox_only():
     assert "--settings" in argv, argv
     settings_json = json.loads(argv[argv.index("--settings") + 1])
     hooks = settings_json["hooks"]["PreToolUse"]
-    assert len(hooks) == 1, hooks
+    assert len(hooks) == 2 and "zbus_guard.py" in hooks[1]["hooks"][0]["command"], hooks
     matcher = hooks[0]["matcher"]
     assert re.match(matcher, "mcp__google-workspace__modify_gmail_message_labels")
     assert re.match(matcher, "mcp__google-workspace__batch_modify_gmail_message_labels")
@@ -8750,6 +8752,7 @@ def test_general_manifest_reuses_role_and_renders_matches_committed():
     assert mf["sections"] == [
         "role/ephemeral-oneshot",       # REUSED
         "capabilities/file-access",     # REUSED: harness-specific file tools
+        "capabilities/fleet-dm",         # shared, runtime-identity-gated DMs
         "scopes/general",               # NEW: arbitrary-ticket scope
         "capabilities/general",         # NEW: broad toolset, classifier-judged
         "constraints/general",          # NEW: the hard floor, restated
@@ -19661,7 +19664,7 @@ def test_inbox_chat_grant_repo_stewardship_ops_dm_only():
     argv = a.build_argv("p", "m", "sys", capability="inbox-chat", mcp_config_path=cfg)
     assert argv[argv.index("--permission-mode") + 1] == "acceptEdits"
     assert "--strict-mcp-config" in argv
-    assert json.loads(argv[argv.index("--settings") + 1])["hooks"] == _INBOX_CHAT_HOOK_SETTINGS["hooks"]
+    assert json.loads(argv[argv.index("--settings") + 1])["hooks"]["PreToolUse"][:-1] == _INBOX_CHAT_HOOK_SETTINGS["hooks"]["PreToolUse"]
     ok("/inbox-chat grant = Gmail (every account's own connector) + recall-only Hindsight, ops DM only, "
        "no push, triage repo edits + stage/commit, send denied, strict combined MCP config (fail-closed), TRASH hook on")
 
@@ -19676,26 +19679,316 @@ def _cc_rule_matches(cmd, rule):
     return fnmatch.fnmatchcase(cmd, pat)
 
 
-def test_inbox_chat_ops_dm_configured_or_unset():
-    import routing as RT
+def test_shared_dm_policy_patterns_and_plain_call_floor():
+    from adapters.hermes_gate.dm import recipients, dm_ok, decide
+    patterns = recipients("*-bot@chat.example.test,helper@chat.example.test", "operator@chat.example.test")
+    for target in ("helper-bot@chat.example.test", "wiki-bot@chat.example.test",
+                   "helper@chat.example.test", "operator@chat.example.test"):
+        cmd = 'zbus dm %s "Please answer this question"' % target
+        assert dm_ok(cmd, patterns)
+        assert decide(json.dumps({"tool_input": {"command": cmd}}), patterns) is None
+    cmd = 'zbus dm helper-bot@chat.example.test "question"'
+    for bad in ("zbus say stream hi", "zbus dm human@chat.example.test hi",
+                "zbus dm helper-bot@elsewhere.test hi", "/opt/bin/" + cmd,
+                cmd + "; git status", cmd + " && git status", cmd + " | cat",
+                cmd + "\n" + "git status", "env " + cmd, "sh -c '" + cmd + "'",
+                cmd + " $(id)", cmd + " `id`",
+                "zbus dm helper-bot@chat.example.test --file /etc/passwd"):
+        assert not dm_ok(bad, patterns), bad
+        assert decide(json.dumps({"tool_input": {"command": bad}}), patterns), bad
+    assert dm_ok("zbus dm helper-bot@chat.example.test --stdin", patterns)
+    assert not dm_ok(cmd, [])
+    assert dm_ok("zbus dm any-bot@bus.example.test hi", recipients("*-bot@*"))
+    for invalid in ("*", "*@x) Bash(*)", "bot@x;id", "bot@x bot@y", "bot@x?"):
+        try:
+            recipients(invalid)
+            assert False, invalid
+        except ValueError:
+            pass
+    ok("shared DM pattern allowlist, OSS default, operator exception and shell/flag denial")
+
+
+def test_fleet_dm_mechanical_gate_parity():
+    from adapters.hermes import gate_policy
+    from adapters.hermes_gate.gate import Policy, decide
+    with tempfile.TemporaryDirectory() as root:
+        with patch.dict(os.environ, {"AGENT_DM_RECIPIENTS": "*-bot@chat.example.test"}):
+            for cap in ("read", "write", "code", "inbox", "inbox-chat", "general"):
+                policy = Policy(gate_policy(cap, root, bus_enabled=True))
+                cmd = 'zbus dm helper-bot@chat.example.test "Please answer"'
+                assert decide("terminal", {"command": cmd}, policy).allowed, cap
+                for bad in (cmd + "; git status", "zbus say stream hi",
+                            "zbus dm person@chat.example.test hi", "/usr/bin/" + cmd):
+                    assert not decide("terminal", {"command": bad}, policy).allowed, (cap, bad)
+                policy.deny.append(("Bash", "zbus dm helper-bot@chat.example.test *"))
+                assert not decide("terminal", {"command": cmd}, policy).allowed, cap
+                no_bus = Policy(gate_policy(cap, root, bus_enabled=False))
+                assert not decide("terminal", {"command": cmd}, no_bus).allowed, cap
+    ok("hermes/codex shared mechanical gate uses the same DM policy, without a classifier bypass")
+
+
+def test_bus_mentions_fall_through_to_normal_policy():
+    from adapters.hermes import gate_policy
+    from adapters.hermes_gate.gate import Policy, Verdict, decide, _bus_verdict
+    from adapters.hermes_gate.dm import bus_call, decide as cc_decide
+    mentions = ("grep -rn zbus .", "git log --grep zbus", 'git commit -m "fix zbus guard"')
+    with tempfile.TemporaryDirectory() as root:
+        for enabled in (False, True):
+            for cap in ("read", "write", "code", "inbox", "inbox-chat", "general"):
+                policy = Policy(gate_policy(cap, root, bus_enabled=enabled))
+                for cmd in mentions:
+                    assert _bus_verdict(policy, cmd, root) is None, (cap, enabled, cmd)
+                    assert cc_decide(json.dumps({"tool_input": {"command": cmd}}), []) is None
+            policy = Policy(gate_policy("general", root, bus_enabled=enabled))
+            for cmd in mentions:
+                with patch("adapters.hermes_gate.gate.judge", return_value=Verdict(True, "test approved")) as judge:
+                    verdict = decide("terminal", {"command": cmd}, policy)
+                    judge.assert_called_once()
+                assert verdict.allowed, (cmd, verdict.reason)
+            # Quoted executable strings are now scanned too, unlike plain name mentions.
+            for cmd in ('zbus dm person@chat.example.test hi',
+                        '/opt/bin/zbus dm person@chat.example.test hi',
+                        'X=1 zbus dm person@chat.example.test hi',
+                        "git commit -m 'literal $(zbus) and `zbus`'",
+                        'echo "$(zbus dm person@chat.example.test hi)"',
+                        'echo `zbus dm person@chat.example.test hi`'):
+                assert not decide("terminal", {"command": cmd}, policy).allowed
+                assert cc_decide(json.dumps({"tool_input": {"command": cmd}}), ["*-bot@*"])
+        with patch.dict(os.environ, {"NOTIFY_ZBUS": "/opt/bin/bus-cli"}):
+            assert bus_call("/opt/bin/bus-cli dm person@chat.example.test hi")
+            assert not bus_call("grep bus-cli file")
+        for cmd in ("command -v zbus", "command -V zbus", "env -u zbus git status"):
+            assert not bus_call(cmd), cmd
+            assert cc_decide(json.dumps({"tool_input": {"command": cmd}}), []) is None
+    ok("bus mentions use normal rules on bus and no-bus rows; executable bus calls remain guarded")
+
+
+def test_bus_command_boundaries_and_wrappers_cannot_reach_judge():
+    from adapters.hermes import gate_policy
+    from adapters.hermes_gate.gate import Policy, Verdict, decide
+    from adapters.hermes_gate.dm import bus_call, decide as cc_decide
+    cmd = "zbus dm helper-bot@chat.example.test hi"
+    wrapped = ["timeout 5 " + cmd, "nohup " + cmd, "nice -n 5 " + cmd, "time " + cmd,
+               "xargs " + cmd, "eval " + cmd, "eval '" + cmd + "'", "sudo -u nobody " + cmd,
+               "{ " + cmd + "; }", "if true; then " + cmd + "; fi", "! " + cmd,
+               "$(which zbus) dm helper-bot@chat.example.test hi"]
+    wrapped += [shell + " " + flag + " '" + cmd + "'"
+                for shell in ("bash", "sh") for flag in ("-c", "-lc")]
+    separated = ["echo harmless" + sep + cmd for sep in ("\n", "\r", "\r\n", ";")]
+    separated += ['echo "harmless\ntext"\n' + cmd, "echo 'harmless\rtext'\r" + cmd]
+    separated += ["echo harmless # ignored quote '\n" + cmd, "echo harmless # comment\r" + cmd,
+                  "X=# " + cmd]
+    with tempfile.TemporaryDirectory() as root:
+        for enabled in (False, True):
+            policy = Policy(gate_policy("general", root, bus_enabled=enabled))
+            for raw_cmd in wrapped + separated:
+                assert bus_call(raw_cmd), raw_cmd
+                assert cc_decide(json.dumps({"tool_input": {"command": raw_cmd}}), ["*-bot@*"]), raw_cmd
+                with patch("adapters.hermes_gate.gate.judge", return_value=Verdict(True, "test approved")) as judge:
+                    verdict = decide("terminal", {"command": raw_cmd}, policy)
+                    judge.assert_not_called()
+                assert not verdict.allowed, (raw_cmd, verdict.reason)
+        for mention in ('echo "$(which zbus)"', "which zbus", "grep -n 'mention of zbus' file",
+                        "grep -rn zbus hooks/", "git commit -m 'fix the zbus guard'"):
+            assert not bus_call(mention), mention
+    ok("newlines/CR and execution wrappers deny in CC and Hermes general before an approving judge")
+
+
+def test_bus_split_string_words_cannot_reach_approving_judge():
+    import shlex
+    from adapters.hermes import gate_policy
+    from adapters.hermes_gate.gate import Policy, Verdict, decide
+    from hooks.zbus_guard import bus_call, decide as cc_decide
+    calls = [
+    ]
+    for target in ("control-bot@chat.example.test", "helper-bot@chat.example.test"):
+        cmd = "zbus dm %s clear-request" % target
+        calls += [">/dev/null env -S " + shlex.quote(cmd),
+                  "sh -c " + shlex.quote(cmd), "eval " + json.dumps(cmd),
+                  "bash -c " + shlex.quote("env -S " + shlex.quote(cmd)),
+                  "unknown-wrapper --program " + shlex.quote(cmd),
+                  ">/dev/null env -S " + shlex.quote("stdbuf -o0 " + cmd),
+                  "env -S" + shlex.quote(cmd), "env --split-string=" + shlex.quote(cmd),
+                  "stdbuf -o0 " + cmd, "setsid -f " + cmd,
+                  "echo " + shlex.quote("harmless\n" + cmd),
+                  "echo " + shlex.quote("harmless\r" + cmd),
+                  "grep -n 'timeout zbus' file",
+                  ">/dev/null " + cmd, cmd + " 2>&1"]
+    with tempfile.TemporaryDirectory() as root:
+        with patch.dict(os.environ, {"AGENT_DM_RECIPIENTS": "*-bot@chat.example.test",
+                                     "AGENT_DM_DENY": "control-bot@*,*-driver-bot@*"}):
+            for enabled in (False, True):
+                policy = Policy(gate_policy("general", root, bus_enabled=enabled))
+                for cmd in calls:
+                    assert bus_call(cmd), cmd
+                    assert cc_decide(json.dumps({"tool_input": {"command": cmd}}), ["*-bot@*"]), cmd
+                    with patch("adapters.hermes_gate.gate.judge", return_value=Verdict(True, "test approved")) as judge:
+                        verdict = decide("terminal", {"command": cmd}, policy)
+                        judge.assert_not_called()
+                    assert not verdict.allowed, (cmd, verdict.reason)
+    ok("all whitespace-bearing words are scanned, independent of wrapper; non-plain bus calls bypass no floor")
+
+
+def test_bus_nested_scan_limits_and_parse_errors_fail_closed():
+    import shlex
+    from adapters.hermes import gate_policy
+    from adapters.hermes_gate.gate import Policy, Verdict, decide
+    from hooks.zbus_guard import bus_call, decide as cc_decide
+    # No executable bus word: only the depth-limit/raw-text fallback can find this marker.
+    nested = "echo prefixzbus"
+    harmless = "echo harmless"
+    for _ in range(6):
+        nested = "unknown " + shlex.quote(nested)
+        harmless = "unknown " + shlex.quote(harmless)
+    substitution = "echo prefixzbus"
+    for _ in range(6):
+        substitution = "echo $(" + substitution + ")"
+    cases = [nested, substitution, "unknown 'prefixzbus", "unknown " + shlex.quote("echo 'prefixzbus")]
+    with tempfile.TemporaryDirectory() as root:
+        policy = Policy(gate_policy("general", root, bus_enabled=True))
+        for cmd in cases:
+            assert bus_call(cmd), cmd
+            assert cc_decide(json.dumps({"tool_input": {"command": cmd}}), ["*-bot@*"]), cmd
+            with patch("adapters.hermes_gate.gate.judge", return_value=Verdict(True, "test approved")) as judge:
+                assert not decide("terminal", {"command": cmd}, policy).allowed, cmd
+                judge.assert_not_called()
+        for cmd in (harmless, "unknown 'harmless", "grep zbus file", "git log --grep zbus"):
+            assert not bus_call(cmd), cmd
+            assert cc_decide(json.dumps({"tool_input": {"command": cmd}}), []) is None
+            with patch("adapters.hermes_gate.gate.judge", return_value=Verdict(True, "test approved")) as judge:
+                assert decide("terminal", {"command": cmd}, policy).allowed, cmd
+                judge.assert_called_once()
+    ok("recursive scans cap at four levels; limits and parse errors fail closed only on raw bus text")
+
+
+def test_bus_redirections_cannot_hide_executable_from_shared_hook_or_judge():
+    from adapters.hermes import gate_policy
+    from adapters.hermes_gate.gate import Policy, Verdict, decide
+    from adapters.hermes_gate.dm import bus_call, decide as cc_decide
+    cmd = "zbus dm control-bot@chat.example.test clear-request"
+    redirects = (">/dev/null", "> /dev/null", "2>&1", ">>/dev/null", "</dev/null",
+                 "&>/dev/null", "3>/dev/null", "<<<'input'", "2> /dev/null",
+                 "&>>/dev/null", "3<>/dev/null", "0<&3", ">|/dev/null", ">/dev/null 2>&1", "{fd}>/dev/null")
+    calls = []
+    for redirect in redirects:
+        calls += [redirect + " " + cmd, "timeout 5 " + redirect + " " + cmd,
+                  "env " + redirect + " " + cmd, "command " + redirect + " " + cmd,
+                  cmd + " " + redirect]
+    calls += ["echo harmless;>/dev/null " + cmd, "> >zbus", 'unknown "zbus',
+              '>/dev/null "zbus', ">/dev/null /opt/bin/" + cmd]
+    with tempfile.TemporaryDirectory() as root:
+        with patch.dict(os.environ, {"AGENT_DM_RECIPIENTS": "*-bot@chat.example.test",
+                                     "AGENT_DM_DENY": "control-bot@*"}):
+            for enabled in (False, True):
+                policy = Policy(gate_policy("general", root, bus_enabled=enabled))
+                for raw_cmd in calls:
+                    assert bus_call(raw_cmd), raw_cmd
+                    assert cc_decide(json.dumps({"tool_input": {"command": raw_cmd}}), ["*-bot@*"]), raw_cmd
+                    with patch("adapters.hermes_gate.gate.judge", return_value=Verdict(True, "test approved")) as judge:
+                        verdict = decide("terminal", {"command": raw_cmd}, policy)
+                        judge.assert_not_called()
+                    assert not verdict.allowed, (raw_cmd, verdict.reason)
+            allowed = "zbus dm helper-bot@chat.example.test hi"
+            assert cc_decide(json.dumps({"tool_input": {"command": allowed}}), ["*-bot@*"]) is None
+            policy = Policy(gate_policy("general", root, bus_enabled=True))
+            assert decide("terminal", {"command": allowed}, policy).allowed
+            # Detection must not treat redirection operands or ordinary mentions as executables.
+            for mention in (">/dev/null grep zbus file", "echo hi >zbus", "echo hi 2>zbus",
+                            "timeout 5 echo hi >zbus", "command -v >/dev/null zbus",
+                            "env -u zbus >/dev/null git status"):
+                assert not bus_call(mention), mention
+                assert cc_decide(json.dumps({"tool_input": {"command": mention}}), []) is None
+            with patch.dict(os.environ, {"NOTIFY_ZBUS": "/opt/bin/bus-cli"}):
+                assert bus_call(">/dev/null /opt/bin/bus-cli dm control-bot@chat.example.test hi")
+                assert bus_call('unknown "/opt/bin/bus-cli')
+    ok("redirections stay with their command; bus calls and uncertain parses cannot reach an approving judge")
+
+
+def test_fleet_dm_glob_and_brace_expansion_denied():
+    from adapters.hermes_gate.dm import dm_ok, decide as cc_decide
+    from adapters.hermes import gate_policy
+    from adapters.hermes_gate.gate import Policy, decide
+    with tempfile.TemporaryDirectory() as root:
+        policy = Policy(gate_policy("code", root, bus_enabled=True))
+        for body in ("{--file,} /path", "[-][-]file /path", "*", "?", "~", "{x,y}"):
+            cmd = "zbus dm helper-bot@chat.example.test " + body
+            assert not dm_ok(cmd, ["*-bot@*"]), cmd
+            assert cc_decide(json.dumps({"tool_input": {"command": cmd}}), ["*-bot@*"]), cmd
+            assert not decide("terminal", {"command": cmd}, policy).allowed, cmd
+        for body in ("'literal {x,y} [x] * ? ~'", '"literal {x,y} [x] * ? ~"', r"\*"):
+            assert dm_ok("zbus dm helper-bot@chat.example.test " + body, ["*-bot@*"])
+    ok("unquoted brace/glob/tilde expansion denied in shared policy, CC, Hermes/Codex and forge guard")
+
+
+def test_fleet_dm_expansion_denial_across_harnesses():
+    from adapters.hermes_gate.dm import dm_ok
+    from hooks.zbus_guard import decide as cc_decide
+    from adapters.hermes import gate_policy
+    from adapters.hermes_gate.gate import Policy, decide
+    patterns = ["*-bot@chat.example.test"]
+    cases = [(body, False) for body in (
+        "$VAR", '"${VAR}"', '"$VAR"', "${VAR}", '"cost $5"', "$$", "$?",
+        "'literal'\"$VAR\"", '"single quote inside: \'$VAR\'"', "$'text'",
+    )] + [(body, True) for body in ("'$5 off'", "'${VAR}'", r"\$VAR", r'"\$VAR"', "--stdin")]
+    with tempfile.TemporaryDirectory() as root:
+        with patch.dict(os.environ, {"AGENT_DM_RECIPIENTS": patterns[0]}):
+            for cap in ("inbox", "inbox-chat", "read", "code"):
+                policy = Policy(gate_policy(cap, root, bus_enabled=True))
+                for body, expected in cases:
+                    cmd = "zbus dm helper-bot@chat.example.test " + body
+                    assert dm_ok(cmd, patterns) == expected, cmd
+                    hook = cc_decide(json.dumps({"tool_input": {"command": cmd}}), patterns)
+                    assert (hook is None) == expected, cmd
+                    assert decide("terminal", {"command": cmd}, policy).allowed == expected, (cap, cmd)
+    ok("shared policy, CC hook and Hermes/Codex deny dollar expansion but allow literal dollars and stdin")
+
+
+def test_triage_human_dm_is_independent_of_ops_and_bot_patterns():
     from adapters import cc as CC
-    triage_before = CC.capability_tool_grant("inbox")
-    for handle in ("admin-bot@chat.example.test", ""):
-        with patch.object(RT, "INBOX_CHAT_OPS_DM", handle):
+    from adapters.hermes_gate.dm import dm_ok
+    from adapters.hermes import gate_policy
+    from adapters.hermes_gate.gate import Policy, decide, split_rules
+    human, ops = "human@chat.example.test", "coordinator-bot@chat.example.test"
+    with tempfile.TemporaryDirectory() as root:
+        with patch.dict(os.environ, {"OPERATOR_DM_HANDLE": human, "OPS_HANDLE": ops,
+                                     "AGENT_DM_RECIPIENTS": "*-bot@chat.example.test"}):
+            grant = CC.capability_tool_grant("inbox", bus_enabled=True)
+            allowed = split_rules(grant[grant.index("--allowedTools") + 1])
+            patterns = CC.agent_dm_recipients("inbox")
+            policy = Policy(gate_policy("inbox", root, bus_enabled=True))
+            for target in (human, ops, "helper-bot@chat.example.test"):
+                cmd = "zbus dm %s --stdin" % target
+                assert any(_cc_rule_matches(cmd, rule) for rule in allowed), target
+                assert dm_ok(cmd, patterns), target
+                assert decide("terminal", {"command": cmd}, policy).allowed, target
+            assert not dm_ok("zbus dm stranger@chat.example.test hi", patterns)
+            assert human not in CC.agent_dm_recipients("inbox-chat")
+            with patch.dict(os.environ, {"AGENT_DM_RECIPIENTS": ""}):
+                assert set(CC.agent_dm_recipients("inbox")) == {human, ops}
+            with patch.dict(os.environ, {"OPERATOR_DM_HANDLE": ""}):
+                assert human not in CC.agent_dm_recipients("inbox")
+    ok("triage retains direct human and ops DMs plus fleet bots, even with a distinct human handle")
+
+
+def test_inbox_chat_ops_dm_configured_or_unset():
+    from adapters import cc as CC
+    from adapters.hermes_gate.dm import dm_ok
+    for handle in ("operator@chat.example.test", ""):
+        with patch.dict(os.environ, {"OPS_HANDLE": handle, "AGENT_DM_RECIPIENTS": "*-bot@chat.example.test"}):
             grant = CC.capability_tool_grant("inbox-chat")
             allowed = re.findall(r"Bash\([^)]*\)", grant[grant.index("--allowedTools") + 1])
             denied = re.findall(r"Bash\([^)]*\)", grant[grant.index("--disallowedTools") + 1])
-            assert [t for t in allowed if "zbus" in t] == ([f"Bash(zbus dm {handle}:*)"] if handle else [])
-            for cmd in ("zbus dm admin-bot@chat.example.test --stdin", "zbus dm other@chat.example.test --stdin",
-                        "zbus dm admin-bot@chat.example.test.evil --stdin", "zbus say stream --stdin",
-                        "zbus read", "/opt/site/bin/zbus dm admin-bot@chat.example.test --stdin",
-                        "/other/bin/zbus dm admin-bot@chat.example.test --stdin"):
+            for cmd, expected in (("zbus dm helper-bot@chat.example.test --stdin", True),
+                                  ("zbus dm person@chat.example.test --stdin", False),
+                                  ("zbus dm helper-bot@chat.example.test.evil --stdin", False),
+                                  ("zbus dm operator@chat.example.test --stdin", bool(handle)),
+                                  ("zbus say stream --stdin", False), ("zbus read", False),
+                                  ("/opt/site/bin/zbus dm helper-bot@chat.example.test --stdin", False)):
                 permitted = (any(_cc_rule_matches(cmd, r) for r in allowed)
-                             and not any(_cc_rule_matches(cmd, r) for r in denied))
-                assert permitted == (bool(handle) and cmd == f"zbus dm {handle} --stdin"), (handle, cmd)
-            assert CC.capability_tool_grant("inbox") == triage_before
-    assert RT.INBOX_CHAT_OPS_DM == os.environ.get("OPS_HANDLE", "")
-    ok("inbox-chat grants exactly the configured OPS_HANDLE DM or none when unset; other bus forms denied; triage unchanged")
+                             and not any(_cc_rule_matches(cmd, r) for r in denied)
+                             and dm_ok(cmd, CC.agent_dm_recipients("inbox-chat")))
+                assert permitted == expected, (handle, cmd)
+    ok("shared bot pattern plus existing operator DM; humans outside the allowlist and other bus forms denied")
 
 
 def test_inbox_chat_repo_edits_deny_sensitive_files():
@@ -20285,7 +20578,8 @@ def test_chat_prompt_rendered_and_hash_gated():
     for token in ("Learning-ask answered", "clear yes", "Edit `rules.md` in cwd (`INBOX_REPO`)",
                   "match existing lines", "operator-approved <date>", "commit",
                   "Never hand edits to ops or mention worker limits", "Anything blocked or outside your lane",
-                  "directly to ops", "zbus dm <ops> --stdin", "OPS_HANDLE", "No other zbus form or recipient"):
+                  "directly to ops", "zbus dm <ops> --stdin", "OPS_HANDLE", "AGENT_DM_RECIPIENTS",
+                  "never ask them to relay", "No ack, FYI"):
         assert token in rendered, token
     for stale in ("Repo context is read-only", "harness reads only", "No edits/git",
                   "NEVER message anyone yourself", "explain and suggest ops"):

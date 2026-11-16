@@ -385,6 +385,9 @@ do.
 |---|---|---|
 | `NOTIFY_BACKEND` | `zbus` | `webhook`, `email` or `zbus` ([configuration.md](configuration.md#notifications)). Anything else stops the broker. |
 | `OPS_HANDLE` | unset | Who gets escalations. Unset: they're only logged. |
+| `OPERATOR_DM_HANDLE` | unset | Human operator's private bus DM handle for inbox triage notifications, including OTPs. Always added to triage's allowed recipients, independently of `OPS_HANDLE` and `AGENT_DM_RECIPIENTS`. Set this to the human recipient named in your triage prompts. Restart after changing. |
+| `AGENT_DM_RECIPIENTS` | `*-bot@*` | Comma-separated handles or `*` globs for workers with `ZBUS_ENV`, plus existing operator recipients. Empty disables bot DMs. No channel posts, absolute paths, chaining or expansion. In the Hermes general arm a valid DM is allowed before the exec judge. Restart after changing. |
+| `AGENT_DM_DENY` | `*-driver-bot@*` | Comma-separated handles or `*` globs, validated like `AGENT_DM_RECIPIENTS`. Deny wins over bot and operator allowances in CC and the shared Hermes/Codex gate, including general before its exec judge. Recipients must be lowercase; allow/deny patterns are case-insensitive. Wrapped, substituted and newline/CR-separated bus calls are detected but never granted. The default excludes driver/control bots. Empty removes recipient exclusions, not the single-plain-call restrictions. Restart after changing. |
 | `NOTIFY_WEBHOOK_URL` | unset | Where `webhook` posts. `https`, or `http` to localhost. |
 | `NOTIFY_SMTP_HOST`, `NOTIFY_SMTP_PORT`, `NOTIFY_SMTP_USER`, `NOTIFY_SMTP_STARTTLS`, `NOTIFY_EMAIL_FROM` | unset, `587`, unset, on, unset | The `email` channel. |
 | `NOTIFY_ZBUS`, `NOTIFY_ZBUS_ENV` | unset | The `zbus` chat CLI and its credentials file path. |

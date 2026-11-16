@@ -951,9 +951,8 @@ _MCP_RW = ["Bash(mcp-rw.sh:*)"]
 _MCP_ABS_DENIED = _mcp_abs("mcp.sh", "mcp-rw.sh")
 
 # Tools a READ worker must never get; they're explicitly DISABLED (verified: disallow disables the tool outright).
-# Also denies the secret-file globs: this capability (ansible's default and mr-review) has NO Bash at
-# all (so ansible-inventory/--vault-password-file/git push are already unreachable), but Read/Grep/Glob stay
-# allowed, so a stray *-env file in the cwd would otherwise be plainly readable.
+# Bus-enabled read rows get only the shared DM Bash grant below; no-bus rows (including mr-review)
+# keep Bash disabled. Secret-file denies still protect Read/Grep/Glob on both kinds of row.
 _READ_DENIED = ["Edit", "Write", "MultiEdit", "NotebookEdit", "Bash", "WebFetch", "WebSearch"] + _SECRET_READ_DENIED
 
 # The git verbs a WRITE worker may run as Bash: STAGE + COMMIT only (the broker does the ONLY
@@ -1553,7 +1552,7 @@ _INBOX_GIT = ["Bash(git add:*)", "Bash(git commit -m:*)",
               "Bash(git diff --cached --stat)", "Bash(git diff HEAD)",
               "Bash(git log:*)"]
 
-_INBOX_ALLOWED = _READ_ALLOWED + _INBOX_GIT + _GMAIL_READ + _GMAIL_WRITE_SAFE + _HINDSIGHT + _ZBUS
+_INBOX_ALLOWED = _READ_ALLOWED + _INBOX_GIT + _GMAIL_READ + _GMAIL_WRITE_SAFE + _HINDSIGHT
 
 # DENY-FLOOR: reuse the whole write deny-floor (push/remote/config/ref-rewrite + rm/sudo/curl/wget/ssh +
 # web) and ADD the Gmail denies that map to REAL tools: send (the only send tool) + manage_gmail_filter
@@ -1574,9 +1573,9 @@ _INBOX_DENIED = (_WRITE_DENIED + _GMAIL_DENIED
 
 # The "inbox-chat" capability: an ephemeral worker answering a Zulip DM from the operator (zulip_wake.py
 # routes to routing._ZULIP_INBOX_ROW). Same Gmail surface as triage (read + label/archive/draft, send/filter-create
-# denied, TRASH hook) + read-only Hindsight + triage's repo stewardship + one ops-only DM grant.
+# denied, TRASH hook) + read-only Hindsight + triage's repo stewardship + shared fleet DM grants.
 # The BROKER posts the envelope summary back to the original sender. The row shares triage's ZBUS_ENV;
-# only `zbus dm <OPS_HANDLE>` is allow-listed (unset = none); other bus forms stay denied headless,
+# `zbus dm` targets use AGENT_DM_RECIPIENTS plus the existing operator; other forms stay denied headless,
 # with absolute paths and `say` hard-denied. acceptEdits confines repo edits to
 # cwd (INBOX_REPO); _INBOX_GIT permits stage/commit, never push, with triage's shared deny-floor.
 # Memory is Hindsight RECALL ONLY, through a small recall wrapper that fixes the tool name to
@@ -1755,8 +1754,8 @@ def _wiki_skills_plugin_dir():
     return d
 
 
-def capability_tool_grant(capability, test_runner=None, bypass_classifier=False, test_repo=None,
-                          write_grant=False, judged=False, browser=False, adjudicated=False):
+def _base_capability_tool_grant(capability, test_runner=None, bypass_classifier=False, test_repo=None,
+                                write_grant=False, judged=False, browser=False, adjudicated=False):
     """Translate an abstract Route.capability into the Claude-Code harness tool-grant flags.
 
     Returns a list of argv tokens. FAIL-CLOSED: any capability that is not EXACTLY "write", "inbox", or
@@ -1883,10 +1882,9 @@ def capability_tool_grant(capability, test_runner=None, bypass_classifier=False,
                 "--allowedTools", " ".join(_INBOX_ALLOWED),
                 "--disallowedTools", " ".join(_INBOX_DENIED)]
     if capability == "inbox-chat":
-        # Same cwd stewardship as triage; Gmail + Hindsight recall-only + one ops DM.
+        # Same cwd stewardship as triage; shared fleet DM grant is applied below.
         allowed = list(_INBOX_CHAT_ALLOWED)
-        if routing.INBOX_CHAT_OPS_DM:
-            allowed.append(f"Bash(zbus dm {routing.INBOX_CHAT_OPS_DM}:*)")
+
         return ["--permission-mode", "acceptEdits",
                 "--allowedTools", " ".join(allowed),
                 "--disallowedTools", " ".join(_INBOX_CHAT_DENIED)]
@@ -1902,6 +1900,47 @@ def capability_tool_grant(capability, test_runner=None, bypass_classifier=False,
     # No --permission-mode: with the deny-list disabling Edit/Write/Bash, edits are refused headless.
     return ["--allowedTools", " ".join(_READ_ALLOWED),
             "--disallowedTools", " ".join(_READ_DENIED)]
+
+
+_LEGACY_BUS_CAPABILITIES = ("inbox", "inbox-chat")
+
+
+def agent_dm_recipients(capability):
+    from adapters.hermes_gate.dm import recipients
+    operator = os.getenv("OPS_HANDLE", "") if capability in ("inbox", "inbox-chat", "general") else ""
+    patterns = recipients(os.getenv("AGENT_DM_RECIPIENTS", "*-bot@*"), operator)
+    # Triage notifies the human directly (including OTPs), never via the ops bot.
+    if capability == "inbox":
+        patterns += recipients("", os.getenv("OPERATOR_DM_HANDLE", ""))
+    return list(dict.fromkeys(patterns))
+
+
+def capability_tool_grant(capability, test_runner=None, bypass_classifier=False, test_repo=None,
+                          write_grant=False, judged=False, browser=False, adjudicated=False, bus_enabled=None):
+    """Add one shared DM grant to bus-enabled workers, never a new bus identity."""
+    grant = _base_capability_tool_grant(capability, test_runner, bypass_classifier, test_repo,
+                                       write_grant, judged, browser, adjudicated)
+    # Legacy callers build these historically bus-capable grants without a route.
+    # Actual spawns pass the route's ZBUS_ENV presence explicitly.
+    if bus_enabled is None:
+        bus_enabled = capability in _LEGACY_BUS_CAPABILITIES
+    if capability == "mr-review" or not bus_enabled:
+        return grant
+    ai, di = grant.index("--allowedTools") + 1, grant.index("--disallowedTools") + 1
+    from adapters.hermes_gate.gate import split_rules
+    allowed = split_rules(grant[ai])
+    allowed = [r for r in allowed if "zbus" not in r]
+    denied = split_rules(grant[di])
+    denied = [r for r in denied if r not in ("Bash", "Bash(zbus:*)")]
+    allowed += [f"Bash(zbus dm {p} *)" for p in agent_dm_recipients(capability)]
+    from adapters.hermes_gate.dm import dm_denied, TRIAGE_SAY_PREFIXES
+    if capability == "inbox":
+        allowed += [f"Bash({prefix} *)" for prefix in TRIAGE_SAY_PREFIXES]
+    else:
+        denied += ["Bash(zbus say:*)"]
+    denied += [f"Bash(zbus dm {p} *)" for p in dm_denied()] + _ZBUS[1:] + _ZBUS_ANY_DENIED
+    grant[ai], grant[di] = " ".join(allowed), " ".join(dict.fromkeys(denied))
+    return grant
 
 
 def _with_site_rules(grant, capability, name):
@@ -3085,7 +3124,7 @@ class CCAdapter(Adapter):
                    mcp_config_path=None, test_runner=None, setting_sources=None, effort=None,
                    bypass_classifier=False, session_uuid=None, test_repo=None, write_grant=False,
                    site_capability="", thread_dir=None, judged_bash=False, worktree_root=None,
-                   browser_config=None, steer_hook=None, companions=False):
+                   browser_config=None, steer_hook=None, companions=False, bus_enabled=None):
         if not system_prompt:
             raise ValueError("refusing to spawn without a system prompt (constraint #1: never --bare)")
         # Constraint 4, charter-strip: setting-sources defaults to self.setting_sources ("") so every existing worker
@@ -3124,7 +3163,7 @@ class CCAdapter(Adapter):
                                       # code only: with Portcullis configured the allow-list is dropped and the
                                       # hook adjudicates; unconfigured (the default) keeps the legacy grant, so
                                       # the allow-list is never removed without an adjudicator in its place.
-                                      adjudicated=portcullis is not None)
+                                      adjudicated=portcullis is not None, bus_enabled=bus_enabled)
         if site_capability:   # a broker.yaml capability: its base grant (above) plus its own extra rules
             grant = _with_site_rules(grant, capability, site_capability)
         # Wiki skills (EPH_WIKI_SKILLS_ENABLED, default OFF). An allow-listed capability does NOT include
@@ -3204,6 +3243,21 @@ class CCAdapter(Adapter):
                     **(_INBOX_HOOK_SETTINGS if capability in ("inbox", "inbox-chat") else {}),
                     **(_code_hook_settings(worktree_root, judged_bash, bypass_classifier, portcullis, write_grant)
                        if capability == "code" else {})}
+        # Append, never overwrite any capability-specific hooks.
+        dm_enabled = bus_enabled if bus_enabled is not None else capability in _LEGACY_BUS_CAPABILITIES
+        dm_patterns = agent_dm_recipients(capability) if dm_enabled and capability != "mr-review" else []
+        guard = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks", "zbus_guard.py")
+        from adapters.hermes_gate.dm import dm_denied
+        guard_args = [sys.executable, guard] + dm_patterns
+        guard_args += [a for p in (dm_denied() or [""]) for a in ("--deny", p)]
+        guard_args += ["--zbus-path", os.getenv("NOTIFY_ZBUS", "zbus")]
+        if dm_enabled and capability == "inbox":
+            guard_args += ["--triage-say"]
+        command = " ".join(shlex.quote(a) for a in guard_args)
+        entries = settings.get("hooks", {}).get("PreToolUse", [])
+        if dm_enabled:
+            settings["hooks"] = {**settings.get("hooks", {}), "PreToolUse": entries + [{
+                "matcher": "Bash", "hooks": [{"type": "command", "command": command}]}]}
         if capability == "code" and companions:
             guard = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                  "hooks", "companion_guard.py")
@@ -4955,6 +5009,7 @@ class CCAdapter(Adapter):
             stream_kw["companions"] = True
         argv = self.build_argv(prompt_text, eff_model, system_prompt, resume_session,
                                capability=capability, mcp_config_path=mcp_config_path,
+                               bus_enabled=bool(getattr(route, "env", {}).get("ZBUS_ENV")),
                                test_runner=test_runner, setting_sources=setting_sources, effort=effort,
                                bypass_classifier=bypass_classifier, judged_bash=judged_bash,
                                worktree_root=worker.worktree,   # F5: realpath anchor for the guard, never payload cwd

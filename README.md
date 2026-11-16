@@ -40,6 +40,8 @@ It is for people who already file work as tickets and want an agent to take a fi
 
 **Real code changes need a paid or otherwise funded agent account.** The default agent is [Claude Code](https://www.anthropic.com/claude-code), installed and logged in as the broker's OS user. [hermes-agent](docs/hermes.md) is also supported. The preview below needs no account, repo or token.
 
+Workers with a configured `ZBUS_ENV` may DM fleet bots using `AGENT_DM_RECIPIENTS` (default `*-bot@*`), except `AGENT_DM_DENY` (default `*-driver-bot@*`, deny wins). This does not create bus identities or allow channel posts. The Hermes general arm allows a valid DM before the exec judge; other commands still go through the judge. See [settings](docs/settings.md).
+
 ## Quick start
 
 You need Linux, git, and either Python 3.9+ or [Docker Engine](https://docs.docker.com/engine/install/) with the [Compose plugin](https://docs.docker.com/compose/install/linux/). Allow about 10 minutes.

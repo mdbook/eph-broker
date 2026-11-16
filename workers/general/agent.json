@@ -5,6 +5,7 @@
   "sections": [
     "role/ephemeral-oneshot",
     "capabilities/file-access",
+    "capabilities/fleet-dm",
     "scopes/general",
     "capabilities/general",
     "constraints/general",

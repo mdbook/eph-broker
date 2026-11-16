@@ -122,7 +122,8 @@ UI routes are `/healthz`, `/ui.js`, `/fleet-index`, `/api/agents`, and `/api/age
 snapshots every five seconds, ending with null on removal). `ui.js` exports `mount(el, ctx)` and
 `quickView(el, name, ctx)`; `ctx.baseUrl` optionally prefixes routes, and `ctx.signal` or the
 returned function unmounts it. All agent text
-is rendered with textContent. V1 ships presence only, so there are no View buttons yet.
+is rendered with textContent. Hermes agents with a view add the routes in
+[Hermes agent view](#hermes-agent-view).
 The host can label this module's mount point **Agents**. This package does not change the
 broker dashboard or install a second service; a module supervisor can watch `viewer/VERSION`.
 
@@ -162,12 +163,62 @@ outside the directory lock, so a slow hostname cannot stall heartbeats or UI sna
 At most four DNS lookups per allowlist may remain outstanding, including timed-out OS
 lookups that cannot be cancelled; further lookups are refused while those slots are busy.
 Registration rechecks revocation, name ownership and newer requests after DNS completes.
-Adapters use `Allowlist.fetch`, which connects
-to the checked IP directly, preserves HTTPS hostname verification, refuses redirects,
-and limits responses to 1 MiB. Do not use an unrestricted HTTP client in adapters.
+Adapters use `Allowlist.open` (or `Allowlist.fetch`, its 1 MiB buffered form), which connects
+to the checked IP directly, preserves HTTPS hostname verification and refuses redirects.
+Do not use an unrestricted HTTP client in adapters.
 `viewer.adapters.REGISTRY` maps kinds to adapters; `presence` is the fallback and implements
-no optional methods. Future adapters may implement `view(entry, allowlist)` (JSON response),
-`steer`, or `tail`. No Hermes connection, command execution API, or keypair auth ships in V1.
+no optional methods. An adapter with `view(entry, allowlist, request)` also exports its route
+names as `READ` and `ACT` and a `body_limit(route)`; `hermes` is the one that ships.
+
+## Hermes agent view
+
+A `hermes` agent that registers a `view_url` with the `view` cap is readable in the Agents tab
+through its view sidecar: a small web service beside the agent that serves the agent's transcript,
+progress and commands at the routes below, behind a Host check, forward auth with a proxy secret,
+and an Origin check on POST. The viewer uses the sidecar as a JSON and SSE data API only and never
+serves its HTML or JavaScript, so a compromised agent cannot run script in the broker's origin. Routes, under the module root (the browser sees
+`/viewer/agents/api/a/NAME/ROUTE`):
+
+* `GET /api/a/NAME/ROUTE` for `cfg`, `rows`, `events` (SSE), `earlier`, `img`, `ctx`, `tools`,
+  `search`, `browse`, `skill`, `queue`, `cmds` and `brand`. The query string passes through.
+* `POST /api/a/NAME/ROUTE` for `say`, `stop`, `steer` and `cmd`, JSON only. Allowed only when the
+  module host sends `X-Viewer-Can-Act: 1` (the broker actions permission) and the agent registered
+  the `steer` cap. Standalone mode ignores that header and is read-only.
+
+Each request connects to the registered address again (allowlist checked and pinned), sets
+`Host` to the `view_url` host, adds the forward-auth and proxy-secret headers below, and on POST
+sets `Origin` to the sidecar origin; the broker has already enforced same-origin for the browser.
+No browser header except `Accept`, `Last-Event-ID` and `If-None-Match` is forwarded.
+Replies are re-typed: JSON routes only answer JSON (anything else becomes a 502 JSON error),
+`img` only PNG, JPEG, GIF or WebP bytes, and `brand` arrives as `{"data_url": ...}` so an SVG is never
+a document in the broker origin. A sidecar that refuses the proxy (HTTP 401 or 421) shows as
+502 with a hint. The SSE stream gets a `: keepalive` comment between frames every five seconds,
+inside the module host's ten second idle limit. A command that takes longer than five seconds
+answers 200 with leading whitespace, then its JSON; a failure then carries `error` and `status`
+in the body, so clients should check `error` as well as the HTTP status.
+
+| Variable | Meaning / default |
+|---|---|
+| `AGENTDIR_HERMES_AUTH_HEADER` | Forward-auth header sent with the viewer's user name, default `Remote-User`. Configure the sidecar to trust the same name (`OKO_TAIL_AUTH_HEADER`). |
+| `AGENTDIR_HERMES_PROXY_SECRET_FILE` | 0600 file holding the shared proxy secret, read on every request so rotation needs no restart. Never logged or returned. The sidecar reads the same secret (`OKO_TAIL_PROXY_SECRET_FILE`). Unset sends no secret. |
+| `AGENTDIR_HERMES_PROXY_SECRET_HEADER` | Header carrying it, default `X-View-Proxy-Secret`; set the sidecar's `OKO_TAIL_PROXY_SECRET_HEADER` to match. |
+
+On the sidecar: add the `view_url` host name to `OKO_TAIL_HOSTNAMES` and the viewer's source
+address to `OKO_TAIL_TRUSTED_PROXIES`, and set the auth header and secret as above. The `cfg`
+route (session list and agent name) needs a sidecar that serves `GET /cfg`. Image sends go through the broker's POST limit
+(`BROKER_MAX_BODY`, 1 MiB by default); raise it if people attach several photos.
+
+Trust boundaries worth knowing before you enable it:
+
+* Read routes have no tier beyond module access. Everyone in the Agents module's group can read
+  every view-capable agent's transcript, context, memory browser and skills, so scope that group
+  to people who may see all of them.
+* The proxy secret is shared. Any listener inside `AGENTDIR_VIEW_ALLOW` that an enrolled agent
+  registers as its `view_url` receives it, along with the viewer's user name. Keep the allowlist
+  to the exact sidecar host:port pairs, and treat an enrolled agent as able to present any of
+  them (including another agent's sidecar). Per-agent secrets are the planned upgrade.
+* Non-stream replies have a total deadline of 130 seconds, and image replies are always sent as
+  `Cache-Control: private, no-cache` whatever the sidecar asks for.
 
 For local tests: `python -m pytest tests/test_viewer_*.py`. No JavaScript harness is required;
 server-side asset checks and a socket-free CLI/server-dispatch round trip are included, plus

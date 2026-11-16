@@ -28,14 +28,27 @@ class UIAuth:
         self.socket_peer, self.header, self.basic = socket_peer, header, basic
         self.proxies = [ipaddress.ip_network(v.strip()) for v in proxies.split(',') if v.strip()]
 
+    def trusted(self, peer):
+        try:
+            return any(ipaddress.ip_address(peer) in net for net in self.proxies)
+        except ValueError:
+            return False
+
+    def user(self, headers, peer=''):
+        """The authenticated name accepts() admitted: the identity header from a trusted source, else the basic user."""
+        name = headers.get(self.header, '').strip() if self.socket_peer or self.trusted(peer) else ''
+        if not name and self.basic and not self.socket_peer:
+            name = self.basic.split(b':', 1)[0].decode('utf-8', 'replace')
+        return name
+
+    def can_act(self, headers):
+        # Only the broker module host (socket mode) sets this; a standalone client could forge it.
+        return self.socket_peer and headers.get('X-Viewer-Can-Act', '') == '1'
+
     def accepts(self, headers, peer):
         if self.socket_peer:
             return bool(headers.get(self.header, '').strip())
-        try:
-            trusted = any(ipaddress.ip_address(peer) in net for net in self.proxies)
-        except ValueError:
-            trusted = False
-        if trusted and headers.get(self.header, '').strip():
+        if self.trusted(peer) and headers.get(self.header, '').strip():
             return True
         if self.basic:
             expected = b'Basic ' + base64.b64encode(self.basic)
@@ -51,21 +64,103 @@ def handler(directory, agent_api=False, auth=None, standalone=False):
         def log_message(self, *args):
             pass  # Do not log enrollment tokens, signed bodies or query strings.
 
-        def send(self, status, data, content_type='application/json'):
+        def send(self, status, data, content_type='application/json', headers=None):
             if not isinstance(data, bytes):
                 data = json.dumps(data).encode()
+            headers = headers or {}
             self.send_response(status)
             self.send_header('Content-Type', content_type)
             self.send_header('Content-Length', str(len(data)))
-            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Cache-Control', headers.get('Cache-Control', 'no-store'))
+            if headers.get('ETag'):
+                self.send_header('ETag', headers['ETag'])
             self.send_header('X-Content-Type-Options', 'nosniff')
             if status == 401 and not agent_api:
                 self.send_header('WWW-Authenticate', 'Basic realm="Agent directory"')
             self.end_headers()
             self.wfile.write(data)
 
+        def peer(self):
+            return self.client_address[0] if isinstance(self.client_address, tuple) else ''
+
+        def authorized(self):
+            if not auth or not auth.accepts(self.headers, self.peer()):
+                self.send(401, {'error': 'authentication required'})
+                return False
+            return True
+
+        def agent_view(self, method):
+            """/api/a/NAME/ROUTE: the agent's adapter view, read routes GET and actions POST."""
+            parts = urlsplit(self.path)
+            segments = parts.path.split('/')
+            if len(segments) != 5 or segments[:3] != ['', 'api', 'a']:
+                return self.send(404, {'error': 'not found'})
+            name, route = unquote(segments[3]), segments[4]
+            with directory.lock:
+                directory.reap()
+                entry = dict(directory.entries.get(name) or {})
+            adapter = adapters.get(entry.get('kind'))
+            if not entry or not entry['view_url'] or 'view' not in entry['caps'] or not hasattr(adapter, 'READ'):
+                return self.send(404, {'error': 'agent has no view'})
+            body = b''
+            if method == 'POST':
+                if route not in adapter.ACT:
+                    return self.send(404, {'error': 'not found'})
+                if not auth.can_act(self.headers):
+                    return self.send(403, {'error': 'read-only viewer'})
+                if 'steer' not in entry['caps']:
+                    return self.send(403, {'error': 'this agent does not accept actions'})
+                body = self.body(adapter.body_limit(route))
+                if body is None:
+                    return None
+                if self.headers.get('Content-Type', '').split(';')[0].strip().lower() != 'application/json':
+                    return self.send(415, {'error': 'send application/json'})
+            elif route not in adapter.READ:
+                return self.send(404, {'error': 'not found'})
+            reply = adapter.view(entry, directory.allowlist, dict(
+                route=route, method=method, query=parts.query, body=body, user=auth.user(self.headers, self.peer()),
+                headers={k: self.headers[k] for k in ('Accept', 'Last-Event-ID', 'If-None-Match') if self.headers.get(k)}))
+            if reply.stream is None:
+                return self.send(reply.status, reply.body, reply.content_type, reply.headers)
+            self.send_response(reply.status)
+            self.send_header('Content-Type', reply.content_type)
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('X-Accel-Buffering', 'no')
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            self.close_connection = True
+            try:
+                for chunk in reply.stream:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionError, OSError):
+                pass
+            finally:
+                reply.stream.close()
+
+        def body(self, limit):
+            self.connection.settimeout(30)
+            length = int(self.headers.get('Content-Length', '-1')) if (
+                self.headers.get('Content-Length', '').isdigit()) else -1
+            if (self.headers.get('Transfer-Encoding') or
+                    len(self.headers.get_all('Content-Length', [])) != 1 or not 0 <= length <= limit):
+                self.close_connection = True
+                self.send(413, {'error': 'body must have Content-Length, at most %d bytes' % limit})
+                return None
+            data = self.rfile.read(length)
+            if len(data) != length:
+                self.close_connection = True
+                self.send(400, {'error': 'incomplete body'})
+                return None
+            return data
+
         def do_POST(self):
-            if not agent_api or self.path not in ('/v1/enroll', '/v1/register', '/v1/beat', '/v1/deregister'):
+            if not agent_api:
+                if not self.authorized():
+                    return None
+                return self.agent_view('POST')
+            if self.path not in ('/v1/enroll', '/v1/register', '/v1/beat', '/v1/deregister'):
                 self.close_connection = True
                 return self.send(404, {'error': 'not found'})
             self.connection.settimeout(10)
@@ -89,9 +184,10 @@ def handler(directory, agent_api=False, auth=None, standalone=False):
             path = urlsplit(self.path).path
             if path == '/healthz':
                 return self.send(200, {'ok': True})
-            peer = self.client_address[0] if isinstance(self.client_address, tuple) else ''
-            if not auth or not auth.accepts(self.headers, peer):
-                return self.send(401, {'error': 'authentication required'})
+            if not self.authorized():
+                return None
+            if path.startswith('/api/a/'):
+                return self.agent_view('GET')
             if path == '/ui.js':
                 return self.send(200, (ASSETS / 'ui.js').read_bytes(), 'text/javascript; charset=utf-8')
             if path == '/' and standalone:
@@ -125,16 +221,6 @@ def handler(directory, agent_api=False, auth=None, standalone=False):
                             time.sleep(5)
                     except (BrokenPipeError, ConnectionError, OSError):
                         return
-                if action == 'view' and entries[0]['can_view']:
-                    with directory.lock:
-                        entry = dict(directory.entries.get(name) or {})
-                    if not entry:
-                        return self.send(404, {'error': 'agent not found'})
-                    try:
-                        result = adapters.get(entry['kind']).view(entry, directory.allowlist)
-                        return self.send(200, result)
-                    except (OSError, ValueError):
-                        return self.send(502, {'error': 'view connection refused'})
             self.send(404, {'error': 'not found'})
 
     return Handler

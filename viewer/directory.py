@@ -167,6 +167,9 @@ class Directory:
                 public['age'] = max(0, now - entry['last_beat'])
                 if public['age'] >= entry['ttl']:
                     public['status'] = 'grey'
-                public['can_view'] = bool(entry['view_url'] and callable(getattr(adapters.get(entry['kind']), 'view', None)))
+                adapter = adapters.get(entry['kind'])
+                public['can_view'] = bool(entry['view_url'] and 'view' in entry['caps'] and
+                                          callable(getattr(adapter, 'view', None)))
+                public['can_steer'] = public['can_view'] and 'steer' in entry['caps']
                 result.append(public)
             return result

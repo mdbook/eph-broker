@@ -78,26 +78,41 @@ class Allowlist:
         except (OSError, ValueError) as exc:
             raise ValueError('view_url refused: ' + str(exc)) from None
 
-    def fetch(self, url):
-        """Adapters must use this seam, not urlopen. No redirects, no second DNS lookup."""
+    def open(self, url, method='GET', headers=None, body=None, timeout=5):
+        """Adapters must use this seam, not urlopen. No redirects, no second DNS lookup.
+
+        Returns (response, close). The caller reads the response and must call close().
+        """
         parsed, port, addresses = self.resolve(url)
-        raw = socket.create_connection((addresses[0], port), timeout=5)
-        connection = http.client.HTTPConnection(parsed.hostname, port, timeout=5)
+        sock = [socket.create_connection((addresses[0], port), timeout=timeout)]
+        connection = http.client.HTTPConnection(parsed.hostname, port, timeout=timeout)
+
+        def close():
+            sock[0].close()
+            connection.close()
+
         try:
             if parsed.scheme == 'https':
-                raw = ssl.create_default_context().wrap_socket(raw, server_hostname=parsed.hostname)
-            connection.sock = raw
+                sock[0] = ssl.create_default_context().wrap_socket(sock[0], server_hostname=parsed.hostname)
+            connection.sock = sock[0]
             path = parsed.path or '/'
             if parsed.query:
                 path += '?' + parsed.query
-            connection.request('GET', path)
+            connection.request(method, path, body=body, headers=headers or {})
             response = connection.getresponse()
-            if 300 <= response.status < 400:
+            if 300 <= response.status < 400 and response.status != 304:  # 304 is revalidation
                 raise ValueError('view redirects are refused')
+            return response, close
+        except BaseException:
+            close()
+            raise
+
+    def fetch(self, url):
+        response, close = self.open(url)
+        try:
             data = response.read(1024 * 1024 + 1)
             if len(data) > 1024 * 1024:
                 raise ValueError('view response exceeds 1 MiB')
             return response.status, data
         finally:
-            raw.close()
-            connection.close()
+            close()

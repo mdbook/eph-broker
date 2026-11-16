@@ -1,12 +1,13 @@
-"""Optional adapter methods: view(entry, allowlist), steer, tail.
+"""Optional adapter methods: view(entry, allowlist, request), steer, tail.
 
 Presence is the fallback for every known kind. View implementations must route
-outbound requests through allowlist.fetch so DNS is checked and pinned.
+outbound requests through allowlist.open or allowlist.fetch so DNS is checked and
+pinned. An adapter with view also exports READ and ACT (route names) and body_limit.
 """
-from . import presence
+from . import hermes, presence
 
 KINDS = ('hermes', 'claude-code', 'codex', 'generic')
-REGISTRY = {kind: presence for kind in KINDS}
+REGISTRY = dict({kind: presence for kind in KINDS}, hermes=hermes)
 
 
 def get(kind):

@@ -117,6 +117,9 @@ class UI(ViewerTest):
         assert auth.accepts({'Authorization': 'Basic ZGVtbzpwYXNzd29yZA=='}, '203.0.113.1')
         assert not auth.accepts({'Authorization': 'Basic bad'}, '203.0.113.1')
         assert not auth.accepts({'Authorization': 'Basic \u00e9'}, '203.0.113.1')
+        basic = {'Authorization': 'Basic ZGVtbzpwYXNzd29yZA==', 'X-Forwarded-User': 'anyone'}
+        assert auth.user(basic, '203.0.113.1') == 'demo'  # an untrusted peer cannot pick its label
+        assert auth.user(headers, '192.0.2.1') == 'forged'
 
 
 if __name__ == '__main__':

@@ -4,6 +4,7 @@ import os
 import signal
 
 from . import auth
+from .adapters import hermes
 from .allowlist import Allowlist
 from .directory import Directory
 from .server import UIAuth, serve
@@ -28,6 +29,7 @@ def main():
         args.state_dir = (os.path.join(os.path.dirname(os.path.abspath(args.socket)), name + '-state')
                           if args.socket and not args.standalone else 'agentdir-state')
     try:
+        hermes.settings()  # Refuse a bad header name at startup, not on the first view.
         key = auth.private_read(os.environ['AGENTDIR_ENROLL_KEY_FILE'])
         directory = Directory(key, args.state_dir, Allowlist(os.environ.get('AGENTDIR_VIEW_ALLOW', '')))
         basic_file = os.environ.get('AGENTDIR_BASIC_AUTH_FILE')

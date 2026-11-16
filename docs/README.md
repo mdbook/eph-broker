@@ -39,6 +39,7 @@ how it works first.
 
 ## Harnesses
 
+- [agent-directory.md](agent-directory.md): optional agent presence UI, enrollment and signed heartbeats.
 - [adapters.md](adapters.md): what a harness is, the Adapter interface, the result envelope, how a route picks
   its harness, how Claude Code and hermes differ, and a worked example for adding another CLI.
 - [hermes.md](hermes.md): running workers on hermes-agent, and keeping its venv non-editable.

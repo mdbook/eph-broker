@@ -7,6 +7,7 @@ events.jsonl
 worktrees/
 .companions/
 demo-state/
+agentdir-state/
 # eph-gate-denials.jsonl (adapters/hermes_gate.record_denial) lands in HERMES_HOME
 # normally, but a test that calls a hook with no HERMES_HOME set writes it here instead (belt-and-
 # suspenders alongside the test-side fix that points HERMES_HOME at a tempdir for the whole suite).

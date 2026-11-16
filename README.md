@@ -107,6 +107,7 @@ back to another model. Invalid lists stop broker startup.
 - **Dashboard and events.** Tabbed worker and queue views, a separate Settings page and phone hamburger navigation
   ([dashboard guide](docs/operations.md#health-and-the-dashboard)), plus [signed run events](docs/events.md) for your own automation.
 - **Optional UI modules.** [Add a tab](docs/modules.md#try-it-in-ten-minutes) without embedding another app in the broker.
+- **Agent directory.** An optional [Agents tab](docs/agent-directory.md) lists agents that enroll once and send signed heartbeats, including agents the broker did not start.
 
 ![The dashboard's worker view](docs/images/dashboard-workers.png)
 

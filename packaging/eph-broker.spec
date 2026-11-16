@@ -32,6 +32,14 @@ inbound events and serves a dashboard. Pure Python stdlib, no venv.
 
 Built from commit %{commit}.
 
+%package viewer
+Summary:        Optional agent directory module
+Requires:       python3 >= 3.9
+
+%description viewer
+Stdlib agent directory with enrollment, signed heartbeats and an Agents UI.
+The module has its own VERSION and does not restart the broker on upgrade.
+
 %prep
 %autosetup -n %{name}-%{pkg_version}
 
@@ -49,6 +57,7 @@ cp -a prompts %{buildroot}/opt/eph-broker/
 cp -a workers %{buildroot}/opt/eph-broker/
 cp -a tools %{buildroot}/opt/eph-broker/
 cp -a hooks %{buildroot}/opt/eph-broker/
+cp -a viewer %{buildroot}/opt/eph-broker/
 cp -a approved-prompts.json %{buildroot}/opt/eph-broker/
 
 install -d -m 0755 %{buildroot}%{_unitdir}
@@ -59,8 +68,14 @@ install -d -m 0755 %{buildroot}%{_unitdir}/eph-broker.service.d
 %license LICENSE
 %dir /opt/eph-broker
 /opt/eph-broker/*
+%exclude /opt/eph-broker/viewer
 %{_unitdir}/eph-broker.service
 %dir %{_unitdir}/eph-broker.service.d
+
+%files viewer
+%license LICENSE
+%dir /opt/eph-broker
+/opt/eph-broker/viewer
 
 %pre
 getent group eph-broker >/dev/null || groupadd -r eph-broker

@@ -4,7 +4,7 @@
 hermes is FAKED: a small script stands in for the `hermes` CLI (like test_broker's fake claude), records its
 argv / stdin / env-key names / HERMES_HOME config, and prints stream-json. No real hermes, model or endpoint.
 """
-import gc, hashlib, json, os, pathlib, stat, subprocess, sys, tempfile, time
+import gc, hashlib, json, os, pathlib, shlex, stat, subprocess, sys, tempfile, time
 
 os.environ.setdefault("WORKER_SANDBOX", "off")   # fake CLI; kernel boundary is tested in test_sandbox.py
 
@@ -86,6 +86,7 @@ if rec:
                             "key": os.environ.get("AUXILIARY_VLLM_API_KEY"), "home": home, "config": cfg,
                             "cwd": os.getcwd(), "policy": policy, "terminal_cwd": os.environ.get("TERMINAL_CWD"),
                             "path": os.environ["PATH"], "ssh": shutil.which("ssh"),
+                            "npm_cache": os.environ.get("npm_config_cache"),
                             "git_identity": {k: v for k, v in os.environ.items()
                                              if k.startswith(("GIT_AUTHOR_", "GIT_COMMITTER_"))},
                             "verdicts": {t: _directive(hooks, t, a)[0] for t, a in (
@@ -333,6 +334,10 @@ def _check_hermes_ssh_config(row):
                 assert r["git_identity"] == routing.worker_git_identity(route)
                 assert_ssh_config(env={"PATH": r["path"]})
                 (init,) = json.loads(r["config"])["terminal"]["shell_init_files"]
+                if route.capability == "code":
+                    cache = os.path.join(w.test_tmpdir, "npm-cache")
+                    assert r["npm_cache"] == cache
+                    assert f"export npm_config_cache={shlex.quote(cache)}\n" in pathlib.Path(init).read_text()
                 for name, value in r["git_identity"].items():
                     assert f"export {name}={value}\n" in pathlib.Path(init).read_text()
                 # Model the login snapshot clobbering PATH: the shared SSH selection must be restored.

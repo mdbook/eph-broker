@@ -1069,16 +1069,15 @@ _WRITE_DENIED = ["Bash(git push:*)", "Bash(git remote:*)", "Bash(git config:*)",
 _CODE_TEST_RUNNERS = {
     "pytest": ["Bash(python -m pytest:*)", "Bash(pytest:*)"],
     # A JS/TS repo (package.json; see routing.detect_test_runner, which only fires for a
-    # CODE_REPO_ALLOWLIST repo) needs its deps before `npm test`, so `npm ci` is granted as the EXACT bare
-    # command (no `:*`, so no `--prefix <elsewhere>`/`--cache`/`--userconfig` or any other flag/arg). Never bare
-    # `npm`/`npx`/`npm run <anything>`/`npm exec`. This is NOT posture-neutral: `npm ci` FETCHES packages from
-    # the npm registry over the network, HONOURS any `.npmrc` in the repo/worktree (registry URL, scripts
-    # settings, etc.), and RUNS dependency install scripts (pre/post-install) inside the worktree sandbox; `npm
-    # test` then runs the repo's own "test" script. That is arbitrary third-party code with network access,
-    # beyond what pytest grants. It is accepted ONLY for allowlisted repos (an inferred-only catalog repo
-    # resolves to `none`, never `npm`), on the basis that the worker is cred-free and its sole output is a
-    # human-reviewed feature-branch MR.
-    "npm":    ["Bash(npm ci)", "Bash(npm test:*)", "Bash(npm run test:*)"],
+    # CODE_REPO_ALLOWLIST repo) needs deps before `npm test` and lockfile regeneration for dependency bumps.
+    # Install-shaped grants are EXACT commands: --ignore-scripts is mandatory, no extra flags/packages,
+    # --force, alternate prefix/cache/userconfig, bare npm/npx or npm exec. Fetching registry metadata and
+    # packages still uses the network and repo .npmrc; `npm test` runs repo-owned code. Accept this only for
+    # explicitly selected npm runners, in the cred-free worktree with a human-reviewed feature-branch MR.
+    "npm":    ["Bash(npm ci --ignore-scripts)",
+               "Bash(npm install --package-lock-only --ignore-scripts)",
+               "Bash(npm audit fix --package-lock-only --ignore-scripts)",
+               "Bash(npm test:*)", "Bash(npm run test:*)"],
     "go":     ["Bash(go test:*)"],
     # Syntax-check ONLY for script repos: `bash -n <file>` with NO other flags parses without
     # executing. The allow-list itself is still a `bash -n` prefix grant (the CC Bash-pattern matcher can't
@@ -1107,7 +1106,9 @@ _CODE_TEST_RUNNERS = {
 _CODE_TEST_HINTS = {
     "pytest": "python -m pytest",
     "repo-test": "./run-tests.sh  (the repo's own test entrypoint; no args, no chaining)",
-    "npm":    "npm ci  then  npm test  (two separate calls; no chaining)",
+    "npm":    ("npm ci --ignore-scripts  then  npm test  (separate calls; no chaining). Lockfile updates: "
+               "npm install --package-lock-only --ignore-scripts  or  "
+               "npm audit fix --package-lock-only --ignore-scripts  (exact commands; no --force)"),
     "go":     "go test ./...",
     "bash-n": "bash -n <file.sh>  (one tracked *.sh per call; no chaining)",
     "bash-n+unittest": ("python3 -m unittest <test module or path>  for Python, and  bash -n <file.sh>  for "

@@ -151,6 +151,7 @@ if rec:
             "instructions": open(os.path.join(home, "eph-instructions.md")).read(),
             "auth_link": os.readlink(os.path.join(home, "auth.json")), "home_names": sorted(os.listdir(home)),
             "pythonpath": os.environ.get("PYTHONPATH"),
+            "npm_cache": os.environ.get("npm_config_cache"), "tool_npm_cache": tool_env.get("npm_config_cache"),
             "git_identity": {k: v for k, v in os.environ.items() if k.startswith(("GIT_AUTHOR_", "GIT_COMMITTER_"))},
             "path": os.environ["PATH"], "ssh": shutil.which("ssh"),
             "verdicts": {"push": run_hook("Bash", {"command": "git push origin HEAD"}),
@@ -1014,6 +1015,10 @@ def _check_codex_ssh_config(row):
                 assert "/.ssh/cm-" not in r["tool_ssh_config"], r
                 assert "network_access = true" in r["config"], r
                 assert r["git_identity"] == R.worker_git_identity(route)
+                if route.capability == "code":
+                    cache = os.path.join(w.test_tmpdir, "npm-cache")
+                    assert r["npm_cache"] == r["tool_npm_cache"] == cache
+                    assert 'npm_config_cache = ' + X.toml_str(cache) in r["config"]
                 for name, value in r["git_identity"].items():
                     assert f"{name} = {X.toml_str(value)}" in r["config"]
                 assert 'allow_login_shell = false' in r["config"]

@@ -71,6 +71,9 @@ def apply_tmpdir(env, worker, capability, test_runner=None):
     if not getattr(worker, "test_tmpdir", None):
         worker.test_tmpdir = tempfile.mkdtemp(prefix="t-", dir=os.path.dirname(worker.worktree))
     env["TMPDIR"] = worker.test_tmpdir
+    # The sandbox cannot write npm's default ~/.npm. Reuse the per-worktree scratch mount so the cache
+    # survives warm turns, is cleaned up with the worker and cannot leak into a proposed git diff.
+    env["npm_config_cache"] = os.path.join(worker.test_tmpdir, "npm-cache")
     if test_runner == "ansible-syntax":
         # Ansible otherwise writes to ~/.ansible/tmp, outside the sandbox's writable
         # mounts. Keep both temp locations under the existing per-run scratch mount;

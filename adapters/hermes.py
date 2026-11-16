@@ -868,6 +868,8 @@ class HermesHarness:
             test_repo = getattr(worker, "repo", None) if test_runner == "venv" else None
             _wt_src = os.path.join(cwd, "src")             # G2 parity with the CC path (src-layout venv repos)
             shell_init = f'export PATH={shlex.quote(env["PATH"])}\n'
+            if capability == "code":
+                shell_init += f'export npm_config_cache={shlex.quote(env["npm_config_cache"])}\n'
             for name, value in _cc.routing.worker_git_identity(route).items():
                 shell_init += f'export {name}={shlex.quote(value)}\n'
             shell_init += "".join(f"export {k}={shlex.quote(v)}\n"

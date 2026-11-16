@@ -125,8 +125,11 @@ the live fleet. Validate a real turn (auth, resume, scratch, hooks and hard-kill
 The deny lists (`_READ_DENIED`, `_WRITE_DENIED`, `_CODE_DENIED`, `_GENERAL_DENIED`) cover reading secret files,
 writing under `.git`, `git push` and other ref or remote changes, and destructive shell commands. The code
 worker's only shell access is its test runner, chosen from a fixed table by key, never a command from the
-ticket. The `npm` runner is the weakest entry: `npm ci` downloads packages and runs their install scripts, so
-use it only for repos whose dependencies you already trust.
+ticket. The `npm` runner can download packages with `npm ci --ignore-scripts`, or regenerate lockfiles with
+`npm install --package-lock-only --ignore-scripts` / `npm audit fix --package-lock-only --ignore-scripts`.
+These are exact grants with no extra arguments or `--force`; install lifecycle scripts are disabled.
+Registry access and repo `.npmrc` still apply, and `npm test` runs repo-owned code, so use this runner
+only for repos you trust. Its cache uses private per-worktree scratch, not the broker's home cache.
 
 ### With the Claude Code harness
 

@@ -35,6 +35,15 @@ the worker. Include `pytest` and every required test dependency, such as `websoc
 WebSocket plugin suite. The worker cannot install packages. Setup failures are reported in its brief
 as verification gaps. Unmapped repos keep their existing runner selection.
 
+The `npm` runner grants `npm ci --ignore-scripts` before `npm test`. For dependency changes it also grants
+exactly `npm install --package-lock-only --ignore-scripts` and
+`npm audit fix --package-lock-only --ignore-scripts`. Extra arguments (including `--force`) and installs
+without `--ignore-scripts` are not granted. Install lifecycle scripts stay disabled; tests still run
+the repo's own test script. Each code worker exports `npm_config_cache` to a private `npm-cache` directory
+in its per-worktree scratch space, not the read-only home cache. All harness tool shells receive it too;
+no environment prefix or cache flag is needed. The cache survives resumed turns, stays out of git diffs,
+and is removed with the worker's scratch directory.
+
 Code and issue worktrees default to short roots `~/.cache/ew/c` and `~/.cache/ew/i`. Long subject keys
 use bounded hashes. Each code worker gets a private writable `TMPDIR` next to its worktree, shared
 across its turns and removed when the worker exits. Keep overridden worktree roots short for socket tests.

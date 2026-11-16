@@ -122,6 +122,36 @@ def T(cmd, **kw):
     return dict(command=cmd, **kw)
 
 
+def test_npm_lockfile_and_script_free_install_grants():
+    from adapters import codex as X
+    from adapters import codex_gate as CG
+    f = fx()
+    hermes = G.Policy(H.gate_policy("code", f.wt, test_runner="npm"))
+    codex = G.Policy(X.gate_policy("code", f.wt, test_runner="npm"))
+    prefix = "cd " + shlex.quote(f.wt) + " || exit 1; "
+    allowed = ("npm ci --ignore-scripts", "npm install --package-lock-only --ignore-scripts",
+               "npm audit fix --package-lock-only --ignore-scripts", "npm test", "npm run test")
+    denied = ("npm ci", "npm install", "npm install --package-lock-only",
+              "npm install --ignore-scripts", "npm audit fix", "npm audit fix --package-lock-only",
+              "npm install --package-lock-only --ignore-scripts=false", "npm exec test", "npx test")
+    for cmd in allowed + denied:
+        expected = cmd in allowed
+        v = G.decide("terminal", T(cmd), hermes)
+        assert v.allowed == expected, (cmd, v.reason)
+        v = CG.evaluate({"tool_name": "Bash", "tool_input": T(prefix + cmd)}, codex)[2]
+        assert v.allowed == expected, (cmd, v.reason)
+        if expected:
+            for suffix in (" --force", " --prefix /tmp", " --ignore-scripts=false",
+                           " && git push origin HEAD", " $(git status)"):
+                if cmd in allowed[:3]:
+                    assert not G.decide("terminal", T(cmd + suffix), hermes).allowed, cmd + suffix
+                    assert not CG.evaluate({"tool_name": "Bash", "tool_input": T(prefix + cmd + suffix)},
+                                           codex)[2].allowed, cmd + suffix
+            for policy in (f.write, f.code, f.mr):
+                assert not G.decide("terminal", T(cmd), policy).allowed, cmd
+    ok("npm: exact lockfile/install forms require --ignore-scripts; force, overrides and other capabilities denied")
+
+
 def test_dev_null_argument_exception():
     f = fx()
     syntax = G.Policy(H.gate_policy("code", f.wt, test_runner="ansible-syntax"))

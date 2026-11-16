@@ -125,7 +125,10 @@ def _check_cc_ssh_config(row):
                         "assert 'stricthostkeychecking ask\\n' in r.stdout, r.stdout\n"
                         "assert 'Reading configuration data /etc/ssh/' not in r.stderr, r.stderr\n"
                         "assert '/etc/ssh/ssh_config.d' not in r.stderr, r.stderr\n"
-                        "assert os.environ['CLAUDE_BASH_NO_LOGIN'] == '1'\n" + FAKE_CLAUDE)
+                        "assert os.environ['CLAUDE_BASH_NO_LOGIN'] == '1'\n"
+                        "assert os.environ.get('npm_config_cache') == "
+                        f"(os.path.join(os.environ['TMPDIR'], 'npm-cache') if {row.capability == 'code'} else None)\n"
+                        + FAKE_CLAUDE)
             mcp = os.path.join(d, "mcp.json")
             pathlib.Path(mcp).write_text('{"mcpServers": {}}')
             route = replace(row, adapter="cc", backend="", model="claude-sonnet-5",
@@ -4947,7 +4950,7 @@ def test_g2_venv_and_bash_n_grants():
 
 def test_package_json_repo_gets_npm_ci_and_npm_test():
     """An unmapped ALLOWLISTED package.json repo resolves to the `npm` runner, whose grant includes
-    the EXACT `npm ci` plus `npm test` (never bare npm/npx); a Python repo's resolution + grant are unchanged;
+    exact script-free install commands plus `npm test` (never bare npm/npx); Python grants are unchanged;
     a package.json repo NOT on CODE_REPO_ALLOWLIST is never auto-detected."""
     import routing
     from adapters.cc import code_test_hint
@@ -4977,13 +4980,17 @@ def test_package_json_repo_gets_npm_ci_and_npm_test():
         routing.CODE_REPO_ALLOWLIST = o_allow
     g = capability_tool_grant("code", test_runner="npm")
     toks = g[g.index("--allowedTools") + 1][len(code_base):]
-    assert "Bash(npm ci)" in toks and "Bash(npm test:*)" in toks, toks
+    for command in ("npm ci --ignore-scripts", "npm install --package-lock-only --ignore-scripts",
+                    "npm audit fix --package-lock-only --ignore-scripts"):
+        assert f"Bash({command})" in toks, toks
+        assert command in code_test_hint("npm")
+    assert "Bash(npm ci)" not in toks and "Bash(npm test:*)" in toks, toks
     for bad in ("Bash(npm:*)", "Bash(npx:*)", "Bash(npm ci:*)", "Bash(npm run:*)", "Bash(npm exec:*)"):
         assert bad not in toks, (bad, toks)
     g = capability_tool_grant("code", test_runner="pytest")
     assert g[g.index("--allowedTools") + 1] == code_base + " Bash(python -m pytest:*) Bash(pytest:*)", g
     assert "npm ci" in code_test_hint("npm") and "npm test" in code_test_hint("npm")
-    ok("allowlisted package.json-only repo -> npm runner (exact `npm ci` + `npm test`); "
+    ok("allowlisted package.json-only repo -> npm runner (exact script-free installs + `npm test`); "
        "Python repo unchanged; non-allowlisted repo never auto-detected")
 
 
@@ -23428,6 +23435,34 @@ def test_worker_ansible_temp_configuration_and_resume():
         shutil.rmtree(w.test_tmpdir)
         assert not os.path.exists(path), "scratch cleanup also removes Ansible temp"
     ok("Ansible temp prefix is configurable and contained; resume reuses it; other runners/readers unchanged")
+
+
+def test_worker_npm_cache_configuration_and_resume():
+    import test_environment as T
+    with tempfile.TemporaryDirectory() as d:
+        wt = os.path.join(d, "w"); os.mkdir(wt)
+        workers = [Worker("vikunja:task:9991", "npm-a", wt), Worker("vikunja:task:9992", "npm-b", wt)]
+        caches = []
+        for worker in workers:
+            env = {"npm_config_cache": "/unwritable"}
+            T.apply_tmpdir(env, worker, "code", "npm")
+            cache = env["npm_config_cache"]
+            assert cache == os.path.join(worker.test_tmpdir, "npm-cache")
+            os.mkdir(cache)
+            pathlib.Path(cache, "probe").write_text("writable")
+            resumed = {}
+            T.apply_tmpdir(resumed, worker, "code", "npm")
+            assert resumed == env
+            assert pathlib.Path(resumed["npm_config_cache"], "probe").read_text() == "writable"
+            caches.append(cache)
+        assert caches[0] != caches[1]
+        untouched = {}
+        T.apply_tmpdir(untouched, workers[0], "read", "npm")
+        assert untouched == {}
+        for worker, cache in zip(workers, caches):
+            shutil.rmtree(worker.test_tmpdir)
+            assert not os.path.exists(cache)
+    ok("npm cache is private writable per-worktree scratch, reused on resume and removed with worker scratch")
 
 
 def test_worker_test_dependencies_provision_and_preserve_environment_gaps():

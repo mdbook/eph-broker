@@ -65,6 +65,11 @@ registered name, so a Fleet row with the same name gets a Quick view. Upgrading 
 `eph-broker-viewer` package changes `viewer/VERSION`, which restarts only the module.
 Without `AGENTDIR_STATE_DIR`, state lives in `<name>-state` beside the module socket.
 
+The tab lists agents on the left and shows the picked one on the right (on a phone, the list
+first, then the agent with a back link). The address bar follows the pick
+(`#module/agents/NAME`, plus the session and a message id), so links to an agent, a session or
+a message work. A `hermes` agent with a view shows its live view, below.
+
 ## Hermes agents (plugin)
 
 `viewer/clients/hermes-plugin/agentdir/` is a stdlib Hermes plugin that keeps a gateway listed.
@@ -201,12 +206,20 @@ in the body, so clients should check `error` as well as the HTTP status.
 |---|---|
 | `AGENTDIR_HERMES_AUTH_HEADER` | Forward-auth header sent with the viewer's user name, default `Remote-User`. Configure the sidecar to trust the same name (`OKO_TAIL_AUTH_HEADER`). |
 | `AGENTDIR_HERMES_PROXY_SECRET_FILE` | 0600 file holding the shared proxy secret, read on every request so rotation needs no restart. Never logged or returned. The sidecar reads the same secret (`OKO_TAIL_PROXY_SECRET_FILE`). Unset sends no secret. |
+| `AGENTDIR_HERMES_UI_DIR` | Directory holding the view's renderer: `view.js`, `app.css` and `logo.svg` from the view sidecar's `web/` directory, at the release your sidecars run (one that ships `view.js` and `GET /cfg`). Only those three names are served, at `hermes-ui/`. Unset shows presence only, with a note. |
 | `AGENTDIR_HERMES_PROXY_SECRET_HEADER` | Header carrying it, default `X-View-Proxy-Secret`; set the sidecar's `OKO_TAIL_PROXY_SECRET_HEADER` to match. |
 
 On the sidecar: add the `view_url` host name to `OKO_TAIL_HOSTNAMES` and the viewer's source
 address to `OKO_TAIL_TRUSTED_PROXIES`, and set the auth header and secret as above. The `cfg`
 route (session list and agent name) needs a sidecar that serves `GET /cfg`. Image sends go through the broker's POST limit
 (`BROKER_MAX_BODY`, 1 MiB by default); raise it if people attach several photos.
+
+The live view is the sidecar project's own renderer, mounted in a shadow root in the tab, so it
+has every feature of the sidecar's page: transcript, steps, search, context and usage, memory and
+skills, approvals, the send queue, steer, stop and slash commands. Viewers without the broker
+actions permission, or agents without the `steer` cap, get the same view with the composer
+disabled and a hint. The renderer comes from `AGENTDIR_HERMES_UI_DIR`, which the operator
+installs; the browser never loads script or styles from an agent.
 
 Trust boundaries worth knowing before you enable it:
 

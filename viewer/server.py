@@ -15,6 +15,10 @@ from . import adapters
 from .directory import Refused
 
 ASSETS = Path(__file__).parent
+# The agent view's renderer files (fixed names; nothing else is served from AGENTDIR_HERMES_UI_DIR).
+# logo.svg is the stylesheet's own mark: operator-installed like the rest, never anything an agent sends.
+VIEW_UI = {'/hermes-ui/view.js': 'text/javascript; charset=utf-8', '/hermes-ui/app.css': 'text/css; charset=utf-8',
+           '/hermes-ui/logo.svg': 'image/svg+xml'}
 PAGE = b'''<!doctype html><meta charset="utf-8"><title>Agents</title>
 <style>:root{color-scheme:light dark}body{font:16px system-ui;margin:2rem}
 td,th{text-align:left;padding:.5rem}table{border-collapse:collapse}</style>
@@ -79,6 +83,17 @@ def handler(directory, agent_api=False, auth=None, standalone=False):
                 self.send_header('WWW-Authenticate', 'Basic realm="Agent directory"')
             self.end_headers()
             self.wfile.write(data)
+
+        def view_ui(self, path):
+            # The agent view's renderer, from an operator-installed directory (the view sidecar's web/ at a release).
+            root = os.environ.get('AGENTDIR_HERMES_UI_DIR', '')
+            if not root:
+                return self.send(404, {'error': 'the agent view UI is not installed (AGENTDIR_HERMES_UI_DIR)'})
+            try:
+                data = (Path(root) / path.rsplit('/', 1)[1]).read_bytes()
+            except OSError:
+                return self.send(404, {'error': 'the agent view UI is missing ' + path.rsplit('/', 1)[1]})
+            return self.send(200, data, VIEW_UI[path], {'Cache-Control': 'no-cache'})
 
         def peer(self):
             return self.client_address[0] if isinstance(self.client_address, tuple) else ''
@@ -190,6 +205,8 @@ def handler(directory, agent_api=False, auth=None, standalone=False):
                 return self.agent_view('GET')
             if path == '/ui.js':
                 return self.send(200, (ASSETS / 'ui.js').read_bytes(), 'text/javascript; charset=utf-8')
+            if path in VIEW_UI:
+                return self.view_ui(path)
             if path == '/' and standalone:
                 return self.send(200, PAGE, 'text/html; charset=utf-8')
             if path == '/api/agents':

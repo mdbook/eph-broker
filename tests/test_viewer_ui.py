@@ -1,6 +1,9 @@
 import io
 import json
+import shutil
+import subprocess
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from viewer.directory import Directory
@@ -95,6 +98,55 @@ class UI(ViewerTest):
         assert status == 200 and json.loads(body) == ['demo']
         script = request(directory, '/ui.js', 'X-Forwarded-User: test\r\n')[1]
         assert b'export function quickView' in script and b'ctx.signal' in script
+
+    def test_view_ui_files_come_only_from_the_installed_dir(self):
+        directory = Directory(KEY, self.tmp_path, clock=lambda: 100)
+        identity = 'X-Forwarded-User: test\r\n'
+        assert request(directory, '/hermes-ui/view.js')[0] == 401
+        with patch.dict('os.environ', {'AGENTDIR_HERMES_UI_DIR': ''}):
+            status, body = request(directory, '/hermes-ui/view.js', identity)
+        assert status == 404 and b'AGENTDIR_HERMES_UI_DIR' in body
+        ui = self.tmp_path / 'web'
+        ui.mkdir()
+        (ui / 'view.js').write_text('export function mount(){}')
+        (ui / 'app.css').write_text('.ob{}')
+        (ui / 'secret.txt').write_text('nope')
+        with patch.dict('os.environ', {'AGENTDIR_HERMES_UI_DIR': str(ui)}):
+            raw = ('GET /hermes-ui/view.js HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n%s\r\n' % identity).encode()
+            sock = Socket(raw)
+            handler(directory, auth=UIAuth(), standalone=True)(sock, '', object())
+            head = sock.output.getvalue().split(b'\r\n\r\n', 1)[0]
+            assert b'Content-Type: text/javascript' in head and b'Cache-Control: no-cache' in head
+            assert request(directory, '/hermes-ui/app.css', identity) == (200, b'.ob{}')
+            assert request(directory, '/hermes-ui/secret.txt', identity)[0] == 404
+            assert request(directory, '/hermes-ui/../web/secret.txt', identity)[0] == 404
+            (ui / 'app.css').unlink()
+            status, body = request(directory, '/hermes-ui/app.css', identity)
+            assert status == 404 and b'missing app.css' in body
+
+    def test_ui_routes_and_slow_command_status(self):
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node unavailable')
+        script = """
+import {parseRoute, makeRoute, viewFetch} from %s;
+const assert = (c, m) => { if (!c) { console.error('FAIL', m); process.exit(1); } };
+const r = makeRoute('books', 'a/b c', '42');
+assert(JSON.stringify(parseRoute(r)) === JSON.stringify({name: 'books', session: 'a/b c', id: '42'}), r);
+assert(JSON.stringify(parseRoute('books')) === JSON.stringify({name: 'books', session: null, id: null}), 'bare');
+assert(parseRoute('books/s/x').id === null, 'non-numeric id');
+let seen;
+globalThis.fetch = async (url, init) => { seen = init; return new Response(url === 'slow'
+  ? '   {"error":"agent offline","status":502}' : '{"ok":true}', {status: 200, headers: {'Content-Type': 'application/json'}}); };
+const slow = await viewFetch('slow', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+assert(slow.status === 502 && (await slow.json()).error === 'agent offline', 'status from body');
+assert(seen.headers.get('X-Broker-Action') === '1', 'action header');
+const ok = await viewFetch('fine');
+assert(ok.status === 200 && seen.headers.get('X-Broker-Action') === null, 'GET untouched');
+console.log('ok');
+""" % json.dumps((Path(__file__).parent.parent / 'viewer' / 'ui.js').as_uri())
+        out = subprocess.run([node, '--input-type=module', '-e', script], capture_output=True, text=True, timeout=60)
+        assert out.returncode == 0 and out.stdout.strip() == 'ok', out.stderr + out.stdout
 
     def test_http_signed_dispatch_and_body_limit(self):
         directory = Directory(KEY, self.tmp_path, clock=lambda: 100)

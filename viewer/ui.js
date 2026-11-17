@@ -6,22 +6,99 @@
 const STATUS_COLOR = {busy: 'var(--run,inherit)', idle: 'var(--t2,inherit)',
   live: 'var(--t1,inherit)', grey: 'var(--t3,inherit)'};
 const VIEW_STATUS = {'': 'idle', busy: 'busy', compact: 'compacting', unread: 'unread reply', off: 'offline'};
+// Public renderer seam. Keep these as CSS references, not computed color snapshots: changing the broker's
+// light/dark/auto theme must update an already open view without remounting it or losing composer state.
+const VIEW_TOKENS = `
+  --agent-view-bg:var(--bg,#f4f5f7);--agent-view-surface:var(--s1,#fff);
+  --agent-view-hover:var(--s2,#f0f2f5);--agent-view-active:var(--s3,#e6e9ee);
+  --agent-view-border:var(--line,#dce0e6);--agent-view-text:var(--t1,rgb(20,25,32));
+  --agent-view-muted:var(--t2,rgb(71,81,96));--agent-view-faint:var(--t3,#626c7b);
+  --agent-view-accent:var(--brand,#2b57c9);--agent-view-on-accent:var(--onbrand,#fff);
+  --agent-view-success:var(--run,rgb(23,115,74));--agent-view-warning:var(--wait,#8a5600);
+  --agent-view-danger:var(--block,#bb3328);--agent-view-shadow:var(--shadow,none);
+  --agent-view-font:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI Variable Text","Segoe UI",system-ui,sans-serif;
+  --agent-view-mono:ui-monospace,SFMono-Regular,"JetBrains Mono",Menlo,monospace;
+  --agent-view-font-size:14px;--agent-view-line-height:1.5;
+  --agent-view-radius:12px;--agent-view-control-radius:8px;--agent-view-space:16px;
+  --agent-view-control-height:36px;`;
+
+// Compatibility stylesheet for today's renderer, which does not yet consume --agent-view-* itself.
+// Only the renderer's shadow tree is affected; never replace its stylesheet or its layout/behavior rules.
+const VIEW_CSS = `
+:host > *, .ob{
+  --bg:var(--agent-view-bg)!important;--panel:var(--agent-view-surface)!important;
+  --panel2:var(--agent-view-hover)!important;--line:var(--agent-view-border)!important;
+  --ink:var(--agent-view-text)!important;--text:var(--agent-view-text)!important;
+  --muted:var(--agent-view-muted)!important;--faint:var(--agent-view-faint)!important;
+  --accent:var(--agent-view-accent)!important;--green:var(--agent-view-success)!important;
+  --amber:var(--agent-view-warning)!important;--red:var(--agent-view-danger)!important;
+  --code:var(--agent-view-hover)!important;--user:var(--agent-view-surface)!important;
+  background:var(--agent-view-surface)!important;color:var(--agent-view-text)!important;
+  font:var(--agent-view-font-size)/var(--agent-view-line-height) var(--agent-view-font)!important;
+  -webkit-font-smoothing:antialiased;
+}
+*{box-sizing:border-box;border-color:var(--agent-view-border)!important}
+button,input,select,textarea{font:inherit!important;color:var(--agent-view-text)!important;
+  background:var(--agent-view-surface)!important;border:1px solid var(--agent-view-border)!important;
+  border-radius:var(--agent-view-control-radius)!important}
+button,input:not([type=checkbox]):not([type=radio]),select{min-height:var(--agent-view-control-height)}
+button{padding:0 var(--agent-view-space)!important;font-size:14px!important;font-weight:600!important}
+/* State selectors must not outrank variants: accent text always needs its accent surface. */
+button:where(:hover,:focus-visible):not(:disabled){background:var(--agent-view-hover)!important;border-color:var(--agent-view-faint)!important}
+button:where(:active):not(:disabled){background:var(--agent-view-active)!important;transform:translateY(1px)}
+/* Dimming the whole control also dims its text below AA. Mark disabled without losing contrast. */
+button:disabled{opacity:1!important;border-style:dashed!important;cursor:not-allowed}
+button.pri,button.primary,button[type=submit]{background:var(--agent-view-accent)!important;color:var(--agent-view-on-accent)!important}
+a{color:var(--agent-view-accent)!important}
+code,pre,kbd,samp{font-family:var(--agent-view-mono)!important}
+pre{background:var(--agent-view-hover)!important;max-width:100%;overflow:auto}
+textarea{padding:8px 12px!important}
+header,footer,nav,aside,dialog{background:var(--agent-view-surface)!important;color:var(--agent-view-text)!important}
+.card,details{border-radius:var(--agent-view-radius)!important}
+.sub,.meta,.muted{color:var(--agent-view-muted)!important;font-size:13px!important}
+.chip,.pill{border-radius:999px!important;font-size:13px!important;font-weight:600!important;
+  background:color-mix(in srgb,currentColor 13%,var(--agent-view-surface))!important}
+.run,.busy,.ok{color:var(--agent-view-success)!important}
+.wait,.warn,.pend{color:var(--agent-view-warning)!important}
+.bad,.error{color:var(--agent-view-danger)!important}
+:focus-visible{outline:2px solid var(--agent-view-accent)!important;outline-offset:2px}
+@media(max-width:720px){button,select,input:not([type=checkbox]):not([type=radio]){min-height:48px}}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+`;
+
+export function themeView(host) {
+  // view.js mounts synchronously into an open shadow root. A renderer without one still inherits the
+  // public variables on its host; it can consume the seam without this compatibility layer.
+  const root = host.shadowRoot;
+  if (root && !root.querySelector('style[data-agent-view-theme]')) {
+    const style = el('style', null, VIEW_CSS);
+    style.setAttribute('data-agent-view-theme', '');
+    root.append(style);
+  }
+}
+
 const CSS = `
 .adir{display:grid;grid-template-columns:260px 1fr;gap:16px;align-items:start;color:var(--t1,inherit)}
-.adir-card{background:var(--s1,transparent);border:1px solid var(--line,currentColor);border-radius:10px;min-width:0}
-.adir-list{padding:6px 0}
-.adir-it{display:flex;align-items:center;gap:10px;padding:10px 14px;border-left:3px solid transparent;
+.adir-card{background:var(--s1,transparent);border:1px solid var(--line,currentColor);border-radius:12px;box-shadow:var(--shadow,none);min-width:0}
+.adir-list{padding:4px 0}
+.adir-it{display:flex;align-items:center;gap:12px;padding:14px 20px;border-left:3px solid transparent;
   color:inherit;text-decoration:none}
 .adir-it:hover,.adir-it:focus-visible{background:var(--s2,transparent)}
-.adir-it[aria-current=true]{background:var(--s2,transparent);border-left-color:var(--brand,currentColor)}
-.adir-it.grey{opacity:.55}.adir-grow{flex:1;min-width:0}.adir-nm{font-weight:600;overflow-wrap:anywhere}
-.adir-meta,.adir-sub{font-size:12px;color:var(--t3,inherit)}
+.adir-it:focus-visible,.adir-back:focus-visible{outline:2px solid var(--brand);outline-offset:2px}
+.adir-it[aria-current=true]{background:color-mix(in srgb,var(--brand) 7%,var(--s1));border-left-color:var(--brand,currentColor)}
+.adir-it.grey{color:var(--t2,inherit)}.adir-grow{flex:1;min-width:0}.adir-nm{font-weight:600;overflow-wrap:anywhere}
+.adir-meta,.adir-sub{font-size:13px;color:var(--t2,inherit)}
 .adir-dot{width:8px;height:8px;border-radius:50%;background:var(--brand,currentColor)}
-.adir-head{display:flex;align-items:center;gap:12px;padding:12px 16px;border-bottom:1px solid var(--line,currentColor);
-  flex-wrap:wrap}.adir-head h2{margin:0;font-size:18px}.adir-sp{flex:1}
-.adir-pill{font-size:12px;padding:2px 8px;border-radius:999px;border:1px solid currentColor}
-.adir-back{display:none}
-.adir-view{height:max(480px,calc(100vh - 220px));position:relative}
+.adir-head{display:flex;align-items:center;gap:12px;padding:16px 20px;border-bottom:1px solid var(--line,currentColor);
+  flex-wrap:wrap}.adir-head h2{margin:0;font-size:18px;font-weight:650}.adir-sp{flex:1}
+.adir-pill{display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:600;padding:2px 8px;border-radius:999px;
+  background:color-mix(in srgb,currentColor 13%,var(--s1));white-space:nowrap}
+.adir-pill::before{content:'';width:6px;height:6px;border-radius:50%;background:currentColor}
+.adir-back{display:none;color:var(--brand);font-size:14px;font-weight:600;text-decoration:none}
+.adir-back:hover{text-decoration:underline}
+/* Resolve references outside the renderer host, whose :host styles may redefine the older tokens. */
+.adir-detail{${VIEW_TOKENS}}
+.adir-view{height:max(480px,calc(100vh - 220px));position:relative;border-radius:0 0 12px 12px}
 .adir-note{padding:16px;color:var(--t2,inherit)}
 .adir-empty{padding:12px 14px;color:var(--t2,inherit)}
 @media (max-width:820px){
@@ -30,7 +107,7 @@ const CSS = `
 }
 @media (max-width:720px){
   .adir-head{flex-wrap:nowrap;gap:10px;padding:8px 12px}.adir-head h2{font-size:16px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .adir-kind,.adir-beat{display:none}.adir-back{min-height:44px;align-items:center}
+  .adir-kind,.adir-beat{display:none}.adir-back{min-height:48px;align-items:center}
   .adir-view{height:calc(100dvh - 132px - env(safe-area-inset-top) - env(safe-area-inset-bottom))}
 }`;
 
@@ -211,6 +288,7 @@ export function mount(el0, ctx = {}) {
           renderList();
         },
       });
+      themeView(host);
     } catch (err) {
       if (shown !== agent.name || stopped) return;
       note.textContent = 'Could not open the live view: ' + err.message;

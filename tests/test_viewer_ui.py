@@ -256,6 +256,150 @@ class UI(ViewerTest):
             status, body = request(directory, '/hermes-ui/app.css', identity)
             assert status == 404 and b'missing app.css' in body
 
+    def test_view_theme_contract_and_shadow_styles(self):
+        script = (Path(__file__).parent.parent / 'viewer' / 'ui.js').read_text()
+        # The host maps live broker variables, rather than freezing the current palette in JS.
+        tokens = {'bg': 'bg', 'surface': 's1', 'hover': 's2', 'active': 's3', 'border': 'line',
+                  'text': 't1', 'muted': 't2', 'faint': 't3', 'accent': 'brand', 'on-accent': 'onbrand',
+                  'success': 'run', 'warning': 'wait', 'danger': 'block', 'shadow': 'shadow'}
+        for name, broker in tokens.items():
+            assert '--agent-view-%s:var(--%s,' % (name, broker) in script
+        assert '.adir-detail{${VIEW_TOKENS}}' in script
+        assert script.index('themeView(host);') > script.index('view = mod.mount(host,')
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('node unavailable (theme token mappings checked)')
+        check = """
+import {themeView} from %s;
+const assert = (c, m) => { if (!c) throw Error(m); };
+let styles = [];
+globalThis.document = {createElement: (tag) => ({tag, setAttribute(k, v) { this[k] = v; }})};
+const host = {shadowRoot: {
+  querySelector: () => styles[0], append: (style) => styles.push(style)
+}};
+themeView(host);
+assert(styles.length === 1 && styles[0].tag === 'style', 'inject into the renderer shadow tree');
+assert(styles[0]['data-agent-view-theme'] === '', 'marked compatibility stylesheet');
+assert(styles[0].textContent.includes('var(--agent-view-surface)'), 'consume the public seam');
+assert(styles[0].textContent.includes(':focus-visible'), 'native focus styling');
+assert(styles[0].textContent.includes('max-width:720px'), 'phone controls');
+themeView(host);
+assert(styles.length === 1, 'idempotent');
+themeView({}); // Non-shadow renderers can read the inherited variables themselves.
+console.log('ok');
+""" % json.dumps((Path(__file__).parent.parent / 'viewer' / 'ui.js').as_uri())
+        out = subprocess.run([node, '--input-type=module', '-e', check], capture_output=True, text=True, timeout=60)
+        assert out.returncode == 0 and out.stdout.strip() == 'ok', out.stderr + out.stdout
+
+    def test_view_theme_in_browser(self):
+        # Optional developer check, not a dependency. This fixture models the installed renderer's open
+        # shadow-root contract; it does not pretend to be a screenshot of the external sidecar renderer.
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            self.skipTest('Playwright unavailable; browser theme check not run')
+        import re
+        import dash
+        css = re.search(r'<style>(.*?)</style>', dash.PAGE, re.S).group(1)
+        script = (Path(__file__).parent.parent / 'viewer' / 'ui.js').read_text()
+        # Capture the actual module stylesheet so the host token mapping is exercised too.
+        script += '\nexport const testCSS = CSS;'
+        with sync_playwright() as playwright:
+            try:
+                browser = playwright.chromium.launch(headless=True)
+            except Exception as exc:
+                self.skipTest('Chromium unavailable: ' + str(exc))
+            try:
+                page = browser.new_page(viewport={'width': 1400, 'height': 900})
+                page.route('**/*', lambda route: route.fulfill(
+                    body=script if route.request.url.endswith('/ui.js') else '<!doctype html><style>' + css + '</style>',
+                    content_type='text/javascript' if route.request.url.endswith('/ui.js') else 'text/html'))
+                page.goto('http://theme.example.test/')
+                page.evaluate("""async () => {
+                  const {themeView, testCSS} = await import('/ui.js');
+                  const style = document.createElement('style'); style.textContent = testCSS;
+                  document.head.append(style);
+                  const host = document.createElement('div'); host.className = 'adir-view';
+                  const detail = document.createElement('div'); detail.className = 'adir-detail';
+                  detail.append(host); document.body.append(detail);
+                  const root = host.attachShadow({mode: 'open'});
+                  const legacy = document.createElement('style');
+                  legacy.textContent = ':host{--bg:#123;--line:pink}.ob{--panel:#123;--ink:#eee;background:var(--panel);color:var(--ink);font:16px serif}';
+                  const panel = document.createElement('main'); panel.className = 'ob';
+                  for (const variant of ['', 'pri', 'primary', 'submit', 'ghost', 'on',
+                    'bad', 'error', 'run', 'busy', 'ok', 'wait', 'warn', 'pend']) {
+                    const button = document.createElement('button');
+                    button.textContent = variant || 'Default'; button.dataset.variant = variant;
+                    if (variant === 'submit') button.type = 'submit'; else button.className = variant;
+                    panel.append(button);
+                  }
+                  root.append(legacy, panel); themeView(host);
+                  window.buttonContrast = (button) => {
+                    const style = getComputedStyle(button);
+                    const luminance = (color) => {
+                      const rgb = color.match(/[\\d.]+/g).map(Number);
+                      if (rgb.length !== 3) throw Error('Expected opaque RGB: ' + color);
+                      return rgb.map(v => v / 255).map(v => v <= .04045 ? v / 12.92
+                        : ((v + .055) / 1.055) ** 2.4).reduce((sum, v, i) =>
+                          sum + v * [.2126, .7152, .0722][i], 0);
+                    };
+                    // An opaque computed pair is not sufficient if an ancestor dims the control.
+                    for (let node = button; node; node = node.parentElement || node.getRootNode().host) {
+                      if (getComputedStyle(node).opacity !== '1') throw Error('Dimmed button');
+                    }
+                    const a = luminance(style.color), b = luminance(style.backgroundColor);
+                    return (Math.max(a, b) + .05) / (Math.min(a, b) + .05);
+                  };
+                }""")
+                for theme, scheme, surface, ink in (
+                    ('light', 'dark', 'rgb(255, 255, 255)', 'rgb(20, 25, 32)'),
+                    ('dark', 'light', 'rgb(22, 26, 32)', 'rgb(232, 236, 241)'),
+                    ('auto', 'dark', 'rgb(22, 26, 32)', 'rgb(232, 236, 241)'),
+                    ('auto', 'light', 'rgb(255, 255, 255)', 'rgb(20, 25, 32)'),
+                ):
+                    page.emulate_media(color_scheme=scheme)
+                    page.evaluate('(theme) => document.documentElement.dataset.theme = theme', theme)
+                    for width in (1400, 390):
+                        page.set_viewport_size({'width': width, 'height': 900})
+                        actual = page.evaluate("""() => {
+                          const host = document.querySelector('.adir-view'), root = host.shadowRoot;
+                          const panel = getComputedStyle(root.querySelector('main'));
+                          const button = getComputedStyle(root.querySelector('button'));
+                          return [panel.backgroundColor, panel.color, panel.fontSize,
+                            button.borderRadius, button.minHeight, host.scrollWidth <= host.clientWidth];
+                        }""")
+                        assert actual == [surface, ink, '14px', '8px', '48px' if width == 390 else '36px', True]
+                        buttons = page.locator('.adir-view button')
+                        for index in range(buttons.count()):
+                            button = buttons.nth(index)
+                            variant = button.get_attribute('data-variant')
+                            for state in ('default', 'hover', 'focus-visible', 'active', 'disabled', 'disabled-hover'):
+                                page.mouse.move(width - 1, 899)
+                                button.evaluate('(button) => { button.disabled = false; button.blur(); }')
+                                if state in ('disabled', 'disabled-hover'):
+                                    button.evaluate('(button) => button.disabled = true')
+                                if state in ('hover', 'active', 'disabled-hover'):
+                                    button.hover()
+                                    assert button.evaluate('(button) => button.matches("button:hover")')
+                                if state == 'focus-visible':
+                                    # Real keyboard modality, not just programmatic focus or a CSS class.
+                                    page.keyboard.press('Tab')
+                                    button.focus()
+                                    assert button.evaluate('(button) => button.matches(":focus-visible")')
+                                if state == 'active':
+                                    page.mouse.down()
+                                try:
+                                    if state == 'active':
+                                        assert button.evaluate('(button) => button.matches("button:active")')
+                                    contrast = button.evaluate('(button) => window.buttonContrast(button)')
+                                    assert contrast >= 4.5, (theme, width, variant, state, contrast)
+                                finally:
+                                    if state == 'active':
+                                        page.mouse.up()
+                            button.evaluate('(button) => button.disabled = false')
+            finally:
+                browser.close()
+
     def test_ui_routes_and_slow_command_status(self):
         node = shutil.which('node')
         if not node:

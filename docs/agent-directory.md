@@ -233,6 +233,62 @@ actions permission, or agents without the `steer` cap, get the same view with th
 disabled and a hint. The renderer comes from `AGENTDIR_HERMES_UI_DIR`, which the operator
 installs; the browser never loads script or styles from an agent.
 
+### Renderer theme contract
+
+The directory list and live pane use the broker's type scale, surfaces, borders, focus rings and
+status tints. The host element passed to a renderer exposes the following CSS custom properties.
+Any renderer can read them inside its shadow root; none depend on an agent kind or a sidecar's
+data API. Values reference the broker tokens, so light, dark and system theme changes update an
+open pane without reconnecting its stream or resetting its composer. Outside the broker, the
+variables fall back to the broker's light palette.
+
+| Renderer variable (`--agent-view-` prefix) | Broker token or value |
+|---|---|
+| `bg`, `surface`, `hover`, `active` | `--bg`, `--s1`, `--s2`, `--s3` |
+| `border` | `--line` |
+| `text`, `muted`, `faint` | `--t1`, `--t2`, `--t3` |
+| `accent`, `on-accent` | `--brand`, `--onbrand` |
+| `success`, `warning`, `danger` | `--run`, `--wait`, `--block` |
+| `shadow` | `--shadow` |
+| `font`, `mono` | System UI and monospace stacks from [the design standards](DESIGN.md#type) |
+| `font-size`, `line-height` | `14px`, `1.5` |
+| `radius`, `control-radius` | `12px`, `8px` |
+| `space`, `control-height` | `16px`, `36px` (phone controls use at least `48px`) |
+
+For example, a renderer can use `background:var(--agent-view-surface)` and
+`color:var(--agent-view-text)` on its root, and `var(--agent-view-accent)` for focus and primary
+actions. Keep layout and behavior in the renderer; use the variables for appearance only.
+
+Today's installed sidecar renderer does not need an upgrade. After its synchronous `mount`,
+the broker appends a marked `style[data-agent-view-theme]` to the host's open shadow root.
+This scoped compatibility sheet maps the older `--panel`, `--panel2`, `--ink`, `--text`,
+`--muted`, `--faint`, `--accent`, `--green`, `--amber`, `--red`, `--code` and `--user` aliases
+on the root (`.ob`), and normalizes standard controls, links, chips and focus styling. It leaves
+the renderer's stylesheet and responsive layout in place. Nothing is injected into the broker
+document or an agent's page. A non-shadow renderer still inherits the public variable set.
+
+For a clean upstream seam, the sidecar should consume `--agent-view-*` directly (with its own
+standalone defaults). That renderer change belongs in its repository, not this one. The
+compatibility sheet remains necessary until the installed renderer adopts that contract;
+changes to its DOM or private CSS names need a visual compatibility check. The optional
+Playwright test in `tests/test_viewer_ui.py` checks live light/dark/auto inheritance and 390px
+controls against a synthetic shadow-root fixture, not the external renderer itself.
+Button variants retain their background/text pairing during hover, keyboard focus and press.
+Disabled buttons keep full text contrast and use a dashed border and unavailable cursor instead
+of reduced opacity. The browser check measures at least 4.5:1 contrast for these states in both themes.
+
+Control-state comparison using that synthetic fixture and the unchanged base compatibility sheet
+versus the fixed sheet. These are not captures
+of an installed external renderer. Each image shows `.pri` hovered, `.primary` keyboard-focused,
+and a disabled submit button.
+
+| Theme / viewport | Before | After |
+|---|---|---|
+| Light / desktop | [Before](images/agents-buttons-before-light-desktop.png) | [After](images/agents-buttons-after-light-desktop.png) |
+| Light / phone | [Before](images/agents-buttons-before-light-phone.png) | [After](images/agents-buttons-after-light-phone.png) |
+| Dark / desktop | [Before](images/agents-buttons-before-dark-desktop.png) | [After](images/agents-buttons-after-dark-desktop.png) |
+| Dark / phone | [Before](images/agents-buttons-before-dark-phone.png) | [After](images/agents-buttons-after-dark-phone.png) |
+
 Trust boundaries worth knowing before you enable it:
 
 * Read routes have no tier beyond module access. Everyone in the Agents module's group can read

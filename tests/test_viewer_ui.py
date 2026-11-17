@@ -1,13 +1,19 @@
+import contextlib
+import http.client
 import io
 import json
 import shutil
+import socket
 import subprocess
+import threading
+import time
 import unittest
+from http.server import ThreadingHTTPServer
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from viewer.directory import Directory
-from viewer.server import PAGE, UIAuth, handler
+from viewer.server import AgentServer, PAGE, UIAuth, handler
 from viewer_support import KEY, ViewerTest, enrolled, signed
 
 
@@ -35,7 +41,131 @@ def request(directory, path, headers='', agent_api=False, method='GET', body=b''
     return int(head.split()[1]), data
 
 
+@contextlib.contextmanager
+def agent_listener(directory, timeout=10):
+    started, finished = threading.Event(), threading.Event()
+
+    class Handler(handler(directory, agent_api=True)):
+        def setup(self):
+            super().setup()
+            started.set()
+
+    class Server(AgentServer):
+        def process_request_thread(self, request, client_address):
+            try:
+                super().process_request_thread(request, client_address)
+            finally:
+                finished.set()  # The slot is released before the test proceeds.
+
+    Handler.timeout = timeout
+    with Server(('127.0.0.1', 0), Handler) as server:
+        worker = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .01}, daemon=True)
+        worker.start()
+        try:
+            yield server.server_address, started, finished
+        finally:
+            server.shutdown()
+            worker.join(timeout=2)
+
+
 class UI(ViewerTest):
+    def test_agent_timeout_covers_idle_request_line_headers_and_body(self):
+        directory = Directory(KEY, self.tmp_path, clock=lambda: 100)
+        assert handler(directory, agent_api=True).timeout == 10
+        assert handler(directory).timeout is None
+        for partial in (b'', b'POST /v1/beat', b'POST /v1/beat HTTP/1.1\r\nHost: localhost\r\n',
+                        b'POST /v1/beat HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{'):
+            with self.subTest(partial=partial), agent_listener(directory, timeout=.15) as (address, started, finished):
+                with socket.create_connection(address, timeout=2) as peer:
+                    if partial:
+                        peer.sendall(partial)
+                    assert started.wait(2)
+                    before = time.monotonic()
+                    assert peer.recv(1) == b''
+                    assert time.monotonic() - before < 2
+                    assert finished.wait(2)
+
+    def test_agent_connection_cap_and_signed_beats_after_slots_free(self):
+        directory = Directory(KEY, self.tmp_path, clock=lambda: 100)
+        credentials = enrolled(directory)
+        directory.request('/v1/register', *signed(credentials, '/v1/register',
+                          dict(name='demo', kind='generic', caps=[], ttl=30)))
+        with patch.dict('os.environ', AGENTDIR_AGENT_MAX_CONNECTIONS='2'), \
+                agent_listener(directory) as (address, started, finished), contextlib.ExitStack() as peers:
+            idle = []
+            for _ in range(2):
+                started.clear()
+                idle.append(peers.enter_context(socket.create_connection(address, timeout=2)))
+                assert started.wait(2)
+            # A TCP handshake can succeed, but excess sockets close without starting a worker.
+            with socket.create_connection(address, timeout=2) as excess:
+                assert excess.recv(1) == b''
+            idle[0].close()
+            assert finished.wait(2)
+            for ts in ('100.1', '100.2'):
+                finished.clear()
+                body, headers = signed(credentials, '/v1/beat', {'status': 'idle'}, ts)
+                headers['Connection'] = 'close'
+                conn = http.client.HTTPConnection(*address, timeout=2)
+                try:
+                    conn.request('POST', '/v1/beat', body, headers)
+                    reply = conn.getresponse()
+                    assert reply.status == 200 and json.loads(reply.read()) == {'ok': True}
+                finally:
+                    conn.close()
+                assert finished.wait(2)  # Normal request completion also returns the slot.
+            assert directory.snapshot()[0]['status'] == 'idle'
+
+    def test_agent_keep_alive_timeout_returns_slot(self):
+        directory = Directory(KEY, self.tmp_path, clock=lambda: 100)
+        with patch.dict('os.environ', AGENTDIR_AGENT_MAX_CONNECTIONS='1'), \
+                agent_listener(directory, timeout=.15) as (address, started, finished):
+            conn = http.client.HTTPConnection(*address, timeout=2)
+            try:
+                conn.request('GET', '/')
+                reply = conn.getresponse()
+                assert reply.status == 404
+                reply.read()
+                assert finished.wait(2)
+                assert conn.sock.recv(1) == b''
+            finally:
+                conn.close()
+            started.clear()
+            finished.clear()
+            with socket.create_connection(address, timeout=2) as peer:
+                assert started.wait(2)
+                assert peer.recv(1) == b''
+                assert finished.wait(2)
+
+    def test_agent_slots_return_on_worker_and_thread_start_failures(self):
+        directory = Directory(KEY, self.tmp_path, clock=lambda: 100)
+        with patch.dict('os.environ', AGENTDIR_AGENT_MAX_CONNECTIONS='1'), \
+                AgentServer(('127.0.0.1', 0), handler(directory, agent_api=True)) as server:
+            with patch.object(ThreadingHTTPServer, 'process_request', side_effect=RuntimeError('thread start')):
+                for _ in range(2):
+                    with self.assertRaisesRegex(RuntimeError, 'thread start'):
+                        server.process_request(Mock(), ('127.0.0.1', 1))
+            with patch.object(server, 'finish_request', side_effect=ValueError('handler failed')), \
+                    patch.object(server, 'handle_error') as error, patch.object(server, 'shutdown_request') as close:
+                assert server._slots.acquire(blocking=False)
+                server.process_request_thread(Mock(), ('127.0.0.1', 1))
+                error.assert_called_once()
+                close.assert_called_once()
+                assert server._slots.acquire(blocking=False)
+                server._slots.release()
+
+    def test_agent_connection_limit_defaults_and_invalid_settings(self):
+        directory = Directory(KEY, self.tmp_path, clock=lambda: 100)
+        for value in (None, '', '0', '-1', 'no', '1.5'):
+            env = {} if value is None else {'AGENTDIR_AGENT_MAX_CONNECTIONS': value}
+            with self.subTest(value=value), patch.dict('os.environ', env, clear=True), \
+                    patch('viewer.server.log.error') as error, \
+                    AgentServer(('127.0.0.1', 0), handler(directory, agent_api=True)) as server:
+                for _ in range(64):
+                    assert server._slots.acquire(blocking=False)
+                assert not server._slots.acquire(blocking=False)
+                assert error.call_count == (0 if value is None else 1)
+
     def test_module_startup_configuration(self):
         from viewer import __main__ as entry, auth
         key_file = self.tmp_path / 'enrollment'

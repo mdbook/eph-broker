@@ -117,6 +117,11 @@ Check it without Hermes: `python3 viewer/clients/hermes-plugin/test_agentdir_plu
   `/v1/register`, `/v1/beat`, `/v1/deregister` exist. Enrollment authenticates the signed
   one-use token; all other requests require per-agent HMAC. `--server URL` or `AGENTDIR_SERVER`
   changes the client target. Never expose plaintext credentials over a network: use a TLS proxy.
+  Connections have a 10-second socket idle timeout, including request lines, headers, bodies and
+  keep-alive waits. `AGENTDIR_AGENT_MAX_CONNECTIONS` caps simultaneous connections (default 64,
+  positive integer). Excess connections close immediately without an HTTP response; clients may retry
+  after a slot frees. Invalid limits log an error and fall back to 64. Restart to change the limit.
+  These limits do not change the UI listeners.
 * UI module: under the broker [module host](modules.md), the child reads `BROKER_MODULE_SOCKET`
   and trusts the `X-Viewer-User` header the broker injects after its SSO group check. Other hosts
   pass `--socket PATH` (or `AGENTDIR_UI_SOCKET`) and must strip client identity headers and inject

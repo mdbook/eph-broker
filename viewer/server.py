@@ -3,6 +3,7 @@ import base64
 import hmac
 import ipaddress
 import json
+import logging
 import os
 import socketserver
 import threading
@@ -15,6 +16,7 @@ from . import adapters
 from .directory import Refused
 
 ASSETS = Path(__file__).parent
+log = logging.getLogger('eph-broker.viewer')
 # The agent view's renderer files (fixed names; nothing else is served from AGENTDIR_HERMES_UI_DIR).
 # logo.svg is the stylesheet's own mark: operator-installed like the rest, never anything an agent sends.
 VIEW_UI = {'/hermes-ui/view.js': 'text/javascript; charset=utf-8', '/hermes-ui/app.css': 'text/css; charset=utf-8',
@@ -64,6 +66,7 @@ class UIAuth:
 def handler(directory, agent_api=False, auth=None, standalone=False):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.1'
+        timeout = 10 if agent_api else None
 
         def log_message(self, *args):
             pass  # Do not log enrollment tokens, signed bodies or query strings.
@@ -180,7 +183,6 @@ def handler(directory, agent_api=False, auth=None, standalone=False):
             if self.path not in ('/v1/enroll', '/v1/register', '/v1/beat', '/v1/deregister'):
                 self.close_connection = True
                 return self.send(404, {'error': 'not found'})
-            self.connection.settimeout(10)
             try:
                 length = int(self.headers.get('Content-Length', '-1'))
                 if (self.headers.get('Transfer-Encoding') or
@@ -249,8 +251,39 @@ class UnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
 
 
+class AgentServer(ThreadingHTTPServer):
+    """Bound agent connections before starting threads, including idle keep-alive peers."""
+    def __init__(self, address, request_handler):
+        try:
+            limit = int(os.environ.get('AGENTDIR_AGENT_MAX_CONNECTIONS', '64'))
+            if limit < 1:
+                raise ValueError()
+        except ValueError:
+            log.error('agent listener: invalid AGENTDIR_AGENT_MAX_CONNECTIONS; using 64')
+            limit = 64
+        self._slots = threading.BoundedSemaphore(limit)
+        super().__init__(address, request_handler)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            # No worker owns this slot if thread creation fails.
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
 def serve(directory, socket_path=None, bind=('127.0.0.1', 8790), port=None, auth=None):
-    agent = ThreadingHTTPServer(bind, handler(directory, agent_api=True))
+    agent = AgentServer(bind, handler(directory, agent_api=True))
     ui = None
     try:
         if port is None:

@@ -453,6 +453,15 @@ Module configuration is read at startup. Replace `<NAME>` with an enabled module
 | `BROKER_MODULE_<NAME>_VERSION_FILE` | unset | Optional file watched for version changes to restart the child. |
 | `BROKER_MODULE_<NAME>_DISABLED_FILE` | unset | Optional marker file that disables the module while present. |
 
+### Agent directory listener
+
+The optional [agent directory](agent-directory.md#listeners-and-authentication) reads these at startup.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `AGENTDIR_AGENT_BIND` | `127.0.0.1:8790` | Agent API TCP listener, separate from the UI socket. |
+| `AGENTDIR_AGENT_MAX_CONNECTIONS` | `64` | Positive maximum concurrent agent API connections, including idle and keep-alive connections. Excess connections close immediately without an HTTP response. Invalid values log an error and use 64. Each connection has a 10-second socket idle timeout from setup, covering request lines, headers and bodies. UI listeners are unchanged. Restart to apply. |
+
 ## Other built-in rows
 
 These rows ship without prompts. They stay off until you set their trigger, and then still need a signed

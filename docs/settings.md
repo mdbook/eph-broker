@@ -439,6 +439,7 @@ do.
 | `BROKER_STEER_ROOT` | `steer/` next to `EVENTS_LOG` | Private per-subject message delivery state. Keep outside workers' writable paths when OS isolation is off. |
 | `FLEET_STATUS_PATH`, `FLEET_MD_PATH`, `SUPERVISOR_STATUS_PATH` | unset | Sources for the optional Fleet view ([configuration.md](configuration.md#the-dashboard)). |
 | `FLEET_STATUS_GEN` | unset | Executable the broker runs (background, at most once/60s, 30s timeout) as `FLEET_STATUS_GEN <FLEET_STATUS_PATH>` to refresh `FLEET_STATUS_PATH`; it must write argv[1], not its own default. Unset (either knob): nothing refreshes it for you. |
+| `FLEET_CONTAINER_SOURCE` | unset | Opt-in Docker TFA discovery JSON file. See [configuration.md](configuration.md#container-tfas) and `config/fleet-containers.example.json`. Unset: no Docker calls or changes to the Fleet API output. |
 
 ### Optional dashboard modules
 

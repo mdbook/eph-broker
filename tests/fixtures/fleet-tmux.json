@@ -1,0 +1,15 @@
+{
+  "agents": [
+    {
+      "name": "tfa-review",
+      "agent_type": "tfa",
+      "runtime": "codex",
+      "pool_bot": "pool-a",
+      "model": "gpt-example",
+      "running": true,
+      "status": "Reviewing ticket 9001",
+      "status_source": "now",
+      "age": 60
+    }
+  ]
+}

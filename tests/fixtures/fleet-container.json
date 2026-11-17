@@ -1,0 +1,13 @@
+{
+  "ps": "abcdef123456\ttfa-example\n123456abcdef\tother-service\n",
+  "inspect": {
+    "name": "/tfa-example",
+    "started": "2027-01-15T07:00:00.000000000Z",
+    "running": true,
+    "pool": "pool-b",
+    "mounts": [
+      {"Source": "@ROOT@/home", "Destination": "/agent"},
+      {"Source": "@ROOT@/work", "Destination": "/workspace"}
+    ]
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "label": "org.example.fleet=tfa",
+  "name_prefix": "",
+  "pool_label": "org.example.pool-bot",
+  "config_path": "/agent/config.yaml",
+  "workspace": "/workspace"
+}

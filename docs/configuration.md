@@ -813,6 +813,37 @@ stdlib example, proxy/auth requirements, hot reload and the Fleet quick-view hoo
 - the `FLEET_MODE:` line in the file at `FLEET_MD_PATH`;
 - `SUPERVISOR_STATUS_PATH` if set, for health flags.
 
+### Container TFAs
+
+Set `FLEET_CONTAINER_SOURCE` to a JSON file based on `config/fleet-containers.example.json` to add
+running Hermes containers alongside the existing status-file (tmux) source. Leave it unset to keep
+the existing Fleet API output and perform no Docker discovery. TFA rows show a `tmux` or `container`
+badge, pool bot when provided, configured model, NOW.md line and age when available.
+
+The source requires a `label` selector (`key` or `key=value`), a literal `name_prefix`, or both
+(both must match). There is no built-in site name or image filter. `pool_label` optionally names the
+Docker label holding the pool bot. `config_path` is the absolute container path to Hermes `config.yaml`;
+`workspace` is its absolute workspace directory. The JSON file is reread after the 15-second Fleet
+cache expires; changing the configured source path takes effect immediately.
+
+Discovery uses only `docker ps` and a field-projected `docker inspect`, each with a three-second
+timeout. It never executes inside containers, requests their environment, or modifies Docker state.
+Only files exposed through local mounts are readable: `model.default` from config.yaml and the first
+non-empty, non-heading line of workspace/NOW.md. Symlink escapes from mounts are refused. YAML uses
+the broker's existing optional PyYAML loader; without it a JSON-formatted config.yaml still works,
+otherwise the model is unknown and a warning is logged. Missing mounts/files leave fields unknown,
+not inferred. Image-only files cannot supply these fields. Use a local Docker daemon, not a remote
+context: mount sources are resolved on the broker host. Make those sources readable to the broker.
+Docker access itself is privileged; this
+feature does not change daemon permissions or grant workers Docker access.
+
+Container age is time since start; the table's last-edit age is NOW.md's mtime. Models from config are
+configured, not evidence of the running model. Container rows do not inherit tmux supervisor verdicts
+or attach commands. Discovery failure leaves the status-file rows visible and shows a source error.
+Container rows can also be displayed without a status file. A container replaces a same-name legacy
+TFA row; a standing agent's identity always wins a name collision. The combined view retains the
+200-agent limit. Merging, releasing and enabling a deployment's selector remain operator actions.
+
 ### Models in the dashboard
 
 Both the run views and Fleet show a model, and both are careful about what that model means.
@@ -827,8 +858,9 @@ Both the run views and Fleet show a model, and both are careful about what that 
   then shows that model, and falls back to the configured one (tagged `stale` when the reading or the whole
   file is older than `FLEET_STALE_S`, 300 seconds) otherwise. An agent with neither field shows a dash. Neither field is required, and a row that lacks them renders exactly as before.
 
-Nothing in the dashboard probes a process itself: it never runs `ps`, reads a transcript or calls a model.
-It renders the metadata it is given, and shows a quiet dash when it has none.
+Apart from the opt-in Docker inventory above, nothing in the dashboard probes a process itself: it never
+runs host `ps`, reads a transcript or calls a model. It renders the metadata it is given, and shows a
+quiet dash when it has none.
 
 The status file's `agents` list includes both standing agents and temporary fleet agents (TFAs).
 Producers mark rows with `agent_type: "standing"` or `agent_type: "tfa"`; omitted types retain the

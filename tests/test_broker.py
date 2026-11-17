@@ -12956,7 +12956,8 @@ class _Fleet:
         self.tmp = tempfile.mkdtemp()
         self.status = os.path.join(self.tmp, "fleet-status.json")
         self.md = os.path.join(self.tmp, "FLEET.md")
-        self.saved = {k: os.environ.get(k) for k in ("FLEET_STATUS_PATH", "FLEET_MD_PATH")}
+        self.saved = {k: os.environ.get(k) for k in ("FLEET_STATUS_PATH", "FLEET_MD_PATH", "FLEET_CONTAINER_SOURCE")}
+        os.environ.pop("FLEET_CONTAINER_SOURCE", None)
         os.environ["FLEET_STATUS_PATH"], os.environ["FLEET_MD_PATH"] = self.status, self.md
         dash._fleet_cache.update(key=None, at=0.0, val=None)
         return self
@@ -12989,6 +12990,263 @@ def _broker():
     class B:
         coalescer = Co(); echo_guard = type("E", (), {"dropped": 0})(); rejected = 0
     return B()
+
+
+def _container_fixture(fx):
+    with open(os.path.join(HERE, "fixtures", "fleet-container.json")) as f:
+        fixture = json.loads(f.read().replace("@ROOT@", fx.tmp))
+    for directory in ("home", "work"):
+        os.mkdir(os.path.join(fx.tmp, directory))
+    with open(os.path.join(fx.tmp, "home", "config.yaml"), "w") as f:
+        json.dump({"model": {"default": "provider/example-model"}}, f)
+    note = os.path.join(fx.tmp, "work", "NOW.md")
+    with open(note, "w") as f:
+        f.write("# Now\n\n- Checking <container> ticket 9002\n")
+    now = 1_800_000_000
+    os.utime(note, (now - 120, now - 120))
+    config = {"label": "org.example.fleet=tfa", "name_prefix": "tfa-",
+              "pool_label": "org.example.pool-bot", "config_path": "/agent/config.yaml", "workspace": "/workspace"}
+    source = os.path.join(fx.tmp, "containers.json")
+    with open(source, "w") as f:
+        json.dump(config, f)
+    os.environ["FLEET_CONTAINER_SOURCE"] = source
+    def run(argv, **kw):
+        assert kw == {"capture_output": True, "text": True, "timeout": 3, "check": True}
+        assert argv[:2] in (["docker", "ps"], ["docker", "inspect"]), argv
+        assert "Env" not in str(argv) and "exec" not in argv
+        if argv[1] == "ps":
+            assert argv[-2:] == ["--filter", "label=org.example.fleet=tfa"]
+            return type("Result", (), {"stdout": fixture["ps"]})()
+        assert argv[-1] == "abcdef123456" and "123456abcdef" not in argv
+        assert ".Config.Labels" in argv[3] and ".Mounts" in argv[3]
+        return type("Result", (), {"stdout": json.dumps(fixture["inspect"]) + "\n"})()
+    return now, source, fixture, run
+
+
+def test_fleet_container_disabled_preserves_status_source():
+    with _Fleet() as fx:
+        with open(os.path.join(HERE, "fixtures", "fleet-tmux.json")) as f:
+            fx.write(json.load(f))
+        now = time.time()
+        expected = dash._read_fleet(fx.status, fx.md, now)
+        with patch.object(dash.subprocess, "run", side_effect=AssertionError("Docker must stay disabled")):
+            actual = dash.fleet_snapshot(now)
+        assert actual == expected
+        row = actual["agents"][0]
+        assert row["pool_bot"] == "pool-a" and row["age"] == 60 and row["runtime"] == "codex"
+        assert "runtime_kind" not in row and "container_error" not in actual
+    ok("container source disabled: tmux fixture unchanged, no Docker calls")
+
+
+def test_fleet_container_source_merges_and_caches():
+    with _Fleet() as fx:
+        with open(os.path.join(HERE, "fixtures", "fleet-tmux.json")) as f:
+            fx.write(json.load(f))
+        now, source, fixture, run = _container_fixture(fx)
+        with patch.object(dash.subprocess, "run", side_effect=run) as calls:
+            data = dash.fleet_snapshot(now)
+            assert dash.fleet_snapshot(now + 1) is data and calls.call_count == 2
+        assert [a["name"] for a in data["agents"]] == ["tfa-review", "tfa-example"]
+        row = data["agents"][1]
+        assert row["agent_type"] == "tfa" and row["runtime_kind"] == "container"
+        assert row["runtime"] == "hermes" and row["pool_bot"] == "pool-b"
+        assert row["model"] == "provider/example-model" and row["model_state"] == "configured"
+        assert row["ledger"] == "Checking <container> ticket 9002" and row["ledger_source"] == "now"
+        assert row["ledger_age"] == 120 and row["age"] == 3600 and row["alive"] is True
+        assert row["busy"] is None and row["flags"] == [] and not row["silent"]
+        assert "@ROOT@" not in json.dumps(data) and fx.tmp not in json.dumps(data)
+    ok("container fixture: merged TFA, configured model, pool, NOW.md, ages and cached read-only discovery")
+
+
+def test_fleet_container_source_fail_soft_and_independent():
+    with _Fleet() as fx:
+        now, source, fixture, run = _container_fixture(fx)
+        with patch.object(dash.subprocess, "run", side_effect=run):
+            data = dash.fleet_snapshot(now)
+        assert len(data["agents"]) == 1 and "error" not in data and "status_error" in data
+        fx.write({"agents": [{"name": "standing"}]})
+        for error in (FileNotFoundError(), subprocess.TimeoutExpired("docker", 3),
+                      subprocess.CalledProcessError(1, "docker"), ValueError("invalid JSON")):
+            dash._fleet_cache.update(key=None)
+            with patch.object(dash.subprocess, "run", side_effect=error):
+                data = dash.fleet_snapshot(now)
+            assert data["agents"][0]["name"] == "standing" and "container_error" in data
+        with open(source, "w") as f:
+            json.dump({"label": "", "name_prefix": ""}, f)
+        dash._fleet_cache.update(key=None)
+        with patch.object(dash.subprocess, "run", side_effect=AssertionError("missing selector")):
+            assert "container_error" in dash.fleet_snapshot(now)
+    ok("container errors fail soft; containers display without a status file; no selector fails closed")
+
+
+def test_fleet_container_missing_files_stopped_and_collisions():
+    with _Fleet() as fx:
+        now, source, fixture, run = _container_fixture(fx)
+        fixture["inspect"]["mounts"] = []
+        with patch.object(dash.subprocess, "run", side_effect=run):
+            rows = dash._read_containers(source, now)
+        assert rows[0]["model"] is None and rows[0]["ledger"] is None and rows[0]["ledger_age"] is None
+        for kind in ("standing", "tfa"):
+            fleet = {"agents": [dash._agent_row(None, {"name": "tfa-example", "agent_type": kind}, now)]}
+            with patch.object(dash, "_read_containers", return_value=rows):
+                merged = dash._merge_containers(fleet, source, now)["agents"]
+            assert len(merged) == 1 and merged[0]["agent_type"] == kind
+            assert merged[0].get("runtime_kind") == ("container" if kind == "tfa" else None)
+        fixture["inspect"]["running"] = False
+        with patch.object(dash.subprocess, "run", side_effect=run):
+            assert dash._read_containers(source, now) == []
+        home = os.path.join(fx.tmp, "home")
+        os.symlink(os.path.join(fx.tmp, "work"), os.path.join(home, "escape"))
+        mounts = [{"Source": home, "Destination": "/agent"}]
+        assert dash._container_file(mounts, "/agent/escape/NOW.md", 4096) is None
+        mounts.append({"Source": os.path.join(fx.tmp, "work"), "Destination": "/agent/work"})
+        assert dash._container_file(mounts, "/agent/work/NOW.md", 4096)[0].startswith(b"# Now\n")
+    ok("container missing files stay unknown; stopped omitted; standing identity and mount boundaries preserved")
+
+
+def test_fleet_container_fifos_return_with_timeout():
+    with _Fleet() as fx:
+        now, source, fixture, run = _container_fixture(fx)
+        for directory, filename in (("work", "NOW.md"), ("home", "config.yaml")):
+            path = os.path.join(fx.tmp, directory, filename)
+            os.unlink(path)
+            os.mkfifo(path)
+        result = []
+        worker = threading.Thread(target=lambda: result.append(dash._container_notes(
+            fixture["inspect"]["mounts"], "/agent/config.yaml", "/workspace", now)), daemon=True)
+        worker.start()
+        worker.join(timeout=2)
+        assert not worker.is_alive(), "FIFO notes must not block dashboard discovery"
+        assert result == [(None, None, None)]
+    ok("container FIFO NOW.md and config.yaml fail soft within a timeout")
+
+
+def test_fleet_container_symlink_components_refused():
+    with _Fleet() as fx:
+        now, source, fixture, run = _container_fixture(fx)
+        mounts = fixture["inspect"]["mounts"]
+        home, work = os.path.join(fx.tmp, "home"), os.path.join(fx.tmp, "work")
+        # Even links whose target stays inside the mount are refused, not resolved then reopened.
+        os.rename(os.path.join(work, "NOW.md"), os.path.join(work, "real.md"))
+        os.symlink("real.md", os.path.join(work, "NOW.md"))
+        os.rename(os.path.join(home, "config.yaml"), os.path.join(home, "real.yaml"))
+        os.symlink("real.yaml", os.path.join(home, "config.yaml"))
+        assert dash._container_notes(mounts, "/agent/config.yaml", "/workspace", now) == (None, None, None)
+        os.symlink(work, os.path.join(home, "linked"))
+        assert dash._container_file(mounts, "/agent/linked/real.md", 4096) is None
+        assert dash._container_file(mounts, "/agent/../work/real.md", 4096) is None
+    ok("container symlink leaves, intermediate directories and parent traversal are refused")
+
+
+def test_fleet_container_regular_files_bounded_and_single_file_mount():
+    with _Fleet() as fx:
+        now, source, fixture, run = _container_fixture(fx)
+        mounts = fixture["inspect"]["mounts"]
+        model, line, age = dash._container_notes(mounts, "/agent/config.yaml", "/workspace", now)
+        assert (model, line, age) == ("provider/example-model", "- Checking <container> ticket 9002", 120)
+        note = os.path.join(fx.tmp, "work", "NOW.md")
+        with open(note, "w") as f:
+            f.write("x" * 10000)
+        assert len(dash._container_file(mounts, "/workspace/NOW.md", 4096)[0]) == 4096
+        config = os.path.join(fx.tmp, "home", "config.yaml")
+        mounts = [{"Source": config, "Destination": "/agent/config.yaml"}]
+        assert dash._container_notes(mounts, "/agent/config.yaml", "/workspace", now) == (model, None, None)
+        with open(config, "w") as f:
+            f.write(" " * 65537)
+        assert dash._container_notes(mounts, "/agent/config.yaml", "/workspace", now) == (None, None, None)
+    ok("container regular files retain first line and fd age; reads bounded; single-file mounts supported")
+
+
+def test_fleet_container_directory_swap_stays_on_open_fd():
+    with _Fleet() as fx:
+        home, outside = os.path.join(fx.tmp, "home"), os.path.join(fx.tmp, "outside")
+        os.mkdir(home)
+        os.mkdir(outside)
+        os.mkdir(os.path.join(home, "notes"))
+        pathlib.Path(home, "notes", "NOW.md").write_text("original\n")
+        pathlib.Path(outside, "NOW.md").write_text("outside\n")
+        real_open = os.open
+        def swap(path, flags, **kw):
+            fd = real_open(path, flags, **kw)
+            if path == "notes":
+                os.rename(os.path.join(home, "notes"), os.path.join(home, "saved"))
+                os.symlink(outside, os.path.join(home, "notes"))
+            return fd
+        with patch.object(dash.os, "open", side_effect=swap):
+            content = dash._container_file([{"Source": home, "Destination": "/agent"}],
+                                           "/agent/notes/NOW.md", 4096)
+        assert content[0] == b"original\n"
+    ok("container directory swap cannot redirect an already anchored read outside the mount")
+
+
+def test_fleet_container_yaml_config_uses_existing_loader():
+    with _Fleet() as fx:
+        now, source, fixture, run = _container_fixture(fx)
+        with open(os.path.join(fx.tmp, "home", "config.yaml"), "w") as f:
+            f.write('model:\n  default: "provider/yaml-model"\n')
+        try:
+            site_env._yaml_load('model:\n  default: "provider/yaml-model"\n')
+            expected = "provider/yaml-model"
+        except site_env.BrokerConfigError:
+            expected = None  # Optional loader absent: discovery still works, model stays unknown.
+        with patch.object(dash.subprocess, "run", side_effect=run):
+            assert dash._read_containers(source, now)[0]["model"] == expected
+    ok("container YAML uses existing optional safe loader, or leaves model unknown when unavailable")
+
+
+def test_fleet_container_prefix_only_and_empty_source():
+    with _Fleet() as fx:
+        now, source, fixture, run = _container_fixture(fx)
+        with open(source) as f:
+            config = json.load(f)
+        config["label"] = ""
+        with open(source, "w") as f:
+            json.dump(config, f)
+        calls = []
+        def prefix_run(argv, **kw):
+            calls.append(argv)
+            if argv[1] == "ps":
+                assert "--filter" not in argv
+                return type("Result", (), {"stdout": fixture["ps"]})()
+            return run(argv, **kw)
+        with patch.object(dash.subprocess, "run", side_effect=prefix_run):
+            assert len(dash._read_containers(source, now)) == 1
+        assert len(calls) == 2
+        with patch.object(dash.subprocess, "run", return_value=type("Result", (), {"stdout": ""})()) as call:
+            assert dash._read_containers(source, now) == [] and call.call_count == 1
+        for field, value in (("pool_label", 'bad"label'), ("workspace", "relative"),
+                             ("config_path", "/agent/../config.yaml")):
+            with open(source, "w") as f:
+                json.dump(dict(config, **{field: value}), f)
+            with patch.object(dash.subprocess, "run", side_effect=AssertionError("invalid config")):
+                assert "container_error" in dash._merge_containers({}, source, now)
+    ok("literal name prefix works without a label; empty selection is cheap; invalid configuration fails closed")
+
+
+def test_fleet_runtime_badges_rendering():
+    node = shutil.which("node")
+    if not node:
+        SKIPPED.append("Fleet runtime badges: node unavailable")
+        return
+    js = dash.PAGE[dash.PAGE.index("function kTok("):dash.PAGE.index("// Tower: click a `tmux attach`")]
+    harness = r'''
+const assert = require('node:assert/strict');
+const esc = v => String(v).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fleetOpen = new Set(), HARNESS = {codex:'Codex', hermes:'Hermes'};
+const tfa = {name:'tfa-<review>', agent_type:'tfa', runtime:'codex', context_state:'unknown'};
+assert(agentRow(tfa).includes('class="tag">tmux</span>'));
+const container = {...tfa, runtime:'hermes', runtime_kind:'container', pool_bot:'pool-<b>', age:3600,
+  ledger_source:'now', ledger:'Checking <ticket>', ledger_age:120, model:'example-model', model_state:'configured'};
+const rendered = agentRow(container);
+assert(rendered.includes('class="tag">container</span>'));
+assert(rendered.includes('Temporary · Hermes · pool-&lt;b&gt; · age 1h'));
+assert(rendered.includes('Checking &lt;ticket&gt;') && rendered.includes('NOW.md last edited'));
+assert(rendered.includes('example-model') && !rendered.includes('pool-<b>'));
+assert(!needCard({...container, busy:true}, {sev:'warn', head:'Check'}).includes('tmux attach'));
+'''
+    result = subprocess.run([node, "-e", js + harness], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    ok("Fleet renders tmux/container badges, escaped pool/model/NOW.md and age; containers have no tmux attach")
 
 
 def test_fleet_mode_parse():

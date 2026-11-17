@@ -22,6 +22,7 @@ import logging
 import math
 import os
 import re
+import stat
 import subprocess
 import threading
 import time
@@ -67,6 +68,156 @@ _MODE_RE = re.compile(r"^FLEET_MODE: (high|normal|lean|min|zero)$", re.M)
 _MODEL_RE = re.compile(r"^(?:claude-)?(opus|sonnet|haiku|fable)-(\d+)(?:-(\d+))?(?:-\d{8})?$")
 _fleet_lock = threading.Lock()
 _fleet_cache = {"key": None, "at": 0.0, "val": None}
+
+
+def _container_file(mounts, path, limit):
+    """Read bounded bytes and metadata from a mounted regular file, or return None.
+    Anchor every open to a directory fd: container-controlled symlink swaps must never redirect a
+    read outside the mount. Nonblocking opens plus fstat refuse FIFOs and other non-regular files.
+    """
+    matches = []
+    for mount in mounts:
+        if not isinstance(mount, dict):
+            continue
+        dest, src = mount.get("Destination", ""), mount.get("Source", "")
+        if not isinstance(dest, str) or not dest or not isinstance(src, str) or not os.path.isabs(src):
+            continue
+        if path == dest or path.startswith(dest.rstrip("/") + "/"):
+            matches.append((dest, src))
+    if not matches:
+        return None
+    dest, src = max(matches, key=lambda m: len(m[0]))
+    if path == dest:  # A single-file bind mount has no path components beneath its source.
+        src, leaf = os.path.split(src)
+        parts = [leaf]
+    else:
+        parts = os.path.relpath(path, dest).split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        return None
+    directory_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY
+    try:
+        directory = os.open(src, directory_flags)
+        try:
+            for part in parts[:-1]:
+                child = os.open(part, directory_flags, dir_fd=directory)
+                os.close(directory)
+                directory = child
+            fd = os.open(parts[-1], os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=directory)
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode):
+                    return None
+                return os.read(fd, limit), info
+            finally:
+                os.close(fd)
+        finally:
+            os.close(directory)
+    except (OSError, ValueError):
+        return None  # Mounted notes are optional, including files replaced during discovery.
+
+
+def _container_notes(mounts, config_path, workspace, now):
+    model, line, age = None, None, None
+    content = _container_file(mounts, config_path, 65537)
+    if content:
+        try:
+            raw, _ = content
+            if len(raw) <= 65536:
+                text = raw.decode("utf-8")
+                try:
+                    data = json.loads(text)  # JSON is also YAML; needs no optional dependency.
+                except ValueError:
+                    data = site_env._yaml_load(text)
+                value = data.get("model") if isinstance(data, dict) else None
+                value = value.get("default") if isinstance(value, dict) else None
+                model = value[:200] if isinstance(value, str) else None
+        except (OSError, ValueError, site_env.BrokerConfigError):
+            log.warning("fleet containers: config.yaml unreadable or invalid")
+    content = _container_file(mounts, workspace.rstrip("/") + "/NOW.md", 4096)
+    if content:
+        raw, info = content
+        text = raw.decode("utf-8", errors="replace")
+        line = next((s.strip() for s in text.splitlines() if s.strip() and not s.lstrip().startswith("#")), None)
+        age = _round(max(0, now - info.st_mtime))
+    return model, line, age
+
+
+def _read_containers(source_path, now):
+    """Opt-in Docker source. Project only mounts, start time, name and one configured pool label;
+    never request Config.Env or run anything inside a container. A selector is mandatory.
+    """
+    with open(source_path, encoding="utf-8") as f:
+        config = json.load(f)
+    if not isinstance(config, dict):
+        raise ValueError("container source must be an object")
+    label, prefix = config.get("label", ""), config.get("name_prefix", "")
+    pool_label = config.get("pool_label", "")
+    if (not all(isinstance(v, str) for v in (label, prefix, pool_label)) or not (label or prefix)
+            or (pool_label and not re.fullmatch(r"[A-Za-z0-9_.-]+", pool_label))):
+        raise ValueError("container source needs a label or name_prefix and a valid pool_label")
+    config_path, workspace = config.get("config_path", ""), config.get("workspace", "")
+    if (not isinstance(config_path, str) or not os.path.isabs(config_path)
+            or os.path.basename(config_path) != "config.yaml"
+            or not isinstance(workspace, str) or not os.path.isabs(workspace)
+            or ".." in config_path.split("/") or ".." in workspace.split("/")):
+        raise ValueError("container source needs absolute config.yaml and workspace paths")
+    argv = ["docker", "ps", "--format", "{{.ID}}\t{{.Names}}"]
+    if label:
+        argv += ["--filter", "label=" + label]
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=3, check=True)
+    ids = []
+    for line in result.stdout.splitlines():
+        ident, sep, name = line.partition("\t")
+        if sep and name.startswith(prefix) and re.fullmatch(r"[a-f0-9]{12,64}", ident):
+            ids.append(ident)
+    if not ids:
+        return []
+    pool = '{{json (index .Config.Labels "' + pool_label + '")}}' if pool_label else '""'
+    fmt = ('{"name":{{json .Name}},"started":{{json .State.StartedAt}},'
+           '"running":{{json .State.Running}},"mounts":{{json .Mounts}},"pool":' + pool + '}')
+    result = subprocess.run(["docker", "inspect", "--format", fmt] + ids[:FLEET_MAX_AGENTS],
+                            capture_output=True, text=True, timeout=3, check=True)
+    rows = []
+    for line in result.stdout.splitlines():
+        item = json.loads(line)
+        if item.get("running") is not True:
+            continue
+        model, note, age = _container_notes(item.get("mounts") or [], config_path, workspace, now)
+        row = _agent_row(None, {"name": item["name"].lstrip("/"), "agent_type": "tfa",
+                               "runtime": "hermes", "model": model, "status": note,
+                               "status_source": "now" if age is not None else None, "running": True}, now)
+        # Docker emits nanoseconds, while Python 3.9's ISO parser accepts at most microseconds.
+        started = item.get("started")
+        if isinstance(started, str):
+            started = re.sub(r"(\.\d{6})\d+", r"\1", started)
+        started = _ts(started)
+        row.update(runtime_kind="container", pool_bot=_scalar(item.get("pool")), ledger_age=age,
+                   age=_round(max(0, now - started)) if started is not None else None,
+                   flags=[], busy=None, busy_age=None, silent=False)
+        rows.append(row)
+    return rows
+
+
+def _merge_containers(fleet, source_path, now):
+    if not source_path:
+        return fleet  # No docker calls and byte-for-byte legacy API shape when disabled.
+    try:
+        rows = _read_containers(source_path, now)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, subprocess.SubprocessError) as e:
+        log.warning("fleet containers: discovery failed: %s", type(e).__name__)
+        fleet["container_error"] = "Container discovery failed: " + type(e).__name__
+        return fleet
+    existing = fleet.setdefault("agents", [])
+    names = {a["name"] for a in existing}
+    # Standing identities win. A discovered container replaces a legacy TFA of the same name.
+    by_name = {a["name"]: a for a in rows}
+    existing[:] = [by_name.pop(a["name"]) if a["agent_type"] == "tfa" and a["name"] in by_name else a
+                   for a in existing]
+    existing.extend(a for n, a in by_name.items() if n not in names)
+    fleet["agents"] = existing[:FLEET_MAX_AGENTS]
+    if rows and "error" in fleet:
+        fleet["status_error"] = fleet.pop("error")
+    return fleet
 
 
 def fleet_mode(text):
@@ -230,7 +381,7 @@ def _agent_row(name, a, now):
     stale = sample_age is not None and (sample_age > FLEET_STALE_S or sample_age < -30)
     valid = tokens is not None and window is not None and sample_age is not None
     pct = round(tokens * 100 / window, 1) if tokens is not None and window else context_percent(ctx)
-    return {
+    row = {
         "name": _scalar(_first(a, "name", "agent", "id") or name),
         "agent_type": a.get("agent_type", "standing") if a.get("agent_type", "standing") in ("standing", "tfa") else None,
         "model": model,
@@ -264,6 +415,13 @@ def _agent_row(name, a, now):
         "context": _scalar(ctx),
         "update_age": _round(max(0.0, now - upd)) if upd is not None else None,
     }
+    # Additive source metadata: old status producers keep their existing API shape.
+    for field in ("pool_bot", "age"):
+        if field in a:
+            row[field] = _scalar(a[field])
+    if a.get("runtime_kind") in ("tmux", "container"):
+        row["runtime_kind"] = a["runtime_kind"]
+    return row
 
 
 def _read_fleet(status_path, md_path, now):
@@ -446,7 +604,8 @@ def fleet_snapshot(now=None):
         _maybe_run_fleet_gen(now, status_path)
     except Exception as e:   # dispatching the generator must never block/break the read side
         log.exception("fleet status generator dispatch failed: %s", e)
-    key = (status_path, os.environ.get("FLEET_MD_PATH") or FLEET_MD_DEFAULT)
+    key = (status_path, os.environ.get("FLEET_MD_PATH") or FLEET_MD_DEFAULT,
+           os.environ.get("FLEET_CONTAINER_SOURCE", ""))
     with _fleet_lock:
         c = _fleet_cache
         if c["key"] == key and c["val"] is not None and 0 <= now - c["at"] < FLEET_CACHE_S:
@@ -455,6 +614,7 @@ def fleet_snapshot(now=None):
         val = _read_fleet(key[0], key[1], now)
     except Exception as e:   # belt-and-braces: the fleet view must never take /state down
         val = {"mode": None, "error": "fleet read failed: " + type(e).__name__}
+    val = _merge_containers(val, key[2], now)
     with _fleet_lock:
         _fleet_cache.update(key=key, at=now, val=val)
     return val
@@ -1692,7 +1852,7 @@ function needCard(a, n){
   return '<div>' + stIcon(n.sev === 'bad' ? 'block' : 'wait') + '<div><div class="h"><b>' + esc(name) + '</b> ' + esc(n.head) + '</div>'
     + (n.why ? '<div class="s">' + esc(n.why) + '</div>' : '') + '</div>'
     + '<span class="when" title="STATE.md/TASKS.md last edited">' + esc(a.ledger_age == null ? '' : 'ledger ' + ago(a.ledger_age)) + '</span>'
-    + '<span class="acts">' + ((a.busy === true || a.busy === false) && /^[A-Za-z0-9_.-]+$/.test(name)   // pane verdict + shell-safe name
+    + '<span class="acts">' + (a.runtime_kind !== 'container' && (a.busy === true || a.busy === false) && /^[A-Za-z0-9_.-]+$/.test(name)   // pane verdict + shell-safe name
       ? '<code class="cmd" tabindex="0" title="click to copy">' + esc('tmux attach -t ' + name) + '</code>' : '') + '</span></div>';
 }
 function agentRow(a){
@@ -1700,8 +1860,11 @@ function agentRow(a){
   const eff = EFFORTS.has(a.effort) ? '<span class="mst-l">' + esc(a.effort + ' effort') + '</span>' : '';
   const now = a.ledger_source === 'now';
   return '<tr class="ag pick' + (open ? ' open' : '') + '" data-agent="' + esc(name) + '" tabindex="0" aria-expanded="' + open + '">'
-    + '<td><div class="an"><b>' + esc(a.name ?? '?') + '</b><span class="role" title="' + esc(a.role || '') + '">' + esc(
-      [a.agent_type === 'tfa' ? 'Temporary' : '', a.runtime && a.runtime !== 'claude' ? HARNESS[a.runtime] || a.runtime : '', a.role]
+    + '<td><div class="an"><b>' + esc(a.name ?? '?') + '</b>'
+    + (a.agent_type === 'tfa' ? ' <span class="tag">' + esc(a.runtime_kind === 'container' ? 'container' : 'tmux') + '</span>' : '')
+    + '<span class="role" title="' + esc(a.role || '') + '">' + esc(
+      [a.agent_type === 'tfa' ? 'Temporary' : '', a.runtime && a.runtime !== 'claude' ? HARNESS[a.runtime] || a.runtime : '',
+        a.pool_bot, a.age == null ? '' : 'age ' + ago(a.age), a.role]
         .filter(Boolean).join(' · ')) + '</span></div></td>'
     + '<td class="m-end"><span class="stw ' + k + '">' + stIcon(k) + esc(word) + '</span></td>'
     + '<td class="m-hide"><div class="mdl-c">' + modelChip(a) + eff + '</div></td>'
@@ -1709,7 +1872,7 @@ function agentRow(a){
     + '<td class="m-sub"><div class="led' + (a.ledger && !now ? ' old' : '') + '"' + (a.ledger && !now
       ? ' title="From its notes (STATE.md): this agent has no NOW.md line yet"' : '') + '>' + (a.ledger ? esc(a.ledger) : '<i>-</i>') + '</div></td>'
     + '<td class="num m-hide"><span class="lage' + (la > 86400 ? ' old' : la > 21600 ? ' stale' : '')
-    + '" title="STATE.md last edited">' + esc(la == null ? '-' : ago(la)) + '</span></td></tr>';
+    + '" title="' + (now ? 'NOW.md' : 'STATE.md') + ' last edited">' + esc(la == null ? '-' : ago(la)) + '</span></td></tr>';
 }
 // Phone: agents that need attention first, then working ones, idle ones folded into one row.
 function fleetGroups(shown){
@@ -1742,8 +1905,8 @@ function paintFleet(f){
     + (sup && sup.error ? ' <span class="pill warn">' + esc(sup.error) + '</span>'
       : sup && sup.stale ? ' <span class="pill warn">supervisor ' + esc(ago(sup.age)) + ' old</span>'
       : sup && sup.tmux_server_up === false ? ' <span class="pill bad">tmux server down</span>' : '');
-  $('f-err').hidden = !f.error && rows.length > 0;
-  $('f-err').textContent = f.error || 'No agents listed in fleet-status.json.';
+  $('f-err').hidden = !f.error && !f.container_error && !f.status_error && rows.length > 0;
+  $('f-err').textContent = [f.error, f.container_error, f.status_error].filter(Boolean).join('; ') || 'No agents listed in fleet-status.json.';
   $('f-needs-w').hidden = true;   // Fleet is the agent table; attention is also visible in each row.
   $('f-needs-n').textContent = needs.length;
   $('f-needs').innerHTML = needs.map(p => needCard(p[0], p[1])).join('');
@@ -3422,8 +3585,8 @@ def module_page(modules):
                         + ".tbl td [data-quick-module]{display:inline-flex}}\n</style>")
     page = page.replace("function toggleAgent(e){\n",
                         "function toggleAgent(e){\n  if(e.target.closest('[data-quick-module]')) return;\n")
-    page = page.replace("+ '<td><div class=\"an\"><b>' + esc(a.name ?? '?') + '</b><span",
-                        "+ '<td><div class=\"an\"><b>' + esc(a.name ?? '?') + '</b>' + moduleAffordance(name) + '<span")
+    page = page.replace("+ '<td><div class=\"an\"><b>' + esc(a.name ?? '?') + '</b>'",
+                        "+ '<td><div class=\"an\"><b>' + esc(a.name ?? '?') + '</b>' + moduleAffordance(name)")
     return page.replace("loadCan().then(tick);", MODULE_JS.replace("__MODULE_CONFIG__", config) + "\nloadCan().then(tick);")
 
 

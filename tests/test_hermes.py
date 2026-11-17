@@ -102,7 +102,12 @@ if first or not os.environ.get("FAKE_SLEEP_ONCE"):
 sid = "sess-h1"
 print(json.dumps({"type": "system", "subtype": "init", "model": "m", "session_id": sid}))
 print("not json noise")
-print(json.dumps({"type": "text", "text": "partial"}))
+if not os.environ.get("FAKE_NO_TEXT"):
+    print(json.dumps({"type": "text", "text": "partial"}))
+    print(json.dumps({"type": "text", "text": " reply"}))
+    if os.environ.get("FAKE_REPLY_TOOL"):
+        print(json.dumps({"type": "tool_use", "name": "read_file", "arguments": {"path": "x"}}))
+        print(json.dumps({"type": "text", "text": "a different assistant message"}))
 text = os.environ.get("FAKE_TEXT", json.dumps({"status": "pass", "summary": "<p>reviewed</p>", "wake": []}))
 res = {"type": "result", "session_id": sid, "exit_code": int(os.environ.get("FAKE_EXIT_CODE", "0")), "text": text,
        "tokens": {"input": 30, "output": 12, "total": 42}}
@@ -527,6 +532,32 @@ def test_hermes_seam_launch_and_refusal():
     assert any("refuses capability 'read'" in m for m in alerts), alerts
     ok("hermes: full seam - an mr-review hermes row launches the fake hermes; a read row is refused and "
        "ops-alerted with no launch")
+
+
+def test_hermes_dashboard_reply_from_first_text():
+    from unittest.mock import patch
+    import steer
+    with tempfile.TemporaryDirectory() as d, _Registry(d), \
+            patch.dict(os.environ, {"BROKER_STEER_ROOT": os.path.join(d, "steer")}):
+        a = _adapter(d, envelope_parser=EnvelopeParser())
+        for i, (env, expected) in enumerate((
+                ({}, "partial reply"),
+                ({"FAKE_REPLY_TOOL": "1"}, "partial reply"),
+                ({"FAKE_NO_RESULT": "1"}, None),
+                ({"FAKE_ERROR": "failed"}, None),
+                ({"FAKE_NO_TEXT": "1", "FAKE_TEXT": "final answer"}, "final answer"),
+                ({"FAKE_NO_TEXT": "1", "FAKE_NO_RESULT": "1"}, None),
+                ({"FAKE_NO_TEXT": "1", "FAKE_TEXT": ""}, None),
+                ({"FAKE_NO_TEXT": "1", "FAKE_TEXT": "harness error", "FAKE_ERROR": "failed"}, None))):
+            key = "vikunja:task:" + str(9007 + i)
+            steer.record(key, "a", "queued", text="check the other file")
+            steer.record(key, "a", "delivered", via="turn")
+            a._one_turn(Worker(key, "run", d), _route(**env), "SYS", "P", resume=False)
+            with open(steer.log_path(key)) as f:
+                replies = [r for r in map(json.loads, f) if r["state"] == "reply"]
+            assert [(r["id"], r["text"]) for r in replies] == ([] if expected is None else [("a", expected)])
+            steer.clear_inbox(key)
+    ok("hermes: joins the first assistant message's deltas through tool-use/result; incomplete/empty text is not a reply")
 
 
 def test_hermes_pass_gating():

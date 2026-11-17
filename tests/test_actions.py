@@ -113,7 +113,11 @@ class ActionTests(T.DrainTests):
         buf = b.coalescer.live[key]["fwd_buffer"]
         assert buf[-1]["doer"] == "web:alice" and buf[-1]["task_id"] == 9005
         brief = C.collapse(buf)
-        assert brief["comments"][0]["text"] == f"{C._COMMENT_BEGIN}\nuse the v2 layout\n{C._COMMENT_END}"
+        mid = buf[-1]["steer_id"]
+        assert brief["comments"][0]["text"] == (
+            f"Dashboard message id: {mid}. A short reply in your next assistant message will be shown "
+            "to the operator on the dashboard.\n"
+            f"{C._COMMENT_BEGIN}\nuse the v2 layout\n{C._COMMENT_END}")
         assert "UNTRUSTED" in brief["comments_notice"]
 
     def test_rerun_and_reconcile_reuse_the_operator_paths(self):

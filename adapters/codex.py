@@ -683,6 +683,7 @@ class _LiveEvents:
         self.turns, self.tokens = worker.turns, worker.tokens
         self.prev = getattr(worker, "codex_usage", None)
         self.items = set()
+        self.completed = set()
         self.item_base = getattr(worker, "items", 0) if resume_session else 0
         worker.items = self.item_base
 
@@ -713,6 +714,11 @@ class _LiveEvents:
                     view = {"type": typ, "item_type": str(item.get("type") or "unknown")[:80]}
                     if typ == "item.completed":
                         view.update(_item_detail(item, self.cwd, w.codex_snaps))
+                        if (item.get("type") == "agent_message"
+                                and (not isinstance(iid, str) or iid not in self.completed)):
+                            steer.reply(w.key, view.get("text"), now=w.last_activity)
+                        if isinstance(iid, str):
+                            self.completed.add(iid)
             elif typ == "turn.completed" and isinstance(ev.get("usage"), dict):
                 usage = ev["usage"]
                 if all(isinstance(usage.get(k, 0), int) and usage.get(k, 0) >= 0

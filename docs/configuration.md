@@ -737,6 +737,17 @@ What each action does:
   a Codex sandbox can write there, and so could reach other tickets' inboxes
   ([same-uid residual](security-residual-same-uid.md)). A message only goes to the main agent: a tool call made
   inside a Claude Code subagent never takes it, so it waits for the main agent's next tool call or the next turn.
+  Each message includes its id and asks for a short reply. The broker attaches the first nonempty assistant
+  text after delivery beneath the message as **Worker reply**, with a **Replied** pill. This is automatic
+  attribution, not proof the worker followed the feedback. Messages delivered together share that next text;
+  tools, reasoning and empty output do not count. No text leaves the message read but unanswered. Replies
+  are plain text, capped at 4000 characters, recorded once per message as `state: "reply"` in the same
+  `log.jsonl`, and retained for history alongside older queued/delivered-only records. Claude Code uses the
+  timestamped main-session transcript regardless of `BROKER_STREAM_ENABLED`; Codex uses completed
+  agent-message events. Neither requires an open viewer. Hermes assembles the first assistant message's
+  text deltas through its tool-use boundary or completed result, then records it at the end of the next turn.
+  Unanswered messages expire with the worker, not into a later run. No worker-supplied reply id is accepted:
+  the broker selects only ids it queued for that subject. The inbound text remains delimited UNTRUSTED data.
 - **Run again**, **pause new runs** and **retry / abandon** use the same code as `/rerun`, `/drain` and
   `/reconcile`. The model menu next to **Run again** runs that one run on the model or backend you pick, ahead
   of any `model:` label on the ticket. A row that pins its model (`pin:true`, `<ROW>_PIN` or `model_pin`) refuses

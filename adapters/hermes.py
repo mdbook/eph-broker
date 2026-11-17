@@ -944,6 +944,29 @@ class HermesHarness:
             worker.turn_started = None
         worker.turns += 1
         wrapper = parse_stream(out)
+        # Hermes has no mid-turn hook: dashboard messages were delivered before this turn. Text records
+        # are deltas, not messages. Assemble through the first tool-use boundary or successful result;
+        # never commit an incomplete trailing delta on EOF/error. Result-only versions use the final text.
+        reply_parts = []
+        for line in (out or "").splitlines():
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            if rec.get("type") == "text" and isinstance(rec.get("text"), str):
+                reply_parts.append(rec["text"])
+            elif rec.get("type") == "tool_use" and "".join(reply_parts).strip():
+                _cc.steer.reply(worker.key, _cc._redact_secretish("".join(reply_parts)))
+                break
+            elif rec.get("type") == "result":
+                if rec.get("exit_code") == 0 and not rec.get("error"):
+                    text = "".join(reply_parts)
+                    if not text.strip():
+                        text = rec.get("text")
+                    _cc.steer.reply(worker.key, _cc._redact_secretish(text) if isinstance(text, str) else "")
+                break
         # Failed-turn postmortem capture: the stream is filtered (capture_stdout), never raw
         _capture = lambda reason: _cc.capture_failed_turn(worker, route, reason, proc.returncode,
                                                           capture_stdout(out), err)

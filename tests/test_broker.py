@@ -494,6 +494,77 @@ for(const [event, send] of [
     assert out.returncode == 0, out.stderr
     ok("dash: Enter sends; Shift+Enter, composition and other keys do not submit or prevent native editing")
 
+
+def test_dash_worker_replies_render_as_text_and_preserve_old_messages():
+    node = shutil.which("node")
+    if not node:
+        SKIPPED.append("dash_worker_replies")
+        return
+    js = r'''
+const assert = require('assert');
+class Node {
+  constructor(tag){ this.tag = tag; this.children = []; this.textContent = ''; this.className = ''; }
+  get innerHTML(){ throw Error('reply rendering must not use markup'); }
+  set innerHTML(v){ throw Error('reply rendering must not use markup'); }
+  get classList(){ return {
+    add: c => { this.className += ' ' + c; },
+    remove: c => { this.className = this.className.split(' ').filter(x => x !== c).join(' '); }
+  }; }
+  remove(){ if(this.parent){ this.parent.children.splice(this.parent.children.indexOf(this), 1); this.parent = null; } }
+  appendChild(n){ n.remove(); n.parent = this; this.children.push(n); return n; }
+  prepend(n){ n.remove(); n.parent = this; this.children.unshift(n); }
+  after(n){ n.remove(); n.parent = this.parent; this.parent.children.splice(this.parent.children.indexOf(this)+1, 0, n); }
+  replaceWith(n){ const p = this.parent, i = p.children.indexOf(this); this.remove(); n.parent = p; p.children.splice(i, 0, n); }
+  get lastElementChild(){ return this.children.at(-1); }
+  get previousElementSibling(){ return this.parent.children[this.parent.children.indexOf(this)-1]; }
+  querySelector(sel){
+    for(const c of this.children){ if(sel === 'time.ts' && c.tag === 'time') return c;
+      const match = c.querySelector(sel); if(match) return match; }
+    return null;
+  }
+}
+const document = {createElement: tag => new Node(tag)};
+const log = new Node('div'), $ = id => log, atBottom = () => true;
+'''
+    js += "function el(tag, cls, text){" + dash.PAGE.split("function el(tag, cls, text){", 1)[1].split(
+        "\n}", 1)[0] + "\n}\n"
+    js += "function timeEl(o){" + dash.PAGE.split("function timeEl(o){", 1)[1].split("function bubble", 1)[0]
+    js += r'''
+const text = '<img src=x onerror=bad()> <script>bad()</script>';
+function event(id, state, extra={}){ webMsg({id, state, timestamp:'2026-11-01T12:00:00Z', via:'tool', ...extra}); }
+event('old', 'queued', {text:'an old message'});
+assert.equal(webMsgs.get('old').chip.textContent.startsWith('Queued:'), true);
+event('old', 'delivered');
+assert.equal(webMsgs.get('old').chip.textContent, 'Read mid-turn');
+assert.equal(webMsgs.get('old').reply, null);
+event('new', 'queued', {text:'operator note'});
+event('new', 'delivered');
+event('new', 'reply', {text});
+const m = webMsgs.get('new');
+assert.equal(m.chip.textContent, 'Replied');
+assert.equal(m.body.textContent, 'operator note');
+assert.equal(m.reply.children[0].textContent, 'Worker reply');
+assert.equal(m.reply.children[1].textContent, text);
+assert.equal(webPending.has(m.ev), false);
+const count = m.ev.children.length;
+event('new', 'queued', {text:'operator note'});
+event('new', 'delivered');
+event('new', 'reply', {text:'duplicate'});
+assert.equal(m.ev.children.length, count);
+assert.equal(m.chip.textContent, 'Replied');
+assert.equal(m.reply.children[1].textContent, text);
+// SSE replay can receive a reply before its queued line. Keep the two bodies separate.
+event('reordered', 'reply', {text});
+event('reordered', 'queued', {text:'original operator note'});
+assert.equal(webMsgs.get('reordered').body.textContent, 'original operator note');
+assert.equal(webMsgs.get('reordered').chip.textContent, 'Replied');
+assert.equal(log.children.length, 3);
+'''
+    result = subprocess.run([node, "-e", js], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    ok("dash: replies are plain text under the right message; old read-only logs, replay and duplicates remain safe")
+
+
 def test_dash_scroll_layout():
     """CSS layout contract: the last transcript row stays reachable at short viewport heights.
 
@@ -4407,10 +4478,12 @@ def test_phase2b_a_capability_reaches_build_argv_end_to_end():
                       envelope_parser=EnvelopeParser(), claude_bin=fake)
         seen = {}
         orig = a.build_argv
-        def cap(p, m, s, resume_session=None, capability="read", mcp_config_path=None, test_runner=None, setting_sources=None, effort=None, bypass_classifier=False, thread_dir=None, judged_bash=False, worktree_root=None, steer_hook=None, bus_enabled=None):
+        def cap(p, m, s, resume_session=None, capability="read", mcp_config_path=None, test_runner=None,
+                setting_sources=None, effort=None, bypass_classifier=False, thread_dir=None, judged_bash=False,
+                worktree_root=None, steer_hook=None, bus_enabled=None, session_uuid=None):
             seen["capability"] = capability
             return orig(p, m, s, resume_session, capability=capability, mcp_config_path=mcp_config_path,
-                        test_runner=test_runner, setting_sources=setting_sources)
+                        test_runner=test_runner, setting_sources=setting_sources, session_uuid=session_uuid)
         a.build_argv = cap
         wrote = Route(domain="wiki", repo="/srv/git/wiki", prompt_class="docs", agent="coder-agent",
                       read_only=False, capability="write", model="claude-sonnet-5")
@@ -4857,10 +4930,12 @@ def test_code_route_threads_runner_end_to_end():
                       envelope_parser=EnvelopeParser(), claude_bin=fake)
         seen = {}
         orig = a.build_argv
-        def cap(p, m, s, resume_session=None, capability="read", mcp_config_path=None, test_runner=None, setting_sources=None, effort=None, bypass_classifier=False, thread_dir=None, judged_bash=False, worktree_root=None, steer_hook=None, bus_enabled=None):
+        def cap(p, m, s, resume_session=None, capability="read", mcp_config_path=None, test_runner=None,
+                setting_sources=None, effort=None, bypass_classifier=False, thread_dir=None, judged_bash=False,
+                worktree_root=None, steer_hook=None, bus_enabled=None, session_uuid=None):
             seen["capability"] = capability; seen["test_runner"] = test_runner
             return orig(p, m, s, resume_session, capability=capability, mcp_config_path=mcp_config_path,
-                        test_runner=test_runner, setting_sources=setting_sources)
+                        test_runner=test_runner, setting_sources=setting_sources, session_uuid=session_uuid)
         a.build_argv = cap
         r = Route(domain="code", repo="/srv/git/sample-app", prompt_class="change-proposer",
                   agent="code-worker", read_only=False, capability="code", test_runner="pytest",
@@ -5487,11 +5562,11 @@ def test_code_judged_bash_threads_through_one_turn_real_spawn_path():
         orig = a.build_argv
         def cap(p, m, s, resume_session=None, capability="read", mcp_config_path=None, test_runner=None,
                 setting_sources=None, effort=None, bypass_classifier=False, thread_dir=None, judged_bash=False,
-                worktree_root=None, steer_hook=None, bus_enabled=None):
+                worktree_root=None, steer_hook=None, bus_enabled=None, session_uuid=None):
             seen["judged_bash"] = judged_bash
             seen["worktree_root"] = worktree_root
             return orig(p, m, s, resume_session, capability=capability, test_runner=test_runner,
-                        setting_sources=setting_sources)
+                        setting_sources=setting_sources, session_uuid=session_uuid)
         a.build_argv = cap
         code_route = Route(domain="code", repo="/srv/git/sample-app", prompt_class="change-proposer",
                            agent="code-worker", read_only=False, capability="code", test_runner="pytest",
@@ -12254,24 +12329,69 @@ def _stream_turn(resume=False, session_id=None):
     return seen["argv"], w
 
 
-def test_session_id_argv_gated_by_flag():
+def test_session_id_argv_pinned_independently_of_stream_flag():
     import stream
-    with _StreamEnv():                                              # flag OFF (default): argv untouched
-        argv, w = _stream_turn()
-        assert "--session-id" not in argv and w.stream_session is None, argv
-    with _StreamEnv(BROKER_STREAM_ENABLED="0"):
-        assert "--session-id" not in _stream_turn()[0]
-    with _StreamEnv(BROKER_STREAM_ENABLED="true"):
-        argv, w = _stream_turn()
-        sid = argv[argv.index("--session-id") + 1]
-        assert stream.valid_uuid(sid) and w.stream_session == sid, (sid, w.stream_session)
-        argv2, w2 = _stream_turn()
-        assert argv2[argv2.index("--session-id") + 1] != sid, "each fresh session gets its own uuid"
-        argv3, w3 = _stream_turn(resume=True, session_id="sess-1")  # warm --resume turn keeps its session
-        assert "--session-id" not in argv3 and argv3[argv3.index("--resume") + 1] == "sess-1"
-        assert w3.stream_session is None
-    ok("--session-id <uuid4> only when BROKER_STREAM_ENABLED (fresh sessions; recorded on Worker); "
-       "OFF / '0' / --resume turn -> no --session-id")
+    for env in ({}, {"BROKER_STREAM_ENABLED": "0"}, {"BROKER_STREAM_ENABLED": "true"}):
+        with _StreamEnv(**env):
+            argv, w = _stream_turn()
+            sid = argv[argv.index("--session-id") + 1]
+            assert stream.valid_uuid(sid) and w.stream_session == sid, (sid, w.stream_session)
+            argv2, w2 = _stream_turn()
+            assert argv2[argv2.index("--session-id") + 1] != sid, "each fresh session gets its own uuid"
+            argv3, w3 = _stream_turn(resume=True, session_id=sid)
+            assert "--session-id" not in argv3 and argv3[argv3.index("--resume") + 1] == sid
+            assert w3.stream_session == sid
+    ok("fresh sessions are pinned for steer replies regardless of streaming; --resume follows the same transcript")
+
+
+def test_cc_dashboard_reply_with_streaming_unset():
+    import steer
+    import stream
+    with tempfile.TemporaryDirectory(dir=ROOT) as d, _StreamEnv(), \
+            patch.dict(os.environ, {"BROKER_STEER_ROOT": os.path.join(d, "steer")}), \
+            patch.object(stream, "PROJECTS_DIR", d), patch.object(stream, "remember") as remember:
+        assert "BROKER_STREAM_ENABLED" not in os.environ
+        a = CCAdapter(router=None, worktree_mgr=None, prompt_loader=None, envelope_parser=EnvelopeParser())
+        key = "vikunja:task:9333"
+        w = Worker(key, "run-9333", d)
+        project = os.path.join(d, "project")
+        os.mkdir(project)
+
+        class _P:
+            def __init__(self, argv, **kw):
+                sid = argv[argv.index("--session-id") + 1] if "--session-id" in argv else w.session_id
+                self.path = os.path.join(project, sid + ".jsonl")
+                self.calls = 0
+
+            def communicate(self, input=None, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    # Both buffered records are read after delivery. Only their transcript timestamps
+                    # distinguish the earlier assistant text from the actual reply.
+                    before = time.time() - 10
+                    steer.record(key, "a" + str(w.turns), "queued", text="use the other file")
+                    steer.record(key, "a" + str(w.turns), "delivered", via="tool")
+                    with open(self.path, "a") as f:
+                        # Keep the reply beyond delivery's rounded millisecond, without a timing sleep.
+                        for text, ts in (("before delivery", before), ("I will check it.", time.time() + 0.01)):
+                            f.write(json.dumps({"type": "assistant", "timestamp": steer._iso(ts),
+                                                "message": {"content": [{"type": "text", "text": text}]}}) + "\n")
+                    raise subprocess.TimeoutExpired("fake-claude", timeout)
+                with open(steer.log_path(key)) as f:
+                    replies = [r for r in map(json.loads, f) if r["state"] == "reply"]
+                assert replies[-1]["text"] == "I will check it.", replies
+                return json.dumps({"result": json.dumps({"status": "done", "summary": "ok", "wake": []}),
+                                   "session_id": w.stream_session}), ""
+
+        with patch.object(cc.subprocess, "Popen", _P):
+            for resume in (False, True):
+                assert a._one_turn(w, _route(), "SYS", "P", resume=resume)
+        with open(steer.log_path(key)) as f:
+            replies = [r for r in map(json.loads, f) if r["state"] == "reply"]
+        assert [(r["id"], r["text"]) for r in replies] == [("a0", "I will check it."), ("a1", "I will check it.")]
+        remember.assert_not_called()
+        steer.clear_inbox(key)
+    ok("cc: an adapter turn records the first post-delivery reply with streaming unset, fresh and resumed")
 
 
 class _StreamBroker:

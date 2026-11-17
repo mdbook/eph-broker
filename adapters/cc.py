@@ -22,6 +22,7 @@ The 7 constraints:
 """
 import html, inspect, json, os, queue, re, shlex, shutil, subprocess, sys, tempfile, threading, time, uuid, logging, weakref
 from contextlib import contextmanager
+from datetime import datetime
 from urllib.parse import urlsplit
 from .base import Adapter
 from .hermes_gate import providers as _gate_providers   # exec-gate label + override hint for deny alerts
@@ -2003,6 +2004,45 @@ def transcript_context_tokens(session_id, tail_bytes=262144):
         return None
 
 
+class _SteerReplies:
+    """Tail the same main-session transcript as the dashboard, even when no viewer is connected.
+
+    CC's normal stdout is a final JSON wrapper, not live assistant text. Reading its timestamped transcript
+    avoids attributing buffered, pre-delivery output to a newly delivered dashboard message.
+    """
+    def __init__(self, worker):
+        self.key, self.sid = worker.key, worker.stream_session
+        self.path = stream.find_transcript(self.sid)
+        try:
+            self.offset = os.path.getsize(self.path) if self.path else 0
+        except OSError:
+            self.offset = 0
+
+    def poll(self):
+        self.path = self.path or stream.find_transcript(self.sid)
+        if not self.path:
+            return
+        try:
+            lines, self.offset = stream._read_complete(self.path, self.offset)
+        except OSError:
+            return
+        for line in lines:
+            try:
+                rec = json.loads(line)
+                if (not isinstance(rec, dict) or rec.get("type") != "assistant" or rec.get("isSidechain")
+                        or rec.get("parent_tool_use_id") or rec.get("isReplay")):
+                    continue
+                msg = rec.get("message") or {}
+                if msg.get("model") == "<synthetic>":
+                    continue
+                text = "\n".join(p["text"] for p in msg.get("content", [])
+                                 if isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str))
+                ts = datetime.fromisoformat(rec["timestamp"].replace("Z", "+00:00")).timestamp()
+            except (ValueError, KeyError, TypeError, AttributeError):
+                continue
+            steer.reply(self.key, _redact_secretish(text), now=ts)
+
+
 class _InboxUsage:
     """Read complete stream-json records from communicate's cumulative stdout.
 
@@ -2121,7 +2161,7 @@ class Worker:
         self.sandbox_gitdir = (sandbox.gitdir(worktree)
                                if os.getenv("WORKER_SANDBOX", "bwrap").strip().lower() != "off" else None)
         self.session_id = None      # claude session id, once known (for --resume)
-        self.stream_session = None  # Uuid4 we passed as --session-id (stream ON only) -> transcript file
+        self.stream_session = None  # Pinned/resumed session -> transcript file for steer replies and the viewer
         self.last_output = None      # Most recent raw worker output (wrapped UNTRUSTED on escalate)
         self.last_summary = None     # The latest envelope summary (a GitLab-issue MR description quotes it)
         self.turn_capped = False     # Sticky: some turn hit --max-turns, so a WIP branch at teardown and no MR
@@ -4981,15 +5021,17 @@ class CCAdapter(Adapter):
                             _backend, SPAWN_MODELS_JSON, route.model)
         if capability == "inbox":
             _InboxUsage.prices_for_model(self.model_prices, eff_model)
-        # With streaming ON, pin every FRESH session (seed / rotation / non-resume fallback) to a uuid we
-        # choose, so the dash stream can find ~/.claude/projects/*/<uuid>.jsonl while the turn is still running
-        # (session_id is otherwise only learned post-exit). A --resume turn keeps its session (and file). OFF =
-        # argv unchanged.
+        # Pin every fresh session so steer replies can tail its timestamped transcript even with dashboard
+        # streaming off (session_id is otherwise only learned post-exit). Resume follows the actual session,
+        # including after rotation/fallback; only viewer history registration depends on the streaming opt-in.
         stream_kw = {}
-        if not resume_session and stream.enabled():
+        if not resume_session:
             worker.stream_session = str(uuid.uuid4())
-            stream_kw["session_uuid"] = worker.stream_session   # only passed when ON: OFF call is byte-identical
-            stream.remember(worker.key, worker.stream_session, title=getattr(worker, "title", None))  # Browsable after it ends
+            stream_kw["session_uuid"] = worker.stream_session
+            if stream.enabled():
+                stream.remember(worker.key, worker.stream_session, title=getattr(worker, "title", None))
+        else:
+            worker.stream_session = resume_session
         if test_runner == "venv":                        # same only-when-needed shape as session_uuid
             stream_kw["test_repo"] = getattr(worker, "repo", None)
         if getattr(route, "site_capability", ""):        # only when set, so a built-in row's call is unchanged
@@ -5080,6 +5122,7 @@ class CCAdapter(Adapter):
         worker.in_turn = True                            # turn-completion signal (liveness consumer)
         worker.turn_started = time.time()                # force-close timing (turn_age)
         worker.hard_killed = False                       # Reset before this turn; set True only below
+        replies = _SteerReplies(worker)
         try:                                             # prompt rides STDIN, never argv (E2BIG)
             proc = subprocess.Popen(launch_argv, cwd=worker.worktree, env=env, stdin=subprocess.PIPE,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -5093,7 +5136,7 @@ class CCAdapter(Adapter):
         fail_fast = getattr(route, "cc_fail_fast", True)
         upstream_error = None
         try:
-            if inbox_usage is None and not fail_fast:
+            if inbox_usage is None and not fail_fast and replies is None:
                 out, err = proc.communicate(prompt_text, timeout=wall_clock_s)
             else:
                 deadline = time.monotonic() + wall_clock_s
@@ -5107,6 +5150,8 @@ class CCAdapter(Adapter):
                         break
                     except subprocess.TimeoutExpired as e:
                         stdin = None  # communicate must receive input only on its first call
+                        if replies is not None:
+                            replies.poll()
                         upstream_error = _cc_upstream_error(e.output, e.stderr) if fail_fast else None
                         used = inbox_usage.update(e.output) if inbox_usage is not None else 0
                         over_cost = (inbox_usage is not None and worker.inbox_cost_usd +
@@ -5139,6 +5184,8 @@ class CCAdapter(Adapter):
                 self._alert_ops(f"worker {worker.key} hard-killed: wall-clock {wall_clock_s}s",
                                 subject=f"worker:{worker.key}")
         finally:
+            if replies is not None:
+                replies.poll()
             worker.in_turn = False                       # turn complete: the signal fires here
             worker.turn_started = None                   # between turns
         worker.turns += 1

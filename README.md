@@ -105,7 +105,8 @@ back to another model. Invalid lists stop broker startup.
 - **Pluggable agents.** Claude Code by default, [hermes-agent](docs/hermes.md) and other CLIs through [adapters](docs/adapters.md), with [custom worker types](docs/routes.md).
 - **Your tracker.** GitLab issues and [GitHub opened issues](docs/github-issues.md) work natively (signed intake and summary comments; no GitHub PR support yet). [Vikunja](https://vikunja.io) and others plug in through a [small script](docs/tracker-script.md) and [n8n](https://n8n.io) workflows ([ready-made](docs/n8n.md)).
 - **Dashboard and events.** Tabbed worker and queue views, a separate Settings page and a phone bottom tab bar
-  ([dashboard guide](docs/operations.md#health-and-the-dashboard)), plus [signed run events](docs/events.md) for your own automation.
+  ([dashboard guide](docs/operations.md#health-and-the-dashboard)), [operator messages with worker replies](docs/configuration.md#dashboard-actions),
+  plus [signed run events](docs/events.md) for your own automation.
 - **Optional UI modules.** [Add a tab](docs/modules.md#try-it-in-ten-minutes) without embedding another app in the broker.
 - **Agent directory.** An optional [Agents tab](docs/agent-directory.md) lists agents that enroll once and send signed heartbeats, including agents the broker did not start.
 

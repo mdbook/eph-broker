@@ -953,6 +953,7 @@ PAGE = r"""<!DOCTYPE html>
   .who{font-weight:650;color:var(--ink)}
   .ev.user .who{color:var(--accent)}
   .ev.you.pending{border-style:dashed}
+  .worker-reply{margin-top:12px;padding:12px;border:1px solid var(--line);border-radius:8px;background:var(--s1);color:var(--t1);white-space:pre-wrap;overflow-wrap:anywhere}
   .ts{font-size:11px;color:var(--faint);font-variant-numeric:tabular-nums;margin-left:auto;white-space:nowrap}
   .md{overflow-wrap:anywhere}
   .md p{margin:.35em 0} .md ul,.md ol{margin:.35em 0;padding-left:1.4em}
@@ -2231,12 +2232,27 @@ function webMsg(o){
     const time = timeEl(o);
     meta.appendChild(time);
     ev.appendChild(meta);
-    ev.appendChild(el('div', 'md', o.text || ''));   // textContent: the operator's own words, never markup
-    m = {ev, chip, time, state: null};
+    const body = el('div', 'md', o.state === 'queued' ? o.text || '' : '');
+    ev.appendChild(body);   // textContent: the operator's own words, never markup
+    m = {ev, chip, time, body, reply: null, state: null};
     webMsgs.set(o.id, m);
   }
-  if(o.text && !m.ev.querySelector('.md').textContent) m.ev.querySelector('.md').textContent = o.text;
-  if(o.state === 'delivered'){
+  if(o.state === 'queued' && o.text && !m.body.textContent) m.body.textContent = o.text;
+  if(o.state === 'reply'){
+    m.state = 'reply';
+    m.chip.className = 'pill ok';
+    m.chip.textContent = 'Replied';
+    if(!m.reply){
+      m.reply = el('div', 'worker-reply');
+      m.reply.appendChild(el('div', 'who', 'Worker reply'));
+      m.reply.appendChild(el('div', '', o.text || ''));   // textContent only, including final JSON/HTML
+      m.ev.appendChild(m.reply);
+    }
+    m.ev.classList.remove('pending');
+    webPending.delete(m.ev);
+    const t = new Date(m.time._ts).getTime();
+    if(Number.isFinite(t)) placeAt(m.ev, t); else log.appendChild(m.ev);
+  }else if(o.state === 'delivered' && m.state !== 'reply'){
     m.state = 'delivered';
     m.chip.className = 'pill ok';
     m.chip.textContent = o.via === 'tool' ? 'Read mid-turn' : 'Read at the start of its next turn';
@@ -2245,7 +2261,7 @@ function webMsg(o){
     webPending.delete(m.ev);
     const t = new Date(o.timestamp).getTime();
     if(Number.isFinite(t)) placeAt(m.ev, t); else log.appendChild(m.ev);
-  }else if(m.state !== 'delivered'){
+  }else if(o.state === 'queued' && m.state !== 'delivered' && m.state !== 'reply'){
     m.state = 'queued';
     m.chip.className = 'pill pend';
     m.chip.textContent = o.via === 'tool' ? 'Queued: it reads this after its next tool call'

@@ -249,8 +249,9 @@ def _render_comment(evt):
         cid = int(evt.get("comment_id"))
     except (TypeError, ValueError):
         cid = None
+    hint = steer.reply_hint(evt["steer_id"]) if evt.get("steer_id") else ""
     return {"doer": str(evt.get("doer") or "")[:64], "comment_id": cid,
-            "text": f"{_COMMENT_BEGIN}\n{text}\n{_COMMENT_END}"}
+            "text": hint + f"{_COMMENT_BEGIN}\n{text}\n{_COMMENT_END}"}
 
 
 def normalize(evt):

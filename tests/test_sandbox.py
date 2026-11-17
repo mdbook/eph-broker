@@ -606,7 +606,7 @@ for name in sys.argv[1:]:
         self.assertEqual(result.returncode, 0, result.stderr)
         output = json.loads(result.stdout)["hookSpecificOutput"]
         self.assertEqual(output["hookEventName"], "PostToolUse")
-        self.assertIn(steer.frame("a real mid-turn message", "operator"), output["additionalContext"])
+        self.assertIn(steer.frame("a real mid-turn message", "operator", "one"), output["additionalContext"])
         self.assertFalse(steer.reclaim(key, "one"), "the delivery log prevents turn-boundary duplication")
         self.assertTrue(list(Path(steer.subject_dir(other), "inbox").glob("*.msg")))
         # No grant of the steer root, another inbox, or the events/state directory.

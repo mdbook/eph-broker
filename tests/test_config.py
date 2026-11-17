@@ -856,7 +856,8 @@ def test_live_fractional_constraints_reach_turn_budget_without_immediate_exhaust
             returncode = 0
 
             def communicate(self, input=None, timeout=None):
-                assert timeout == 0.5 and timeout > 0
+                # Steer polling subtracts elapsed time from the fractional turn budget.
+                assert 0.4 < timeout <= 0.5
                 budgets.append(timeout)
                 return json.dumps({"type": "result", "result": "{}", "session_id": "synthetic"}), ""
 
@@ -864,7 +865,8 @@ def test_live_fractional_constraints_reach_turn_budget_without_immediate_exhaust
                 patch.object(cc.sandbox, "wrap", side_effect=lambda argv, *a, **kw: argv), \
                 patch.object(cc.events, "emit"):
             b.adapter._one_turn(worker, route, "SYS", "{}", resume=False)
-        assert budgets == [0.5] and not worker.hard_killed and worker.turn_wall_clock == 0.5
+        assert len(budgets) == 1 and 0.4 < budgets[0] <= 0.5
+        assert not worker.hard_killed and worker.turn_wall_clock == 0.5
         for cfg in ({"wall_clock_s": 0}, {"wall_clock_s": "nan"}, {"wall_clock_by_capability": {"read": -1}},
                     {"model_prices": {"test": {"input_tokens": -1}}}):
             _reload(b, path, constraints=cfg)

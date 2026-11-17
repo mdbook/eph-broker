@@ -110,13 +110,15 @@ class UI(ViewerTest):
         ui.mkdir()
         (ui / 'view.js').write_text('export function mount(){}')
         (ui / 'app.css').write_text('.ob{}')
+        (ui / 'logo.svg').write_text('<svg/>')
         (ui / 'secret.txt').write_text('nope')
         with patch.dict('os.environ', {'AGENTDIR_HERMES_UI_DIR': str(ui)}):
-            raw = ('GET /hermes-ui/view.js HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n%s\r\n' % identity).encode()
-            sock = Socket(raw)
-            handler(directory, auth=UIAuth(), standalone=True)(sock, '', object())
-            head = sock.output.getvalue().split(b'\r\n\r\n', 1)[0]
-            assert b'Content-Type: text/javascript' in head and b'Cache-Control: no-cache' in head
+            for path, kind in (('view.js', b'text/javascript'), ('app.css', b'text/css'), ('logo.svg', b'image/svg+xml')):
+                raw = ('GET /hermes-ui/%s HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n%s\r\n' % (path, identity)).encode()
+                sock = Socket(raw)
+                handler(directory, auth=UIAuth(), standalone=True)(sock, '', object())
+                head = sock.output.getvalue().split(b'\r\n\r\n', 1)[0]
+                assert b'Content-Type: ' + kind in head and b'Cache-Control: no-cache' in head, head
             assert request(directory, '/hermes-ui/app.css', identity) == (200, b'.ob{}')
             assert request(directory, '/hermes-ui/secret.txt', identity)[0] == 404
             assert request(directory, '/hermes-ui/../web/secret.txt', identity)[0] == 404
@@ -129,7 +131,7 @@ class UI(ViewerTest):
         if not node:
             self.skipTest('node unavailable')
         script = """
-import {parseRoute, makeRoute, viewFetch} from %s;
+import {parseRoute, makeRoute, viewFetch, rowSummary, tailRows} from %s;
 const assert = (c, m) => { if (!c) { console.error('FAIL', m); process.exit(1); } };
 const r = makeRoute('books', 'a/b c', '42');
 assert(JSON.stringify(parseRoute(r)) === JSON.stringify({name: 'books', session: 'a/b c', id: '42'}), r);
@@ -143,6 +145,16 @@ assert(slow.status === 502 && (await slow.json()).error === 'agent offline', 'st
 assert(seen.headers.get('X-Broker-Action') === '1', 'action header');
 const ok = await viewFetch('fine');
 assert(ok.status === 200 && seen.headers.get('X-Broker-Action') === null, 'GET untouched');
+const user = {id: 1, role: 'user', content: 'hi'}, call = {id: 2, role: 'assistant', content: null,
+  tool_calls: [{name: 'terminal'}, {}]}, result = {id: 3, role: 'tool', content: 'up'};
+const said = {id: 4, role: 'assistant', content: 'done'}, img = {id: 5, role: 'user', content: '', images: ['x']};
+assert(JSON.stringify(rowSummary(call, 'books')) === '["tool","terminal, tool"]', 'tool calls');
+assert(rowSummary(result) === null && rowSummary({id: 6, role: 'assistant'}) === null, 'skipped rows');
+assert(rowSummary(said, 'books')[0] === 'books' && rowSummary(img)[1] === '[image]', 'agent and image');
+let tail = tailRows([], [user, call, result], 2);
+assert(tail.map((r) => r.id).join() === '1,2', 'results dropped, order kept');
+tail = tailRows(tail, [{...call, content: 'edited'}, said, img], 3);
+assert(tail.map((r) => r.id).join() === '2,4,5' && tail[0].content === 'edited', 'merge by id, newest n');
 console.log('ok');
 """ % json.dumps((Path(__file__).parent.parent / 'viewer' / 'ui.js').as_uri())
         out = subprocess.run([node, '--input-type=module', '-e', script], capture_output=True, text=True, timeout=60)

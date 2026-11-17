@@ -116,9 +116,11 @@ def handler(directory, agent_api=False, auth=None, standalone=False):
                 entry = dict(directory.entries.get(name) or {})
             adapter = adapters.get(entry.get('kind'))
             if not entry or not entry['view_url'] or 'view' not in entry['caps'] or not hasattr(adapter, 'READ'):
+                self.close_connection = method == 'POST'
                 return self.send(404, {'error': 'agent has no view'})
             body = b''
             if method == 'POST':
+                self.close_connection = True  # a refusal below leaves the body unread on the socket
                 if route not in adapter.ACT:
                     return self.send(404, {'error': 'not found'})
                 if not auth.can_act(self.headers):

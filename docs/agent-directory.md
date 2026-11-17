@@ -70,6 +70,13 @@ first, then the agent with a back link). The address bar follows the pick
 (`#module/agents/NAME`, plus the session and a message id), so links to an agent, a session or
 a message work. A `hermes` agent with a view shows its live view, below.
 
+On the Fleet page, **Quick view** on a listed agent opens a small card: status, kind and the last
+beat (with its local time). For an agent with a view it adds the last five transcript lines
+streaming live, the turn's working state and a one-line composer: **Send** starts a turn, and
+while a turn sent from a view is running, **Stop** ends it and **Steer** passes it the typed text.
+The composer is disabled with a hint for viewers without the broker actions permission or agents
+that did not register `steer`. Closing the card closes its stream, so a tab holds at most one.
+
 ## Hermes agents (plugin)
 
 `viewer/clients/hermes-plugin/agentdir/` is a stdlib Hermes plugin that keeps a gateway listed.

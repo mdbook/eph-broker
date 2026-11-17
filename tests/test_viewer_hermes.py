@@ -188,6 +188,17 @@ class HermesView(ViewerTest):
         assert status == 404
         assert len(Sidecar.seen) == count + 1  # only the read reached the sidecar
 
+    def test_a_refused_post_closes_instead_of_parsing_its_body_as_a_request(self):
+        body = b'{"session":"s1"}'
+        post = (b'POST /api/a/%s/stop HTTP/1.1\r\nHost: localhost\r\nX-Viewer-User: demo\r\nX-Viewer-Can-Act: 0\r\n'
+                b'Content-Type: application/json\r\nContent-Length: %d\r\n\r\n%s')
+        follow = b'GET /api/a/books/rows HTTP/1.1\r\nHost: localhost\r\nX-Viewer-User: demo\r\n\r\n'
+        for name in (b'books', b'nobody'):  # read-only refusal, then an agent with no view
+            sock = Socket(post % (name, len(body), body) + follow)
+            handler(self.directory, auth=UIAuth(header='X-Viewer-User'))(sock, '', object())
+            out = sock.output.getvalue()
+            assert out.count(b'HTTP/1.1 ') == 1 and out.split(b' ', 2)[1] in (b'403', b'404'), out
+
     def test_standalone_ignores_a_client_can_act_header(self):
         raw = (b'POST /api/a/books/say HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic ZGVtbzpwYXNzd29yZA==\r\n'
                b'X-Viewer-Can-Act: 1\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}')

@@ -248,13 +248,176 @@ export function mount(el0, ctx = {}) {
   return cleanup;
 }
 
-export function quickView(el, agentName, ctx = {}) {
-  const line = document.createElement('p');
-  const error = document.createElement('p'); error.setAttribute('role', 'status');
-  el.replaceChildren(line, error);
-  return poller(ctx, (agents) => {
+// Fleet quick view: presence for every agent; a view-capable one adds its last few transcript lines (live over
+// the sidecar's /events), a one-line composer and stop/steer. The broker panel supplies "Open full view".
+const QUICK_ROWS = 5;
+const QUICK_CSS = `
+.aqv{display:grid;gap:8px;color:var(--t1,inherit)}
+.aqv-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.aqv-head b{font-size:15px}
+.aqv-pill{font-size:12px;padding:2px 8px;border-radius:999px;border:1px solid currentColor}
+.aqv-sub{font-size:12px;color:var(--t3,inherit)}
+.aqv-rows{list-style:none;margin:0;padding:8px 10px;display:grid;gap:4px;background:var(--s2,transparent);
+  border-radius:8px;font-size:13px}
+.aqv-rows:empty{display:none}
+.aqv-rows li{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}
+.aqv-who{font-weight:600;margin-right:6px;color:var(--t2,inherit)}
+.aqv-form{display:flex;gap:6px;flex-wrap:wrap}.aqv-form input{flex:1;min-width:160px}`;
+
+// One transcript row as [who, text], or null for rows not worth a quick-view line (tool results, empty steps).
+export function rowSummary(row, agentName) {
+  if (!row || typeof row !== 'object') return null;
+  const calls = Array.isArray(row.tool_calls) ? row.tool_calls : [];
+  const images = Array.isArray(row.images) ? row.images.length : 0;
+  let line = null;
+  if (row.role === 'user') line = [row.sender || 'user', row.content || (images ? '[image]' : '')];
+  else if (row.role === 'assistant') {
+    if (row.content) line = [agentName || 'agent', row.content];
+    else if (calls.length) line = ['tool', calls.map((c) => (c && c.name) || 'tool').join(', ')];
+    else if (row.reasoning) line = ['thinking', row.reasoning];
+  }
+  return line && line[1] ? [String(line[0]), String(line[1])] : null;
+}
+
+// Merge rows by id (a re-sent row replaces the old copy) and keep the newest `n` that have a summary.
+export function tailRows(have, more, n = QUICK_ROWS) {
+  const byId = new Map(have.map((r) => [r.id, r]));
+  for (const r of more || []) if (r && Number.isFinite(r.id) && rowSummary(r)) byId.set(r.id, r);
+  return [...byId.values()].sort((a, b) => a.id - b.id).slice(-n);
+}
+
+const clock = (ms) => new Date(ms).toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'});
+const beatText = (age) => 'last beat ' + ago(age) + ' (' + clock(Date.now() - age * 1000) + ')';
+
+export function quickView(el0, agentName, ctx = {}) {
+  const base = ctx.baseUrl || '/';
+  const api = base + 'api/a/' + encodeURIComponent(agentName) + '/';
+  const wrap = el('div', 'aqv'), head = el('div', 'aqv-head');
+  const pill = el('span', 'aqv-pill'), beat = el('span', 'aqv-sub'), kind = el('span', 'aqv-sub');
+  head.append(el('b', null, agentName), kind, pill, beat);
+  const rowsEl = el('ol', 'aqv-rows'); rowsEl.setAttribute('aria-live', 'polite');
+  // Presence errors (the poller clears its own on every success) and action/stream errors stay separate.
+  const live = el('p', 'aqv-sub'), error = el('p', 'aqv-sub'), note = el('p', 'aqv-sub');
+  error.setAttribute('role', 'status'); note.setAttribute('role', 'status');
+  const form = el('form', 'aqv-form'), input = el('input');
+  input.type = 'text'; input.maxLength = 8000; input.setAttribute('aria-label', 'Message ' + agentName);
+  input.placeholder = 'Message ' + agentName + '…';
+  const send = el('button', 'btn', 'Send'), steer = el('button', 'btn', 'Steer'), stopB = el('button', 'btn', 'Stop');
+  send.type = 'submit'; steer.type = 'button'; stopB.type = 'button';
+  form.append(input, send, steer, stopB); form.hidden = true;
+  wrap.append(head, rowsEl, live, form, note, error);
+  el0.replaceChildren(el('style', null, QUICK_CSS), wrap);
+
+  let stopped = false, started = false, es = null, session = null, rows = [], running = false, canAct = false,
+    busyPost = false;
+  const controller = new AbortController();
+
+  function paintControls() {
+    for (const b of [send, steer, stopB, input]) b.disabled = !canAct || busyPost;
+    steer.hidden = stopB.hidden = !running;
+    send.title = steer.title = stopB.title = input.title = canAct ? '' : ctx.canAct
+      ? agentName + ' does not accept messages from here.'
+      : 'Read-only: sending needs the broker actions permission.';
+  }
+
+  function paintRows() {
+    rowsEl.replaceChildren(...rows.map((r) => {
+      const [who, text] = rowSummary(r, agentName), li = el('li');
+      li.append(el('span', 'aqv-who', who), document.createTextNode(text));
+      return li;
+    }));
+  }
+
+  function onFrame(p) {
+    if (!p || typeof p !== 'object') return;
+    rows = tailRows(rows, p.rows); paintRows();
+    const run = p.live && !p.live.ended ? p.live : null;
+    running = !!(run && run.run_id && (run.status === 'running' || run.status === 'starting'));
+    const busy = !!(p.waiting || run);
+    pill.textContent = p.compacting ? 'compacting' : busy ? 'busy' : 'idle';
+    pill.style.color = busy ? 'var(--run,inherit)' : 'var(--t2,inherit)';
+    live.textContent = run ? 'Working' + (run.stage ? ': ' + run.stage : run.tool ? ': ' + run.tool : '') + '…'
+      : p.waiting ? 'Working: ' + (p.phase || 'model') + (Number.isFinite(p.since_ts) ? ' since ' + clock(p.since_ts * 1000) : '') : '';
+    paintControls();
+  }
+
+  async function backfill() {
+    const before = rows.length ? '&before=' + rows[0].id : '';
+    try {
+      const r = await viewFetch(api + 'earlier?limit=20&session=' + encodeURIComponent(session) + before,
+        {signal: controller.signal});
+      if (r.ok && !stopped) { rows = tailRows(rows, (await r.json()).rows); paintRows(); }
+    } catch (e) { /* the stream still shows new rows */ }
+  }
+
+  async function startStream() {
+    try {
+      const r = await viewFetch(api + 'cfg', {signal: controller.signal});
+      const cfg = await r.json();
+      if (!r.ok) throw new Error(cfg.error || 'HTTP ' + r.status);
+      if (stopped) return;
+      session = cfg.session && cfg.session !== '*' ? cfg.session : cfg.main;
+      if (!session) { live.textContent = agentName + ' has no session yet.'; return; }
+      form.hidden = false; paintControls();
+      let first = true;
+      es = new EventSource(api + 'events?session=' + encodeURIComponent(session), {withCredentials: true});
+      es.onmessage = (m) => {
+        let p; try { p = JSON.parse(m.data); } catch (e) { return; }
+        note.textContent = '';
+        onFrame(p);
+        if (first) { first = false; if (rows.length < QUICK_ROWS) backfill(); }
+      };
+      es.onerror = () => { if (!stopped) note.textContent = 'Reconnecting to ' + agentName + '…'; };
+    } catch (err) {
+      if (!stopped) live.textContent = 'Live view unavailable: ' + err.message;
+    }
+  }
+
+  async function post(route, body) {
+    busyPost = true; paintControls();
+    try {
+      const r = await viewFetch(api + route, {method: 'POST', signal: controller.signal,
+        headers: {'Content-Type': 'application/json'}, body: JSON.stringify({session, ...body})});
+      let j = {}; try { j = await r.json(); } catch (e) { j = {}; }
+      if (!r.ok) throw new Error(j.error || 'HTTP ' + r.status);
+      note.textContent = '';
+      return true;
+    } catch (err) {
+      if (!stopped) note.textContent = 'Could not ' + route + ': ' + err.message;
+      return false;
+    } finally { busyPost = false; if (!stopped) paintControls(); }
+  }
+
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const message = input.value.trim();
+    if (message && await post('say', {message})) input.value = '';
+  };
+  steer.onclick = async () => {
+    const message = input.value.trim();
+    if (!message) { note.textContent = 'Type the steer message first.'; return; }
+    if (await post('steer', {message})) input.value = '';
+  };
+  stopB.onclick = () => post('stop', {});
+
+  const stopPoll = poller(ctx, (agents) => {
     const agent = agents.find((a) => a.name === agentName);
-    if (!agent) { line.textContent = agentName + ' is not registered.'; return; }
-    line.textContent = agent.kind + ', ' + agent.status + ', last beat ' + ago(agent.age);
+    if (!agent) { pill.textContent = 'gone'; beat.textContent = ''; kind.textContent = agentName + ' is not registered.'; return; }
+    kind.textContent = agent.kind;
+    beat.textContent = beatText(agent.age);
+    canAct = !!(ctx.canAct && agent.can_steer);
+    if (!agent.can_view) {
+      pill.textContent = agent.status; pill.style.color = STATUS_COLOR[agent.status] || 'inherit';
+      return;
+    }
+    if (!started) { started = true; startStream(); }
+    paintControls();
   }, error);
+
+  const cleanup = () => {
+    if (stopped) return;
+    stopped = true; stopPoll(); controller.abort();
+    if (es) { es.close(); es = null; }
+  };
+  if (ctx.signal) ctx.signal.addEventListener('abort', cleanup);
+  return cleanup;
 }

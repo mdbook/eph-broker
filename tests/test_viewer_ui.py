@@ -261,7 +261,7 @@ class UI(ViewerTest):
         if not node:
             self.skipTest('node unavailable')
         script = """
-import {parseRoute, makeRoute, viewFetch, rowSummary, tailRows} from %s;
+import {parseRoute, makeRoute, viewFetch, rowSummary, tailRows, plainText} from %s;
 const assert = (c, m) => { if (!c) { console.error('FAIL', m); process.exit(1); } };
 const r = makeRoute('books', 'a/b c', '42');
 assert(JSON.stringify(parseRoute(r)) === JSON.stringify({name: 'books', session: 'a/b c', id: '42'}), r);
@@ -281,6 +281,9 @@ const said = {id: 4, role: 'assistant', content: 'done'}, img = {id: 5, role: 'u
 assert(JSON.stringify(rowSummary(call, 'books')) === '["tool","terminal, tool"]', 'tool calls');
 assert(rowSummary(result) === null && rowSummary({id: 6, role: 'assistant'}) === null, 'skipped rows');
 assert(rowSummary(said, 'books')[0] === 'books' && rowSummary(img)[1] === '[image]', 'agent and image');
+const md = {id: 7, role: 'assistant', content: 'See **[#12](https://x.test/t/12)**, `cmd` and __this__; [a] (b) stays'};
+assert(rowSummary(md, 'books')[1] === 'See #12, cmd and this; [a] (b) stays', 'markdown to plain text');
+assert(plainText('[x](javascript:alert(1)) 2**3') === 'x) 2**3', 'label kept, nothing rendered');
 let tail = tailRows([], [user, call, result], 2);
 assert(tail.map((r) => r.id).join() === '1,2', 'results dropped, order kept');
 tail = tailRows(tail, [{...call, content: 'edited'}, said, img], 3);

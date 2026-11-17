@@ -3416,7 +3416,9 @@ def module_page(modules):
         return PAGE
     config = json.dumps(modules).replace("<", "\\u003c").replace("&", "\\u0026")
     page = PAGE.replace("function route(){\n", "function route(){\n  if(moduleRoute()) return;\n")
-    page = page.replace("</style>", "@media (max-width:720px){"
+    # A compact button beside the agent name, so it does not crowd the name or push the role line down.
+    page = page.replace("</style>", ".ag .an [data-quick-module]{height:26px;min-width:0;padding:0 10px;margin-left:10px;"
+                        "font-size:12.5px;vertical-align:1px}\n@media (max-width:720px){"
                         + ".tbl td [data-quick-module]{display:inline-flex}}\n</style>")
     page = page.replace("function toggleAgent(e){\n",
                         "function toggleAgent(e){\n  if(e.target.closest('[data-quick-module]')) return;\n")

@@ -537,6 +537,7 @@ def test_dashboard_module_shell_and_fleet_contract():
     assert "new Date(s.since * 1000).toLocaleString()" in page
     assert "function paintModuleSettings()" in page and "Disable or enable" in page
     assert ".tbl td [data-quick-module]{display:inline-flex}" in page
+    assert ".ag .an [data-quick-module]{height:26px" in page
 
 
 def test_viewer_import_failure_retries_with_backoff_and_fresh_url():

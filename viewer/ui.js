@@ -281,7 +281,13 @@ export function rowSummary(row, agentName) {
     else if (calls.length) line = ['tool', calls.map((c) => (c && c.name) || 'tool').join(', ')];
     else if (row.reasoning) line = ['thinking', row.reasoning];
   }
-  return line && line[1] ? [String(line[0]), String(line[1])] : null;
+  return line && line[1] ? [String(line[0]), plainText(line[1])] : null;
+}
+
+// The quick view prints text, not markdown: keep link labels and drop **bold**, __bold__ and `code` markers.
+export function plainText(s) {
+  return String(s).replace(/\[([^\]\n]+)\]\([^)\s]+\)/g, '$1')
+    .replace(/\*\*([^*\n]+)\*\*|__([^_\n]+)__|`([^`\n]+)`/g, (m, a, b, c) => a || b || c);
 }
 
 // Merge rows by id (a re-sent row replaces the old copy) and keep the newest `n` that have a summary.

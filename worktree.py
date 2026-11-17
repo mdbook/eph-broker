@@ -46,12 +46,108 @@ def _safe(key):
     return re.sub(r"[^A-Za-z0-9._-]", "_", key)
 
 
-def _ci_skip_opts():
-    """With REPO_INFER_ENABLED on, worker branches can land in any catalog repo,
-    and a worker can edit .gitlab-ci.yml, so its push carries `-o ci.skip`. Flag off: plain push, CI runs as
-    before (the allowlisted repos keep their MR test results)."""
+def _ci_skip_opts(base_repo=None, path=None, base_ref=None, push_url=None):
+    """With inference on, skip CI unless an allowlisted MR leaves the target's CI config unchanged.
+    Resolve the entrypoint from live GitLab project metadata, then check the whole MR, including earlier
+    fix rounds and recursively included local files. Unknown/external entrypoints or dependencies,
+    YAML/git errors, and WIP pushes without an MR target keep
+    `-o ci.skip`. Flag off: plain push, exactly as before. Never read the worker's uncommitted files."""
     import routing
-    return ["-o", "ci.skip"] if routing.repo_infer_enabled() else []
+    if not routing.repo_infer_enabled():
+        return []
+    skip = ["-o", "ci.skip"]
+    if not (base_repo and path and base_ref and push_url):
+        return skip
+    import cd
+    import urllib.parse
+    project = urllib.parse.unquote(urllib.parse.urlsplit(push_url).path).strip("/")
+    project = project[:-4] if project.endswith(".git") else project
+    if base_repo not in routing.CODE_REPO_ALLOWLIST and not cd.repo_allowed(project):
+        return skip
+    import repo_catalog
+    if urllib.parse.urlsplit(push_url).netloc != repo_catalog.GITLAB_HOST:
+        return skip   # metadata from a different GitLab instance proves nothing about this push
+    try:
+        entrypoint = repo_catalog.ci_config_path(project)
+        return [] if _ci_config_unchanged(path, base_ref, entrypoint) else skip
+    except (OSError, ValueError, subprocess.CalledProcessError) as e:
+        log.warning("ci skip: cannot establish unchanged CI config (%s) -> skip", type(e).__name__)
+        return skip
+
+
+def _ci_config_unchanged(path, base_ref, entrypoint):
+    """Fail closed on anything we cannot resolve locally. Includes are relative to the repo root,
+    even when nested. Inspect committed blobs at the merge base, never checkout files or symlinks.
+    Remote/project/component includes can themselves include local files, so they are unknown too."""
+    import fnmatch
+    from site_env import _yaml_load, BrokerConfigError
+    if (not isinstance(entrypoint, str) or not entrypoint or
+            any(c in entrypoint for c in ("@", ":", "$", "\\", "*", "?", "[", "]"))):
+        return False   # unknown, external (path@project or URL), or dynamic entrypoint
+    entrypoint = entrypoint.lstrip("/")
+    if not entrypoint or any(p in ("", ".", "..") for p in entrypoint.split("/")):
+        return False
+    env = _wt_env(path)
+    def git(*args):
+        # _git strips stdout, which would corrupt a first changed path starting with whitespace.
+        return subprocess.run(_wt_argv(path, *args), check=True, capture_output=True, text=True, env=env).stdout
+    base = _git(path, "merge-base", base_ref, "HEAD", env=env)
+    if not _SHA_RE.fullmatch(base):
+        return False
+    changed = set(git("diff", *_NO_EXT_DIFF, *_SUBMODULE_VISIBLE, "--no-renames", "--name-only", "-z",
+                      base, "HEAD", "--").split("\0")) - {""}
+    entries = git("ls-tree", "-r", "-z", "--full-tree", base).split("\0")
+    files = {}
+    for entry in filter(None, entries):
+        meta, name = entry.split("\t", 1)
+        files[name] = meta.split()[0]
+    pending, seen = [entrypoint], set()
+    while pending:
+        name = pending.pop()
+        if name in changed:
+            return False
+        if name in seen:
+            continue
+        seen.add(name)
+        if len(seen) > 150 or files.get(name) not in ("100644", "100755"):
+            return False
+        try:
+            doc = _yaml_load(git("show", f"{base}:{name}")) or {}
+        except BrokerConfigError:
+            # PyYAML is optional; absent, invalid or unsupported YAML must not loosen the guard.
+            return False
+        if not isinstance(doc, dict):
+            return False
+        # Child-pipeline trigger:include is CI too, not just the top-level include list.
+        nodes, visited, includes = [doc], set(), []
+        while nodes:
+            node = nodes.pop()
+            if id(node) in visited:
+                continue
+            visited.add(id(node))
+            if isinstance(node, dict):
+                inc = node.get("include", [])
+                includes.extend(inc if isinstance(inc, list) else [inc])
+                nodes.extend(node.values())
+            elif isinstance(node, list):
+                nodes.extend(node)
+        for inc in includes:
+            if isinstance(inc, dict) and set(inc) <= {"local", "rules", "inputs"}:
+                inc = inc.get("local")
+            if not isinstance(inc, str) or not inc or "$" in inc or "://" in inc:
+                return False
+            pattern = inc.lstrip("/")
+            # Reject ambiguous/dynamic patterns; fnmatch's * overmatches directories, which is safe.
+            if any(p in (".", "..") for p in pattern.split("/")) or any(c in pattern for c in "{}[]()\\"):
+                return False
+            pattern = pattern.replace("**/", "*")   # also cover ** matching zero directory levels
+            if any(fnmatch.fnmatchcase(p, pattern) for p in changed):
+                return False
+            matches = [p for p in files if fnmatch.fnmatchcase(p, pattern)]
+            if not matches:
+                return False
+            pending.extend(matches)
+    return True
 
 
 def _push_cred_args(base_repo):
@@ -539,7 +635,7 @@ class WorktreeManager:
                 raise RuntimeError(f"wiki publish rebase conflict key={key}: {rb.stderr.strip()}")
         raise RuntimeError(f"wiki publish key={key}: push still rejected after {retries} rebase-retries")
 
-    def publish_iteration(self, key, branch):
+    def publish_iteration(self, key, branch, *, mr_target_ref=None):
         """Fast-forward an EXISTING broker MR branch. Never create, overwrite, rebase or open an MR."""
         import routing
         refusal = routing.mr_iteration_refusal(branch)
@@ -560,7 +656,8 @@ class WorktreeManager:
         # Bind the update to the exact fetched tip, not a mutable remote-tracking ref. An ordinary
         # push could recreate a branch deleted after fetch, or overwrite a concurrent rewind. The
         # lease rejects BOTH; the ancestry check above still forbids non-fast-forward updates.
-        r = subprocess.run(_wt_argv(path, *cred, "push", *_ci_skip_opts(),
+        ci = _ci_skip_opts(repo, path, f"refs/remotes/origin/{mr_target_ref}" if mr_target_ref else None, push_url)
+        r = subprocess.run(_wt_argv(path, *cred, "push", *ci,
                                     f"--force-with-lease=refs/heads/{branch}:{fetched}", push_url,
                                     f"HEAD:refs/heads/{branch}"), capture_output=True, text=True, env=env)
         if r.returncode != 0:
@@ -599,7 +696,8 @@ class WorktreeManager:
         assert branch != mr_target_ref and not mr_target_ref.endswith(f"/{branch}"), \
             f"refusing to publish onto the MR target ref {mr_target_ref!r} (code MRs push a feature branch only)"
         push_url = _gitlab_push_url(path, remote)        # fail closed unless https://<BROKER_PUSH_HOSTS>/
-        r = subprocess.run(_wt_argv(path, *_wt_cred_args(repo), "push", *_ci_skip_opts(), push_url,
+        ci = _ci_skip_opts(repo, path, f"refs/remotes/{remote}/{mr_target_ref}", push_url)
+        r = subprocess.run(_wt_argv(path, *_wt_cred_args(repo), "push", *ci, push_url,
                                     f"HEAD:refs/heads/{branch}"), capture_output=True, text=True, env=env)
         if r.returncode != 0:
             raise RuntimeError(f"code publish_mr key={key}: feature-branch push failed: {r.stderr.strip()}")

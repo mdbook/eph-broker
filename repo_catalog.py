@@ -166,6 +166,29 @@ class Catalog:
 
 
 # ---------------------------------------------------------------- listing + cache
+def ci_config_path(project):
+    """Read the effective CI entrypoint from GitLab, never from a worker checkout or stale catalog.
+    None means unknown; an explicit null/empty setting means GitLab's default entrypoint.
+    Fetch at push time so a changed project setting cannot leave an old entrypoint trusted."""
+    token = os.getenv(GITLAB_TOKEN_ENV)
+    if not GITLAB_API or not token:
+        return None
+    pid = urllib.parse.quote(project, safe="")
+    req = urllib.request.Request(f"{GITLAB_API}/projects/{pid}", headers={"PRIVATE-TOKEN": token})
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as r:
+            data = json.loads(r.read())
+        if not isinstance(data, dict) or "ci_config_path" not in data:
+            return None
+        value = data["ci_config_path"]
+        if value is None or value == "":
+            return ".gitlab-ci.yml"
+        return value if isinstance(value, str) else None
+    except (OSError, ValueError):
+        log.warning("ci config: cannot read project metadata -> skip CI")
+        return None
+
+
 def _gitlab_list(token, ns=CATALOG_NS, max_pages=20):
     out = []
     for page in range(1, max_pages + 1):

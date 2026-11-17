@@ -48,6 +48,29 @@ credential, the ticket parks (it gets the `PARKED_LABEL_ID` label). A repo count
 credential store has a line for exactly that repo's path, as above. A local checkout with an ssh origin also
 passes this check, but the push itself is then refused (see above), so give every checkout an https origin.
 
+### Worker CI with inference enabled
+
+With `REPO_INFER_ENABLED=1`, worker MR pushes omit `-o ci.skip` only when the checkout is on
+`CODE_REPO_ALLOWLIST` or the push destination (`ns/name`) is on `CD_REPO_ALLOWLIST`, and the entire MR leaves
+CI config unchanged. The broker compares committed blobs against the merge base with the MR target,
+including earlier changes on continued branches and MR-comment iterations. Uncommitted files do not count.
+
+The broker fetches the project's `ci_config_path` from the trusted GitLab API at push time, not from the
+worker tree or a stale catalog. An explicit null/empty setting selects `.gitlab-ci.yml`; missing metadata,
+an unreadable/missing entrypoint, or an external entrypoint (`path@group/project` or a URL) keeps `ci.skip`.
+An unused root `.gitlab-ci.yml` does not protect a custom entrypoint.
+The protected config is that entrypoint plus recursively included local files, including glob matches and
+child-pipeline `trigger:include` files. Changes, additions, deletions or renames of those files keep
+`ci.skip`. Conditional includes are checked regardless of their rules. Remote/project/component/artifact
+includes, variable paths, unsupported patterns, symlinks, unreadable git data or YAML that cannot be parsed
+also keep `ci.skip`: the broker cannot prove their local dependencies unchanged. Parsing uses the existing
+optional PyYAML loader; without PyYAML, existing CI configs keep `ci.skip`.
+
+Inferred repos on neither allowlist and incomplete WIP pushes still carry `ci.skip`. With inference off,
+pushes are unchanged and do not add it. This pre-push guard lets trusted, unchanged CI run before review
+without executing worker-edited CI config. CD still requires reviewer PASS and a green pipeline; it does not
+create a pipeline after review. If CI was skipped, a human must review the config and arrange a pipeline.
+
 ### One token for the whole namespace
 
 - `REPO_PUSH_BROAD_CRED_ENABLED` (default **off**; `1`/`true`/`yes`/`on` turns it on, the same parsing as the

@@ -4245,7 +4245,8 @@ def test_worker_prompt_file_access():
     """Workers describe harness tools and optional repo standards, in site and public renders."""
     rp = _load_render_module()
     root = pathlib.Path(ROOT)
-    standards_workers = {"code/change-proposer", "mr-review/agent", "mr-review/quick"}
+    signed_workers = {"code/change-proposer", "mr-review/agent", "mr-review/quick"}
+    standards_workers = set(signed_workers)
     loader = PromptLoader(str(root / "prompts"), str(root / "approved-prompts.json"))
     guidance = (root / "modules/capabilities/file-access.md").read_text(encoding="utf-8").rstrip("\n")
     manifests = sorted((root / "workers").rglob("*.json"))
@@ -4257,7 +4258,7 @@ def test_worker_prompt_file_access():
             out, rendered = rp.render(mf)
             assert rendered == out.read_text(encoding="utf-8"), out
             key = mf.relative_to(root / "workers").with_suffix("").as_posix()
-            if key in standards_workers:
+            if key in signed_workers:
                 assert loader.load(mf.stem, mf.parent.name) == rendered, key
             renders.append((mf, rendered))
             # Copy only generic modules: site overrides must not be needed for the fix.
@@ -15986,7 +15987,7 @@ def test_publish_mr_and_save_wip_use_ci_skip():
         off = [c for c in calls if "push" in c]
         assert len(off) == 2 and all("-o" not in c and "ci.skip" not in c for c in off), off
         calls.clear()
-        with _Env(REPO_INFER_ENABLED="1"):
+        with _Env(REPO_INFER_ENABLED="1", CD_REPO_ALLOWLIST=""), patch("routing.CODE_REPO_ALLOWLIST", set()):
             branch = wm.publish_mr("vikunja:task:7", branch_prefix="eph/code-change", mr_target_ref="main")
             wm.save_wip("vikunja:task:7")
         try:
@@ -16003,8 +16004,224 @@ def test_publish_mr_and_save_wip_use_ci_skip():
         assert p[i + 1:i + 3] == ["-o", "ci.skip"] and p[i + 3] == _GL_PUSH_URL, p
         assert ":main" not in p[-1] and p[-1].startswith("HEAD:refs/heads/eph/"), p
     assert branch.startswith("eph/code-change/")
-    ok("worker-branch pushes (publish_mr + save_wip) carry `-o ci.skip` only with REPO_INFER_ENABLED=1 "
+    ok("inferred non-allowlisted pushes (publish_mr + save_wip) carry `-o ci.skip` with REPO_INFER_ENABLED=1 "
        "(flag off = plain push); never-push-target assert intact")
+
+
+def test_ci_skip_allowlist_and_fail_closed():
+    import worktree as W
+    import routing as RT
+    repo, path, target = "/synthetic/repo", "/synthetic/worker", "refs/remotes/origin/main"
+    with _Env(REPO_INFER_ENABLED="1", CD_REPO_ALLOWLIST=""), \
+            patch.object(RT, "CODE_REPO_ALLOWLIST", {repo}), \
+            patch("repo_catalog.ci_config_path", return_value=".gitlab-ci.yml") as metadata, \
+            patch.object(W, "_ci_config_unchanged", return_value=True) as check:
+        assert W._ci_skip_opts(repo, path, target, _GL_PUSH_URL) == []
+        check.assert_called_once_with(path, target, ".gitlab-ci.yml")
+        metadata.assert_called_once_with("owner/sample-app")
+        check.reset_mock()
+        assert W._ci_skip_opts("/unlisted", path, target, _GL_PUSH_URL) == ["-o", "ci.skip"]
+        assert not check.called
+        project = _GL_PUSH_URL.split("/", 3)[-1].removesuffix(".git")
+        with _Env(CD_REPO_ALLOWLIST=project.upper()):
+            assert W._ci_skip_opts("/unlisted", path, target, _GL_PUSH_URL) == []
+        check.return_value = False
+        assert W._ci_skip_opts(repo, path, target, _GL_PUSH_URL) == ["-o", "ci.skip"]
+        check.side_effect = subprocess.CalledProcessError(128, "git")
+        assert W._ci_skip_opts(repo, path, target, _GL_PUSH_URL) == ["-o", "ci.skip"]
+        check.reset_mock()
+        assert W._ci_skip_opts() == ["-o", "ci.skip"]   # WIP has no MR target
+        with _Env(REPO_INFER_ENABLED="0"):
+            assert W._ci_skip_opts(repo, path, target, _GL_PUSH_URL) == []
+        assert not check.called
+    ok("CI runs for CODE/CD-allowlisted unchanged configs only; inference-only/unknown/WIP skip; flag off unchanged")
+
+
+def test_ci_skip_committed_recursive_local_configs():
+    import worktree as W
+    import routing as RT
+    # JSON is valid YAML; inject its stdlib parser so the optional PyYAML package is not a test dependency.
+    # Exercise real git diffs/blobs, including whitespace names, glob additions, and previous fix rounds.
+    root = {"include": [{"local": "/ci/jobs.yml"}],
+            "child": {"trigger": {"include": [{"local": "ci/child.yml"}]}}}
+    files = {".gitlab-ci.yml": json.dumps(root),
+             "ci/jobs.yml": json.dumps({"include": [{"local": "ci/nested/**/*.ci"}, " leading.ci"]}),
+             "ci/nested/test.ci": "{}", "ci/child.yml": "{}", " leading.ci": "{}", "app.py": "base\n"}
+    cases = [("app.py", "code\n", True), (".gitlab-ci.yml", "{}", False),
+             ("ci/jobs.yml", "{}", False), ("ci/nested/test.ci", '{"test": {}}', False),
+             ("ci/nested/new.ci", "{}", False), ("ci/child.yml", '{"test": {}}', False),
+             ("ci/nested/test.ci", None, False), (" leading.ci", '{"test": {}}', False),
+             ("docs.md", "docs\n", True)]
+    for changed, content, allowed in cases:
+        with _mr_note_tempdir() as d:
+            def git(*args):
+                return subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+                                       "-c", "user.name=test", "-c", "user.email=test@example.com", "-C", d, *args],
+                                      check=True, capture_output=True, text=True,
+                                      env={**os.environ, "GIT_CONFIG_GLOBAL": os.devnull,
+                                           "GIT_CONFIG_NOSYSTEM": "1"}).stdout.strip()
+            git("init", "-q")
+            for name, text in files.items():
+                p = pathlib.Path(d, name)
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(text)
+            git("add", "."); git("commit", "-qm", "base")
+            git("update-ref", "refs/remotes/origin/main", "HEAD")
+            if content is None:
+                pathlib.Path(d, changed).unlink()
+            else:
+                pathlib.Path(d, changed).write_text(content)
+            git("add", "."); git("commit", "-qm", "worker change")
+            with _Env(REPO_INFER_ENABLED="1", CD_REPO_ALLOWLIST=""), \
+                    patch.object(RT, "CODE_REPO_ALLOWLIST", {d}), \
+                    patch("repo_catalog.ci_config_path", return_value=".gitlab-ci.yml"), \
+                    patch.object(site_env, "_yaml_load", side_effect=json.loads):
+                args = (d, d, "refs/remotes/origin/main", _GL_PUSH_URL)
+                assert W._ci_skip_opts(*args) == ([] if allowed else ["-o", "ci.skip"]), changed
+                # Dirty CI edits do not change what this push executes.
+                pathlib.Path(d, ".gitlab-ci.yml").write_text("uncommitted: [invalid")
+                assert W._ci_skip_opts(*args) == ([] if allowed else ["-o", "ci.skip"]), changed
+                # A later code-only fix round must not bless an earlier CI edit.
+                pathlib.Path(d, "app.py").write_text("next round\n")
+                git("add", "app.py"); git("commit", "-qm", "fix round")
+                assert W._ci_skip_opts(*args) == ([] if allowed else ["-o", "ci.skip"]), changed
+    ok("real git: recursive/glob/child CI edits, additions and deletions skip across fix rounds; code/docs run CI")
+
+
+def test_ci_skip_effective_project_entrypoint():
+    import worktree as W
+    import routing as RT
+    import repo_catalog as RC
+    # Real git, and real metadata decoding through a fake HTTP boundary. The unused root must not
+    # hide edits to the custom entrypoint, and custom includes must get the same recursive protection.
+    class Resp:
+        def __init__(self, data): self.data = data
+        def read(self): return json.dumps(self.data).encode()
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+    for unused_root in (False, True):
+        with _mr_note_tempdir() as d:
+            def git(*args):
+                return subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+                                       "-c", "user.name=test", "-c", "user.email=test@example.com", "-C", d, *args],
+                                      check=True, capture_output=True, text=True,
+                                      env={**os.environ, "GIT_CONFIG_GLOBAL": os.devnull,
+                                           "GIT_CONFIG_NOSYSTEM": "1"}).stdout.strip()
+            git("init", "-q")
+            pathlib.Path(d, "ci").mkdir()
+            pathlib.Path(d, "ci/pipeline.yml").write_text(json.dumps({"include": {"local": "ci/jobs.yml"}}))
+            pathlib.Path(d, "ci/jobs.yml").write_text("{}")
+            pathlib.Path(d, "app.py").write_text("base\n")
+            if unused_root:
+                pathlib.Path(d, ".gitlab-ci.yml").write_text("{}")
+            git("add", "."); git("commit", "-qm", "base")
+            git("update-ref", "refs/remotes/origin/main", "HEAD")
+            pathlib.Path(d, "app.py").write_text("worker change\n")
+            git("add", "."); git("commit", "-qm", "code only")
+            data = {"ci_config_path": "ci/pipeline.yml"}
+            def urlopen(req, timeout=None):
+                assert req.full_url == RC.GITLAB_API + "/projects/owner%2Fsample-app"
+                return Resp(data)
+            with _Env(REPO_INFER_ENABLED="1", CD_REPO_ALLOWLIST="", GITLAB_MR_TOKEN="SENTINEL-9400"), \
+                    patch.object(RT, "CODE_REPO_ALLOWLIST", {d}), \
+                    patch.object(RC.urllib.request, "urlopen", side_effect=urlopen), \
+                    patch.object(site_env, "_yaml_load", side_effect=json.loads):
+                args = (d, d, "refs/remotes/origin/main", _GL_PUSH_URL)
+                assert W._ci_skip_opts(*args) == []
+                # Unknown metadata (including old/incomplete API responses) must not mean default.
+                for value in ({}, {"ci_config_path": 42}, {"ci_config_path": "ci/pipeline.yml@group/project"},
+                              {"ci_config_path": "https://example.com/pipeline.yml"},
+                              {"ci_config_path": "missing.yml"}, {"ci_config_path": "$CI_FILE"}):
+                    data = value
+                    assert W._ci_skip_opts(*args) == ["-o", "ci.skip"], value
+                # Explicit default retains normal root-file behavior, but absence is not safe.
+                for setting in (None, "", ".gitlab-ci.yml"):
+                    data = {"ci_config_path": setting}
+                    assert W._ci_skip_opts(*args) == ([] if unused_root else ["-o", "ci.skip"])
+                data = {"ci_config_path": "ci/pipeline.yml"}
+                pathlib.Path(d, "ci/jobs.yml").write_text('{"job": {}}')
+                git("add", "."); git("commit", "-qm", "included CI edit")
+                assert W._ci_skip_opts(*args) == ["-o", "ci.skip"]
+                # Restore the include to isolate an entrypoint-only edit in the full MR diff.
+                pathlib.Path(d, "ci/jobs.yml").write_text("{}")
+                pathlib.Path(d, "ci/pipeline.yml").write_text('{"worker_job": {}}')
+                git("add", "."); git("commit", "-qm", "custom entrypoint edit")
+                assert W._ci_skip_opts(*args) == ["-o", "ci.skip"]
+                # Pointing the live project at a previously unused root still uses that root's closure.
+                if unused_root:
+                    data = {"ci_config_path": None}
+                    assert W._ci_skip_opts(*args) == []
+    ok("real git: trusted live custom/default entrypoints and local includes protected, with/without unused root; "
+       "unknown, external and missing entrypoints skip CI")
+
+
+def test_ci_entrypoint_metadata_fail_closed():
+    import repo_catalog as RC
+    with _Env(GITLAB_MR_TOKEN=None), patch.object(RC.urllib.request, "urlopen") as request:
+        assert RC.ci_config_path("owner/sample-app") is None
+        assert not request.called
+    with _Env(GITLAB_MR_TOKEN="SENTINEL-9400"), \
+            patch.object(RC.urllib.request, "urlopen", side_effect=OSError("unavailable")):
+        assert RC.ci_config_path("owner/sample-app") is None
+    ok("missing token or unreadable GitLab project metadata never guesses a CI entrypoint")
+
+
+def test_ci_skip_publish_paths_use_full_mr_target():
+    import worktree as W
+    import routing as RT
+    from types import SimpleNamespace
+    repo, key = "/srv/git/sample-app", "vikunja:task:9400"
+    wm = WorktreeManager(repo, "/synthetic/worktrees")
+    _seed_made(wm, key, repo)
+    branch = "eph/code-change/task-9400-abcd1234"
+    def git(path, *args, **kw):
+        return "b" * 40 if args[:1] == ("rev-parse",) else ""
+    with _Env(REPO_INFER_ENABLED="1"), patch.object(RT, "CODE_REPO_ALLOWLIST", {repo}), \
+            patch.object(W, "_git", side_effect=git), patch.object(W, "_gitlab_push_url", return_value=_GL_PUSH_URL), \
+            patch.object(W, "_wt_cred_args", return_value=[]), \
+            patch("repo_catalog.ci_config_path", return_value=".gitlab-ci.yml"), \
+            patch.object(W, "_ci_config_unchanged", return_value=True) as check, \
+            patch.object(W.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")) as run:
+        wm.publish_mr(key)
+        wm.publish_mr(key, continue_branch=branch)
+        wm.publish_iteration(key, branch, mr_target_ref="main")
+        wm.save_wip(key)
+        pushes = [c.args[0] for c in run.call_args_list if "push" in c.args[0]]
+        assert len(pushes) == 4 and all("ci.skip" not in p for p in pushes[:3]), pushes
+        assert "ci.skip" in pushes[3], pushes
+        assert check.call_count == 3
+        assert all(c.args[1] == "refs/remotes/origin/main" for c in check.call_args_list)
+    ok("new/continued/iterated MRs check the full target diff; allowlisted safe pushes run CI, WIP still skips")
+
+
+def test_ci_skip_unknown_dependencies_and_yaml():
+    import worktree as W
+    from types import SimpleNamespace
+    # All subprocess outputs are committed blobs/tree data, not worker files.
+    docs = {".gitlab-ci.yml": {"include": [{"local": "ci/jobs.yml"}]}, "ci/jobs.yml": {}}
+    def run(argv, **kw):
+        if "ls-tree" in argv:
+            out = "".join(f"100644 blob {'a' * 40}\t{p}\0" for p in docs)
+        elif "diff" in argv:
+            out = "app.py\0"
+        else:
+            out = json.dumps(docs[argv[-1].split(":", 1)[1]])
+        return SimpleNamespace(stdout=out, returncode=0)
+    with patch.object(W, "_git", return_value="a" * 40), patch.object(W.subprocess, "run", side_effect=run), \
+            patch.object(site_env, "_yaml_load", side_effect=json.loads):
+        assert W._ci_config_unchanged("/worker", "target", ".gitlab-ci.yml")
+        with patch.object(W, "_git", return_value=""):
+            assert not W._ci_config_unchanged("/worker", "target", ".gitlab-ci.yml")
+        for inc in ({"remote": "https://example.com/ci.yml"}, {"project": "group/ci", "file": "ci.yml"},
+                    {"local": "$CI_FILE"}, {"local": "missing.yml"}, {"artifact": "ci.yml", "job": "generate"}):
+            docs["ci/jobs.yml"] = {"include": inc}
+            assert not W._ci_config_unchanged("/worker", "target", ".gitlab-ci.yml"), inc
+        docs["ci/jobs.yml"] = {"include": "/.gitlab-ci.yml"}   # bounded cyclic includes
+        assert W._ci_config_unchanged("/worker", "target", ".gitlab-ci.yml")
+    with patch.object(W, "_git", return_value="a" * 40), patch.object(W.subprocess, "run", side_effect=run), \
+            patch.object(site_env, "_yaml_load", side_effect=site_env.BrokerConfigError("YAML unavailable")):
+        assert not W._ci_config_unchanged("/worker", "target", ".gitlab-ci.yml")
+    ok("unknown remote/project/dynamic/artifact includes and unavailable YAML fail closed; cycles are bounded")
 
 
 def test_catalog_listing_cache_creds_clone():
@@ -25030,7 +25247,9 @@ def test_mr_note_iteration_worker_publishes_same_branch_and_rereviews():
             return b._worker_event(event)
         class WM:
             def make(self, key, **kwargs): calls.append(("make", kwargs)); return d
-            def publish_iteration(self, key, branch): calls.append(("publish", branch)); return branch
+            def publish_iteration(self, key, branch, **kwargs):
+                assert kwargs == {"mr_target_ref": "main"}
+                calls.append(("publish", branch)); return branch
             def head_sha(self, key): return "b" * 40
             def remove(self, key): pass
             def save_patch(self, key): pass
@@ -25115,7 +25334,8 @@ def test_mr_note_issue_origin_requirements_reach_iteration_and_reviewer():
                     def publish_mr(self, key, **kwargs):
                         publications.append("new")
                         return evt["source_branch"]
-                    def publish_iteration(self, key, branch):
+                    def publish_iteration(self, key, branch, **kwargs):
+                        assert kwargs == {"mr_target_ref": "main"}
                         publications.append("iteration")
                         return branch
                     def head_sha(self, key): return "b" * 40

@@ -537,7 +537,7 @@ for the original deployment and still experimental.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `REPO_INFER_ENABLED` | off | The code worker may pick a repo when the ticket has no `repo:` line. |
+| `REPO_INFER_ENABLED` | off | The code worker may pick a repo when the ticket has no `repo:` line. Worker MR pushes keep `ci.skip` unless the repo is CODE/CD-allowlisted and its CI config is unchanged ([details](repo-push-cred.md#worker-ci-with-inference-enabled)). |
 | `REPO_INFER_SHADOW` | off | Log the pick it would make, change nothing. |
 | `REPO_INFER_COMMENT_RERUN_ENABLED` | off | A human comment on a parked ticket runs the pick again. |
 | `REPO_INFER_RERUN_USERS` | unset | Users besides the ticket's creator whose comment may do that. |

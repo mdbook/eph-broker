@@ -4340,7 +4340,8 @@ class CCAdapter(Adapter):
                         log.info("publish key=%s: turn-capped -> WIP branch at teardown, no MR", key)
                     elif publish.get("code_repo_path") and mr_iteration is not None:
                         with self._repo_operation(key, repo_lock, repo_lock_held):
-                            branch = self.worktree_mgr.publish_iteration(key, mr_iteration["source_branch"])
+                            branch = self.worktree_mgr.publish_iteration(key, mr_iteration["source_branch"],
+                                                                        mr_target_ref=publish["mr_target_ref"])
                         if not branch:
                             self._save_patch(key, run_id)
                         else:
@@ -4578,6 +4579,7 @@ class CCAdapter(Adapter):
                 # communicate() in _one_turn blocks (see the comment there) -> that one cap slot leaks.
                 # SIGKILL makes it ~unreachable, and the liveness force-close still frees the coalescer side regardless.
                 self._sem.release()
+
 
     def _turn_with_envelope(self, worker, route, system_prompt, prompt_text, resume, run_id):
         # A turn is "complete" when it yields a PARSED result-envelope.

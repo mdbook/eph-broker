@@ -565,6 +565,236 @@ assert.equal(log.children.length, 3);
     ok("dash: replies are plain text under the right message; old read-only logs, replay and duplicates remain safe")
 
 
+def test_dash_detail_surfaces():
+    """Quick views and run previews share a bounded native modal; routed details remember the list's place."""
+    page = dash.module_page([{"name": "agents", "label": "Agents"}])
+    assert "$('fleet-view').appendChild(quickPanel)" not in page
+    for needle in ("openDetailSheet('Quick view: ' + name", "openDetailSheet('Run details', p",
+                   "dialog.showModal()", "dialog.addEventListener('cancel'", "aria-labelledby",
+                   "max-height:calc(100dvh - 32px)", "body.detail-open{overflow:hidden}",
+                   "#r-side{position:sticky", "focusDetailRoute($('d-title'))", "focusDetailRoute(content)",
+                   "pendingDetailPlace = rememberPlace(p)", "syncDetailRoute();"):
+        assert needle in page, needle
+    viewer = pathlib.Path(ROOT, "viewer/ui.js").read_text()
+    assert ".adir-detail{position:sticky" in viewer
+    assert ".adir-detail{position:static;max-height:none;overflow:visible}" in viewer
+    # Preserve the shipped phone navigation, compact lists and full-screen agent transcript.
+    for needle in ('id="tabbar"', "fleetGroups(shown)", "body[data-detail] .tabbar{display:none}"):
+        assert needle in page, needle
+    assert ".adir.picked .adir-listcard{display:none}" in viewer
+
+    node = shutil.which("node")
+    if not node:
+        SKIPPED.append("detail surface JS: node unavailable")
+        return
+    helpers = page.split("// Shared detail surfaces:", 1)[1].split("async function tick", 1)[0]
+    helpers = "// Shared detail surfaces:" + helpers
+    quick = dash.MODULE_JS.split("function closeQuickViewer(){", 1)[1].split("async function pollViewers", 1)[0]
+    quick = "function closeQuickViewer(){" + quick
+    script = r"""
+const assert = require('node:assert/strict');
+const listeners = {}, observers = [];
+global.scrollX = 0; global.scrollY = 1400;
+global.location = {hash: '#fleet'};
+global.scrollTo = ({left = scrollX, top = scrollY}) => { scrollX = left; scrollY = top; };
+global.requestAnimationFrame = fn => fn();
+global.setTimeout = () => 0;
+global.MutationObserver = class {
+  constructor(fn){ this.fn = fn; observers.push(this); }
+  observe(){} disconnect(){ this.disconnected = true; }
+};
+class Node {
+  constructor(tag, cls, text){
+    this.tagName = tag.toUpperCase(); this.className = cls; this.textContent = text;
+    this.attrs = {}; this.children = []; this.events = {}; this.isConnected = true; this.dataset = {};
+    this.classList = {add(){}, remove(){}};
+  }
+  setAttribute(a, v){ this.attrs[a] = v; }
+  getAttribute(a){ return this.attrs[a] ?? null; }
+  hasAttribute(a){ return a in this.attrs; }
+  closest(sel){ return sel === 'section' ? scope : this; }
+  querySelectorAll(tag){ return this.children.filter(n => n.tagName === tag); }
+  contains(target){ return this === target || this.children.some(n => n.contains(target)); }
+  append(...nodes){ this.children.push(...nodes); }
+  appendChild(n){ this.append(n); }
+  remove(){ this.isConnected = false; }
+  addEventListener(name, fn){ this.events[name] = fn; }
+  showModal(){ this.open = true; }
+  close(){ this.open = false; if(this.events.close) this.events.close(); }
+  focus(opts){ assert.equal(opts.preventScroll, true); document.activeElement = this; }
+}
+const el = (tag, cls, text) => new Node(tag, cls, text), scope = el('section'), main = el('main');
+global.document = {body: el('body'), activeElement: null,
+  addEventListener: (name, fn, capture) => { listeners[name + (capture ? '-capture' : '')] = fn; },
+  querySelector: () => main};
+global.window = {addEventListener: (name, fn) => { listeners[name] = fn; }};
+const rows = el('tbody'), $ = () => rows;
+function origin(name){
+  const n = el('button'); n.setAttribute('data-quick-module', 'agents'); n.setAttribute('data-quick-agent', name);
+  n.dataset = {quickModule: 'agents', quickAgent: name}; scope.append(n); return n;
+}
+""" + helpers + r"""
+let cleaned = 0;
+const a = origin('demo-one'), sheet = openDetailSheet('Quick view', a, () => cleaned++);
+assert(sheet.dialog.open && detailSheet === sheet);
+assert.equal(sheet.dialog.getAttribute('aria-labelledby'), 'detail-sheet-title');
+assert.equal(document.activeElement.textContent, 'Close');
+// The 5-second Fleet repaint replaced the button. Close finds the new one and restores the original scroll.
+a.isConnected = false; scope.children = [];
+const replacement = origin('demo-one'); scrollY = 2200;
+let prevented = false;
+sheet.dialog.events.cancel({preventDefault(){ prevented = true; }});
+assert(prevented && sheet.closed && !sheet.dialog.open && detailSheet === null);
+assert.equal(document.activeElement, replacement); assert.equal(scrollY, 1400);
+sheet.close(); assert.equal(cleaned, 1);
+
+// History, waiting-run and module routes use the same saved place, without stealing focus on a poll.
+for(const hash of ['#run/vikunja%3Atask%3A9101', '#module/agents/demo-one']){
+  location.hash = '#runs'; scrollY = 1700;
+  pendingDetailPlace = rememberPlace(replacement);
+  location.hash = hash; syncDetailRoute();
+  const heading = el('h1'); focusDetailRoute(heading);
+  assert.equal(scrollY, 0); assert.equal(document.activeElement, heading);
+  const input = el('input'); input.focus({preventScroll: true});
+  syncDetailRoute(); focusDetailRoute(heading); assert.equal(document.activeElement, input);
+  let prevented = false;
+  listeners.keydown({key: 'Escape', target: input, preventDefault(){ prevented = true; }});
+  assert(prevented); assert.equal(location.hash, '#runs');
+  syncDetailRoute(); assert.equal(scrollY, 1700); assert.equal(document.activeElement, replacement);
+}
+// Asynchronously remounted Agents lists restore focus when the link arrives, not to a detached node.
+location.hash = '#module/agents'; scope.children = []; replacement.isConnected = false;
+const place = rememberPlace(replacement); restorePlace(place);
+const back = origin('demo-one'); observers.at(-1).fn();
+assert.equal(document.activeElement, back); assert(observers.at(-1).disconnected);
+
+let viewerStatus = {agents: {state: 'up'}}, quickCleanup = null, quickAbort = null,
+  quickName = null, quickStatus = null, quickSheet = null;
+const viewerModules = [{name: 'agents'}], viewerContext = (m, signal) => ({signal});
+let resolveCode, finished = 0, mounted = 0;
+let viewerCode = () => new Promise(resolve => { resolveCode = resolve; });
+""" + quick + r"""
+(async () => {
+  location.hash = '#fleet'; scrollY = 1900;
+  const event = {target: back};
+  const pending = rows.events.click(event), abort = quickAbort;
+  assert(quickSheet.dialog.open); quickSheet.close();
+  assert(abort.signal.aborted); assert.equal(quickName, null);
+  resolveCode({quickView(){ mounted++; }}); await pending; assert.equal(mounted, 0);
+  // Closing while quickView itself is awaiting its mount runs the eventual cleanup exactly once.
+  let finishMount;
+  viewerCode = async () => ({quickView: () => new Promise(resolve => { finishMount = resolve; })});
+  const mounting = rows.events.click(event); await Promise.resolve();
+  quickSheet.close(); finishMount(() => finished++); await mounting;
+  assert.equal(finished, 1); assert.equal(scrollY, 1900);
+  viewerCode = async () => ({quickView: () => () => finished++});
+  await rows.events.click(event);
+  // Navigation to the full viewer dismisses the sheet without restoring the list over the destination.
+  scrollY = 0; location.hash = '#module/agents/demo-one'; listeners.hashchange();
+  assert.equal(finished, 2); assert.equal(scrollY, 0); assert.equal(quickSheet, null);
+})().catch(e => { console.error(e); process.exitCode = 1; });
+"""
+    result = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr + result.stdout
+    ok("detail sheets: viewport modal, Escape, stable focus/scroll across polling, routed return and async cleanup")
+
+
+def test_dash_run_sheet_focus_survives_repaint():
+    """Polling and async model options must not detach a focused run action or model picker."""
+    node = shutil.which("node")
+    if not node:
+        SKIPPED.append("dash_run_sheet_focus_survives_repaint: node unavailable")
+        return
+
+    def js_between(start, end):
+        return dash.PAGE[dash.PAGE.index(start):dash.PAGE.index(end)]
+
+    js = js_between("function esc(s)", "// ---- theme")
+    js += js_between("function title(key)", "// ---- Fleet:")
+    js += js_between("function tid(key)", "// ---- views.")
+    js += js_between("const NATIVE =", "function paintSettings()")
+    js += js_between("function actAttrs(", "async function act(")
+    harness = r'''
+const assert = require('node:assert/strict');
+class Box {
+  constructor(){ this.children = []; this.classList = {toggle(){}, add(){}, remove(){}}; }
+  contains(n){ return n === this || this.children.includes(n); }
+  set innerHTML(html){
+    for(const n of this.children){
+      n.isConnected = false;
+      if(document.activeElement === n) document.activeElement = document.body;
+    }
+    this.html = html;
+    this.children = [...html.matchAll(/<(button|a|select)\b([^>]*)>([\s\S]*?)<\/\1>/g)].map(m => ({
+      label: m[1] === 'select' ? 'Run again on' : m[3], isConnected: true,
+      matches: s => s === '[data-rr]' && m[2].includes('data-rr='),
+      focus(){ document.activeElement = this; }
+    }));
+  }
+  get innerHTML(){ return this.html; }
+}
+const dom = {}, $ = id => dom[id] ||= new Box();
+const document = {body: {matches: () => false}, activeElement: null, querySelectorAll: () => []};
+const PHONE = {matches: false}, can = true, showHarness = false;
+const settings = {models: ['sonnet']}, rerunModel = {}, rerunOptions = new Map();
+function paintFleet(){}
+function paintDetail(){}
+let optionRequests = 0;
+async function fetch(){
+  optionRequests++;
+  return {ok: true, json: async () => ({model: 'sonnet', pinned: false})};
+}
+const key = 'vikunja:task:9101', pastKey = 'vikunja:task:9102';
+const d = {now: 1800000000, workers: [{key, in_turn: true, tokens: 100}],
+  live: [{key, state: 'open_running'}], pending: [], queue: [], counters: {},
+  concurrency: {cap: 3, in_use: 1}, ticket_url: 'https://tickets.example.com/tasks/{}',
+  history: [{key: pastKey, session: 'previous', ts: 1799999900, ended: 1799999950}]};
+rerunOptions.set(pastKey, {model: 'sonnet', pinned: false, at: Date.now()});
+const content = $('run-sheet');
+function focusAction(label){
+  const control = content.children.find(n => n.label === label);
+  assert(control, label); control.focus(); return control;
+}
+function focused(control){
+  assert.equal(document.activeElement, control, control.label);
+  assert(control.isConnected && content.contains(control), control.label);
+}
+(async () => {
+  for(const [runKey, past, labels] of [
+    [key, null, ['Watch live', 'Open ticket', 'Cancel run']],
+    [pastKey, 'previous', ['Open transcript', 'Open ticket', 'Run again', 'Run again on']]
+  ]){
+    document.activeElement = document.body;
+    runSheet = {key: runKey, past, sheet: {content}};
+    paint(d);
+    for(const label of labels){
+      const control = focusAction(label);
+      d.now++;
+      paint(d); focused(control); // the ordinary five-second poll
+      await loadRerunOptions(pastKey, rerunOptions.get(pastKey));
+      focused(control); // the async options response also calls paint(lastState)
+    }
+    const control = document.activeElement;
+    document.activeElement = document.body;
+    paint(d);
+    assert.equal(control.isConnected, false, 'painting resumes after focus leaves');
+    assert(content.children.some(n => n.label === control.label && n.isConnected));
+  }
+  assert.equal(optionRequests, 7);
+  const control = focusAction('Run again');
+  d.history = [];
+  paint(d); focused(control); // even a disappearing run must not strand keyboard focus
+  document.activeElement = document.body;
+  paint(d);
+  assert.equal(control.isConnected, false);
+  assert(content.innerHTML.includes('This run is no longer listed.'));
+})().catch(e => { console.error(e); process.exitCode = 1; });
+'''
+    result = subprocess.run([node, "-e", js + harness], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr + result.stdout
+    ok("run sheet: all actions and model picker retain connected focus on polls/options; repaint resumes after blur")
+
+
 def test_dash_scroll_layout():
     """CSS layout contract: the last transcript row stays reachable at short viewport heights.
 
@@ -14067,6 +14297,7 @@ const PHONE = {matches: false, addEventListener(){}};
 let selected = null, lastState = null, runsFilter, fleetFilter;
 function select(key,past){ selected = [key,past]; }
 function closeStream(){}
+function syncDetailRoute(){}  // Detail focus/scroll is exercised separately in test_dash_detail_surfaces.
 '''
     cases = r'''
 for(const [hash, view, tab] of [['#settings/groups','settings','groups'], ['#now/queue','now','queue'],

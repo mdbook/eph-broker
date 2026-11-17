@@ -1059,6 +1059,20 @@ PAGE = r"""<!DOCTYPE html>
   .side{padding:20px 24px 24px}
   .side h3{margin:0 0 4px;font-size:18px;font-weight:650;letter-spacing:-.01em}
   .side .acts{display:flex;gap:10px;margin-top:20px;flex-wrap:wrap}
+  /* List details live in the viewport, never after a potentially long list. */
+  .detail-sheet{padding:0;color:var(--t1);width:min(640px,calc(100% - 32px));max-height:calc(100dvh - 32px);
+                background:var(--s1);border:1px solid var(--line);border-radius:12px;overflow:auto}
+  .detail-sheet::backdrop{background:color-mix(in srgb,var(--t1) 35%,transparent)}
+  .detail-head{position:sticky;top:0;z-index:1;display:flex;align-items:center;gap:16px;padding:16px 24px;
+               background:var(--s1);border-bottom:1px solid var(--line)}
+  .detail-head h2{margin:0;flex:1;font-size:18px;overflow-wrap:anywhere}
+  body.detail-open{overflow:hidden}
+  #r-side{position:sticky;top:80px;max-height:calc(100dvh - 96px);overflow:auto}
+  @media (max-width:720px){
+    .detail-sheet{width:calc(100% - 16px);max-height:calc(100dvh - 16px - env(safe-area-inset-bottom))}
+    .detail-head{padding:12px 16px}.detail-head .btn{min-height:44px}
+    .detail-sheet .side{padding:16px}
+  }
   .bars > div{display:grid;grid-template-columns:110px minmax(0,1fr) 40px;gap:12px;align-items:center;padding:10px 24px;font-size:14px}
   .bars > div + div{border-top:1px solid var(--line)}
   .bars i{display:block;height:6px;border-radius:3px;background:color-mix(in srgb,var(--brand) 65%,var(--s3))}
@@ -1547,6 +1561,7 @@ function el(tag, cls, text){
   if(text !== undefined && text !== null) e.textContent = text;   // untrusted text: textContent only
   return e;
 }
+
 function fmtNum(n){ return Number(n || 0).toLocaleString(); }
 function age(s){
   if(s === null || s === undefined) return 'n/a';
@@ -1721,7 +1736,7 @@ function previous(d){
 let lastState = null, lastDerived = null, selected = null, selectedPast = null, booted = false;
 const HIST_PAGE = 25;
 let histLimit = HIST_PAGE;      // Previous sessions are paged server-side (/state?hist=N)   // selectedPast = 8-char session of a previous one
-let runsFilter = 'all', runsQ = '', runsSel = null, fleetFilter = 'all', qLimit = 10;
+let runsFilter = 'all', runsQ = '', runsSel = null, runSheet = null, fleetFilter = 'all', qLimit = 10;
 const fleetOpen = new Set();          // agents whose ledger line is expanded; survives the 5s repaint
 const HARNESS = {cc: 'Claude Code', codex: 'Codex', hermes: 'Hermes'};
 // Why an admitted subject has no worker yet (adapter._waiting reasons), in plain words
@@ -2066,7 +2081,7 @@ function needRow(n){
 }
 function runRow(w, D, d){
   const t0 = D.started.get(w.key), r = runName(w.key, w);
-  return '<tr class="pick" data-key="' + esc(w.key) + '"><td><div class="runc">' + stIcon(w.in_turn ? 'run' : 'idle')
+  return '<tr class="pick" tabindex="0" data-key="' + esc(w.key) + '"><td><div class="runc">' + stIcon(w.in_turn ? 'run' : 'idle')
     + '<div><div class="t">' + esc(r.title || r.ref) + '</div><div class="s2">'
     + esc([r.title ? r.ref : '', w.in_turn ? 'Running' : 'Idle between turns', w.route].filter(Boolean).join(' · ')) + '</div></div></div></td>'
     + '<td class="m-sub nw">' + esc(w.model_label || w.model || 'model unknown') + '<div class="s2 dk">' + esc(HARNESS[w.harness] || w.harness || '') + '</div></td>'
@@ -2164,7 +2179,7 @@ function paintRuns(d, D){
     || (r.key + ' ' + runName(r.key, r.w).ref + ' ' + ((r.w && r.w.title) || '')).toLowerCase().includes(runsQ)));
   const sel = rows.find(r => runsSel && r.key === runsSel.key && (r.past || null) === runsSel.past) || rows[0] || null;
   const cap = PHONE.matches && !runsAll && rows.length > RUNS_PHONE + 2 ? RUNS_PHONE : rows.length;
-  $('r-rows').innerHTML = rows.length ? rows.slice(0, cap).map(r => '<tr class="pick' + (r === sel ? ' sel' : '') + '" data-pick="' + esc(r.key) + '"'
+  $('r-rows').innerHTML = rows.length ? rows.slice(0, cap).map(r => '<tr tabindex="0" class="pick' + (r === sel ? ' sel' : '') + '" data-pick="' + esc(r.key) + '"'
       + (r.past ? ' data-ppast="' + esc(r.past) + '"' : '') + ' data-grp="' + r.grp + '">'
       + '<td><div class="t">' + runLabel(r.key, r.w) + '</div></td>'
       + '<td class="m-sub"><span class="stw">' + stIcon(r.k) + esc(r.word) + '</span></td>'
@@ -2179,6 +2194,10 @@ function paintRuns(d, D){
       + (d.history_total || 0) + ' recorded sessions' : '')) + '</span>'
     + (more ? '<button class="lnk" id="h-more">Load ' + esc(Math.min(HIST_PAGE, d.history_total - d.history.length)) + ' more</button>' : '');
   if(!picking('r-side')) $('r-side').innerHTML = sel ? runCard(sel, false) : '<p class="sub">Pick a run to see its details.</p>';
+  if(runSheet && !picking('run-sheet')){
+    const sel = all.find(r => r.key === runSheet.key && (r.past || null) === runSheet.past);
+    runSheet.sheet.content.innerHTML = sel ? runCard(sel, false) : '<p class="sub">This run is no longer listed.</p>';
+  }
 }
 
 function paintQueue(d, D){
@@ -2229,6 +2248,7 @@ document.addEventListener('keydown', e => {
   e.preventDefault(); tabs[next].focus(); location.hash = tabs[next].hash;
 });
 function showTab(v){
+  syncDetailRoute();
   for(const [k, id] of Object.entries(VIEWS)) $(id).hidden = k !== v;
   const navLink = document.querySelector('#tabbar [data-view="' + (v === 'run' ? 'runs' : v) + '"], header nav [data-view="' + v + '"]');
   $('vt').textContent = v === 'run' ? 'Run' : v === 'settings' ? 'Settings' : navLink ? navLink.textContent.trim() : '';
@@ -2287,7 +2307,8 @@ function select(key, past){
   if(key === selected && past === selectedPast && es) return;
   selected = key; selectedPast = past;
   paintDetail();
-  scrollTo({top: 0});
+  $('sv-x').href = detailRoute && detailRoute.place ? detailRoute.place.hash : '#runs';
+  focusDetailRoute($('d-title'));
   if(lastState && lastState.stream_enabled) openStream(key, past);
   else {
     closeStream(); resetLog();
@@ -3339,10 +3360,10 @@ function opts(list, cur, dflt){
   return '<option value="">' + esc('Default' + (dflt ? ' (' + dflt + ')' : '')) + '</option>'
     + list.map(m => '<option' + (m === cur ? ' selected' : '') + '>' + esc(m) + '</option>').join('');
 }
-// An open model menu inside `id` would close under the user on the 5-second repaint: skip that box until it blurs.
+// Keep every focused control connected, not just model menus. Polls and async rerun options both repaint these boxes.
 function picking(id){
   const a = document.activeElement;
-  return !!(a && a.matches('[data-rr]') && $(id).contains(a));
+  return !!(a && $(id).contains(a));
 }
 function rerunBlocked(key){
   const o = rerunOptions.get(key), pick = rerunModel[key];
@@ -3526,11 +3547,20 @@ document.addEventListener('click', e => {
   if(f){ e.preventDefault(); runsFilter = f.dataset.filter; location.hash = '#runs/' + runsFilter; }
   const b = e.target.closest('[data-key]');
   if(b){ select(b.dataset.key, b.dataset.past); return; }
-  // Runs table: a wide screen shows the pick in the side panel, a narrow one opens it (no side panel there)
+  // Explicit picks use a viewport sheet; a narrow screen opens transcripts directly.
   const p = e.target.closest('[data-pick]');
   if(p){
-    if(matchMedia('(max-width:1100px)').matches && p.dataset.grp !== 'waiting') select(p.dataset.pick, p.dataset.ppast);
-    else { runsSel = {key: p.dataset.pick, past: p.dataset.ppast || null}; paint(lastState); }
+    if(matchMedia('(max-width:1100px)').matches && p.dataset.grp !== 'waiting'){
+      pendingDetailPlace = rememberPlace(p); select(p.dataset.pick, p.dataset.ppast);
+    }else {
+      runsSel = {key: p.dataset.pick, past: p.dataset.ppast || null};
+      const row = allRuns(lastState, lastDerived).find(r => r.key === runsSel.key && (r.past || null) === runsSel.past);
+      if(row){
+        const sheet = openDetailSheet('Run details', p, () => { runSheet = null; });
+        sheet.content.id = 'run-sheet'; runSheet = {...runsSel, sheet};
+      }
+      paint(lastState);
+    }
     return;
   }
   if(e.target.closest('#h-more')){ histLimit += HIST_PAGE; tick(); }
@@ -3549,6 +3579,83 @@ function setHarness(on){
 $('hr').onclick = () => setHarness(true);
 $('cv').onclick = () => setHarness(false);
 
+// Shared detail surfaces: keep the list's place even when a poll replaces its rows (ticket 2809).
+let detailSheet = null, detailRoute = null, pendingDetailPlace = null;
+function rememberPlace(target){
+  if(detailSheet && detailSheet.dialog.contains(target)) return detailSheet.place;
+  const attrs = ['data-quick-module', 'data-quick-agent', 'data-pick', 'data-ppast', 'data-key', 'data-past', 'href'];
+  const identity = attrs.filter(a => target.hasAttribute(a)).map(a => [a, target.getAttribute(a)]);
+  const scope = target.closest('section') || document;
+  return {x: scrollX, y: scrollY, hash: location.hash || '#now', find: () => target.isConnected ? target
+    : [...scope.querySelectorAll(target.tagName)].find(n => identity.length && identity.every(([a, v]) => n.getAttribute(a) === v))};
+}
+function restorePlace(place){
+  if(!place) return;
+  // Module lists arrive asynchronously. Wait for their row, without retaining an unbounded observer.
+  const restore = () => {
+    if((location.hash || '#now') !== place.hash) return true;
+    const target = place.find();
+    if(target){ target.focus({preventScroll: true}); scrollTo({left: place.x, top: place.y, behavior: 'instant'}); }
+    return !!target;
+  };
+  scrollTo({left: place.x, top: place.y, behavior: 'instant'});
+  if(restore()) return;
+  const observer = new MutationObserver(() => { if(restore()) observer.disconnect(); });
+  observer.observe(document.querySelector('main'), {childList: true, subtree: true});
+  setTimeout(() => observer.disconnect(), 5000);
+}
+function openDetailSheet(title, origin, cleanup = () => {}){
+  if(detailSheet) detailSheet.close();
+  const dialog = el('dialog', 'detail-sheet'), head = el('div', 'detail-head');
+  const heading = el('h2', null, title), close = el('button', 'btn', 'Close'), content = el('div', 'side');
+  heading.id = 'detail-sheet-title'; dialog.setAttribute('aria-labelledby', heading.id);
+  head.append(heading, close); dialog.append(head, content);
+  const sheet = {dialog, content, place: rememberPlace(origin), closed: false, close: (restore = true) => {
+    if(sheet.closed) return;
+    sheet.closed = true;
+    cleanup(); dialog.close(); dialog.remove();
+    document.body.classList.remove('detail-open');
+    if(detailSheet === sheet) detailSheet = null;
+    if(restore) restorePlace(sheet.place);
+  }};
+  close.onclick = () => sheet.close();
+  dialog.addEventListener('cancel', e => { e.preventDefault(); sheet.close(); });
+  dialog.addEventListener('close', () => sheet.close());
+  document.body.appendChild(dialog); document.body.classList.add('detail-open');
+  detailSheet = sheet; dialog.showModal(); close.focus({preventScroll: true});
+  return sheet;
+}
+// Full transcripts retain their existing routes and phone layout. They share the same return-place contract.
+document.addEventListener('click', e => {
+  const origin = e.target.closest('[data-key], a[href]');
+  if(origin && !detailRoute && (origin.hasAttribute('data-key') || /^#module\/[^/]+\/.+/.test(origin.hash || '')))
+    pendingDetailPlace = rememberPlace(origin);
+}, true);
+function syncDetailRoute(){
+  const full = /^#(?:run\/.+|module\/[^/]+\/.+)/.test(location.hash);
+  if(full){
+    if(!detailRoute) detailRoute = {place: pendingDetailPlace, hash: null};
+    if(detailSheet) detailSheet.close(false);
+    if(detailRoute.hash !== location.hash){ detailRoute.hash = location.hash; detailRoute.focus = true; scrollTo({top: 0}); }
+  }else if(detailRoute){
+    const place = detailRoute.place; detailRoute = null;
+    requestAnimationFrame(() => { if(place && (location.hash || '#now') === place.hash) restorePlace(place); });
+  }
+  pendingDetailPlace = null;
+}
+function focusDetailRoute(target){
+  if(detailRoute && detailRoute.focus){ target.tabIndex = -1; target.focus({preventScroll: true}); detailRoute.focus = false; }
+}
+window.addEventListener('hashchange', () => { if(detailSheet) detailSheet.close(false); });
+document.addEventListener('keydown', e => {
+  if(e.key === 'Escape' && !detailSheet && detailRoute){
+    e.preventDefault();
+    location.hash = detailRoute.place ? detailRoute.place.hash
+      : location.hash.startsWith('#run/') ? '#runs' : location.hash.split('/').slice(0, 2).join('/');
+  }
+  const row = e.target.closest('tr[data-pick], tr[data-key]');
+  if(row && e.target === row && ['Enter', ' '].includes(e.key)){ e.preventDefault(); row.click(); }
+});
 async function tick(){
   try{
     const r = await fetch('/state' + (histLimit > HIST_PAGE ? '?hist=' + histLimit : ''), {cache:'no-store'});
@@ -3594,10 +3701,7 @@ MODULE_JS = r"""
 // Modules are trusted site-installed code, native DOM, not iframes.
 const viewerModules = __MODULE_CONFIG__;
 const viewerRuntime = new Map();
-let viewerStatus = {}, viewerBusy = false, quickCleanup = null, quickAbort = null, quickName = null, quickStatus = null;
-const quickPanel = el('aside', 'card side');
-quickPanel.hidden = true;
-$('fleet-view').appendChild(quickPanel);
+let viewerStatus = {}, viewerBusy = false, quickCleanup = null, quickAbort = null, quickName = null, quickStatus = null, quickSheet = null;
 for(const m of viewerModules){
   const key = 'module-' + m.name, section = el('section');
   section.id = 'v-' + key; section.hidden = true;
@@ -3645,6 +3749,7 @@ function downViewer(m, s, error){
     card.appendChild(b);
   }
   r.section.appendChild(card);
+  if(!r.section.hidden) focusDetailRoute(card);
 }
 async function viewerCode(m, s){
   const r = viewerRuntime.get(m.name), version = (s.version || '') + ':' + s.restarts + ':' + s.since;
@@ -3682,12 +3787,13 @@ async function renderViewer(m){
   clearViewer(r); r.token = token; r.abort = new AbortController();
   const abort = r.abort;
   const content = el('div'); r.section.appendChild(content);
+  if(agentName){ content.setAttribute('role', 'region'); content.setAttribute('aria-label', m.label + ': ' + agentName); }
   try{
     const js = await viewerCode(m, s);
     if(abort.signal.aborted) return;
     const cleanup = await js.mount(content, viewerContext(m, abort.signal, agentName));
     if(abort.signal.aborted){ if(typeof cleanup === 'function') cleanup(); }
-    else r.cleanup = cleanup;
+    else { r.cleanup = cleanup; if(agentName) focusDetailRoute(content); }
   }catch(e){ if(!abort.signal.aborted) downViewer(m, s, 'Could not load viewer: ' + e.message); }
 }
 function moduleAffordance(name){
@@ -3695,9 +3801,7 @@ function moduleAffordance(name){
   return m ? '<button class="btn" data-quick-module="' + esc(m.name) + '" data-quick-agent="' + esc(name) + '">Quick view</button>' : '';
 }
 function closeQuickViewer(){
-  if(quickAbort) quickAbort.abort();
-  if(typeof quickCleanup === 'function'){ try{ quickCleanup(); }catch(e){} }
-  quickCleanup = null; quickName = null; quickPanel.replaceChildren(); quickPanel.hidden = true;
+  if(quickSheet) quickSheet.close();
 }
 $('f-rows').addEventListener('click', async e => {
   const button = e.target.closest('[data-quick-module]');
@@ -3705,12 +3809,15 @@ $('f-rows').addEventListener('click', async e => {
   const m = viewerModules.find(m => m.name === button.dataset.quickModule), name = button.dataset.quickAgent;
   closeQuickViewer(); quickAbort = new AbortController(); const abort = quickAbort;
   quickName = m.name; quickStatus = JSON.stringify(viewerStatus[m.name]);
-  quickPanel.hidden = false;
-  const close = el('button', 'btn', 'Close'); close.onclick = closeQuickViewer;
+  quickSheet = openDetailSheet('Quick view: ' + name, button, () => {
+    abort.abort();
+    if(typeof quickCleanup === 'function'){ try{ quickCleanup(); }catch(e){} }
+    quickCleanup = null; quickAbort = null; quickName = null; quickSheet = null;
+  });
   const full = el('a', 'btn', 'Open full view');
   full.href = '#module/' + m.name + '/' + encodeURIComponent(name);
-  quickPanel.append(close, full);
-  const content = el('div'); quickPanel.appendChild(content);
+  quickSheet.content.appendChild(full);
+  const content = el('div'); quickSheet.content.appendChild(content);
   try{
     const js = await viewerCode(m, viewerStatus[m.name]);
     if(abort.signal.aborted) return;

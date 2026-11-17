@@ -80,6 +80,7 @@ export function themeView(host) {
 const CSS = `
 .adir{display:grid;grid-template-columns:260px 1fr;gap:16px;align-items:start;color:var(--t1,inherit)}
 .adir-card{background:var(--s1,transparent);border:1px solid var(--line,currentColor);border-radius:12px;box-shadow:var(--shadow,none);min-width:0}
+.adir-detail{position:sticky;top:80px;max-height:calc(100dvh - 96px);overflow:auto}
 .adir-list{padding:4px 0}
 .adir-it{display:flex;align-items:center;gap:12px;padding:14px 20px;border-left:3px solid transparent;
   color:inherit;text-decoration:none}
@@ -103,6 +104,7 @@ const CSS = `
 .adir-empty{padding:12px 14px;color:var(--t2,inherit)}
 @media (max-width:820px){
   .adir{grid-template-columns:1fr}.adir.picked .adir-listcard{display:none}.adir:not(.picked) .adir-detail{display:none}
+  .adir-detail{position:static;max-height:none;overflow:visible}
   .adir-back{display:inline-flex}.adir-view{height:calc(100vh - 160px)}
 }
 @media (max-width:720px){

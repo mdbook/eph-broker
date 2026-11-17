@@ -115,7 +115,12 @@ status color for chips and pills, 8% `--block` for the error banner, 16% for sta
   A selected row gets the 7% brand tint and a 3px inset `--brand` bar on the left. On phones each row becomes
   a title line plus one muted detail line.
 - **Side panel** (`.side`): ref, 18px title, key/value list (`.kv`, label left `--t2`, value right 600), then
-  actions.
+  actions. Desktop run and agent previews stick below the header and scroll within the viewport.
+- **Detail sheet** (`.detail-sheet`): native modal dialog for Fleet quick views and explicit run previews,
+  up to 640px wide, bounded by the viewport on desktop and phone. A sticky header names the detail and
+  keeps Close visible. Opening focuses Close; Close or Escape restores the initiating row and scroll
+  position, even after polling replaces the row. Full transcript routes retain the phone layout, focus
+  their detail, and return to the originating list position on Back or Escape.
 - **Navigation**: header tabs (`.nav`) and in-page sub-tabs (`.subtabs`) both mark the current item with a
   3px `--brand` bottom border and 600 weight. Sub-tabs carry a count badge.
 - **Segmented control** (`.seg`): `--s3` track, selected segment raised on `--s1` with `--shadow`. Used for

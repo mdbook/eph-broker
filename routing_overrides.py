@@ -278,7 +278,7 @@ class RoutingOverrides:
         overridden = data.get("rows", {})
         rows = []
         for key, t in sorted(templates().items()):
-            eff = self.apply(t)
+            eff = t.effective_template()
             rows.append({"row": key, "adapter": eff.adapter, "backend": eff.backend, "model_pin": eff.model_pin,
                          "pin": eff.pin, "pinned": eff.pin or bool(eff.model_pin), "default_pin": t.pin,
                          "default_backend": t.backend, "default_model_pin": t.model_pin,

@@ -19,6 +19,7 @@ import cd   # reused by the tiered MR review below for cd._patterns(tier_cfg, re
             # import (cd.py imports gitlab_mr + site_env, never routing).
 
 log = logging.getLogger("eph-broker.routing")
+_RUNTIME_ROWS = {}   # id(startup template) -> live settings; resolved/running routes are never rewritten
 
 FLEET_MODEL_SH = os.getenv("FLEET_MODEL_SH", "")   # from site.env; unset means resolve_model uses the fallback model
 
@@ -1015,9 +1016,14 @@ class Route:
                                  "- refusing (fail-closed)")
             validate_browser_mcp_config(self.browser_mcp_config)
 
-    def with_model(self):
+    def effective_template(self):
+        """Live settings first, per-row routing overrides last. Never mutate a running route."""
         from routing_overrides import OVERRIDES
-        self = OVERRIDES.apply(self)
+        fields = _RUNTIME_ROWS.get(id(self), {})
+        return OVERRIDES.apply(replace(self, **fields) if fields else self)
+
+    def with_model(self):
+        self = self.effective_template()
         if self.model_pin:                   # pinned model, no mode lookup
             model, backend = self.model_pin, self.backend
             # a model_pin pins the MODEL only. If the pin NAMES a spawn-registry backend (e.g.
@@ -1195,11 +1201,11 @@ def model_choice_error(name):
 def row_pinned(row_key):
     """True when the row `row_key` pins its model or backend (env or routing overrides), so a per-run pick
     would be ignored at spawn. Unknown rows are not pinned."""
-    from routing_overrides import OVERRIDES, templates
+    from routing_overrides import templates
     t = templates().get(row_key)
     if t is None:
         return False
-    t = OVERRIDES.apply(t)
+    t = t.effective_template()
     return t.pin or bool(t.model_pin)
 
 
@@ -2166,11 +2172,12 @@ def resolve_mr_review_tier(route, diff_text, paths=None, repo=None, tier_cfg=Non
     `--model haiku`/`--model opus`."""
     tier, reason = select_mr_review_tier(diff_text, paths, repo=repo, tier_cfg=tier_cfg)
     model, backend, backend_pinned = route.model, route.backend, route.backend_pinned
-    if not route.backend_pinned:          # only an explicit pin wins every tier
-        mode_resolved = _MR_REVIEW_ROW.with_model()   # the FLEET_MODE lookup, same as the single-model path
+    template = _MR_REVIEW_ROW.effective_template()
+    if not (route.backend_pinned or template.model_pin or template.backend):
+        mode_resolved = template.with_model()   # the FLEET_MODE lookup, same as the single-model path
         tier_model = _mr_review_tier_model(tier, route.adapter)
         if tier_model and not mode_resolved.backend:
-            resolved = replace(_MR_REVIEW_ROW, model_pin=tier_model).with_model()
+            resolved = replace(template, model_pin=tier_model).with_model()
             model, backend, backend_pinned = resolved.model, resolved.backend, resolved.backend_pinned
     prompt_class = "quick" if tier == "quick" else _MR_REVIEW_ROW.prompt_class
     return tier, reason, model, backend, backend_pinned, prompt_class

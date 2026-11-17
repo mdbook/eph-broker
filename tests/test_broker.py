@@ -26091,6 +26091,244 @@ def test_envelope_escalation_once_per_run_concurrent_and_after_reload():
     ok("envelope escalation reserves run id once across concurrent forwards and durable state reload")
 
 
+@contextmanager
+def _hold_test_broker(config=None, durable=False):
+    import app as A
+    with tempfile.TemporaryDirectory(dir=ROOT) as d, \
+            patch.dict(os.environ, {"BROKER_STATE_PATH": "", "BROKER_DRAIN_ON_NEW_JOURNAL": "0",
+                                   "DISPATCH_PRIORITY": "fifo", "ROW_CONCURRENCY": ""}), \
+            patch.object(site_env, "CONFIG", config or {}), \
+            patch.object(A, "CONFIG_DIR", d), \
+            patch.object(C, "COMPLETED_PATH", ""), patch.object(C, "EVENTS_LOG", os.path.join(d, "events.jsonl")), \
+            patch.object(C, "INITIAL_WINDOWS", {}), patch.object(C, "INITIAL_DEFAULT", 0):
+        b = A.Broker(state_path=os.path.join(d, "state.sqlite3") if durable else None)
+        calls = []
+        b.adapter.spawn = lambda key, brief: calls.append((key, brief))
+        try:
+            yield b, calls
+        finally:
+            if b.state:
+                b.state.close()
+
+
+def _hold_event(**extra):
+    return {"source": "vikunja", "task_id": 9670, "event_name": "task.updated", "doer": "owner",
+            "assignees": ["dev"], "labels": [], **extra}
+
+
+def test_hold_assignment_and_release_use_normal_dispatch():
+    import app as A
+    for assignee in ("dev", "eph", "infra-eph", "fleet"):
+        with _hold_test_broker() as (b, calls), patch.object(A.log, "info") as info, \
+                patch.object(b, "_launch_tfa", return_value="tfa") as tfa:
+            held = _hold_event(assignees=[assignee], labels=["blocked"])
+            for _ in range(3):
+                assert b.ingest(dict(held)) is None
+            b.tick()
+            assert not b.coalescer.pending and not b.coalescer.live and not calls and not tfa.called
+            assert not b.route_stamps
+            assert sum(c.args[0].startswith("hold:") for c in info.call_args_list) == 1
+            released = _hold_event(assignees=[assignee])
+            if assignee == "fleet":
+                assert b.ingest(released) == "tfa"  # same existing TFA launch seam, never called while held
+                tfa.assert_called_once()
+            else:
+                key = b.ingest(dict(released))
+                assert key == "vikunja:task:9670"
+                assert b.ingest(dict(released)) == key
+                b.tick()
+                b.tick()
+                assert len(calls) == 1 and calls[0][0] == key
+                assert calls[0][1]["event_names"] == ["task.updated"]
+    ok("hold at assignment starts no worker/TFA; release reuses ordinary route/coalescer and batches once")
+
+
+def test_hold_unlabelled_and_disabled_dispatch_unchanged():
+    for config, labels in (({}, []), ({"hold_labels": []}, ["blocked"]),
+                           ({"hold_labels": ["waiting"]}, ["blocked"])):
+        with _hold_test_broker(config) as (b, calls):
+            assert b.ingest(_hold_event(labels=labels)) == "vikunja:task:9670"
+            b.tick()
+            assert len(calls) == 1
+    ok("unlabelled assignment unchanged; empty hold_labels disables; custom policy replaces blocked")
+
+
+def test_hold_added_during_debounce_and_sparse_events():
+    with _hold_test_broker({"hold_labels": ["waiting", "dependency"]}) as (b, calls):
+        key = b.ingest(_hold_event())
+        assert key in b.coalescer.pending
+        assert b.ingest(_hold_event(labels=["waiting", "dependency"])) is None
+        assert key not in b.coalescer.pending
+        sparse = _hold_event()
+        sparse.pop("labels")
+        assert b.ingest(sparse) is None
+        assert b.ingest(_hold_event(labels=["dependency"])) is None
+        b.tick()
+        assert not calls
+        assert b.ingest(_hold_event()) == key
+        b.tick()
+        assert len(calls) == 1
+    ok("hold cancels debounce; sparse updates or removal of only one hold label cannot release")
+
+
+def test_hold_durable_restart_drain_and_completion_dedup():
+    import app as A
+    with _hold_test_broker(durable=True) as (b, calls):
+        b.set_drain(True)
+        b.ingest(_hold_event(labels=["blocked"], doer="svc-account"))
+        b.tick()
+        assert b.state.status()["queued"] == 1 and not calls
+        b.set_drain(False)
+        b.tick()
+        assert b._held_tickets == {"vikunja:task:9670"} and not calls
+        path = b.state.db.execute("PRAGMA database_list").fetchone()[2]
+        b.state.close()
+        b.state = None
+        restored = A.Broker(state_path=path)
+        restored.adapter.spawn = lambda key, brief: calls.append((key, brief))
+        try:
+            with patch.object(A.log, "info") as info:
+                assert restored.ingest(_hold_event(labels=["blocked"], doer="svc-account")) is None
+                assert not any(c.args[0].startswith("hold:") for c in info.call_args_list)
+            key = restored.ingest(_hold_event(doer="svc-account"))
+            restored.tick()
+            assert len(calls) == 1
+            restored.coalescer.settle_self(key)
+            restored.ingest(_hold_event(labels=["blocked"], doer="svc-account"))
+            restored.ingest(_hold_event(doer="svc-account"))
+            restored.tick()
+            assert len(calls) == 1 and restored.coalescer.deduped == 1
+        finally:
+            restored.state.close()
+    ok("holds honor drain, survive restart without repeat logs, and preserve completion dedup on release")
+
+
+def test_hold_fifo_queued_update_cancels_pending_before_spawn():
+    import app as A
+    for scenario in ("backlog", "drain", "restart"):
+        with _hold_test_broker(durable=True) as (b, calls):
+            key = b.ingest(_hold_event())
+            if scenario != "backlog":
+                b.set_drain(True)
+            other = b.ingest(_hold_event(task_id=9671))
+            b.ingest(_hold_event(labels=["blocked"]))
+            assert b.state.status()["queued"] == 2
+            restored = None
+            if scenario == "restart":
+                path = b.state.db.execute("PRAGMA database_list").fetchone()[2]
+                b.state.close()
+                b.state = None
+                restored = A.Broker(state_path=path)
+                restored.adapter.spawn = lambda key, brief: calls.append((key, brief))
+            active = restored or b
+            try:
+                if scenario != "backlog":
+                    active.tick()
+                    assert not calls and active.state.status()["queued"] == 2
+                    active.set_drain(False)
+                active.tick()
+                assert key not in active.coalescer.pending and key not in active.coalescer.live
+                assert active._held_tickets == {key} and not calls
+                assert active.state.get("held_tickets") == [key]
+                assert other in active.coalescer.pending
+                active.tick()
+                assert [k for k, _ in calls] == [other]
+                active.coalescer.settle_self(other)
+                active.ingest(_hold_event())
+                active.tick()
+                active.tick()
+                assert [k for k, _ in calls] == [other, key]
+            finally:
+                if restored:
+                    restored.state.close()
+    ok("FIFO queued holds cancel pending before spawn across backlog, drain and restart; release runs once")
+
+
+def test_hold_fifo_replays_pending_snapshots_in_order_without_admitting_new_subjects():
+    for final_labels in (["blocked"], []):
+        with _hold_test_broker(durable=True) as (b, calls):
+            key = b.ingest(_hold_event())
+            other = b.ingest(_hold_event(task_id=9671))
+            # An older unheld snapshot must not later undo the queued hold. Conversely,
+            # hold removal in the same queued burst must not get stranded behind it.
+            for labels in ([], ["blocked"], [], final_labels):
+                b.ingest(_hold_event(labels=labels))
+            sparse = _hold_event()
+            sparse.pop("labels")
+            b.ingest(sparse)
+            with patch.object(b.coalescer, "_row_capped", return_value=True):
+                b.tick()
+                assert not calls
+                if final_labels:
+                    assert key not in b.coalescer.pending and key in b._held_tickets
+                else:
+                    assert key in b.coalescer.pending and key not in b._held_tickets
+                    assert other not in b.coalescer.pending
+                    assert [b._intake_subject(kind, payload) for _, kind, payload, _ in
+                            b.state.queued(limit=-1)] == [other]
+            b.tick()
+            assert [k for k, _ in calls] == ([other] if final_labels else [key])
+    ok("FIFO batches same-subject snapshots in order, preserving sparse holds and unrelated head blocking")
+
+
+def test_hold_non_head_claim_survives_restart_as_admission_barrier():
+    import app as A
+    for scenario in ("fifo", "reviews-first", "selected-pending", "selected-intake", "hold-disabled"):
+        with _hold_test_broker(durable=True) as (b, calls):
+            key = b.ingest(_hold_event())
+            other = b.ingest(_hold_event(task_id=9671))
+            b.ingest(_hold_event(labels=["blocked"]))
+            head = b.state.head()
+            hold_id = b.state.queued(limit=-1)[1][0]
+            # Crash after the out-of-order claim commits, BEFORE the atomic pending/hold handoff.
+            b.state.claim(hold_id)
+            path = b.state.db.execute("PRAGMA database_list").fetchone()[2]
+            b.state.close()
+            b.state = None
+            restored = A.Broker(state_path=path)
+            restored.adapter.spawn = lambda key, brief: calls.append((key, brief))
+            try:
+                assert key in restored.coalescer.pending and not restored.coalescer.recovery
+                assert not restored._held_tickets and restored.state.head() == head
+                if scenario.startswith("selected-"):
+                    chosen = key if scenario == "selected-pending" else other
+                    assert restored.move_to_front(chosen)[0] == 200
+                policy = "reviews-first" if scenario == "reviews-first" else "fifo"
+                config = {"hold_labels": []} if scenario == "hold-disabled" else {}
+                with patch.dict(os.environ, {"DISPATCH_PRIORITY": policy}), \
+                        patch.object(site_env, "CONFIG", config), \
+                        patch.object(restored, "_dispatch_intake", wraps=restored._dispatch_intake) as replay, \
+                        patch.object(restored.coalescer, "tick", wraps=restored.coalescer.tick) as spawn_tick:
+                    for _ in range(3):
+                        restored.tick()
+                    assert not calls, scenario
+                    assert not replay.called and not spawn_tick.called, scenario
+                assert list(restored.coalescer.pending) == [key]
+                assert restored.state.head() == head and not restored._held_tickets
+                status = restored.state.status()
+                assert status["queued"] == 1 and status["dispatching_ids"] == [hold_id]
+                if scenario.startswith("selected-"):
+                    # A held selection must not reserve a worker slot while intake is ambiguous.
+                    assert restored.semaphore.acquire(blocking=False, key="unrelated")
+                    restored.semaphore.release()
+            finally:
+                restored.state.close()
+    ok("non-head claimed hold survives restart and blocks FIFO, reviews-first and selected replay/spawn")
+
+
+def test_hold_fifo_queued_update_cannot_cross_ambiguous_intake():
+    with _hold_test_broker(durable=True) as (b, calls):
+        key = b.ingest(_hold_event())
+        b.ingest(_hold_event(task_id=9671))
+        b.ingest(_hold_event(labels=["blocked"]))
+        b.state.claim(b.state.head()[0])
+        b.tick()
+        assert not calls and key in b.coalescer.pending
+        assert not b._held_tickets
+        assert b.state.status()["queued"] == 1 and b.state.status()["dispatching"] == 1
+    ok("FIFO pending updates and spawn both stop at an ambiguous durable intake intent")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     print(f"running {len(tests)} broker self-tests...")

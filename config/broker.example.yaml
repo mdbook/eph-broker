@@ -4,12 +4,18 @@
 # An unknown section, a repeated key or a parse error stops the broker at startup.
 
 # Case-insensitive literal substrings forbidden in final worker model ids. Empty = unrestricted.
-# Checked at launch for every harness, including backend/env model remapping. Restart after changes.
+# Checked at launch for every harness, including backend/env model remapping. Reload with SIGHUP.
 model_denylist: []
+
+# Keep tickets assigned to their owner while waiting on a dependency. Exact label names (case-insensitive)
+# or positive integer ids. Default: [blocked]; [] disables this gate. Restart after changing it.
+# Id matching needs an id-aware tap (label_ids or full label objects); the bundled tap sends names.
+hold_labels: [blocked]
 
 # Environment settings, the same keys as config/site.example.env. The real environment wins over these,
 # and these win over site.env. Values are strings, numbers or true/false (true becomes "1"). Quote anything
-# YAML might read as something else (on, off, 0755). Read at startup, so restart after changing them.
+# YAML might read as something else (on, off, 0755). On SIGHUP, runtime settings below override the startup
+# defaults (including env); paths, ports and identities still require restart. See README's inventory.
 # Never put secrets here, see docs/configuration.md#secrets.
 settings:
   TICKET_URL_TEMPLATE: "https://tracker.example.com/tasks/{}"
@@ -22,6 +28,11 @@ settings:
   GENERAL_REPO_ALLOWLIST: "/srv/git/app:/srv/git/docs-site"
   CODE_REPO_ALLOWLIST: "/srv/git/app:/srv/git/docs-site"
   CONCURRENCY: 5
+  DISPATCH_PRIORITY: "reviews-first"
+  MAX_SPAWNS_PER_HOUR: 60
+  ROW_CONCURRENCY: ""  # example: code=2,mr-review=1; 0 pauses a group without killing workers
+  CD_ENABLED: false
+  # MR_REVIEWER_MODEL: "sonnet"  # explicit pin wins even for a full-tier review
   # OS isolation (requires bubblewrap). "off" is an explicit, unsafe rollout/rollback override.
   WORKER_SANDBOX: "bwrap"
   # Colon-separated absolute paths; hides always win over read-only or writable binds.
@@ -63,7 +74,8 @@ settings:
 #     allow: ["Bash(wc -w:*)"]
 #     deny: [WebFetch]
 
-# Turn caps and wall-clock limits (config/constraints.json). Read at startup.
+# Turn caps and wall-clock limits (config/constraints.json). Reload with SIGHUP.
+# Positive fractional durations are supported, e.g. wall_clock_s: 0.5. Running invocations keep their timeout.
 constraints:
   max_turns: 50
   max_turns_by_capability: {code: 100, inbox: 15}

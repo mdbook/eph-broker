@@ -2385,8 +2385,8 @@ class CCAdapter(Adapter):
         self._ticket_fetch_retry_delay_s = ticket_fetch_retry_delay_s
         self._ticket_fetch_sleep = ticket_fetch_sleep or time.sleep
         # 429/529 back-off schedule (one retry per delay) + an injectable sleep so tests don't wait.
-        self._api_overload_delays_s = tuple(API_OVERLOAD_RETRY_DELAYS_S if api_overload_delays_s is None
-                                            else api_overload_delays_s)
+        # None follows the live policy; an explicit constructor override stays fixed for tests.
+        self._api_overload_delays_s = None if api_overload_delays_s is None else tuple(api_overload_delays_s)
         self._api_overload_sleep = api_overload_sleep or time.sleep
         # MR-reviewer: the broker RE-INGESTS a synthetic mr.opened event in-process after a code
         # worker's MR opens (instead of an HTTP self-POST). Broker.ingest already runs echo_guard +
@@ -4618,9 +4618,10 @@ class CCAdapter(Adapter):
         # spend the warm re-prompt on it. If every retry is still overloaded, give up ONCE (comment and alert) and
         # flag the worker so _run_worker exits WITHOUT stamping the subject completed (re-armable).
         if _detect_api_overload(getattr(worker, "last_output", None)):
-            for attempt, delay in enumerate(self._api_overload_delays_s, 1):
+            delays = API_OVERLOAD_RETRY_DELAYS_S if self._api_overload_delays_s is None else self._api_overload_delays_s
+            for attempt, delay in enumerate(delays, 1):
                 log.warning("API overload (429/529) key=%s run_id=%s -> retry %d/%d in %ss", worker.key, run_id,
-                            attempt, len(self._api_overload_delays_s), delay)
+                            attempt, len(delays), delay)
                 remaining = float(delay)
                 while remaining > 0 and not getattr(worker, "done", False):   # teardown interrupts the wait
                     step = min(remaining, 5.0)
@@ -4635,7 +4636,7 @@ class CCAdapter(Adapter):
                 if not _detect_api_overload(getattr(worker, "last_output", None)):
                     break                                # a real parse miss now -> the warm re-prompt below
             else:
-                self._api_overload_giveup(worker, run_id)
+                self._api_overload_giveup(worker, run_id, len(delays))
                 return None
             if getattr(worker, "done", False):
                 return None
@@ -4714,11 +4715,10 @@ class CCAdapter(Adapter):
             "session_id": worker.session_id, "tokens": worker.inbox_input_tokens,
             "run_id": run_id, "harness": getattr(route, "adapter", "cc")}
 
-    def _api_overload_giveup(self, worker, run_id):
+    def _api_overload_giveup(self, worker, run_id, n):
         """Every 429/529 back-off retry failed. Flag the worker (so _run_worker exits WITHOUT stamping the
         subject completed), post ONE ticket comment and send the alert ONCE. Never raises into the turn."""
         worker.api_overloaded = True
-        n = len(self._api_overload_delays_s)
         log.error("API overload: %d back-off retr%s exhausted key=%s run_id=%s -> exiting un-stamped",
                   n, "y" if n == 1 else "ies", worker.key, run_id)
         self._post_ticket_note(worker.key, (

@@ -29,6 +29,24 @@ class PrioritySlots:
         self._reserved = False
 
     @property
+    def limit(self):
+        with self._condition:
+            return self._limit
+
+    def resize(self, value):
+        """Change admission, not ownership. Negative availability is shrink debt.
+
+        Holders always release normally; a shrink only blocks new starts until
+        enough holders leave. Waking all waiters on growth fills every new slot.
+        """
+        if type(value) is not int or value < 1:
+            raise ValueError("slot limit must be a positive integer")
+        with self._condition:
+            self._value += value - self._limit
+            self._limit = value
+            self._condition.notify_all()
+
+    @property
     def front(self):
         with self._condition:
             return self._front
@@ -68,7 +86,7 @@ class PrioritySlots:
                     preferred = next((w for w in self._waiters if w[0] == self._front), None) \
                         if self._front is not None else None
                     first = preferred or (None if self._reserved else self._waiters[0])
-                    if self._value and first is waiter:
+                    if self._value > 0 and first is waiter:
                         self._value -= 1
                         if key == self._front:
                             self._front, self._reserved = None, False

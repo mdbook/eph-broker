@@ -100,6 +100,8 @@ def test_ingest_stamps_ref_from_key_not_body():
             seen.append(evt); return None
     b = app.Broker.__new__(app.Broker)
     b.state = None  # This fixture exercises raw ref stamping with durable admission disabled.
+    b.coalescer = C.Coalescer()
+    b._held_tickets = set()
     b.echo_guard = Guard()
     caller = {"source": "vikunja", "task_id": 7, "ref": "github:evil/repo#1", "event_name": "task.updated"}
     assert b.ingest(dict(caller)) is None

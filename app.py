@@ -279,7 +279,7 @@ class Config:
     """Hot-reloadable config from CONFIG_DIR/*.json and the broker.yaml sections below. SIGHUP re-reads. Value-free."""
     SECTIONS = ("constraints", "windows", "zulip-wake", "cd-tier", "deploy-paths", "pool-vikunja-ids")
     # read on every use, so a SIGHUP edit takes effect; every other broker.yaml section is read once at startup
-    LIVE = ("windows", "zulip-wake", "cd-tier", "deploy-paths", "pool-vikunja-ids")
+    LIVE = ("settings", "model_denylist", "constraints", "windows", "zulip-wake", "cd-tier", "deploy-paths", "pool-vikunja-ids")
 
     def __init__(self, config_dir):
         self.config_dir = config_dir
@@ -352,6 +352,8 @@ class Config:
         # apply window overrides live onto the coalescer module globals (same shape as env override)
         C.INITIAL_WINDOWS.update({k: float(v) for k, v in win.get("initial", {}).items()})
         C.RECEIVE_WINDOWS.update({k: float(v) for k, v in win.get("receive", {}).items()})
+        if hasattr(self, "on_reload"):
+            self.on_reload()
         log.info("config reloaded: %s", list(loaded))
         return self.data
 
@@ -391,6 +393,7 @@ class Broker:
         if drain_on_create and not path:
             raise StateError("initial drain requires a durable broker state path")
         self.state = BrokerState(path, drain_on_create=drain_on_create) if path else None
+        self._held_tickets = set(self.state.get("held_tickets", []) if self.state else [])
         self._mr_iterations = {}             # legacy in-memory mode; journal mode reads receipts atomically
         self._mr_tasks = {}                  # project/MR -> originating ticket; journal mode is durable
         self._mr_issues = {}                 # project/MR -> source issue identity and requirements
@@ -445,9 +448,9 @@ class Broker:
             # Per-capability --max-turns override (e.g. code=40), else the global max_turns.
             max_turns_by_capability={k: int(v) for k, v in
                                      (constraints.get("max_turns_by_capability") or {}).items()},
-            wall_clock_s=int(constraints.get("wall_clock_s", 600)),
+            wall_clock_s=float(constraints.get("wall_clock_s", 600)),
             # Per-capability wall-clock override (e.g. code=1200), else the global wall_clock_s.
-            wall_clock_by_capability={k: int(v) for k, v in
+            wall_clock_by_capability={k: float(v) for k, v in
                                       (constraints.get("wall_clock_by_capability") or {}).items()},
             inbox_max_input_tokens=int(constraints.get("inbox_max_input_tokens", 3_000_000)),
             inbox_max_cost_usd=float(constraints.get("inbox_max_cost_usd", 2.0)),
@@ -555,6 +558,15 @@ class Broker:
                 constraints.get("wall_clock_by_capability")),
             period=C.TICK,
         )
+        from runtime_settings import RuntimeSettings
+        self.runtime_settings = RuntimeSettings(self)
+        self.config.on_reload = self._apply_runtime_config
+
+    def _apply_runtime_config(self):
+        self.runtime_settings.apply(self.config.yaml)
+        self.runtime_settings.apply_constraints(self.config.data.get("constraints", {}))
+        self.liveness.period = C.TICK
+        self.zulip_wake.start()  # enabling either flag after startup must also start reconciliation
 
     def ingest(self, evt, internal=False):
         if self.state is None:
@@ -680,14 +692,19 @@ class Broker:
 
     def tick(self):
         with self.coalescer.lock:
+            self._state_ready()
+            if self.state and self.state.status()["dispatching"]:
+                # Out-of-order handoffs can leave a claimed row BEHIND a queued head after a crash.
+                # Any ambiguous intake must stop replay and spawning, not just a claimed head.
+                self.semaphore.defer(self.semaphore.front)
+                return
             # Keep owed re-review delivery and scheduling in the same admission critical section:
             # retirement cannot open a gap in which new work overtakes the deferred BLOCK round.
             self._cd_retry_recover()
             self._state_ready()
             front = self.semaphore.front
             if self.state and front:
-                head = self.state.head()
-                if self.state.get("draining", False) or self.coalescer.recovery or (head and head[3] != "queued"):
+                if self.state.get("draining", False) or self.coalescer.recovery:
                     self.semaphore.defer(front)
                     return
                 # An explicit selection may cross the intake/pending boundary even in FIFO mode.
@@ -700,9 +717,6 @@ class Broker:
             if self.state and C.reviews_first():
                 if self.state.get("draining", False) or self.coalescer.recovery:
                     return
-                head = self.state.head()
-                if head is not None and head[3] != "queued":
-                    return  # never overtake an ambiguous intake intent
                 # Admit a finite snapshot before choosing workers. Leaving reviews behind a capped
                 # pending ticket in durable intake made coalescer priority ineffective. Each handoff
                 # still commits intent and queue removal atomically through the existing path.
@@ -710,6 +724,17 @@ class Broker:
                     self._dispatch_intake(item_id, kind, payload)
                 self.coalescer.tick()
                 return
+            if self.state and site_env.CONFIG.get("hold_labels", ["blocked"]):
+                if not self.state.get("draining", False) and not self.coalescer.recovery:
+                    # FIFO orders new subjects, not updates to an already-admitted burst. A hold
+                    # queued behind unrelated intake must cancel debounce BEFORE the spawn tick.
+                    # Replay all snapshots for those subjects in order (including releases), using
+                    # the normal atomic handoff; never inspect only the last/held snapshot.
+                    pending = set(self.coalescer.pending)
+                    for item_id, kind, payload, _arrived in self.state.queued(limit=-1):
+                        if kind == "event" and payload["event"].get("source") == "vikunja" \
+                                and self._intake_subject(kind, payload) in pending:
+                            self._dispatch_intake(item_id, kind, payload)
             self.coalescer.tick()
             if not self.state or self.state.get("draining", False) or self.coalescer.pending \
                     or self.coalescer.recovery:
@@ -776,7 +801,42 @@ class Broker:
                     self._mr_iterations = receipts
             return admitted
 
+    def _hold_ticket(self, key, evt):
+        """Stop held Vikunja intake before any launch path, including the interactive TFA row.
+
+        Label removal needs no special dispatch: its assigned task snapshot goes through the ordinary
+        echo guard, router and coalescer below. Remember a hold across sparse updates and restarts;
+        only an explicit label snapshot can release it. An already-running worker is not cancelled.
+        Caller holds coalescer.lock, so a hold arriving during debounce cannot race the spawn tick.
+        """
+        if evt.get("source") != "vikunja" or not site_env.CONFIG.get("hold_labels", ["blocked"]):
+            return False
+        was_held = key in self._held_tickets
+        held = (site_env.has_hold_label(evt.get("labels"), evt.get("label_ids"))
+                if "labels" in evt or "label_ids" in evt else was_held)
+        if held != was_held:
+            if held:
+                self._held_tickets.add(key)
+                log.info("hold: key=%s held by hold_labels; no dispatch", key)
+            else:
+                self._held_tickets.discard(key)
+            if self.state:
+                self.state.put("held_tickets", sorted(self._held_tickets))
+        if held and key in self.coalescer.pending:
+            self.coalescer.pending.pop(key)
+            self.coalescer._save_pending()
+            self.semaphore.discard(key)
+            if key not in self.coalescer.live:
+                self.route_stamps.pop(key, None)
+        return held
+
     def _ingest_event(self, evt, internal=False):
+        with self.coalescer.lock:
+            if self._hold_ticket(C.normalize(evt), evt):
+                return None
+            return self._ingest_unheld_event(evt, internal=internal)
+
+    def _ingest_unheld_event(self, evt, internal=False):
         """HMAC already checked at the Handler. Pipeline: echo-guard, then the allowlist reject and
         route-stamp, then coalescer.on_event. echo-guard and classify run BEFORE on_event so the coalescer's island
         (the lock + state handoff in on_event/tick) stays verbatim, EXCEPT one FORWARD_ONLY

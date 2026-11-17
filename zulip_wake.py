@@ -35,7 +35,8 @@ WHICH BOTS: registry (`ZULIP_REGISTRY_PATH`, the supervisor registry JSON) entri
 re-read with a TTL. Wake-mapped bots listen in wake mode (needs ZULIP_WAKE_ENABLED); the rest minus
 ZULIP_AUTOREPLY_EXCLUDE listen in auto-reply mode (needs ZULIP_AUTOREPLY_ENABLED). A bot whose stood_down
 flips false loses its listener at the next reconcile (the standing agent owns its bot again). Both flags 0 ->
-start() returns without starting a thread or a child.
+start() returns without starting a thread or a child. A config reload calls start() again so enabling
+either feature later starts the single reconciliation loop.
 
 Env knobs (read at call time): ZULIP_WAKE_ENABLED=0 · ZULIP_AUTOREPLY_ENABLED=0 · ZULIP_WAKE_SENDERS= (empty: nobody wakes) ·
 ZULIP_WAKE_BOT_SENDERS= (empty; numeric BOT ids allowed to wake, e.g. a monitoring bot) · ZULIP_MAX_AGE_S=300 · ZULIP_AUTOREPLY_WINDOW_S=86400 · ZULIP_AUTOREPLY_EXCLUDE= ·
@@ -431,6 +432,7 @@ class ZulipWake:
                          "not_allowlisted": 0, "woken": 0, "rate_limited": 0, "autoreplied": 0, "unmapped": 0,
                          "ingest_failed": 0}
         self._thread = None
+        self._start_lock = threading.RLock()                  # SIGHUP may re-enter start() on the main thread
 
     # ---- config ----
     def wake_map(self):
@@ -583,13 +585,16 @@ class ZulipWake:
         return want
 
     def start(self):
-        """Start the reconcile loop. Both flags 0 -> nothing at all (no thread, no child)."""
-        if not (wake_enabled() or autoreply_enabled()):
-            log.info("zulip-wake: ZULIP_WAKE_ENABLED=0 and ZULIP_AUTOREPLY_ENABLED=0 -> no listeners")
-            return False
-        self._thread = threading.Thread(target=self._loop, name="zulip-wake-reconcile", daemon=True)
-        self._thread.start()
-        return True
+        """Start reconciliation once, at startup or reload. Both flags 0 -> no new thread or child."""
+        with self._start_lock:
+            if self._thread is not None:
+                return False
+            if not (wake_enabled() or autoreply_enabled()):
+                log.info("zulip-wake: ZULIP_WAKE_ENABLED=0 and ZULIP_AUTOREPLY_ENABLED=0 -> no listeners")
+                return False
+            self._thread = threading.Thread(target=self._loop, name="zulip-wake-reconcile", daemon=True)
+            self._thread.start()
+            return True
 
     def _loop(self):
         while True:

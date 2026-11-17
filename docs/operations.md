@@ -73,13 +73,15 @@ systemctl kill -s HUP eph-broker
 | `windows.json` | Applies right away |
 | `zulip-wake.json`, `pool-vikunja-ids.json` | Applies right away |
 | `cd-tier.json`, `deploy-paths.json` | Applies right away |
+| Runtime `settings`, `model_denylist` in broker config | Applies to future requests/turns/routes; environment values are startup defaults |
+| `constraints.json` or `constraints` section | Applies to adapter/coalescer/liveness; fractional durations stay fractional, running invocations keep their timeout |
 | `approved-prompts.json` | Read at every worker start, so no reload or restart needed |
-| Everything else: `constraints.json`, `routes.json`, provenance, inbox accounts, `config/site.env` and the environment | Restart the broker. For a broker.yaml section, the reload logs which ones changed |
+| Bootstrap settings, `routes.json`, provenance, inbox accounts, `config/site.env` and the environment | Restart the broker. See [the lifecycle inventory](../README.md#runtime-settings-and-reload-inventory) |
 
 A bad edit never takes the broker down. A file that can't be read or parsed, or a `windows` value that isn't a
 number of seconds, is logged as an error and the broker keeps the last good copy of that file. A broken
-broker.yaml keeps the whole previous broker.yaml. If the file was already broken at startup, there's no good copy
-to keep, so the broker starts without it.
+broker.yaml keeps the whole previous broker.yaml. Invalid runtime settings or constraints keep the previous
+applied block. A malformed explicit broker config refuses startup; it is not silently ignored.
 
 ## Health and the dashboard
 

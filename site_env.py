@@ -18,9 +18,10 @@ if not os.getenv("BROKER_CONFIG") and not os.path.exists(BROKER_CONFIG):
         BROKER_CONFIG = _json_config
 # Top-level keys of the broker config. `settings` feeds the environment; every other key is the content of the
 # config/<key>.json file it replaces (routes: the rows list), except `capabilities` (routing.load_site_capabilities),
-# which has no file, and `model_denylist` (the launch policy). Anything else is a typo and stops the broker.
+# which has no file, and `model_denylist` / `hold_labels` (launch/intake policies).
+# Anything else is a typo and stops the broker.
 SECTIONS = frozenset({"settings", "routes", "capabilities", "constraints", "windows", "provenance", "inbox-accounts",
-                      "zulip-wake", "cd-tier", "deploy-paths", "pool-vikunja-ids", "model_denylist"})
+                      "zulip-wake", "cd-tier", "deploy-paths", "pool-vikunja-ids", "model_denylist", "hold_labels"})
 
 
 class BrokerConfigError(ValueError):
@@ -105,6 +106,10 @@ def read_config(path=None):
     denylist = doc.get("model_denylist", [])
     if not isinstance(denylist, list) or any(not isinstance(s, str) or not s.strip() for s in denylist):
         raise BrokerConfigError(f"{path}: model_denylist must be a list of non-empty strings")
+    holds = doc.get("hold_labels", ["blocked"])
+    if not isinstance(holds, list) or any(not (
+            isinstance(s, str) and s.strip() or type(s) is int and s > 0) for s in holds):
+        raise BrokerConfigError(f"{path}: hold_labels must be a list of non-empty names or positive integer ids")
     try:        # plain data only, so every later copy (section()) can't fail: YAML reads 2026-10-18 as a date
         return json.loads(json.dumps(doc))
     except (TypeError, ValueError) as e:
@@ -148,10 +153,31 @@ def section(name, config=None):
     return json.loads(json.dumps(doc[name])) if name in doc else None
 
 
+def has_hold_label(labels, label_ids=()):
+    """Exact case-insensitive names or numeric ids, never substring matches. Empty config disables holds.
+
+    The usual tap sends label titles; id-aware taps can also send label_ids, or full label objects.
+    Read at startup, like routes. No tracker-specific ids are built into the policy.
+    """
+    if isinstance(labels, str):
+        labels = [labels]
+    names, ids = set(), {str(i) for i in (label_ids or [])}
+    for label in labels or []:
+        if isinstance(label, dict):
+            names.add(str(label.get("title") or "").strip().casefold())
+            ids.add(str(label.get("id")))
+        elif type(label) is int:
+            ids.add(str(label))
+        else:
+            names.add(str(label).strip().casefold())
+    return any(str(s) in ids if type(s) is int else s.strip().casefold() in names
+               for s in CONFIG.get("hold_labels", ["blocked"]))
+
+
 def require_model_allowed(model, env=None):
     """Last-launch guard for every harness: case-insensitive literal substrings, empty = no restriction.
     CC can remap aliases and auxiliary calls through its final environment, so check those model ids too.
-    Read the startup config, like routes; changing the policy requires a broker restart.
+    The broker publishes a validated policy on SIGHUP; an existing turn is never interrupted.
     """
     denylist = CONFIG.get("model_denylist", [])
     candidates = [("model", model)]

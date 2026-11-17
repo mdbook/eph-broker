@@ -5,7 +5,13 @@ stdlib assert only, same runner shape as test_routes.py. Import-time behaviour (
 file) runs in a subprocess with its own environment; everything else patches site_env.CONFIG and restores it.
 """
 import ast, hashlib, json, logging, os, re, shutil, subprocess, sys, tempfile
+import threading
+import time
+from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -149,6 +155,31 @@ def test_model_denylist_config():
     ok("model_denylist: validates lists, literal case-insensitive matching, unrestricted when omitted")
 
 
+def test_hold_labels_config():
+    with tempfile.TemporaryDirectory() as d:
+        for invalid in ("blocked", {}, [True], [0], [-1], [1.5], [""], ["   "], None):
+            path = _write(d, "holds.json", json.dumps({"hold_labels": invalid}))
+            try:
+                site_env.read_config(path)
+                raise AssertionError(f"accepted invalid hold_labels: {invalid!r}")
+            except site_env.BrokerConfigError:
+                pass
+        for valid in ([], ["waiting", 9123]):
+            doc = {"hold_labels": valid}
+            assert site_env.read_config(_write(d, "holds.json", json.dumps(doc))) == doc
+    with patched_config({}):
+        assert site_env.has_hold_label([" BLOCKED "])
+        assert not site_env.has_hold_label(["unblocked", "blocked-later"])
+    with patched_config({"hold_labels": ["Waiting", 9123]}):
+        assert site_env.has_hold_label(["waiting"])
+        assert site_env.has_hold_label([], [9123])
+        assert site_env.has_hold_label([{"id": 9123, "title": "dependency"}])
+        assert not site_env.has_hold_label(["blocked", "9123"])
+    with patched_config({"hold_labels": []}):
+        assert not site_env.has_hold_label(["blocked"], [9123])
+    ok("hold_labels: validates names/ids, exact matching, blocked default, explicit empty disables")
+
+
 def test_default_config_selection_without_pyyaml():
     with tempfile.TemporaryDirectory() as d:
         shutil.copyfile(os.path.join(ROOT, "site_env.py"), os.path.join(d, "site_env.py"))
@@ -179,7 +210,7 @@ def test_model_denylist_only_config_preserves_json_config():
     with tempfile.TemporaryDirectory() as d:
         cdir = os.path.join(d, "config"); os.makedirs(cdir)
         # Include every JSON-backed section and an extra legacy file: none should be replaced.
-        names = site_env.SECTIONS - {"settings", "capabilities", "model_denylist"}
+        names = site_env.SECTIONS - {"settings", "capabilities", "model_denylist", "hold_labels"}
         want = {name: {"initial": {}} if name == "windows" else {"from": name} for name in names}
         want["legacy"] = {"unchanged": True}
         for name, value in want.items():
@@ -284,11 +315,11 @@ def test_hot_config_sections_replace_json_and_survive_a_bad_reload():
             h = logging.Handler(); h.emit = lambda r: seen.append(r.getMessage())
             app.log.addHandler(h)
             try:                                                # a restart-only section changed: one line says so
-                _write(d, "broker.json", json.dumps({"windows": {"initial": {"zz:a": 2}}, "constraints": {"x": 1}}))
+                _write(d, "broker.json", json.dumps({"windows": {"initial": {"zz:a": 2}}, "routes": []}))
                 c.reload()
             finally:
                 app.log.removeHandler(h)
-            assert any("['constraints'] changed" in m and "restart" in m for m in seen), seen
+            assert any("['routes'] changed" in m and "restart" in m for m in seen), seen
             _write(d, "broker.json", json.dumps({"cd-tier": {"from": "yaml"}}))
             c.reload()
             assert c.data["windows"] == {"initial": {"zz:a": 1}} and c.data["cd-tier"] == {"from": "yaml"}
@@ -459,6 +490,386 @@ def test_provenance_and_inbox_sections_parity():
                 assert "exactly" in str(e)
     ok("provenance and inbox-accounts: a broker.yaml section loads like the json file, same checks; an explicit "
        "path env var still wins")
+
+
+@contextmanager
+def _live_broker():
+    import app
+    import coalescer
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        path = Path(d, "broker.json")
+        path.write_text("{}")
+        config_dir = Path(d, "config")
+        config_dir.mkdir()
+        rows, profiles, config = routing._RUNTIME_ROWS, routing.PROFILES, site_env.CONFIG
+        with patch.dict(os.environ), patch.object(app, "CONFIG_DIR", str(config_dir)), \
+                patch.object(coalescer, "COMPLETED_PATH", ""), \
+                patch.object(site_env, "BROKER_CONFIG", str(path)):
+            broker = app.Broker()
+            try:
+                yield broker, path
+            finally:
+                broker.runtime_settings.apply({})
+                routing._RUNTIME_ROWS, routing.PROFILES = rows, profiles
+                site_env.CONFIG = config
+
+
+def _reload(broker, path, settings=None, **sections):
+    path.write_text(json.dumps({"settings": settings or {}, **sections}))
+    broker.config.reload()
+
+
+def test_live_settings_sighup_changes_existing_broker_and_keeps_bootstrap():
+    import app
+    import coalescer
+    import dispatch
+    import cd
+    from adapters import cc, hermes, codex
+    with _live_broker() as (b, path):
+        identity = (b.adapter, b.coalescer, b.state, b.semaphore)
+        path.write_text(json.dumps({"settings": {
+            "CONCURRENCY": 2, "DISPATCH_PRIORITY": "fifo", "ROW_CONCURRENCY": "code=0",
+            "MAX_SPAWNS_PER_HOUR": 7, "CD_ENABLED": True, "PORT": 9999,
+            "LOCAL_WALL_CLOCK_MULT": 2.5, "API_OVERLOAD_RETRY_DELAYS_S": "0.5,1.5",
+            "CODEX_REASONING_SUMMARY": "concise", "CODE_CHANGE_ADAPTER": "codex",
+            "INITIAL_DEFAULT": 0.25, "BROKER_STREAM_ENABLED": "on"}}))
+        port = app.PORT
+        with patch.object(app, "BROKER", b):
+            app._reload_on_hup()
+        assert b.semaphore.limit == app.CONCURRENCY == 2
+        assert not dispatch.reviews_first() and coalescer.row_concurrency()["code"] == 0
+        assert coalescer.MAX_SPAWNS_PER_HOUR == 7 and coalescer.INITIAL_DEFAULT == 0.25
+        assert cd.enabled() and app.PORT == port
+        assert cc.LOCAL_WALL_CLOCK_MULT == hermes.LOCAL_WALL_CLOCK_MULT == 2.5
+        assert cc.API_OVERLOAD_RETRY_DELAYS_S == (0.5, 1.5) and codex.REASONING_SUMMARY == "concise"
+        assert routing._CODE_ROW.with_model().adapter == "codex"
+        assert app.stream.enabled()
+        assert identity == (b.adapter, b.coalescer, b.state, b.semaphore)
+        _reload(b, path)  # removal returns to startup defaults
+        assert app.PORT == port and b.semaphore.limit == b.runtime_settings.defaults["CONCURRENCY"]
+    ok("SIGHUP updates the existing broker's scheduler, CD, harness, stream and retry policy; bootstrap stays fixed")
+
+
+def test_live_settings_bad_file_and_bad_values_keep_last_good():
+    import app
+    import dispatch
+    with _live_broker() as (b, path):
+        _reload(b, path, {"CONCURRENCY": 2, "DISPATCH_PRIORITY": "fifo"})
+        path.write_text("{")
+        b.config.reload()
+        assert b.semaphore.limit == 2 and not dispatch.reviews_first()
+        for name, invalid in (("CONCURRENCY", 0), ("CONCURRENCY", True), ("CONCURRENCY", 1.5),
+                              ("TICK", "nan"), ("TICK", -1), ("DISPATCH_PRIORITY", "typo"),
+                              ("ROW_CONCURRENCY", "code=-1"), ("CD_ENABLED", "maybe"),
+                              ("MR_REVIEWER_BACKEND", "unresolvable-test-backend"),
+                              ("CODE_CHANGE_ADAPTER", "typo"), ("CODEX_REASONING_SUMMARY", "typo"),
+                              ("WORKER_SANDBOX", "typo"), ("EPH_GATE_NONSECRET_PATHS", "[]"),
+                              ("INITIAL_WINDOWS", "[]"), ("EVENTS_WEBHOOK_KINDS", "no-such-kind")):
+            with patch.object(logging.getLogger("eph-broker.settings"), "error") as error:
+                _reload(b, path, {"CONCURRENCY": 4, "DISPATCH_PRIORITY": "reviews-first", name: invalid})
+                assert error.called, name
+            assert b.semaphore.limit == app.CONCURRENCY == 2, name
+            assert not dispatch.reviews_first(), name
+    ok("parse errors and invalid runtime values log and keep the whole last-good settings block")
+
+
+def test_live_api_overload_retries_follow_reload_and_removal():
+    from adapters import cc
+    with _live_broker() as (b, path), patch.object(cc, "USAGE_CAP_FALLBACK_ENABLED", False):
+        adapter = b.adapter  # constructed before the policy changes
+        default = b.runtime_settings.defaults["API_OVERLOAD_RETRY_DELAYS_S"]
+        sleeps, calls = [], []
+
+        def overloaded(worker, route, system_prompt, prompt_text, resume):
+            calls.append((prompt_text, resume))
+            worker.last_output = json.dumps({"is_error": True, "api_error_status": 529})
+            return None
+
+        with patch.object(adapter, "_one_turn", side_effect=overloaded), \
+                patch.object(adapter, "_api_overload_sleep", side_effect=sleeps.append), \
+                patch.object(adapter, "_post_ticket_note") as note, patch.object(adapter, "_alert_ops"):
+            for settings, expected in (({"API_OVERLOAD_RETRY_DELAYS_S": "0.5,1.5"}, (0.5, 1.5)),
+                                       ({}, default)):
+                _reload(b, path, settings)
+                sleeps.clear()
+                calls.clear()
+                note.reset_mock()
+                worker = cc.Worker("vikunja:task:9992", "retry-reload", str(path.parent))
+                assert adapter._turn_with_envelope(worker, routing._CODE_ROW, "SYS", "PROMPT", False,
+                                                   "retry-reload") is None
+                assert len(calls) == 1 + len(expected) and all(c == ("PROMPT", False) for c in calls)
+                assert sum(sleeps) == sum(expected), (sleeps, expected)
+                if settings:
+                    assert sleeps == list(expected), sleeps
+                assert worker.api_overloaded and note.call_count == 1
+                assert "across %d back-off" % len(expected) in note.call_args[0][1]
+    ok("existing adapter retries with reloaded delays; removing the setting restores the startup default schedule")
+
+
+def test_live_api_overload_keeps_explicit_constructor_override():
+    from adapters import cc
+    with _live_broker() as (b, path), patch.object(cc, "USAGE_CAP_FALLBACK_ENABLED", False):
+        sleeps = []
+        adapter = cc.CCAdapter(router=None, worktree_mgr=None, prompt_loader=None, envelope_parser=None,
+                               api_overload_delays_s=(0.25,), api_overload_sleep=sleeps.append)
+        worker = cc.Worker("vikunja:task:9993", "retry-override", str(path.parent))
+        worker.last_output = json.dumps({"is_error": True, "api_error_status": 429})
+        with patch.object(adapter, "_one_turn", return_value=None) as turn, \
+                patch.object(adapter, "_post_ticket_note"), patch.object(adapter, "_alert_ops"):
+            _reload(b, path, {"API_OVERLOAD_RETRY_DELAYS_S": "1,2"})
+            adapter._turn_with_envelope(worker, routing._CODE_ROW, "SYS", "PROMPT", False, "retry-override")
+            assert sleeps == [0.25] and turn.call_count == 2
+    ok("an explicit retry schedule override stays fixed across policy reloads")
+
+
+@contextmanager
+def _live_zulip_reconciliation(flag):
+    import zulip_wake
+    with patch.dict(os.environ, ZULIP_WAKE_ENABLED="0", ZULIP_AUTOREPLY_ENABLED="0"), \
+            _live_broker() as (b, path):
+        zw = b.zulip_wake
+        ready, stop = threading.Event(), threading.Event()
+
+        def loop():
+            zw.reconcile()
+            ready.set()
+            stop.wait()  # hold the driver alive until the test has exercised further reloads
+
+        wake_map = {"chat-bot": {"row": "inbox-chat", "account": "test"}} if flag == "ZULIP_WAKE_ENABLED" else {}
+        with patch.object(zw.registry, "retired", return_value={"chat-bot": "/example/bot-env"}), \
+                patch.object(zw, "wake_map", return_value=wake_map), \
+                patch.object(zw, "_loop", side_effect=loop) as loops, \
+                patch.object(zulip_wake._Listener, "start") as starts, \
+                patch.object(zulip_wake._Listener, "stop"):
+            try:
+                assert zw.start() is False and zw._thread is None
+                yield b, path, ready, loops, starts
+            finally:
+                stop.set()
+                if zw._thread is not None:
+                    zw._thread.join(5)
+                    assert not zw._thread.is_alive()
+
+
+def test_live_zulip_disabled_at_startup_enables_after_sighup():
+    import app
+    for flag in ("ZULIP_WAKE_ENABLED", "ZULIP_AUTOREPLY_ENABLED"):
+        with _live_zulip_reconciliation(flag) as (b, path, ready, loops, starts):
+            path.write_text(json.dumps({"settings": {flag: True}}))
+            with patch.object(app, "BROKER", b):
+                app._reload_on_hup()
+            assert ready.wait(5), flag
+            assert loops.call_count == starts.call_count == 1
+            listener = b.zulip_wake.listeners["chat-bot"]
+            assert listener.mode == ("wake" if flag == "ZULIP_WAKE_ENABLED" else "autoreply")
+    ok("either Zulip feature enabled via SIGHUP starts reconciliation and its listener after an all-off startup")
+
+
+def test_live_zulip_repeated_reload_keeps_one_reconciliation_loop():
+    for flag in ("ZULIP_WAKE_ENABLED", "ZULIP_AUTOREPLY_ENABLED"):
+        with _live_zulip_reconciliation(flag) as (b, path, ready, loops, starts):
+            _reload(b, path, {flag: True})
+            assert ready.wait(5), flag
+            thread = b.zulip_wake._thread
+            for settings in ({flag: True}, {flag: True}, {}, {flag: True}):
+                _reload(b, path, settings)
+                assert b.zulip_wake._thread is thread
+            assert loops.call_count == starts.call_count == 1
+            # Disabling still uses the existing reconciliation stop path, not a second loop.
+            _reload(b, path)
+            listener = b.zulip_wake.listeners["chat-bot"]
+            b.zulip_wake.reconcile()
+            assert not b.zulip_wake.listeners
+            listener.stop.assert_called_once()
+    ok("repeated reloads and disable/re-enable keep one Zulip reconciliation loop; disabling stops listeners")
+
+def test_concurrency_reload_grows_and_shrinks_with_real_waiters():
+    with _live_broker() as (b, path):
+        _reload(b, path, {"CONCURRENCY": 1})
+        slots = b.semaphore
+        assert slots.acquire(key="holder")
+        admitted = [threading.Event() for _ in range(3)]
+        release = [threading.Event() for _ in range(3)]
+        errors, threads = [], []
+
+        def run(i):
+            try:
+                assert slots.acquire(timeout=5, key=str(i))
+                admitted[i].set()
+                try:
+                    assert release[i].wait(5)
+                finally:
+                    slots.release()
+            except BaseException as exc:
+                errors.append(exc)
+
+        holder = True
+        try:
+            for i in range(3):
+                t = threading.Thread(target=run, args=(i,))
+                threads.append(t)
+                t.start()
+                deadline = time.monotonic() + 5
+                while True:
+                    with slots._condition:
+                        if len(slots._waiters) == i + 1:
+                            break
+                    assert time.monotonic() < deadline
+                    time.sleep(0.001)
+            _reload(b, path, {"CONCURRENCY": 3})
+            assert admitted[0].wait(2) and admitted[1].wait(2), "growth must wake all new capacity at once"
+            assert not admitted[2].is_set()
+            _reload(b, path, {"CONCURRENCY": 1})
+            assert threads[0].is_alive() and threads[1].is_alive(), "shrink cannot kill holders"
+            slots.release()
+            holder = False
+            release[0].set()
+            threads[0].join(2)
+            assert not admitted[2].wait(0.05), "one remaining holder still occupies the shrunken cap"
+            release[1].set()
+            assert admitted[2].wait(2)
+        finally:
+            if holder:
+                slots.release()
+            for event in release:
+                event.set()
+            for t in threads:
+                t.join(5)
+        assert not errors and not any(t.is_alive() for t in threads)
+        assert slots is b.adapter._sem is b.coalescer.slots
+        assert slots.acquire(blocking=False)
+        slots.release()
+        try:
+            slots.release()
+            raise AssertionError("over-release accepted")
+        except ValueError:
+            pass
+    ok("live grow immediately fills new slots; shrink leaves holders alone and blocks admission until below cap")
+
+
+def test_resize_preserves_operator_reservations_and_repeated_shrink_debt():
+    from dispatch import PrioritySlots
+    slots = PrioritySlots(3)
+    assert all(slots.acquire(blocking=False) for _ in range(3))
+    slots.resize(1)
+    slots.resize(2)
+    assert not slots.acquire(blocking=False)
+    slots.release()
+    assert not slots.acquire(blocking=False)
+    slots.release()
+    slots.promote("selected", pending=True, reserve=True)
+    slots.resize(3)
+    assert not slots.acquire(blocking=False, key="ordinary")
+    assert slots.acquire(blocking=False, key="selected")
+    slots.release()
+    slots.release()
+    assert slots.limit == 3
+    ok("repeated resize accounts for existing ownership and retains operator reservations")
+
+
+def test_live_reviewer_model_and_backend_survive_full_tier_and_dispatch():
+    from adapters import cc
+    from routing_overrides import OVERRIDES
+    diff = "diff --git a/auth.py b/auth.py\n--- a/auth.py\n+++ b/auth.py\n@@ -1 +1 @@\n-old\n+new\n"
+    # Explicitly unpinned startup template, regardless of the fixture/site's defaults.
+    template = replace(routing._MR_REVIEW_ROW, model_pin="", backend="", pin=False)
+    with patch.object(routing, "_MR_REVIEW_ROW", template), patch.object(OVERRIDES, "apply", side_effect=lambda r: r), \
+            patch.object(routing, "resolve_model", return_value="claude-default"), _live_broker() as (b, path):
+        assert not template.model_pin and not template.backend
+        _reload(b, path, {"MR_REVIEWER_MODEL": "sonnet"})
+        route = template.with_model()
+        tier = routing.resolve_mr_review_tier(route, diff)
+        assert tier[0] == "full" and tier[2] == "sonnet", tier
+        seen = []
+        directory = str(path.parent)
+        wt = SimpleNamespace(make=lambda *a, **kw: directory, mr_diff=lambda *a, **kw: diff,
+                             cut_sha=lambda *a: "a" * 40, remove=lambda *a: None)
+        a = cc.CCAdapter(router=SimpleNamespace(route=lambda *a: template.with_model()), worktree_mgr=wt,
+                         prompt_loader=SimpleNamespace(load=lambda *a, **kw: "SYS"),
+                         envelope_parser=None, alert_ops=lambda *a, **kw: None)
+
+        def turn(worker, dispatched, *args, **kwargs):
+            seen.append((dispatched.model, dispatched.backend, dispatched.backend_pinned))
+            worker.done = True
+            return {"status": "pass", "summary": "synthetic review"}
+
+        with patch.object(a, "_turn", side_effect=turn), patch.object(a, "_post_envelope"), \
+                patch.object(a, "_post_mr_verdict"), patch.object(cc.events, "emit"):
+            a._run_worker("mr:example/app!9991", {"n_events": 1, "task_id": None, "mr": {
+                "project": "example/app", "mr_iid": 9991, "repo_path": directory,
+                "source_branch": "eph/review-test", "target_ref": "main"}}, "synthetic-review-run")
+        assert seen == [("sonnet", "", True)], seen
+        _reload(b, path, {"MR_REVIEWER_BACKEND": "claude"})
+        route = template.with_model()
+        assert routing.resolve_mr_review_tier(route, diff)[2:4] == (route.model, "claude")
+    ok("reloaded reviewer model/backend wins full-tier resolution and the CC-dispatched route carries sonnet")
+
+
+def test_live_route_pins_show_in_settings_and_file_overrides_still_win():
+    from routing_overrides import OVERRIDES, RoutingOverrides
+    with _live_broker() as (b, path), patch.object(routing, "resolve_model", return_value="claude-default"):
+        loader = RoutingOverrides(str(path.with_name("overrides.json")))
+        with patch("routing_overrides.OVERRIDES", loader):
+            before = routing._MR_REVIEW_ROW.with_model()
+            _reload(b, path, {"MR_REVIEWER_MODEL": "sonnet"})
+            after = routing._MR_REVIEW_ROW.with_model()
+            assert before.model == "claude-default" and after.model == "sonnet"
+            assert routing.row_pinned("mr-review")
+            view = next(row for row in loader.view()["rows"] if row["row"] == "mr-review")
+            assert view["pinned"] and view["model_pin"] == "sonnet"
+            Path(loader.path).write_text(json.dumps({"rows": {"mr-review": {"model_pin": "haiku"}}}))
+            route = routing._MR_REVIEW_ROW.with_model()
+            assert route.model == "haiku" and after.model == "sonnet"
+            assert routing.resolve_mr_review_tier(route, "unparseable diff")[2] == "haiku"
+    ok("runtime pins reach dashboard/admission checks; existing routes stay unchanged and row override files win")
+
+
+def test_live_launch_policy_and_optional_rows_reload_without_restart():
+    with _live_broker() as (b, path):
+        _reload(b, path, model_denylist=["blocked-family"])
+        try:
+            site_env.require_model_allowed("blocked-family-model")
+            raise AssertionError("live denylist not applied")
+        except site_env.ModelDenied:
+            pass
+        path.write_text('{"model_denylist": [false]}')
+        b.config.reload()
+        assert site_env.CONFIG["model_denylist"] == ["blocked-family"]
+        _reload(b, path, model_denylist=[])
+        site_env.require_model_allowed("blocked-family-model")
+    ok("launch denylist and optional row enablement reload in place; invalid policy keeps the previous list")
+
+
+def test_live_fractional_constraints_reach_turn_budget_without_immediate_exhaustion():
+    from adapters import cc
+    with _live_broker() as (b, path):
+        _reload(b, path, constraints={"wall_clock_s": 0.5, "wall_clock_by_capability": {"code": 0.75},
+                                     "max_turns": 9, "max_forwards": 3})
+        assert b.adapter.wall_clock_s == 0.5 and b.adapter.wall_clock_by_capability["code"] == 0.75
+        assert b.adapter.max_turns == 9 and b.coalescer.max_forwards == 3
+        route = routing.Route(domain="test", repo=str(path.parent), prompt_class="agent", agent="test",
+                              model="sonnet", cc_fail_fast=False)
+        worker = cc.Worker("test:9992", "synthetic-fractional-run", str(path.parent))
+        budgets = []
+
+        class Proc:
+            returncode = 0
+
+            def communicate(self, input=None, timeout=None):
+                assert timeout == 0.5 and timeout > 0
+                budgets.append(timeout)
+                return json.dumps({"type": "result", "result": "{}", "session_id": "synthetic"}), ""
+
+        with patch.object(cc.subprocess, "Popen", return_value=Proc()), \
+                patch.object(cc.sandbox, "wrap", side_effect=lambda argv, *a, **kw: argv), \
+                patch.object(cc.events, "emit"):
+            b.adapter._one_turn(worker, route, "SYS", "{}", resume=False)
+        assert budgets == [0.5] and not worker.hard_killed and worker.turn_wall_clock == 0.5
+        for cfg in ({"wall_clock_s": 0}, {"wall_clock_s": "nan"}, {"wall_clock_by_capability": {"read": -1}},
+                    {"model_prices": {"test": {"input_tokens": -1}}}):
+            _reload(b, path, constraints=cfg)
+            assert b.adapter.wall_clock_s == 0.5 and b.adapter.wall_clock_by_capability["code"] == 0.75
+    ok("fractional duration reloads reach the actual CC timeout without truncation; bad constraints retain budgets")
 
 
 def test_settings_environment_inventory():

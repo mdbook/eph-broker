@@ -10,13 +10,16 @@ belongs to features that are off by default, and several were built for the orig
 Variables the broker only passes through to workers (`PATH`, `HOME`, `LANG`, `TMPDIR` and so on) aren't listed.
 Harness-owned runtime variables such as `HERMES_HOME` are not operator settings either.
 Flags count as on for `1`, `true`, `yes` or `on`, unless the row says otherwise.
+For reload classification see [the README inventory](../README.md#runtime-settings-and-reload-inventory).
+Runtime policy in `broker.yaml` settings applies on SIGHUP, overriding startup environment defaults.
+Removing an entry restores its startup value. Bootstrap paths, ports and identities still require restart.
 
 ## Process and files
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `PORT` | `8787` | Port on 127.0.0.1 the broker listens on. |
-| `CONCURRENCY` | `5` | Most workers running at once. |
+| `CONCURRENCY` | `5` | Most active turns at once. Positive integer; SIGHUP resizes the existing gate. Growth wakes waiters immediately; shrink never kills holders. |
 | `CONFIG_DIR` | `config/` next to `app.py` | Where the `*.json` config files are read from. |
 | `PROMPTS_DIR` | `prompts/` | Where rendered worker prompts are read from. |
 | `APPROVED_PROMPTS` | `approved-prompts.json` | The file of signed prompt hashes. |
@@ -34,8 +37,8 @@ Flags count as on for `1`, `true`, `yes` or `on`, unless the row says otherwise.
 | `MAX_COMPLETED` | `2000` | How many finished subjects are remembered. |
 | `PENDING_MAX_AGE` | `3600` | Seconds. Legacy JSON pending entries older than this are dropped during import. Journaled pending work has no age expiry. |
 | `WORKTREES_ROOT` | `$TMPDIR/eph-broker-worktrees` | Where worktrees for rows without their own base go. |
-| `WORKER_ENV_PASSTHROUGH` | unset | Comma list of extra environment variable names a worker keeps from the broker env, on top of the fixed allowlist. Names containing `TOKEN`, `SECRET`, `KEY` or `PASSWORD` are refused. Read at import. |
-| `WORKER_SANDBOX` | `bwrap` | Bubblewrap OS boundary for every worker harness. Missing bwrap or an unknown value refuses startup; `off` explicitly disables isolation. Restart after changes. See [security.md](security.md#os-boundary-on-by-default). |
+| `WORKER_ENV_PASSTHROUGH` | unset | Comma list of extra environment variable names a worker keeps from the broker env, on top of the fixed allowlist. Names containing `TOKEN`, `SECRET`, `KEY` or `PASSWORD` are refused. File edits apply on SIGHUP. |
+| `WORKER_SANDBOX` | `bwrap` | Bubblewrap OS boundary for every worker harness. Missing bwrap or an unknown value refuses startup; `off` explicitly disables isolation. File edits apply on SIGHUP to future launches; invalid modes or unavailable bwrap retain the old setting. See [security.md](security.md#os-boundary-on-by-default). |
 | `WORKER_SANDBOX_EXTRA_RO` | unset | Colon-separated absolute paths to bind read-only (also accepts `~`). Cannot restore host `/proc` or `/dev`. |
 | `WORKER_SANDBOX_HIDE` | unset | Colon-separated absolute paths to hide in addition to the default secret paths. Hides always win; files become empty read-only files, directories empty tmpfs mounts. Include any external systemd env-file directory and sibling secrets. |
 | `WORKER_MCP_SSH_CONFIG` | `~/.ssh/config` | Broker user's SSH config for MCP-granted workers. The managed launcher uses `ssh -F` with this file, or `/dev/null` when absent. Absolute path, `~` accepted. |
@@ -62,7 +65,7 @@ all other rows retain their existing limits.
 
 `inbox_max_input_tokens` (default `3000000`) and `inbox_max_cost_usd` (default `2.0`)
 are positive per-worker-run ceilings in the constraints section of
-`config/constraints.json` or `broker.yaml`. Restart to apply changes. Usage is
+`config/constraints.json` or `broker.yaml`. Send SIGHUP to apply changes. Usage is
 cumulative across forwards, retries and session rotation. Input includes uncached
 input, cache reads and cache creation, not output tokens or context-window size.
 The broker polls CC stream-json usage once a second, without needing dashboard
@@ -84,7 +87,7 @@ if the CLI is still running, the broker kills and reaps it first.
 The `<synthetic>` placeholder needs no price entry when all token counts are zero; nonzero usage raises an error.
 The shipped table is an example, not a live provider catalog. Review rates and
 add every inbox model you use, including aliases and internally selected tiers,
-then restart. Existing configs
+then send SIGHUP. Existing configs
 without a table must add one before inbox triage can run. Stream usage is deduplicated
 per request and priced at each request's model rates. Final per-model token counts
 fill gaps without double charging streamed usage; counts never decrease for an
@@ -135,7 +138,7 @@ run escalations or suppression-tail DMs for duplicate calls.
 | `DISPATCH_PRIORITY` | `reviews-first` | Pending MR reviews (including reruns) and valid `continue-mr:` fix rounds precede new tickets on the same repo. Repos are served fairly; a capped/debouncing repo does not hold unrelated repos. `fifo` restores strict durable FIFO and FIFO checkout-lock admission. Other values refuse startup. See [configuration.md](configuration.md#dispatch-priority). |
 | `DISPATCH_METADATA_WAIT` | `5` | Seconds of grace from lookup start before ordinary admission falls back to unknown-target ordering while eligible same-row metadata is still resolving. Shared row-cap groups share the grace; known follow-ups and other rows can dispatch. `0` disables the grace. Only applies to `reviews-first`. |
 | `MAX_SPAWNS_PER_HOUR` | `60` | Warning only: past it, each start logs `BREAKER-WOULD-TRIP`. Nothing is stopped. |
-| `API_OVERLOAD_RETRY_DELAYS_S` | `120,300,600` | Back-off in seconds when the model API answers 429 or 529. |
+| `API_OVERLOAD_RETRY_DELAYS_S` | `120,300,600` | Back-off in seconds when the model API answers 429 or 529. Existing adapters read the live schedule when a retry sequence begins; an in-progress sequence keeps its schedule. Removing the setting restores the startup default. |
 | `HARDKILL_REPROMPT_CAP_S` | `60` | Time limit for the one re-prompt after a worker was killed for running too long. |
 | `LOCAL_WALL_CLOCK_MULT` | `4` | Time limit multiplier for a `local` registry backend. |
 
@@ -519,7 +522,7 @@ default.
 | Variable | Default | Meaning |
 |---|---|---|
 | `ZULIP_ROW_SOURCE` | unset | Event source of the chat row. |
-| `ZULIP_WAKE_ENABLED`, `ZULIP_AUTOREPLY_ENABLED` | off | A direct message to a mapped bot starts a chat worker; a message to a retired bot gets one canned reply. |
+| `ZULIP_WAKE_ENABLED`, `ZULIP_AUTOREPLY_ENABLED` | off | A direct message to a mapped bot starts a chat worker; a message to a retired bot gets one canned reply. Enabling either flag on reload starts reconciliation even if both were off at startup. Repeated reloads reuse the same loop; disabling stops listeners on the next reconciliation. |
 | `ZULIP_WAKE_SENDERS`, `ZULIP_WAKE_BOT_SENDERS` | unset | Human user ids, and bot user ids, allowed to wake a bot. |
 | `ZULIP_AUTOREPLY_EXCLUDE`, `ZULIP_AUTOREPLY_TEXT`, `ZULIP_AUTOREPLY_WINDOW_S` | unset, a neutral line, `86400` | The auto-reply's exclusions, text (`{bot}` is replaced) and once-per window. |
 | `ZULIP_REGISTRY_PATH`, `ZULIP_MCP_SCRIPT`, `ZULIP_UV_BIN`, `ZULIP_STATE_DIR` | unset, unset, `uv` on `PATH`, next to `COMPLETED_PATH` | The bot registry, the listener script, its runner and the state directory. |

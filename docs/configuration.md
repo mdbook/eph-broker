@@ -57,22 +57,44 @@ exist stops the broker, and so does an unknown section, a repeated key or a pars
 | `settings` | The environment settings below, as `NAME: value`. Strings, numbers or `true`/`false` (`true` becomes `1`). | `config/site.env` |
 | `routes` | Your own agent types, a list of rows ([routes.md](routes.md)) | `config/routes.json` |
 | `capabilities` | Your own capabilities: a built-in base plus extra allow and deny rules ([routes.md](routes.md#site-capabilities)) | (new) |
+| `hold_labels` | Labels that hold assigned Vikunja tickets, default `["blocked"]`; `[]` disables holds ([below](#hold-labels)) | (new) |
 | `constraints`, `windows` | [Limits and batching](#limits-and-batching) | `config/constraints.json`, `config/windows.json` |
 | `provenance` | [Who counts as an agent](#who-counts-as-an-agent) | `config/provenance.json` |
 | `inbox-accounts`, `zulip-wake`, `cd-tier`, `deploy-paths`, `pool-vikunja-ids` | The content of that json file, as is | `config/<name>.json` |
 
 Which value wins:
 
-- The real environment (systemd drop-ins, tests) wins over `settings`, and `settings` win over `site.env`.
+- At startup the real environment (systemd drop-ins, tests) wins over `settings`, and `settings` win over `site.env`.
 - A section wins over its json file; the broker logs that the file is ignored.
 - An explicit path variable (`ROUTES_PATH`, `BROKER_PROVENANCE_PATH`, `BROKER_INBOX_ACCOUNTS`) wins over the section.
 
-`windows`, `zulip-wake`, `cd-tier`, `deploy-paths` and `pool-vikunja-ids` are re-read on `SIGHUP`, and a bad
-edit keeps the last good copy (logged). Every other section is read once at startup; a `SIGHUP` logs which of
-them changed so you know to restart. The full table is in
+`settings` runtime policy, `constraints`, `model_denylist`, `windows`, `zulip-wake`, `cd-tier`, `deploy-paths`
+and `pool-vikunja-ids` are applied on `SIGHUP`. Runtime settings in the file then win over startup defaults,
+including environment values. Bad settings/constraints keep their last good applied values (logged).
+Paths, ports, identities and other bootstrap definitions still require restart. The classification inventory
+is in [README](../README.md#runtime-settings-and-reload-inventory). The section table is in
 [operations.md](operations.md#reloading-config). Quote dates and times (`"2026-10-18"`): YAML reads them as dates, and the
 broker only takes strings, numbers, true/false, lists and mappings. Never put secrets in it, see
 [Secrets](#secrets).
+
+## Hold labels
+
+An assignee is the owner, even when work is waiting on another merge. Keep the ticket assigned and add
+`blocked` to hold broker dispatch. Top-level `hold_labels` in `broker.yaml` or `broker.json` defaults to
+`["blocked"]`. Use another list of exact, case-insensitive label names or positive integer label ids,
+or `[]` to disable this gate. Invalid lists stop startup. Restart after changing this policy.
+
+The gate applies to Vikunja intake before routing, including interactive workers. Repeated held snapshots
+log `hold: ... held by hold_labels` once per hold interval (remembered across restarts with a durable
+journal), without a worker or MR. A hold added during debounce removes the pending launch. It does not
+cancel an already-running worker. Maintenance drain, admission rules and completion dedup still apply.
+Existing provenance `handoff_parked_labels` remain a separate agent-echo restriction.
+
+Send `task.updated` when labels change, with the ticket's current `assignees` and `labels`, including an
+explicit empty list when the last label is removed. A missing label snapshot cannot release a known hold.
+Removing the last matching hold label uses the normal assignment/coalescer path, not a separate launcher.
+The bundled n8n tap sends label names. For id matching, your tap must also send `label_ids: [123]`, or
+full label objects in `labels` with `id` and `title`; names are sufficient with the bundled tap.
 
 ## The settings file
 
@@ -117,7 +139,7 @@ into `settings`.
 | `TFA_BACKEND` | Backend flag passed to `SPAWN_SH` as `--<name>` when the external launcher row starts an agent. | No flag |
 | `USAGE_CAP_FALLBACK_CHAIN` | Comma list of registry backends a usage-capped worker retries on (with `USAGE_CAP_FALLBACK_ENABLED`). | No fallback |
 | `FLEET_USAGE_FILE` | Usage snapshot JSON; at the thresholds the capped Anthropic attempt is skipped up front. | Not read |
-| `WORKER_ENV_PASSTHROUGH` | Comma list of extra environment variable names a worker keeps from the broker env, on top of the fixed allowlist (`PATH`, `HOME`, locale, ...), e.g. the interpreter a repo's test runner reads. Names containing `TOKEN`, `SECRET`, `KEY` or `PASSWORD` (any case) are refused with a log line. Read at import, so restart after changing it. | Allowlist only |
+| `WORKER_ENV_PASSTHROUGH` | Comma list of extra environment variable names a worker keeps from the broker env, on top of the fixed allowlist (`PATH`, `HOME`, locale, ...), e.g. the interpreter a repo's test runner reads. Names containing `TOKEN`, `SECRET`, `KEY` or `PASSWORD` (any case) are refused. File changes apply on SIGHUP for future turns. | Allowlist only |
 | `PARKED_LABEL_ID` | Tracker label id added when a worker returns `blocked`. | No label |
 | `FLEET_ASSIGNEE`, `GENERAL_ROW_LABEL` | Assignee and label that start the general worker, see [Built-in rows](#built-in-rows). | `eph`, `eph:general` |
 | `DEV_ASSIGNEE`, `CODE_ROW_LABEL` | Assignee and label that start the code worker. | `eph-code`, `eph:code-change` |
@@ -127,7 +149,7 @@ into `settings`.
 | `CODE_BROWSER_MCP_CONFIG` | Opt-in: the playwright MCP config a code worker loads (`--strict-mcp-config`, Claude Code harness only) so it can drive a real browser and return screenshot/console evidence for a UI change. Unset: no browser, argv unchanged. See [The code worker's browser](#the-code-workers-browser). | Unset (off) |
 | `AUTO_MERGE_REPOS` | Repos (`ns/name` list) whose worker MRs merge once the pipeline is green, **with no reviewer**. See [cd-deploy-paths.md](cd-deploy-paths.md#auto-merge-without-a-reviewer-auto_merge_repos). | Off |
 | `CODE_NONCLAUDE_OK` | `1` lets a code worker run on a non-Anthropic backend. Any code worker on the hermes or Codex harness needs it too. | Such a code worker is refused |
-| `<ROW>_ADAPTER` | The harness a built-in row's workers run on: `cc`, `hermes` or `codex`, see [Choosing a row's harness](#choosing-a-rows-harness). Read at startup; an unknown value stops the broker. | `cc` |
+| `<ROW>_ADAPTER` | The harness a built-in row's workers run on: `cc`, `hermes` or `codex`, see [Choosing a row's harness](#choosing-a-rows-harness). Runtime file changes apply to new routes on SIGHUP; invalid values keep the previous policy. | `cc` |
 | `CODEX_AUTH_FILE`, `CODEX_BACKEND`, `CODEX_BIN`, `CODEX_HOME_ROOT`, `CODEX_SANDBOX_NETWORK` | The Codex harness, see [The Codex harness](#the-codex-harness). | Codex workers are refused |
 
 Process settings read by `app.py`: `PORT` (8787), `CONCURRENCY` (5), `CONFIG_DIR`, `PROMPTS_DIR`,
@@ -143,8 +165,9 @@ Process settings read by `app.py`: `PORT` (8787), `CONCURRENCY` (5), `CONFIG_DIR
 | `config/constraints.json` | Turn caps, wall-clock limits, forwards, session rotation | 50 turns and 1800 s (code: 100 turns and 3600 s), 10 forwards, rotate after 20 turns or 120k tokens of context |
 | `config/windows.json` | How long to collect a burst before starting a worker, and how long a worker stays warm | 3 s and 45 s for tracker tickets |
 
-`windows.json` is re-read on `SIGHUP`. `constraints.json` is only read at startup, so restart after changing it
-(see [operations.md](operations.md#reloading-config)).
+`windows.json` and `constraints.json` are applied on `SIGHUP`
+(see [operations.md](operations.md#reloading-config)). Wall-clock durations accept positive fractional seconds;
+running invocations keep their current timeout, and future turns use the new limits.
 
 ### Dispatch priority
 
@@ -387,7 +410,8 @@ takes precedence over both ticket model and harness labels. Existing capability 
 To ignore ticket choices, set `"pin": true` on the row, or `<ROW>_PIN=true` alongside its backend
 environment setting (for example `CODE_CHANGE_PIN=true`, `GENERAL_PIN=true`, `MR_REVIEWER_PIN=true`).
 The prefix matches the backend setting, including `INFRA_GENERAL_PIN` (inherits `INFRA_PIN`).
-Environment pins are read at startup. File pins reload like other routing overrides.
+Environment pins are startup defaults. Pins in broker config settings apply on SIGHUP;
+file routing overrides remain the final per-row layer.
 `pin:false` allows choices again unless `model_pin` is still set. No migration edit is needed:
 existing backend/adapter rows without `pin` remain their defaults and now accept labels.
 
@@ -471,8 +495,8 @@ To review on native Claude Code with a model you pick, whatever `FLEET_MODEL_SH`
 2. Leave `MR_REVIEWER_BACKEND` unset, or set it to `claude`.
 3. Set `MR_REVIEW_ADAPTER=cc`, because the hermes harness refuses native Claude.
 
-A per-ticket `model:` label can't override this. To go back, unset `MR_REVIEWER_MODEL`. These are read at
-startup, so restart the broker after changing them (`SIGHUP` isn't enough). This doesn't touch
+A per-ticket `model:` label can't override this. To go back, remove the file pin (restores its startup default).
+Set these in `broker.yaml` settings and send SIGHUP; the pin wins even for a full-tier review. This doesn't touch
 `GENERAL_BACKEND`, which must stay unset (see [security-residual-same-uid.md](security-residual-same-uid.md)).
 
 ## Tiered MR review
@@ -496,7 +520,7 @@ cutoffs with `MR_REVIEW_QUICK_MAX_DIFF_LINES` / `MR_REVIEW_FULL_DIFF_LINES`. `MR
 its backend instead of using a tier's native model, but still accepts ticket labels. The tier is still
 computed and named on the MR note. A per-ticket `model:`/`hermes`/`codex` label on the MR's source ticket also wins
 over a tier's model pick, same precedence as everywhere else (an explicit choice beats a computed one). These
-are read at startup, so restart the broker after changing them.
+can be edited in broker config settings and applied with SIGHUP.
 
 The `quick` tier's lighter prompt (`prompts/mr-review/quick.md`) needs its own operator sign-off
 ([prompts.md](prompts.md#signing)) before it runs; until then, a `quick`-tier review automatically falls back
@@ -517,7 +541,8 @@ Every built-in worker row reads its own harness setting, `cc` (Claude Code) unle
 
 A harness that can't run a row's capability refuses every spawn on that row and alerts; it never falls back to
 `cc`. Today hermes and Codex run `mr-review`, `write`, `code` and `general`, so the read-only report and the two
-inbox rows stay on `cc`. Rows from `config/routes.json` always run on `cc`. These are read at startup.
+inbox rows stay on `cc`. Rows from `config/routes.json` always run on `cc`. Built-in row harness settings
+in broker config apply on SIGHUP for new routes.
 
 For one ticket instead of a whole row, a `hermes` or `codex` label moves that ticket's worker, under the same
 rules: only from a creator in `MODEL_LABEL_TRUSTED_CREATORS`, never on a row with a pinned backend, only for

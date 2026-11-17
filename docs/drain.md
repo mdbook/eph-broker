@@ -132,7 +132,11 @@ session check and persisted burst TTL, rather than entering the CC concurrency c
 
 Fresh subjects, including detached TFAs, wait behind an older pending FIFO head
 even when the intake table is empty. A new event for the same pending subject can
-still join its leading-edge burst. When a worker is retired, eligible buffered
+still join its leading-edge burst. With hold labels enabled, queued Vikunja updates
+for pending subjects also join that burst before the spawn tick, even behind unrelated
+intake. This lets a hold cancel debounce after drain or restart without admitting new
+subjects out of FIFO order. Drain, recovery and ambiguous intake still block admission.
+When a worker is retired, eligible buffered
 inputs and row stamps transfer to pending in the same locked transaction that
 removes its active intent. Close/settle callers receive a transfer receipt and
 only alert; they do not enqueue those buffers again. A clean terminal ticket

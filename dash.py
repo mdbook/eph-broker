@@ -1079,26 +1079,15 @@ PAGE = r"""<!DOCTYPE html>
        background:var(--s1);cursor:copy;user-select:all;white-space:nowrap}
   .cmd.copied{color:var(--run);border-color:var(--run)}
 
-  /* ---- phone navigation disclosure; modules append links to the same menu */
-  #menu-toggle,.mobile-menu{display:none}
-
   @media (max-width:1100px){
     .cols{grid-template-columns:minmax(0,1fr)}
     #r-side{display:none}
   }
-  /* Mobile: view links move to a hamburger, the summary strip becomes a short list,
+  /* Mobile: the summary strip becomes a short list,
      tables become stacked rows (title line, then one muted detail line), row actions collapse into the row. */
   @media (max-width:720px){
-    .top-in{padding:0 16px;height:56px;gap:12px}
-    .nav,.inst,#settings-gear{display:none}
+    .nav,.inst{display:none}
     .top-r{gap:6px}
-    #theme{min-width:0;padding:0 6px;font-size:12px}
-    #paused{display:none} /* Pause remains visible in Now counts and Queue controls. */
-    #menu-toggle{display:inline-flex}
-    .mobile-menu{display:flex;flex-direction:column;padding:8px 16px;max-height:70vh;overflow-y:auto}
-    .mobile-menu a{padding:12px;min-height:48px;border-radius:8px;text-decoration:none}
-    .mobile-menu a:hover{background:var(--s2)}
-    .mobile-menu a[aria-current=page]{color:var(--brand);background:var(--s2)}
     .queue-preview{grid-template-columns:minmax(0,1fr)}
     .page{padding:20px 16px 48px}
     .ph h1{font-size:26px}
@@ -1144,7 +1133,7 @@ PAGE = r"""<!DOCTYPE html>
          background:color-mix(in srgb,var(--s1) 86%,transparent);padding-top:env(safe-area-inset-top)}
     .top-in{height:48px;padding:0 8px 0 16px;gap:8px}
     .brand{min-width:0;font-size:17px} .vt{overflow:hidden;text-overflow:ellipsis}
-    #theme,#menu-toggle,.mobile-menu{display:none !important}
+    #theme{display:none}
     #settings-gear{display:inline-flex;min-width:44px;height:44px;border:0;background:none;font-size:20px;color:var(--t2)}
     #paused{display:inline-flex;padding:4px 10px;font-size:12px}
     .live{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--t2);font-variant-numeric:tabular-nums;white-space:nowrap}
@@ -1244,14 +1233,9 @@ PAGE = r"""<!DOCTYPE html>
     <span class="m-only live" id="live" title="Read-only, refreshes every 5 seconds"></span>
     <button class="btn" id="theme" title="Theme: auto" aria-label="Theme: auto">Theme: auto</button>
     <a class="btn sq ghost" id="settings-gear" href="#settings/workers" data-view="settings" aria-label="Settings" title="Settings">⚙</a>
-    <button class="btn sq ghost" id="menu-toggle" aria-expanded="false" aria-controls="mobile-menu" aria-label="Navigation menu">☰</button>
   </div>
 </div>
-<nav class="mobile-menu" id="mobile-menu" aria-label="Mobile views" hidden>
-  <a href="#now" data-view="now">Now</a><a href="#runs" data-view="runs">Runs</a>
-  <a href="#queue" data-view="queue">Queue</a><a href="#fleet" data-view="fleet">Fleet</a>
-  <a href="#settings/workers" data-view="settings">Settings</a>
-</nav></header>
+</header>
 
 <div id="err" class="err-banner" style="display:none" role="alert"></div>
 
@@ -2072,20 +2056,7 @@ function showSubtab(view, tab){
     a.tabIndex = active ? 0 : -1;
   }
 }
-function closeMenu(focus){
-  $('mobile-menu').hidden = true;
-  $('menu-toggle').setAttribute('aria-expanded', 'false');
-  if(focus) $('menu-toggle').focus();
-}
-$('menu-toggle').onclick = () => {
-  const open = $('mobile-menu').hidden;
-  $('mobile-menu').hidden = !open;
-  $('menu-toggle').setAttribute('aria-expanded', open);
-  if(open) $('mobile-menu').querySelector('a').focus();
-};
-$('mobile-menu').addEventListener('click', e => { if(e.target.closest('a')) closeMenu(true); });
 document.addEventListener('keydown', e => {
-  if(e.key === 'Escape' && !$('mobile-menu').hidden){ closeMenu(true); return; }
   const tab = e.target.closest('[role=tab]');
   if(!tab || !['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
   const tabs = [...tab.closest('[role=tablist]').querySelectorAll('[role=tab]')], i = tabs.indexOf(tab);
@@ -2113,7 +2084,6 @@ function route(){
   if(SUBTABS[v]) showSubtab(v, SUBTABS[v].includes(parts[1]) ? parts[1] : SUBTABS[v][0]);
   if(v === 'runs') runsFilter = ['all', 'running', 'waiting', 'finished'].includes(parts[1]) ? parts[1] : 'all';
   if(v === 'fleet') fleetFilter = ['all', 'standing', 'tfa'].includes(parts[1]) ? parts[1] : 'all';
-  closeMenu(false);
   if(lastState){ paintRuns(lastState, lastDerived); paintFleet(lastState.fleet); }
 }
 window.addEventListener('hashchange', route);
@@ -3452,7 +3422,7 @@ for(const m of viewerModules){
   section.id = 'v-' + key; section.hidden = true;
   document.querySelector('main').appendChild(section);
   VIEWS[key] = section.id;
-  for(const nav of [document.querySelector('header nav'), $('mobile-menu'), $('tabbar')]){
+  for(const nav of [document.querySelector('header nav'), $('tabbar')]){
     const a = el('a', null, nav.id === 'tabbar' ? null : m.label);
     if(nav.id === 'tabbar'){
       a.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v11H9l-5 4V5Z"/></svg>';
@@ -3470,7 +3440,6 @@ function moduleRoute(){
   const match = /^module\/([a-z][a-z0-9_]*)(?:\/(.*))?$/.exec(location.hash.slice(1));
   const m = match && viewerModules.find(x => x.name === match[1]);
   if(!m) return false;
-  closeMenu(false);
   showTab('module-' + m.name);
   renderViewer(m);
   return true;

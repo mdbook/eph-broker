@@ -741,7 +741,7 @@ What each action does:
   `/reconcile`. The model menu next to **Run again** runs that one run on the model or backend you pick, ahead
   of any `model:` label on the ticket. A row that pins its model (`pin:true`, `<ROW>_PIN` or `model_pin`) refuses
   the pick; change the row instead.
-- **Settings > Workers** (header gear, or phone hamburger) edits the [routing overrides file](routing-overrides.md): each row's
+- **Settings > Workers** (header gear, on desktop and phone) edits the [routing overrides file](routing-overrides.md): each row's
   default `backend`, `model_pin` and explicit `pin` policy. It distinguishes **Overridable default** from **Pinned**.
   **Settings > Groups** edits the `row_concurrency` cap per group. **Default** removes your change and puts
   back the environment value. New runs pick the change up; running ones keep what they started with. The

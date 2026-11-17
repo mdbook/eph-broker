@@ -13560,9 +13560,6 @@ location.hash = '#settings/groups'; listeners.hashchange();
 assert.equal($('settings-groups').hidden, false);
 location.hash = '#runs/finished'; route(); assert.equal(runsFilter, 'finished');
 location.hash = '#fleet/tfa'; route(); assert.equal(fleetFilter, 'tfa');
-$('mobile-menu').hidden = true; $('menu-toggle').onclick();
-assert.equal($('menu-toggle').attrs['aria-expanded'], true);
-listeners.keydown({key:'Escape'}); assert.equal($('mobile-menu').hidden, true);
 const tabs = ['running','queue','recent'].map(t => ({hash:'#now/'+t, focus(){this.focused=true;}}));
 tabs[0].closest = () => ({querySelectorAll: () => tabs});
 let prevented = false;
@@ -13573,7 +13570,7 @@ assert.deepEqual(selected, ['vikunja:task:9001','abc12345']);
 '''
     r = subprocess.run([node, '-e', harness + js + cases], capture_output=True, text=True, timeout=10)
     assert r.returncode == 0, r.stderr
-    ok('dash: Settings outside Fleet, hash sub-tabs, defaults, history re-entry, keyboard and hamburger')
+    ok('dash: Settings outside Fleet, hash sub-tabs, defaults, history re-entry and keyboard')
 
 
 def test_dash_queue_preview_metadata_and_stages():
@@ -13665,15 +13662,15 @@ def test_dash_mobile_layout():
     m = re.search(r"/\* Mobile:.*?@media \(max-width:720px\)\{(.*?)\n  \}\n", page, re.S)
     assert m, "mobile media query missing"
     css = m.group(1)
-    for needle in (".nav,.inst,#settings-gear{display:none}", "#menu-toggle{display:inline-flex}",
+    for needle in (".nav,.inst{display:none}",
                    ".tbl thead{display:none}", ".tbl tr{display:grid", ".tbl td .btn{display:none}",
-                   ".strip{grid-template-columns:minmax(0,1fr)", "min-height:48px"):
+                   ".strip{grid-template-columns:minmax(0,1fr)"):
         assert needle in css, needle
     for v in ("now", "runs", "queue", "fleet"):
-        assert page.count('href="#%s" data-view="%s"' % (v, v)) == 3, v   # desktop + hamburger + phone tab bar
+        assert page.count('href="#%s" data-view="%s"' % (v, v)) == 2, v   # desktop + phone tab bar
     assert page.count('class="tabbar"') == 1 and '.m-only,.tabbar{display:none}' in page   # hidden on desktop
-    assert 'aria-controls="mobile-menu"' in page and 'aria-expanded="false"' in page
-    assert page.count('href="#settings/workers" data-view="settings"') == 2
+    assert 'menu-toggle' not in page and 'mobile-menu' not in page   # the tab bar replaced the hamburger
+    assert page.count('href="#settings/workers" data-view="settings"') == 1
     body = page[page.index("function agentRow(a)"):page.index("function fleetSort(")]
     for needle in ('class="an"', 'class="mdl-c"', 'class="led', 'class="lage', "ctxMeter(a)", 'class="m-sub"'):
         assert needle in body, needle

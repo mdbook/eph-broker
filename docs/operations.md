@@ -112,8 +112,8 @@ subjects only (the same list that stops a closed ticket from starting again), an
 it's persisted (`COMPLETED_PATH`, or `completed.json` next to `EVENTS_LOG`). Like the dashboard it has no login, so it sits behind the same proxy.
 
 The dashboard has Now, Runs, Queue and Fleet views plus a full Settings page. Desktop navigation keeps
-Settings in the header gear beside the theme button. On phones, the hamburger contains every view,
-Settings and any configured viewer modules. Escape closes the menu.
+Settings in the header gear beside the theme button. On phones, a bottom tab bar holds every view
+and any configured viewer modules; Settings stays in the top bar gear and holds the theme switch.
 Underlined sub-tabs keep their selection in the URL hash for reload, back and forward. Use Tab to reach
 the selected sub-tab, then Left/Right or Home/End to change it.
 

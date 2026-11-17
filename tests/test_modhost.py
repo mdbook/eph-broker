@@ -530,7 +530,7 @@ def test_dashboard_module_shell_and_fleet_contract():
     assert "Agents </script>" not in page
     assert "if(moduleRoute()) return" in page
     assert "moduleAffordance(name) + '<span" in page
-    assert "header nav" in page and "$('mobile-menu')" in page
+    assert "header nav" in page and "$('tabbar')" in page
     assert "js.mount(content, viewerContext" in page and "js.quickView(content, name" in page
     assert "Agent viewer is down" in page and "Open full view" in page
     assert "if(can && m.child)" in page and "module_reload" in page

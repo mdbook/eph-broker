@@ -1382,6 +1382,9 @@ def test_failed_turn_capture_written_and_capped():
             assert "run-9353" in name and stat.S_IMODE(os.stat(path).st_mode) == 0o600, name
             body = open(path).read()
             assert "reason: parse miss" in body and "returncode: 1" in body, body[:300]
+            diagnostic = next(line for line in body.splitlines() if line.startswith("parse_diagnostic: "))
+            assert json.loads(diagnostic.split(": ", 1)[1]) == {
+                "stage": "wrapper_json", "error_class": "JSONDecodeError", "position": 0}, diagnostic
             assert "TAIL-OUT" in body and "boom-err" in body and "[truncated" in body, body[:300]
             assert body.count("X") <= 1000 and len(body) < 2000, len(body)          # capped
             assert "s3cr3t-value-9353" not in body                                  # never the env
@@ -1527,6 +1530,99 @@ def test_redactor_keeps_token_count_keys_and_json_parseable():
         assert s not in red, (s, red)
     assert '"api_token": "[redacted]"' in red and "GITLAB_MR_TOKEN=[redacted]" in red, red
     ok("redactor leaves token-count keys intact (JSON parseable) and still redacts real tokens")
+
+
+def test_redacted_capture_stays_valid_json():
+    """Synthetic CLI wrappers only: quoted, numeric, boolean and escaped secret values.
+    The result string also contains an envelope and nested secret-looking JSON keys."""
+    from adapters.cc import _redact_secretish, capture_failed_turn
+    values = ("synthetic-value", 12345, True, False, 'synthetic-"quoted"-tail',
+              {"nested": "synthetic-value"}, ["synthetic-value"], None)
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        for i, value in enumerate(values):
+            secrets = {"api_token": value, "auth_count": value, "password": value}
+            inner = dict(secrets, status="done", summary="synthetic {report}", wake=[])
+            wrapper = dict(secrets, result=json.dumps(inner), session_id="synthetic-session",
+                           usage={"input_tokens": 12345, "output_tokens": 5})
+            raw = json.dumps(wrapper)
+            assert json.loads(raw) == wrapper
+            red = _redact_secretish(raw)
+            back = json.loads(red)
+            for key in secrets:
+                assert back[key] == "[redacted]", (key, back)
+                assert json.loads(back["result"])[key] == "[redacted]", back
+            assert back["usage"] == wrapper["usage"]
+            assert json.loads(back["result"])["summary"] == "synthetic {report}"
+            path = capture_failed_turn(Worker("vikunja:task:9409", "run-9409", d), _route(),
+                                       "non-zero exit", 1, raw, raw, capture_dir=d)
+            body = pathlib.Path(path).read_text()
+            stdout, stderr = body.split("--- stdout ---\n", 1)[1].split("\n--- stderr ---\n", 1)
+            assert json.loads(stdout) == back and json.loads(stderr) == back, i
+    # JSON strings and arrays are also serialized safely; malformed/plain input never raises.
+    for obj in ([{"auth_count": 12345}], 'api_key=synthetic-value', '-----BEGIN PRIVATE KEY-----\nbody'):
+        assert json.loads(_redact_secretish(json.dumps(obj))) is not None
+    for text in (None, "", '{"auth_count": 12345', "auth_count=12345", "\\" * 65536):
+        assert isinstance(_redact_secretish(text), str)
+    deep = "[" * 2000 + '{"auth_count": 12345}' + "]" * 2000
+    assert json.loads(_redact_secretish(deep)) == "[redacted]"
+    ok("synthetic secret values stay redacted and CLI capture stdout/stderr remain valid JSON")
+
+
+def test_redactor_secret_keys_with_separators():
+    """Secret keywords need not start a JSON key, matching the whole-text redaction floor."""
+    from adapters.cc import _redact_secretish
+    for separator in (" ", "-", ".", "_"):
+        for value in ("synthetic-value", 12345, True, False, None, {"nested": "synthetic-value"}):
+            key = "db" + separator + "password"
+            obj = {key: value, "input_tokens": 42, "plain": "safe"}
+            expected = {key: "[redacted]", "input_tokens": 42, "plain": "safe"}
+            assert json.loads(_redact_secretish(json.dumps(obj))) == expected, (separator, value)
+            wrapper = {"result": json.dumps(obj)}
+            back = json.loads(_redact_secretish(json.dumps(wrapper)))
+            assert json.loads(back["result"]) == expected, (separator, value)
+    ok("JSON secret-key substring matching covers space, dash, dot and underscore without breaking JSON")
+
+
+def test_redactor_private_key_split_across_array_elements():
+    """Synthetic PEM spans retain the text redactor's floor across JSON leaves of every type."""
+    from adapters.cc import _redact_secretish
+    begin = "-----BEGIN RSA PRIVATE KEY-----"
+    end = "-----END RSA PRIVATE KEY-----"
+    marker = "[redacted]"
+    scalars = [123456789, 12.5, True, False, None]
+    for tail in ([end, "after"] + scalars, []):
+        obj = ["before", begin, "synthetic key body", ["nested body"] + scalars, "last body"] + tail
+        expected = ["before", marker, marker, [marker] * 6, marker] + (
+            [marker, "after"] + scalars if tail else [])
+        assert json.loads(_redact_secretish(json.dumps(obj))) == expected
+    # The token-count allowlist must not exempt non-string object values inside a PEM span.
+    for value in scalars:
+        obj = [begin, {"input_tokens": value}, end, value]
+        assert json.loads(_redact_secretish(json.dumps(obj))) == [marker, {marker: marker}, marker, value]
+    # An END followed by another BEGIN in one element must reopen the floor.
+    obj = [begin, "first body", end + " " + begin, "second body", end, "after"]
+    assert json.loads(_redact_secretish(json.dumps(obj))) == [marker] * 5 + ["after"]
+    ok("split JSON array PEM bodies redacted through END or document end; nested leaves covered")
+
+
+def test_redactor_private_key_split_across_object_values():
+    from adapters.cc import _redact_secretish
+    begin = "-----BEGIN OPENSSH PRIVATE KEY-----"
+    end = "-----END OPENSSH PRIVATE KEY-----"
+    marker = "[redacted]"
+    # A secret-key value must still open/close the span before it is replaced.
+    for tail in ({"password": end, "after": "safe", "input_tokens": 42}, {}):
+        obj = dict({"before": "safe", "api_key": begin,
+                    "body": {"part": "synthetic key body"}}, **tail)
+        back = json.loads(_redact_secretish(json.dumps(obj)))
+        assert back == dict({"before": "safe", "api_key": marker,
+                             marker: {marker: marker}}, **(
+                                 {marker: marker, "after": "safe", "input_tokens": 42} if tail else {}))
+        assert "synthetic key body" not in json.dumps(back)
+    # Marker detection also applies to object keys, not just value leaves.
+    obj = {begin: "synthetic body", "last": end, "after": "safe"}
+    assert json.loads(_redact_secretish(json.dumps(obj))) == {marker: marker, "after": "safe"}
+    ok("split JSON object PEM bodies redacted, including markers under secret keys and missing END")
 
 
 def test_wall_clock_kill():
@@ -2056,13 +2152,65 @@ def test_envelope_multiple_objects_and_prose():
         'Context {"detail": {"nested": true}} before the envelope:\n' + last,
         'Malformed {not JSON}\n' + last + '\n{unfinished',
     ):
-        env = p.try_parse({"result": text}, "run-9409", _route())
+        # Exercise the actual serialized --output-format json wrapper, not only dict input.
+        from envelope import parse_cli_json, _extract_inner
+        raw = json.dumps({"result": text})
+        result_text, _, _ = parse_cli_json(raw)
+        assert _extract_inner(result_text)["summary"] == "final {report}"
+        env = p.try_parse(raw, "run-9409", _route())
         assert env is not None, text
         assert env["status"] == "done" and env["summary"] == "final {report}", env
         assert env["wake"] == ["ops"], env
     for text in ('no object', '{"summary": "no status"}', '{broken'):
         assert p.try_parse({"result": text}, "run-9409", _route()) is None, text
     ok("envelope scan: last status object wins amid concatenated objects, prose, fences and malformed braces")
+
+
+def test_envelope_parse_miss_diagnostic_is_value_free():
+    """A parse miss records its stage and exception class/offset, never exception text or values."""
+    import logging
+    from adapters.cc import capture_failed_turn
+    marker = "synthetic-private-value"
+    cases = (
+        ('{"result": "' + marker + '" "broken"}', "wrapper_json", "JSONDecodeError"),
+        (json.dumps({"result": '{"status": "done", "summary": "' + marker + '" "broken"}'}),
+         "inner_extract", "JSONDecodeError"),
+        (json.dumps({"result": json.dumps({"summary": marker})}), "no_status", "NoStatusError"),
+        (json.dumps({"result": {"summary": marker}}), "no_status", "NoStatusError"),
+        (json.dumps({"result": {"status": marker}}), "no_status", "ValueError"),
+    )
+    records = []
+    class CaptureLog(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+    handler = CaptureLog()
+    logger = logging.getLogger("eph-broker.envelope")
+    logger.addHandler(handler)
+    try:
+        with tempfile.TemporaryDirectory(dir=ROOT) as d:
+            for raw, stage, error_class in cases:
+                env, diagnostic = EnvelopeParser().try_parse_with_diagnostic(raw, "run-9409", _route())
+                assert env is None
+                assert set(diagnostic) == {"stage", "error_class", "position"}, diagnostic
+                assert diagnostic["stage"] == stage and diagnostic["error_class"] == error_class, diagnostic
+                if error_class == "JSONDecodeError":
+                    assert isinstance(diagnostic["position"], int), diagnostic
+                else:
+                    assert diagnostic["position"] is None, diagnostic
+                path = capture_failed_turn(Worker("vikunja:task:9409", "run-9409", d), _route(),
+                                           "parse miss", 0, raw, "", capture_dir=d, parse_diagnostic=diagnostic)
+                header = pathlib.Path(path).read_text().split("--- stdout ---", 1)[0]
+                line = next(line for line in header.splitlines() if line.startswith("parse_diagnostic: "))
+                assert json.loads(line.split(": ", 1)[1]) == diagnostic, header
+                assert marker not in header
+            good = json.dumps({"result": {"status": "done"}})
+            env, diagnostic = EnvelopeParser().try_parse_with_diagnostic(good, "run-9409", _route())
+            assert env["status"] == "done" and diagnostic == {}, diagnostic
+    finally:
+        logger.removeHandler(handler)
+    assert len(records) == len(cases) and all(marker not in record for record in records), records
+    assert all("parse_diagnostic=" in record for record in records), records
+    ok("parse-miss logs and capture headers contain only stage, error class and position")
 
 
 def test_envelope_last_status_still_fails_closed():

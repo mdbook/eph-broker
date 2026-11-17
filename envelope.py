@@ -92,6 +92,10 @@ def wrap_untrusted_html(text, cap=_UNTRUSTED_CAP):
             f"<pre>{html.escape(body)}</pre>")
 
 
+class NoStatusError(ValueError):
+    """A decoded worker object has no status, rather than broken JSON syntax."""
+
+
 def _extract_inner(result_text):
     """Find the worker's {status,summary,wake} envelope inside the result text."""
     if isinstance(result_text, dict):
@@ -102,21 +106,29 @@ def _extract_inner(result_text):
         # dict with a status wins, even if invalid (try_parse must fail closed).
         decoder = json.JSONDecoder()
         obj = None
+        decoded_dict = False
+        decode_error = None
         start = s.find("{")
         while start != -1:
             try:
                 candidate, end = decoder.raw_decode(s, start)
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as e:
+                decode_error = e
                 start = s.find("{", start + 1)
                 continue
             if isinstance(candidate, dict) and "status" in candidate:
                 obj = candidate
+            decoded_dict = decoded_dict or isinstance(candidate, dict)
             # Never promote a nested object (or braces in a string) to an envelope.
             start = s.find("{", end)
         if obj is None:
+            if decoded_dict:
+                raise NoStatusError("worker envelope missing 'status'")
+            if decode_error is not None:
+                raise decode_error
             raise ValueError("no JSON object with 'status' in worker result")
     if "status" not in obj:
-        raise ValueError("worker envelope missing 'status'")
+        raise NoStatusError("worker envelope missing 'status'")
     return {
         "status": obj.get("status"),
         "summary": obj.get("summary", ""),
@@ -156,12 +168,20 @@ class EnvelopeParser:
     # re-parse. So parsing is a single attempt (try_parse), and escalation is a separate step (escalate)
     # the adapter calls only after the re-prompt ALSO fails. A parsed envelope is the turn-completion
     # signal; pid-exit is a crash, not completion.
-    def try_parse(self, raw, run_id, route):
+    def try_parse_with_diagnostic(self, raw, run_id, route):
+        """Per-call diagnostics, safe across concurrent workers; never include worker values."""
+        diagnostic = {}
+        return self.try_parse(raw, run_id, route, diagnostic=diagnostic), diagnostic
+
+    def try_parse(self, raw, run_id, route, diagnostic=None):
         """Single parse attempt. Returns the {status,summary,wake,session_id,tokens,run_id} envelope, or
         None on a parse miss. NO retry, NO escalation (logs the miss only)."""
+        stage = "wrapper_json"
         try:
             result_text, session_id, tokens = parse_cli_json(raw)
+            stage = "inner_extract"
             env = _extract_inner(result_text)
+            stage = "no_status"
             # The status must be one this route's capability allows (mr-review: pass|block); otherwise it's a
             # parse miss (then a warm re-prompt, then escalation), never a mislabelled verdict. An UNKNOWN
             # capability fails CLOSED (parse miss), never open. A route object without the attribute takes
@@ -183,7 +203,12 @@ class EnvelopeParser:
             env["harness"] = getattr(route, "adapter", "cc") or "cc"
             return env
         except (ValueError, json.JSONDecodeError, AttributeError, TypeError) as e:
-            log.warning("envelope parse miss run_id=%s: %s", run_id, e)
+            details = {"stage": "no_status" if isinstance(e, NoStatusError) else stage,
+                       "error_class": type(e).__name__,
+                       "position": e.pos if isinstance(e, json.JSONDecodeError) else None}
+            if diagnostic is not None:
+                diagnostic.update(details)
+            log.warning("envelope parse miss run_id=%s parse_diagnostic=%s", run_id, json.dumps(details, sort_keys=True))
             return None
 
     def escalate(self, run_id, route, reason, task_id=None, worker_text=None):

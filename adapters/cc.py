@@ -125,6 +125,8 @@ _SECRETISH_RES = (
     re.compile(r"(?<![A-Za-z0-9_\-])eyJ[A-Za-z0-9_\-]{8,4096}\.[A-Za-z0-9_\-]{8,4096}\.[A-Za-z0-9_\-]{8,}"),  # JWT
     re.compile(r"(?i)\b(bearer|basic)\s{1,8}[A-Za-z0-9._~+/=\-]{12,}"),
 )
+# Same bounded delimiters as the text floor, also tracked across decoded JSON strings.
+_PRIVATE_KEY_MARKER_RE = re.compile(r"-----(BEGIN|END) [A-Z ]{0,40}PRIVATE KEY-----")
 # KEY=value / "key": "value" / key: value where the key NAME looks secret -> the value is redacted, name kept.
 # Limitation: key names are capped at 64 chars either side of the keyword; a longer name goes unredacted.
 # token-COUNT metric keys (input_tokens, cache_*_tokens, ...) are an explicit allowlist and never match:
@@ -136,12 +138,55 @@ _SECRET_KV_RE = re.compile(
           [A-Za-z0-9_.\-]{0,64}["']?\s{0,8}[:=]\s{0,8})(["']?)([^\s"',}]{4,})""")
 
 
-def _redact_secretish(text):
-    """Replace secret-shaped substrings with a marker. Pure; never raises on str input."""
-    s = "" if text is None else str(text)
+def _redact_secretish_text(s):
     for rx in _SECRETISH_RES:
         s = rx.sub("[redacted]", s)
     return _SECRET_KV_RE.sub(lambda m: m.group(1) + m.group(2) + "[redacted]", s)
+
+
+def _redact_secretish(text):
+    """Replace secret-shaped substrings with a marker. Pure; never raises on str input."""
+    s = "" if text is None else str(text)
+    # Regex replacement on serialized JSON can eat escapes or replace a numeric value
+    # with a bare [redacted]. Redact decoded values, then let the encoder own quoting.
+    # Result strings may themselves contain JSON; use the same path for those too.
+    try:
+        obj = json.loads(s)
+        private_key_open = False
+
+        def private_key_span(value):
+            # Per-string redaction alone loses PEM bodies split across JSON elements.
+            # Walk in document order, including keys and values hidden by secret-key
+            # redaction, and keep the floor through END (or the rest of the document).
+            nonlocal private_key_open
+            sensitive = private_key_open
+            for marker in _PRIVATE_KEY_MARKER_RE.finditer(value):
+                private_key_open = marker.group(1) == "BEGIN"
+                sensitive = sensitive or private_key_open
+            return sensitive
+
+        def redact(value):
+            if isinstance(value, dict):
+                result = {}
+                for k, v in value.items():
+                    key = "[redacted]" if private_key_span(k) else _redact_secretish_text(k)
+                    redacted = redact(v)
+                    result[key] = "[redacted]" if _SECRET_KV_RE.search(json.dumps(k) + ": xxxx") else redacted
+                return result
+            if isinstance(value, list):
+                return [redact(v) for v in value]
+            if isinstance(value, str):
+                return "[redacted]" if private_key_span(value) else _redact_secretish(value)
+            return "[redacted]" if private_key_open else value
+        # A JSON string scalar is already decoded; do not recursively decode it again.
+        return json.dumps(_redact_secretish_text(obj) if isinstance(obj, str) else redact(obj))
+    except json.JSONDecodeError:
+        # Malformed/truncated streams still get the existing best-effort text redaction.
+        pass
+    except (ValueError, RecursionError):
+        # Decoder limits (huge integers/deep nesting) must neither raise nor expose values.
+        return '"[redacted]"'
+    return _redact_secretish_text(s)
 
 
 def _cap_tail(text, cap):
@@ -181,7 +226,8 @@ def _prune_captures(d, keep=None, max_age_s=None, now=None):
                 pass
 
 
-def capture_failed_turn(worker, route, reason, rc, out, err, capture_dir=None, max_chars=None):
+def capture_failed_turn(worker, route, reason, rc, out, err, capture_dir=None, max_chars=None,
+                        parse_diagnostic=None):
     """Write a failed turn's raw stdout/stderr (each tail-capped at `max_chars`, secret-shaped text
     redacted) to <capture_dir>/<utc-ts>-<run_id>-t<turn>.txt (mode 0600) for postmortem, then prune the dir.
     Returns the path, or None when capture is disabled or the write fails; a capture must NEVER break or
@@ -195,9 +241,11 @@ def capture_failed_turn(worker, route, reason, rc, out, err, capture_dir=None, m
         safe = re.sub(r"[^A-Za-z0-9._-]", "_", str(getattr(worker, "run_id", "") or "run"))[:80]
         name = f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{safe}-t{getattr(worker, 'turns', 0)}.txt"
         path = os.path.join(d, name)
+        header = f"parse_diagnostic: {json.dumps(parse_diagnostic, sort_keys=True)}\n" if parse_diagnostic else ""
         body = (f"key: {getattr(worker, 'key', '?')}\nrun_id: {getattr(worker, 'run_id', '?')}\n"
                 f"adapter: {getattr(route, 'adapter', 'cc')}\ncapability: {getattr(route, 'capability', '?')}\n"
                 f"reason: {reason}\nreturncode: {rc}\n"
+                f"{header}"
                 f"--- stdout ---\n{_redact_secretish(_cap_tail(out, cap))}\n"
                 f"--- stderr ---\n{_redact_secretish(_cap_tail(err, cap))}\n")
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -5223,10 +5271,16 @@ class CCAdapter(Adapter):
         # Parse WITHOUT escalating here; escalation is owned by _turn_with_envelope
         # (after the warm re-prompt). A parsed envelope IS the turn-completion signal; pid-exit is a crash.
         parse = getattr(self.envelope_parser, "try_parse", self.envelope_parser)
-        result = parse(out, worker.run_id, route)        # parse {status,summary,wake}
+        parse_with_diagnostic = getattr(self.envelope_parser, "try_parse_with_diagnostic", None)
+        diagnostic = None
+        if parse_with_diagnostic:
+            result, diagnostic = parse_with_diagnostic(out, worker.run_id, route)
+        else:
+            result = parse(out, worker.run_id, route)    # injected/legacy parsers keep their contract
         rc = getattr(proc, "returncode", 0)              # getattr: minimal Popen stand-ins (tests) lack it
         if result is None or rc != 0:                    # Keep the raw failed turn for postmortem
-            capture_failed_turn(worker, route, "parse miss" if result is None else "non-zero exit", rc, out, err)
+            capture_failed_turn(worker, route, "parse miss" if result is None else "non-zero exit", rc, out, err,
+                                parse_diagnostic=diagnostic)
         if result is not None and rc != 0:
             # A process that exited non-zero is a FAILED turn even if its stdout holds a valid envelope
             # (same PASS gating as hermes.py); otherwise a cc mr-review `pass` from a failed run could reach CD.

@@ -426,6 +426,7 @@ class SandboxTests(unittest.TestCase):
 
     def test_worker_launch_with_unavailable_steer_storage(self):
         from adapters import cc, codex
+        from envelope import EnvelopeParser
         from routing import Route
         os.environ["BROKER_STEER_MID_TURN"] = "1"
         real_which = shutil.which
@@ -443,8 +444,9 @@ class SandboxTests(unittest.TestCase):
                         worker = cc.Worker("vikunja:task:9001", "run", str(self.wt))
                         route = Route(domain="test", repo=str(self.wt), prompt_class="p", agent="a",
                                       capability="mr-review", adapter=harness)
-                        parser = Mock()
+                        parser = Mock(spec=EnvelopeParser)
                         parser.try_parse.return_value = {"status": "done"}
+                        parser.try_parse_with_diagnostic.return_value = ({"status": "done"}, {})
                         adapter = cc.CCAdapter(router=None, worktree_mgr=None, prompt_loader=None,
                                                envelope_parser=parser, claude_bin="/bin/true")
                         if harness == "cc":
@@ -486,6 +488,12 @@ class SandboxTests(unittest.TestCase):
                             # Unavailable storage still leaves messages for the next turn.
                             self.assertFalse(steer.enqueue(worker.key, "pending", "next turn"))
                             self.assertTrue(steer.reclaim(worker.key, "pending"))
+                        if harness == "cc":
+                            parser.try_parse_with_diagnostic.assert_called_once_with("{}", worker.run_id, route)
+                            parser.try_parse.assert_not_called()
+                        else:
+                            parser.try_parse.assert_called_once()
+                            parser.try_parse_with_diagnostic.assert_not_called()
                         self.assertEqual(len(logs.output), 1)
                         self.assertEqual(len(launches), 1)
                         argv = launches[0]

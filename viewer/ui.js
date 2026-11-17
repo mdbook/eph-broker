@@ -27,6 +27,11 @@ const CSS = `
 @media (max-width:820px){
   .adir{grid-template-columns:1fr}.adir.picked .adir-listcard{display:none}.adir:not(.picked) .adir-detail{display:none}
   .adir-back{display:inline-flex}.adir-view{height:calc(100vh - 160px)}
+}
+@media (max-width:720px){
+  .adir-head{flex-wrap:nowrap;gap:10px;padding:8px 12px}.adir-head h2{font-size:16px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .adir-kind,.adir-beat{display:none}.adir-back{min-height:44px;align-items:center}
+  .adir-view{height:calc(100dvh - 132px - env(safe-area-inset-top) - env(safe-area-inset-bottom))}
 }`;
 
 function ago(seconds) {
@@ -148,8 +153,8 @@ export function mount(el0, ctx = {}) {
     const back = el('a', 'adir-back', '‹ Agents');
     back.href = standalone ? '#' : location.hash.split('/').slice(0, 2).join('/');
     pill = el('span', 'adir-pill');
-    beat = el('span', 'adir-sub');
-    head.append(back, el('h2', null, agent.name), el('span', 'adir-sub', agent.kind), pill, beat, el('span', 'adir-sp'));
+    beat = el('span', 'adir-sub adir-beat');
+    head.append(back, el('h2', null, agent.name), el('span', 'adir-sub adir-kind', agent.kind), pill, beat, el('span', 'adir-sp'));
     return head;
   }
 
@@ -185,8 +190,9 @@ export function mount(el0, ctx = {}) {
       }
       if (shown !== agent.name || stopped) return;
       note.remove();
-      const readOnly = !ctx.canAct ? 'Read-only: you can watch ' + agent.name +
-          ', but sending, steering and commands need the broker actions permission.'
+      const readOnly = !ctx.canAct ? (matchMedia('(max-width:720px)').matches   // a phone shows the hint on one line
+          ? 'Watching only. Sending needs action access.'
+          : 'Read-only: you can watch ' + agent.name + ', but sending, steering and commands need the broker actions permission.')
         : !agent.can_steer ? agent.name + ' does not accept messages or commands from here.' : '';
       view = mod.mount(host, {
         cfg, base: api, css: base + 'hermes-ui/app.css', fetch: viewFetch, brand, readOnly,

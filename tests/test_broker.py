@@ -13037,8 +13037,9 @@ def test_dash_pending_runs_paused_for_drain_rendering():
     js += js_between("function tid(key)", "// ---- views.")
     harness = r'''
 const assert = require('node:assert/strict');
-const dom = {}, $ = id => dom[id] ||= {};
+const dom = {}, $ = id => dom[id] ||= {classList: {toggle(){}, add(){}, remove(){}}};
 const document = {querySelectorAll: () => []};
+const PHONE = {matches: false};
 const can = false, showHarness = false, picking = () => false;
 function paintFleet(){}
 function paintDetail(){}
@@ -13533,8 +13534,9 @@ def test_dash_navigation_settings_and_hash_tabs():
 const assert = require('node:assert/strict');
 const dom = {}, $ = id => dom[id] ||= {hidden: true, attrs: {}, setAttribute(k,v){this.attrs[k]=v;},
   focus(){this.focused=true;}, addEventListener(){}, querySelector(){return $('first-link');}};
-const listeners = {}, document = {querySelectorAll: () => [], addEventListener: (k, f) => listeners[k] = f};
-const window = {addEventListener: (k,f) => listeners[k] = f}, location = {hash: ''};
+const listeners = {}, document = {querySelectorAll: () => [], querySelector: () => null, addEventListener: (k, f) => listeners[k] = f, body: {toggleAttribute(){}}};
+const window = {addEventListener: (k,f) => { const p = listeners[k]; listeners[k] = p ? e => { p(e); f(e); } : f; }}, location = {hash: ''};
+const PHONE = {matches: false, addEventListener(){}};
 let selected = null, lastState = null, runsFilter, fleetFilter;
 function select(key,past){ selected = [key,past]; }
 function closeStream(){}
@@ -13593,8 +13595,9 @@ def test_dash_queue_preview_metadata_and_stages():
     js += page[page.index('function actAttrs('):page.index('async function act(')]
     harness = r'''
 const assert = require('node:assert/strict');
-const dom = {}, $ = id => dom[id] ||= {};
+const dom = {}, $ = id => dom[id] ||= {classList: {toggle(){}, add(){}, remove(){}}};
 const document = {querySelectorAll: () => []};
+const PHONE = {matches: false};
 let can = false;
 const showHarness = false, picking = () => false;
 function paintFleet(){} function paintDetail(){}
@@ -13656,7 +13659,7 @@ for(const state of ['open_running', 'open_idle']){
 
 
 def test_dash_mobile_layout():
-    """<=720px uses a hamburger for views and Settings, the summary strip becomes a list, tables stack
+    """<=720px uses a bottom tab bar for views (Settings in the top bar), the summary strip becomes a list, tables stack
     into rows (title line + one muted detail line) and row buttons fold into the tappable row."""
     page = dash.PAGE
     m = re.search(r"/\* Mobile:.*?@media \(max-width:720px\)\{(.*?)\n  \}\n", page, re.S)
@@ -13667,14 +13670,14 @@ def test_dash_mobile_layout():
                    ".strip{grid-template-columns:minmax(0,1fr)", "min-height:48px"):
         assert needle in css, needle
     for v in ("now", "runs", "queue", "fleet"):
-        assert page.count('href="#%s" data-view="%s"' % (v, v)) == 2, v   # desktop + hamburger
-    assert 'class="tabbar"' not in page
+        assert page.count('href="#%s" data-view="%s"' % (v, v)) == 3, v   # desktop + hamburger + phone tab bar
+    assert page.count('class="tabbar"') == 1 and '.m-only,.tabbar{display:none}' in page   # hidden on desktop
     assert 'aria-controls="mobile-menu"' in page and 'aria-expanded="false"' in page
     assert page.count('href="#settings/workers" data-view="settings"') == 2
     body = page[page.index("function agentRow(a)"):page.index("function fleetSort(")]
     for needle in ('class="an"', 'class="mdl-c"', 'class="led', 'class="lage', "ctxMeter(a)", 'class="m-sub"'):
         assert needle in body, needle
-    ok("dash.PAGE uses a phone hamburger including Settings, stacked table rows, tappable rows")
+    ok("dash.PAGE uses a phone tab bar, stacked table rows, tappable rows")
 
 
 def test_fleet_parsing():

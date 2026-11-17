@@ -1134,18 +1134,114 @@ PAGE = r"""<!DOCTYPE html>
     .tl{padding:12px 12px 20px}
     .err-banner{margin:12px 12px 0}
   }
+  /* Phone-only pieces stay out of the desktop layout entirely. */
+  .m-only,.tabbar{display:none}
+  /* Phone pass: the scroll depth is the problem, so every list row is compact, repeated text is said once,
+     empty sections fold away and navigation is a bottom tab bar. Nothing here applies above 720px. */
+  @media (max-width:720px){
+    .d-only{display:none} .m-only{display:revert}
+    .top{-webkit-backdrop-filter:saturate(1.8) blur(18px);backdrop-filter:saturate(1.8) blur(18px);
+         background:color-mix(in srgb,var(--s1) 86%,transparent);padding-top:env(safe-area-inset-top)}
+    .top-in{height:48px;padding:0 8px 0 16px;gap:8px}
+    .brand{min-width:0;font-size:17px} .vt{overflow:hidden;text-overflow:ellipsis}
+    #theme,#menu-toggle,.mobile-menu{display:none !important}
+    #settings-gear{display:inline-flex;min-width:44px;height:44px;border:0;background:none;font-size:20px;color:var(--t2)}
+    #paused{display:inline-flex;padding:4px 10px;font-size:12px}
+    .live{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--t2);font-variant-numeric:tabular-nums;white-space:nowrap}
+    .live::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--run)}
+    .live.bad::before{background:var(--block)}
+    .tabbar{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;position:fixed;left:0;right:0;bottom:0;z-index:6;
+            background:color-mix(in srgb,var(--s1) 86%,transparent);-webkit-backdrop-filter:saturate(1.8) blur(18px);backdrop-filter:saturate(1.8) blur(18px);
+            border-top:1px solid var(--line);padding:2px 4px env(safe-area-inset-bottom)}
+    .tabbar a{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;min-height:50px;
+              text-decoration:none;color:var(--t3);font-size:10.5px;font-weight:600}
+    .tabbar svg{width:24px;height:24px;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round;transition:transform .12s}
+    .tabbar a:active svg{transform:scale(.9)}
+    .tabbar a[aria-current=page]{color:var(--brand)}
+    .tb-n{position:absolute;top:3px;left:calc(50% + 5px);min-width:17px;height:17px;padding:0 4px;border-radius:9px;display:grid;place-items:center;
+          font-size:10.5px;font-weight:700;color:#fff;background:var(--t3);font-variant-numeric:tabular-nums}
+    .tb-n.bad{background:var(--block)}
+    body[data-detail] .tabbar{display:none}
+    .page{padding:8px 12px calc(76px + env(safe-area-inset-bottom))}
+    body[data-detail] .page{padding-bottom:calc(16px + env(safe-area-inset-bottom))}
+    footer.page{padding:0 16px calc(72px + env(safe-area-inset-bottom))}
+    .toast{bottom:calc(72px + env(safe-area-inset-bottom))}
+    /* The view name lives in the top bar; only Fleet (mode chip) and run detail (title) keep a page head. */
+    #v-now > .ph,#v-runs > .ph,#v-queue > .ph,#v-settings > .ph{display:none}
+    .ph{margin:4px 4px 8px;flex-wrap:wrap;row-gap:4px} .ph .upd:not(#f-gen){display:none}
+    #fleet-view .ph h1{display:none}
+    .sec{margin-top:16px} .sec h2{font-size:13px;font-weight:600;color:var(--t2);margin:0 4px 6px}
+    .sec h2 .cnt{background:none;padding:0}
+    .card{border:0;border-radius:14px;box-shadow:none}
+    .empty{padding:14px 16px}
+    /* Now: four numbers in one row; each opens its list. */
+    .strip{grid-template-columns:repeat(4,minmax(0,1fr));padding:10px 0}
+    .strip > div{display:flex;flex-direction:column-reverse;align-items:center;border-top:0;border-left:1px solid var(--line);padding:2px 4px;gap:0;cursor:pointer}
+    .strip > div:first-child{border-left:0}
+    .strip .k{font-size:11.5px;color:var(--t2);text-align:center;line-height:1.25}
+    .strip .v{margin:0} .strip .v b{font-size:24px} .strip .v span,.strip .v .lnk,.pips{display:none}
+    #n-needs-w.zero{display:none}
+    /* Sub-tabs become a sticky segmented control that always fits the width. */
+    .subtabs{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(0,1fr);gap:2px;padding:2px;margin:12px 0 0;border:0;border-radius:10px;
+             background:var(--s3);position:sticky;top:calc(48px + env(safe-area-inset-top));z-index:4;box-shadow:0 0 0 8px var(--bg);overflow:visible}
+    .subtabs a{display:flex;align-items:center;justify-content:center;gap:4px;min-height:36px;padding:0 4px;border:0;border-radius:8px;
+               font-size:13px;font-weight:600;color:var(--t2);overflow:hidden;text-overflow:ellipsis}
+    .subtabs a:hover{background:none}
+    .subtabs a[aria-selected=true]{background:var(--s1);color:var(--t1);box-shadow:0 1px 3px rgba(0,0,0,.12)}
+    .subtabs .cnt{background:none;padding:0;font-size:11px;color:var(--t3)}
+    .subtabs + div > .sec:first-child,.subtabs + div > .card:first-child{margin-top:12px}
+    #now-running > .sec{margin-top:12px}
+    /* One compact row everywhere: two-line title, one muted line, the time on the right. */
+    .tbl tr{gap:2px 12px;padding:10px 14px;min-height:56px;align-content:center}
+    .tbl .t,.rows .h{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.3}
+    .tbl td.m-sub,.tbl td.m-sub .s2{font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .tbl td .s2.g{display:none}
+    .runc .s2{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    #n-run .tbl td:first-child{grid-row:1 / span 2} #n-run .tbl td.m-sub{grid-column:2;grid-row:2;text-align:right;max-width:30vw;align-self:end}
+    .tbl tr.grp-h{display:block;min-height:0;padding:14px 4px 6px;background:var(--bg);font-size:13px;font-weight:600;color:var(--t2);border-top:0}
+    .tbl tr.grp-h + tr{border-top:0}
+    .tbl tr.more{display:block;min-height:0;padding:0}
+    .tbl tr.more td{text-align:center}
+    .tbl tr.more .lnk,.tfoot .lnk{min-height:44px}
+    .rows > *{padding:10px 14px;min-height:56px}
+    .rows > .more{display:block;min-height:0;padding:0;text-align:center}
+    .rows .s{font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .tfoot{padding:8px 14px;font-size:12.5px}
+    .queue-preview{gap:12px}
+    #queue-next .sec > h2,#q-sub,.run-search .control-label{display:none}
+    #q-drain .qhead{padding:12px 16px}
+    .bar{margin-bottom:8px;gap:8px} .bar .seg{width:100%;display:grid;grid-auto-flow:column;grid-auto-columns:minmax(0,1fr)}
+    .bar .seg button{min-height:32px}
+    #v-runs .cols > .card{margin-top:4px}
+    /* Fleet: name and status, a thin context bar, one line of what it is doing. */
+    .ag .role{display:none}
+    .ag td.m-sub .meter{flex-direction:row-reverse;align-items:center;gap:8px}
+    .ag td.m-sub .led{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;-webkit-line-clamp:unset}
+    #fleet-view .legend{padding:10px 16px 12px;font-size:12.5px}
+    /* Run detail: a readable title, the transcript gets the screen. */
+    #d-title{font-size:19px;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;cursor:pointer}
+    #d-title.open{display:block}
+    #v-run .ph{margin-bottom:10px}
+    .conv-h{padding:8px 12px;gap:8px}
+    #v-run .tl{max-height:calc(100dvh - 240px)}
+    .msg textarea{min-height:44px}
+    #s-look .qrow{padding:10px 16px}
+    .btn,.lnk{min-height:44px}
+    .tbl td .btn,.rows .acts .btn{min-height:40px}
+  }
   @media (prefers-reduced-motion:reduce){ *{transition:none !important;animation:none !important} }
 </style>
 </head>
 <body>
 <header class="top"><div class="top-in">
-  <div class="brand"><span class="logo" aria-hidden="true"></span>eph-broker<span class="inst" id="inst"></span><span class="dot" id="dot" title="state feed"></span></div>
+  <div class="brand"><span class="logo" aria-hidden="true"></span><span class="d-only">eph-broker</span><span class="m-only vt" id="vt"></span><span class="inst" id="inst"></span><span class="dot" id="dot" title="state feed"></span></div>
   <nav class="nav" aria-label="Views">
     <a href="#now" data-view="now">Now</a><a href="#runs" data-view="runs">Runs</a>
     <a href="#queue" data-view="queue">Queue</a><a href="#fleet" data-view="fleet" id="tab-fleet">Fleet</a>
   </nav>
   <div class="top-r">
-    <a class="chip wait pause" id="paused" href="#queue" hidden>New runs paused</a>
+    <a class="chip wait pause" id="paused" href="#queue" hidden><span class="d-only">New runs paused</span><span class="m-only">Paused</span></a>
+    <span class="m-only live" id="live" title="Read-only, refreshes every 5 seconds"></span>
     <button class="btn" id="theme" title="Theme: auto" aria-label="Theme: auto">Theme: auto</button>
     <a class="btn sq ghost" id="settings-gear" href="#settings/workers" data-view="settings" aria-label="Settings" title="Settings">⚙</a>
     <button class="btn sq ghost" id="menu-toggle" aria-expanded="false" aria-controls="mobile-menu" aria-label="Navigation menu">☰</button>
@@ -1163,7 +1259,7 @@ PAGE = r"""<!DOCTYPE html>
 <section id="v-now">
   <div class="ph"><h1>Now</h1><span class="upd"></span></div>
   <div class="card strip" id="n-strip"></div>
-  <div class="sec"><h2>Needs you <span class="cnt" id="n-needs-n">0</span></h2><div class="card rows" id="n-needs"></div></div>
+  <div class="sec" id="n-needs-w"><h2>Needs you <span class="cnt" id="n-needs-n">0</span></h2><div class="card rows" id="n-needs"></div></div>
   <nav class="subtabs" role="tablist" aria-label="Now sections">
     <a id="tab-now-running" role="tab" href="#now/running" aria-controls="now-running">Running <span class="cnt" id="n-run-n"></span></a>
     <a id="tab-now-queue" role="tab" href="#now/queue" aria-controls="now-queue">Queue <span class="cnt" id="n-q-n"></span></a>
@@ -1201,9 +1297,9 @@ PAGE = r"""<!DOCTYPE html>
   <div class="ph"><h1>Queue</h1><span class="upd"></span></div>
   <div class="card" id="q-drain"></div>
   <nav class="subtabs" role="tablist" aria-label="Queue stages">
-    <a id="tab-queue-waiting" role="tab" href="#queue/waiting" aria-controls="queue-waiting">Waiting to start <span class="cnt" id="q-wait-n"></span></a>
+    <a id="tab-queue-waiting" role="tab" href="#queue/waiting" aria-controls="queue-waiting"><span class="d-only">Waiting to start</span><span class="m-only">Waiting</span> <span class="cnt" id="q-wait-n"></span></a>
     <a id="tab-queue-next" role="tab" href="#queue/next" aria-controls="queue-next">Next up <span class="cnt" id="q-n"></span></a>
-    <a id="tab-queue-source" role="tab" href="#queue/source" aria-controls="queue-source">By source <span class="cnt" id="q-src-n"></span></a>
+    <a id="tab-queue-source" role="tab" href="#queue/source" aria-controls="queue-source"><span class="d-only">By source</span><span class="m-only">Sources</span> <span class="cnt" id="q-src-n"></span></a>
   </nav>
   <div id="queue-waiting" role="tabpanel" aria-labelledby="tab-queue-waiting">
       <div class="card side" id="q-cap"></div>
@@ -1226,7 +1322,7 @@ PAGE = r"""<!DOCTYPE html>
       <div class="seg" id="f-seg" role="group" aria-label="Filter agents" style="margin-left:auto"></div></div>
     <div class="card"><table class="tbl"><thead><tr><th>Agent</th><th>Status</th><th>Model</th><th>Context</th><th>Working on</th><th>Updated</th></tr></thead>
       <tbody id="f-rows"></tbody></table>
-      <div class="legend">Context bar: the tick is the agent's clear floor. Blue under it, amber past it, red past the ceiling.</div></div>
+      <div class="legend"><span class="d-only">Context bar: the tick is the agent's clear floor. Blue under it, amber past it, red past the ceiling.</span><span class="m-only">The bar is how full each agent's memory is. It clears itself after the tick mark; red means it is over its limit.</span></div></div>
   </div>
 </section>
 
@@ -1237,6 +1333,8 @@ PAGE = r"""<!DOCTYPE html>
     <a id="tab-settings-groups" role="tab" href="#settings/groups" aria-controls="settings-groups">Groups</a>
     <a id="tab-settings-modules" role="tab" href="#settings/modules" aria-controls="settings-modules">Modules</a>
   </nav>
+  <div class="sec m-only" id="s-look"><h2>Appearance</h2><div class="card qrow"><span>Theme</span><span></span>
+    <div class="seg" id="s-theme" role="group" aria-label="Theme"></div></div></div>
   <p class="sub" id="s-unavailable">Worker and group settings require dashboard action access.</p>
   <div id="s-w" hidden>
   <div class="sec" id="settings-workers" role="tabpanel" aria-labelledby="tab-settings-workers"><h2>Worker settings</h2>
@@ -1275,6 +1373,13 @@ PAGE = r"""<!DOCTYPE html>
   </div>
 </section>
 </main>
+<!-- Phone navigation (display:none above 720px): every view one tap away, no hamburger. -->
+<nav class="tabbar" id="tabbar" aria-label="Views">
+  <a href="#now" data-view="now"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h4l3-7 4 14 3-7h4"/></svg><span>Now</span></a>
+  <a href="#runs" data-view="runs"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6h11M9 12h11M9 18h11M4.5 6h.01M4.5 12h.01M4.5 18h.01"/></svg><span>Runs</span></a>
+  <a href="#queue" data-view="queue"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 3 8l9 5 9-5-9-5ZM3 13l9 5 9-5"/></svg><b class="tb-n" id="tb-q" hidden></b><span>Queue</span></a>
+  <a href="#fleet" data-view="fleet"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="7" cy="7" r="3"/><circle cx="17" cy="7" r="3"/><circle cx="7" cy="17" r="3"/><circle cx="17" cy="17" r="3"/></svg><b class="tb-n bad" id="tb-f" hidden></b><span>Fleet</span></a>
+</nav>
 
 <footer class="page" style="padding-top:0;font-size:12px;color:var(--t3)">
   <span id="foot">Read-only, refreshes every 5 seconds</span>
@@ -1285,6 +1390,8 @@ PAGE = r"""<!DOCTYPE html>
 
 <script>
 const $ = id => document.getElementById(id);
+// Phone-only list behaviour (row caps, fleet grouping). Desktop rendering never reads it.
+const PHONE = matchMedia('(max-width:720px)');
 
 function esc(s){ return String(s ?? '').replace(/[&<>"']/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -1312,6 +1419,7 @@ function applyTheme(t){
   $('theme').textContent = ic + ' Theme: ' + lb;
   $('theme').title = 'Theme: ' + lb;
   $('theme').setAttribute('aria-label', 'Theme: ' + lb + '. Click to change.');
+  $('s-theme').innerHTML = segHtml('theme', t, [['auto', 'Auto'], ['light', 'Light'], ['dark', 'Dark']]);
 }
 applyTheme(theme);
 $('theme').onclick = () => {
@@ -1497,8 +1605,8 @@ function stamp(ts){   // "4:02 PM" today, "Nov 4, 4:02 PM" before that
     : t.toLocaleDateString([], {month: 'short', day: 'numeric'}) + ', ' + clock(ts);
 }
 function stIcon(k){ return '<span class="st ' + k + '" aria-hidden="true"></span>'; }
-function cell(k, v, s, extra){
-  return '<div><div class="k">' + esc(k) + '</div><div class="v"><b>' + esc(v) + '</b><span>' + esc(s) + '</span>' + (extra || '') + '</div></div>';
+function cell(k, v, s, extra, go){
+  return '<div' + (go ? ' data-go="' + esc(go) + '"' : '') + '><div class="k">' + esc(k) + '</div><div class="v"><b>' + esc(v) + '</b><span>' + esc(s) + '</span>' + (extra || '') + '</div></div>';
 }
 function segHtml(id, cur, opts){
   return opts.map(([v, label]) => '<button data-seg="' + id + '" data-v="' + esc(v) + '" aria-pressed="' + (v === cur) + '">' + esc(label) + '</button>').join('');
@@ -1618,6 +1726,17 @@ function agentRow(a){
     + '<td class="num m-hide"><span class="lage' + (la > 86400 ? ' old' : la > 21600 ? ' stale' : '')
     + '" title="STATE.md last edited">' + esc(la == null ? '-' : ago(la)) + '</span></td></tr>';
 }
+// Phone: agents that need attention first, then working ones, idle ones folded into one row.
+function fleetGroups(shown){
+  const head = (t, n) => '<tr class="grp-h"><td colspan="6">' + esc(t) + ' ' + n + '</td></tr>';
+  const groups = [['Needs attention', shown.filter(a => !a.stood_down && fleetSort(a) <= 1)],
+    ['Working', shown.filter(a => !a.stood_down && fleetSort(a) === 2)], ['Idle', shown.filter(a => !a.stood_down && fleetSort(a) === 3)],
+    ['Stood down', shown.filter(a => a.stood_down)]];
+  return groups.filter(g => g[1].length).map(([t, xs]) => head(t, xs.length) + (t !== 'Idle' || fleetIdle || xs.length < 4 ? xs.map(agentRow).join('')
+    + (t === 'Idle' && xs.length >= 4 ? '<tr class="more"><td colspan="6"><button class="lnk" id="f-idle">Hide idle agents</button></td></tr>' : '')
+    : '<tr class="pick" id="f-idle" tabindex="0" role="button" aria-expanded="false"><td>' + stIcon('idle') + ' ' + esc(xs.slice(0, 3).map(a => a.name).join(', ')
+      + ' and ' + (xs.length - 3) + ' more') + '</td><td class="m-end">Show</td></tr>')).join('');
+}
 function fleetSort(a){ return a.stood_down ? 4 : rank(a) === 0 ? 0 : needWhy(a) ? 1 : a.busy === true ? 2 : 3; }
 function paintFleet(f){
   f = f || {error: 'no fleet data in /state'};
@@ -1649,7 +1768,8 @@ function paintFleet(f){
   const pool = (fleetFilter === 'tfa' ? tfas : fleetFilter === 'standing' ? standing : rows).slice()
     .sort((x, y) => fleetSort(x) - fleetSort(y) || String(x.name).localeCompare(String(y.name)));
   const off = pool.filter(a => a.stood_down).length, shown = fleetBench ? pool : pool.filter(a => !a.stood_down);
-  $('f-rows').innerHTML = (shown.length ? shown.map(agentRow).join('') : '<tr><td colspan="6" class="empty">No agents.</td></tr>')
+  $('tb-f').hidden = !needs.length; $('tb-f').textContent = needs.length;
+  $('f-rows').innerHTML = (shown.length ? PHONE.matches ? fleetGroups(shown) : shown.map(agentRow).join('') : '<tr><td colspan="6" class="empty">No agents.</td></tr>')
     + (off ? '<tr class="more"><td colspan="6"><button class="lnk" id="f-bench">' + esc(fleetBench ? 'Hide stood-down agents'
       : 'Show ' + off + ' stood-down ' + (off === 1 ? 'agent' : 'agents')) + '</button></td></tr>' : '');
 }
@@ -1660,8 +1780,13 @@ $('f-needs').addEventListener('click', e => {
   navigator.clipboard.writeText(c.textContent).then(() => { c.classList.add('copied'); setTimeout(() => c.classList.remove('copied'), 1200); }, () => {});
 });
 let fleetBench = false;   // stood-down agents are hidden until asked for
+let fleetIdle = false, runsAll = false, qAll = false;   // phone: idle agents folded, runs and waiting capped at RUNS_PHONE until asked
+const RUNS_PHONE = 10;
 function toggleAgent(e){
   if(e.type === 'click' && e.target.id === 'f-bench'){ fleetBench = !fleetBench; paintFleet(lastState && lastState.fleet); return; }
+  if(e.target.closest && e.target.closest('#f-idle') && (e.type === 'click' || e.key === 'Enter' || e.key === ' ')){
+    e.preventDefault(); fleetIdle = !fleetIdle; paintFleet(lastState && lastState.fleet); return;
+  }
   const r = e.target.closest('.ag[data-agent]');
   if(!r || (e.type === 'keydown' && e.key !== 'Enter' && e.key !== ' ')) return;
   if(e.type === 'keydown') e.preventDefault();
@@ -1831,10 +1956,15 @@ function paint(d){
   $('foot').textContent = can ? 'Refreshes every 5 seconds. Every action you take here is logged with your name.' : 'Read-only, refreshes every 5 seconds';
 
   // Now
-  $('n-strip').innerHTML = cell('Running', D.used, D.cap != null ? 'of ' + D.cap + ' slots' : 'workers', pips(D.used, D.cap))
-    + cell('Waiting to start', D.waiting.length, 'behind a lock or limit', '<a class="lnk" href="#queue/waiting">View</a>')
-    + cell('Queued', D.queue.length, paused ? 'held while paused' : 'waiting to dispatch', '<a class="lnk" href="#queue/next">View</a>')
+  $('n-strip').innerHTML = cell('Running', D.used, D.cap != null ? 'of ' + D.cap + ' slots' : 'workers', pips(D.used, D.cap), '#now/running')
+    + cell('Waiting to start', D.waiting.length, 'behind a lock or limit', '<a class="lnk" href="#queue/waiting">View</a>', '#queue/waiting')
+    + cell('Queued', D.queue.length, paused ? 'held while paused' : 'waiting to dispatch', '<a class="lnk" href="#queue/next">View</a>', '#queue/next')
     + cell('Needs you', D.needs.length, D.needs.length === 1 ? 'decision waiting' : 'decisions waiting');
+  $('n-needs-w').classList.toggle('zero', !D.needs.length);
+  $('live').textContent = clock(d.now);
+  $('live').classList.remove('bad');
+  const qn = D.queue.length + D.waiting.length;
+  $('tb-q').hidden = !qn; $('tb-q').textContent = qn;
   $('n-needs-n').textContent = D.needs.length;
   $('n-needs').innerHTML = D.needs.length ? D.needs.map(needRow).join('') : '<p class="empty">Nothing needs you right now.</p>';
 
@@ -1885,7 +2015,8 @@ function paintRuns(d, D){
   const rows = all.filter(r => (runsFilter === 'all' || r.grp === runsFilter) && (!runsQ
     || (r.key + ' ' + runName(r.key, r.w).ref + ' ' + ((r.w && r.w.title) || '')).toLowerCase().includes(runsQ)));
   const sel = rows.find(r => runsSel && r.key === runsSel.key && (r.past || null) === runsSel.past) || rows[0] || null;
-  $('r-rows').innerHTML = rows.length ? rows.map(r => '<tr class="pick' + (r === sel ? ' sel' : '') + '" data-pick="' + esc(r.key) + '"'
+  const cap = PHONE.matches && !runsAll && rows.length > RUNS_PHONE + 2 ? RUNS_PHONE : rows.length;
+  $('r-rows').innerHTML = rows.length ? rows.slice(0, cap).map(r => '<tr class="pick' + (r === sel ? ' sel' : '') + '" data-pick="' + esc(r.key) + '"'
       + (r.past ? ' data-ppast="' + esc(r.past) + '"' : '') + ' data-grp="' + r.grp + '">'
       + '<td><div class="t">' + runLabel(r.key, r.w) + '</div></td>'
       + '<td class="m-sub"><span class="stw">' + stIcon(r.k) + esc(r.word) + '</span></td>'
@@ -1893,6 +2024,7 @@ function paintRuns(d, D){
       + '<td class="num m-hide">' + esc(r.started != null ? stamp(r.started) : '-') + '</td>'
       + '<td class="num m-end">' + esc(r.time != null ? dur(r.time) : r.started != null ? agoT(d.now - r.started) : '-') + '</td>'
       + '<td class="num r m-hide">' + esc(r.tokens != null ? kfmt(r.tokens) : '-') + '</td></tr>').join('')
+      + (cap < rows.length ? '<tr class="more"><td colspan="6"><button class="lnk" id="r-all">Show ' + esc(rows.length - cap) + ' more</button></td></tr>' : '')
     : '<tr><td colspan="6" class="empty">No runs match.</td></tr>';
   const more = (d.history_total || 0) > (d.history || []).length;
   $('r-foot').innerHTML = '<span>' + esc('Showing ' + rows.length + ' runs' + (d.stream_enabled ? ', ' + (d.history || []).length + ' of '
@@ -1909,7 +2041,7 @@ function paintQueue(d, D){
   $('q-rows').innerHTML = D.queue.length ? D.queue.slice(0, qLimit).map((q, i) => '<tr><td class="num m-hide">' + (i + 1) + '</td>'
       + '<td><span class="t">' + runLabel(q.key) + '</span></td>'
       + '<td class="m-hide">' + esc((title(q.key).src || '-') + (q.kind === 'rerun' ? ' (rerun)' : '')) + '</td>'
-      + '<td class="num m-sub">' + esc(q.events + (q.events === 1 ? ' event' : ' events')) + '<div class="s2">' + esc(queueWhy(q, d)) + '</div></td>'
+      + '<td class="num m-sub">' + esc(q.events + (q.events === 1 ? ' event' : ' events')) + '<div class="s2' + (queueWhy(q, d) === queueWhy({}, d) ? ' g' : '') + '">' + esc(queueWhy(q, d)) + '</div></td>'
       + '<td class="num m-end">' + esc(q.kind === 'slot' ? 'Waiting for slot' : agoT(q.arrived_age)) + '</td>'
       + '<td>' + (q.key === d.next_subject ? '<span class="tag">Next eligible</span>' : can && q.movable
         ? actBtn('Move to front', 'move-to-front', {subject_key: q.key}, {done: 'Selected ' + runName(q.key).ref + ' as next eligible'}) : '')
@@ -1921,7 +2053,10 @@ function paintQueue(d, D){
     + esc(D.cap != null ? 'of ' + D.cap + ' slots in use' : 'workers running') + '</span></div>' + pips(D.used, D.cap);
   $('q-wait-n').textContent = D.waiting.length;
   $('q-wait-drain').hidden = !paused;
-  $('q-wait').innerHTML = D.waiting.length ? D.waiting.map(x => stageRow(x, d, true, true)).join('') : '<p class="empty">Nothing waiting.</p>';
+  const qcap = PHONE.matches && !qAll && D.waiting.length > RUNS_PHONE + 2 ? RUNS_PHONE : D.waiting.length;
+  $('q-wait').innerHTML = D.waiting.length ? D.waiting.slice(0, qcap).map(x => stageRow(x, d, true, true)).join('')
+    + (qcap < D.waiting.length ? '<div class="more"><button class="lnk" id="q-all">Show ' + esc(D.waiting.length - qcap) + ' more</button></div>' : '')
+    : '<p class="empty">Nothing waiting.</p>';
   $('q-src-n').textContent = D.queue.length + D.waiting.length;
   $('q-src').innerHTML = bars(countBy([...D.queue, ...D.waiting], q => title(q.key).src || 'other'));
 }
@@ -1960,6 +2095,8 @@ document.addEventListener('keydown', e => {
 });
 function showTab(v){
   for(const [k, id] of Object.entries(VIEWS)) $(id).hidden = k !== v;
+  const navLink = document.querySelector('#tabbar [data-view="' + (v === 'run' ? 'runs' : v) + '"], header nav [data-view="' + v + '"]');
+  $('vt').textContent = v === 'run' ? 'Run' : v === 'settings' ? 'Settings' : navLink ? navLink.textContent.trim() : '';
   const nav = v === 'run' ? 'runs' : v;
   document.querySelectorAll('[data-view]').forEach(a => a.setAttribute('aria-current', a.dataset.view === nav ? 'page' : 'false'));
   if(v !== 'run' && selected){ closeStream(); selected = null; selectedPast = null; }
@@ -1980,6 +2117,13 @@ function route(){
   if(lastState){ paintRuns(lastState, lastDerived); paintFleet(lastState.fleet); }
 }
 window.addEventListener('hashchange', route);
+// Phone: an open agent transcript takes the whole screen (no tab bar under its composer).
+function detailFlag(){ document.body.toggleAttribute('data-detail', /^module\/[^/]+\/./.test(location.hash.slice(1))); }
+window.addEventListener('hashchange', detailFlag);
+detailFlag();
+$('d-title').addEventListener('click', e => e.currentTarget.classList.toggle('open'));
+$('n-strip').addEventListener('click', e => { const c = e.target.closest('[data-go]'); if(c && PHONE.matches) location.hash = c.dataset.go; });
+PHONE.addEventListener('change', () => { if(lastState) paint(lastState); });
 
 function paintDetail(){
   if(!selected || !lastState) return;
@@ -3218,6 +3362,11 @@ document.addEventListener('click', e => {
     return;
   }
   const s = e.target.closest('[data-seg]');
+  if(s && s.dataset.seg === 'theme'){
+    theme = THEMES.includes(s.dataset.v) ? s.dataset.v : 'auto';
+    try{ localStorage.setItem('eph-theme', theme); }catch(e){}
+    return applyTheme(theme);
+  }
   if(s){
     if(s.dataset.seg === 'runs') runsFilter = s.dataset.v; else fleetFilter = s.dataset.v;
     location.hash = '#' + s.dataset.seg + '/' + s.dataset.v;
@@ -3237,6 +3386,8 @@ document.addEventListener('click', e => {
   }
   if(e.target.closest('#h-more')){ histLimit += HIST_PAGE; tick(); }
   if(e.target.closest('#q-more')){ qLimit = Infinity; paint(lastState); }
+  if(e.target.closest('#r-all')){ runsAll = true; paint(lastState); }
+  if(e.target.closest('#q-all')){ qAll = true; paint(lastState); }
 });
 $('r-q').addEventListener('input', e => { runsQ = e.target.value.trim().toLowerCase(); if(lastState) paint(lastState); });
 function setHarness(on){
@@ -3258,6 +3409,7 @@ async function tick(){
     $('err').style.display = 'none';
   }catch(e){
     $('dot').className = 'dot bad';
+    $('live').classList.add('bad');
     document.querySelectorAll('.upd').forEach(u => u.classList.add('bad'));
     $('err').textContent = 'state fetch failed: ' + e.message;
     $('err').style.display = '';
@@ -3300,8 +3452,12 @@ for(const m of viewerModules){
   section.id = 'v-' + key; section.hidden = true;
   document.querySelector('main').appendChild(section);
   VIEWS[key] = section.id;
-  for(const nav of [document.querySelector('header nav'), $('mobile-menu')]){
-    const a = el('a', null, m.label);
+  for(const nav of [document.querySelector('header nav'), $('mobile-menu'), $('tabbar')]){
+    const a = el('a', null, nav.id === 'tabbar' ? null : m.label);
+    if(nav.id === 'tabbar'){
+      a.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v11H9l-5 4V5Z"/></svg>';
+      a.appendChild(el('span', null, m.label));
+    }
     a.href = '#module/' + m.name; a.dataset.view = key; nav.appendChild(a);
   }
   viewerRuntime.set(m.name, {section, index: new Set(), cleanup: null, abort: null, token: null, js: null});

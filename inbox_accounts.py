@@ -23,6 +23,7 @@ import os
 import re
 
 import site_env
+import config_paths
 
 # The accounts themselves (addresses, ledgers, postures: personal data) live in the private overlay
 # config/inbox-accounts.json (not shipped; the schema is in
@@ -32,7 +33,7 @@ import site_env
 # import: a half-read account table must never reach a Gmail-capable worker.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 ACCOUNTS_PATH = os.getenv("BROKER_INBOX_ACCOUNTS") or os.path.join(
-    os.getenv("CONFIG_DIR", os.path.join(_HERE, "config")), "inbox-accounts.json")
+    config_paths.config_dir(), "inbox-accounts.json")
 _FIELDS = ("email", "ledger", "posture")
 # an account key becomes an MCP server-name suffix
 # (`google-workspace-<account>`, cc._merge_inbox_chat_mcp_config) that the TRASH-guard hook matches with a

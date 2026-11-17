@@ -19,6 +19,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import site_env         # load config/site.env BEFORE any module reads env at import time
+import config_paths
 import sandbox
 import coalescer as C
 from coalescer import Coalescer
@@ -58,9 +59,9 @@ PORT = int(os.getenv("PORT", "8787"))  # match the reverse proxy, systemd unit a
 # reaches this via host loopback. Binding 0.0.0.0 bypasses that guard and exposes /event unauthenticated to the
 # whole LAN (HMAC is defense-in-depth, not always set).
 BIND_HOST = "127.0.0.1"
-CONFIG_DIR = os.getenv("CONFIG_DIR", os.path.join(os.path.dirname(__file__), "config"))
-PROMPTS_DIR = os.getenv("PROMPTS_DIR", os.path.join(os.path.dirname(__file__), "prompts"))
-APPROVED_PROMPTS = os.getenv("APPROVED_PROMPTS", os.path.join(os.path.dirname(__file__), "approved-prompts.json"))
+CONFIG_DIR = config_paths.config_dir()
+PROMPTS_DIR = config_paths.prompts_dir()
+APPROVED_PROMPTS = config_paths.approved_path()
 WORKTREES_ROOT = os.getenv("WORKTREES_ROOT", os.path.join(os.getenv("TMPDIR", "/tmp"), "eph-broker-worktrees"))
 CONCURRENCY = int(os.getenv("CONCURRENCY", "5"))                  # global cap (was 3)
 # @fleet full-TFA launch: shell out to spawn.sh (real detached tmux TFA), NOT a claude -p

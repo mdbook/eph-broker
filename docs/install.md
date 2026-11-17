@@ -67,8 +67,8 @@ as it. Workers run as the same user, so everything they need lives in that home.
 
 ```sh
 # who counts as a bot (the broker refuses to start without it), see configuration.md#who-counts-as-an-agent
-sudo cp /opt/eph-broker/config/provenance.example.json /opt/eph-broker/config/provenance.json
-sudo cp /opt/eph-broker/config/site.example.env /opt/eph-broker/config/site.env   # then edit it
+sudo cp /etc/eph-broker/provenance.example.json /etc/eph-broker/provenance.json
+sudo cp /etc/eph-broker/site.example.env /etc/eph-broker/site.env   # then edit it
 sudo install -d -o eph-broker -g eph-broker -m 0750 /var/lib/eph-broker
 # log the harness in as the service user (workers use this stored login, not an env var key)
 sudo -u eph-broker -H claude
@@ -77,8 +77,16 @@ sudo -u eph-broker -H git config --global user.name "eph-broker"
 sudo -u eph-broker -H git config --global user.email "eph-broker@example.com"
 ```
 
-Files you add under `/opt/eph-broker/config/` aren't owned by the package, so an upgrade leaves them alone. You
-can also keep them elsewhere and point `CONFIG_DIR`, `BROKER_SITE_ENV` or `BROKER_PROVENANCE_PATH` at them.
+The service reads `/etc/eph-broker/`, not the packaged defaults under `/opt/eph-broker/`. A new install seeds
+this directory once. The first upgrade migrates the old config, prompts and approvals before replacing code,
+even if the directory already holds the service EnvironmentFile. Only missing paths are copied; existing files,
+symlinks, directory modes and ownership are preserved. Initialization writes `.eph-config-initialized` only after
+all copies succeed. Keep this marker: later upgrades leave config untouched, including removed approvals. Back it up
+as operator data. Old path overrides still win: remove overrides pointing into `/opt/eph-broker` after migration.
+For a different location, seed it with `python3 /opt/eph-broker/config_paths.py /path/to/site-config` and set
+`Environment=BROKER_CONFIG_DIR=/path/to/site-config` in a systemd drop-in. The RPM initializes only the default
+`/etc/eph-broker` location. Keep configuration operator-owned and broker-readable. Dashboard edits additionally
+need write access to the routing overrides file and parent directory. Uninstall does not remove site config.
 
 The package also creates an empty drop-in directory `eph-broker.service.d/` next to the unit. Put your settings
 and secrets there (see [configuration.md](configuration.md#secrets)); a drop-in can also set `User=` to run the

@@ -14,6 +14,7 @@ Group=eph-broker
 WorkingDirectory=/opt/eph-broker
 ExecStart=/usr/bin/python3 /opt/eph-broker/app.py
 Environment=PORT=8787 PYTHONDONTWRITEBYTECODE=1
+Environment=BROKER_CONFIG_DIR=/etc/eph-broker
 StateDirectory=eph-broker
 Environment=EVENTS_LOG=/var/lib/eph-broker/events.jsonl
 Restart=on-failure

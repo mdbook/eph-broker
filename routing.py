@@ -13,6 +13,7 @@ from typing import Optional
 
 import provenance
 import site_env  # noqa: F401  load the site overlay before the env reads below
+import config_paths
 import cd   # reused by the tiered MR review below for cd._patterns(tier_cfg, repo) - its Full-path glob
             # CATEGORIES, keyed fresh per call to the MR's own repo/site-config (never its
             # classify_paths()/DEFAULT_FULL_REPOS logic, a stricter deploy-MERGE-gate axis); no circular
@@ -2420,7 +2421,7 @@ _CONFIG_ROUTE_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")             # alway
 _CONFIG_ROUTE_PROMPT_RE = re.compile(r"([a-z0-9][a-z0-9_-]*)/([a-z0-9][a-z0-9_-]*)")
 _CONFIG_ROUTE_NAME_RE = re.compile(r"[A-Za-z0-9._:-]{1,80}")
 _HERE = os.path.dirname(os.path.abspath(__file__))
-ROUTES_PATH = os.getenv("ROUTES_PATH", os.path.join(os.getenv("CONFIG_DIR", os.path.join(_HERE, "config")),
+ROUTES_PATH = os.getenv("ROUTES_PATH", os.path.join(config_paths.config_dir(),
                                                     "routes.json"))
 
 
@@ -2493,9 +2494,8 @@ def load_config_routes(path=None, prompts_dir=None, approved_path=None, site_cap
     extra = {k for k in doc if not k.startswith("_")} - {"routes"}
     if extra:
         raise RoutesConfigError(f"{path}: unknown top-level key(s) {sorted(extra)}")
-    loader = PromptLoader(prompts_dir or os.getenv("PROMPTS_DIR", os.path.join(_HERE, "prompts")),
-                          approved_path or os.getenv("APPROVED_PROMPTS",
-                                                     os.path.join(_HERE, "approved-prompts.json")))
+    loader = PromptLoader(prompts_dir or config_paths.prompts_dir(),
+                          approved_path or config_paths.approved_path())
     reserved_ids, seen, entries = _builtin_row_keys(), set(), []
     # every built-in tracker row, wherever it sits: a config row whose own signal one of them also matches would
     # be pre-empted (narrow substring rows ahead of the splice, possibly with MORE capability) or would take over a

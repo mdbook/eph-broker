@@ -27,6 +27,7 @@ Stdlib only (py3.9, like the rest of the broker).
 import fcntl, fnmatch, json, logging, os, re, shutil, subprocess, threading, time
 import urllib.parse, urllib.request
 import site_env
+import config_paths
 from dataclasses import dataclass, field
 
 log = logging.getLogger("eph-broker.repo_catalog")
@@ -61,7 +62,7 @@ CACHE_FILE = os.path.expanduser(os.getenv("REPO_CATALOG_CACHE", "~/.cache/eph-br
 CACHE_TTL_S = float(os.getenv("REPO_CATALOG_TTL_S", "3600"))
 HTTP_TIMEOUT_S = float(os.getenv("REPO_CATALOG_HTTP_TIMEOUT", "15"))
 CLONE_ROOT = os.path.expanduser(os.getenv("REPO_CLONE_ROOT", "~/.cache/eph-repo-cache"))
-ALIASES_FILE = os.getenv("REPO_ALIASES_FILE", os.path.join(HERE, "config", "repo-aliases.json"))
+ALIASES_FILE = os.getenv("REPO_ALIASES_FILE", os.path.join(config_paths.config_dir(), "repo-aliases.json"))
 CRED_FILE = os.path.expanduser(os.getenv("REPO_CRED_FILE", "~/.git-credentials"))
 # NAME of the env var holding the namespace-wide push token (used only with REPO_PUSH_BROAD_CRED_ENABLED).
 PUSH_TOKEN_ENV = os.getenv("GITLAB_PUSH_TOKEN_ENV", "GITLAB_PUSH_TOKEN")

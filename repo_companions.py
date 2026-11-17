@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import config_paths
 
 log = logging.getLogger("eph-broker.companions")
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -18,7 +19,7 @@ def load(path=None):
     """Read fresh at each cut. Missing default = off; explicit missing or malformed config = refuse."""
     explicit = path or os.getenv("REPO_COMPANIONS_FILE")
     try:
-        with open(explicit or os.path.join(HERE, "config", "repo-companions.json"), encoding="utf-8") as f:
+        with open(explicit or os.path.join(config_paths.config_dir(), "repo-companions.json"), encoding="utf-8") as f:
             mapping = json.load(f)
     except FileNotFoundError:
         if not explicit:

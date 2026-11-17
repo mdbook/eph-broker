@@ -78,12 +78,36 @@ install -d -m 0755 %{buildroot}%{_unitdir}/eph-broker.service.d
 /opt/eph-broker/viewer
 
 %pre
+# Migrate BEFORE RPM replaces the old packaged config. The directory is deliberately
+# not package-owned: upgrades and removals must never replace operator configuration.
+# BEGIN site config migration
+# This must also work on older RPMs that do not yet contain config_paths.py.
+copy_missing() {
+    if [ ! -e "$2" ] && [ ! -L "$2" ]; then
+        cp -a "$1" "$2" || exit 1
+    elif [ -d "$1" ] && [ ! -L "$1" ] && [ -d "$2" ] && [ ! -L "$2" ]; then
+        for entry in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+            [ -e "$entry" ] || [ -L "$entry" ] || continue
+            copy_missing "$entry" "$2/${entry##*/}"
+        done
+    fi
+}
+if [ ! -e /etc/eph-broker/.eph-config-initialized ] && [ ! -L /etc/eph-broker/.eph-config-initialized ] && [ -d /opt/eph-broker/config ]; then
+    [ ! -L /etc/eph-broker ] || exit 1
+    copy_missing /opt/eph-broker/config /etc/eph-broker
+    copy_missing /opt/eph-broker/prompts /etc/eph-broker/prompts
+    copy_missing /opt/eph-broker/approved-prompts.json /etc/eph-broker/approved-prompts.json
+    touch /etc/eph-broker/.eph-config-initialized || exit 1
+fi
+# END site config migration
 getent group eph-broker >/dev/null || groupadd -r eph-broker
 getent passwd eph-broker >/dev/null || \
     useradd -r -g eph-broker -M -d /var/lib/eph-broker -s /sbin/nologin -c "eph-broker service" eph-broker
 exit 0
 
 %post
+# A new install starts with defaults. A completed migration is never filled in again.
+/usr/bin/python3 /opt/eph-broker/config_paths.py /etc/eph-broker || exit 1
 %systemd_post eph-broker.service
 
 %preun

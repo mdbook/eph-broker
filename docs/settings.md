@@ -20,16 +20,17 @@ Removing an entry restores its startup value. Bootstrap paths, ports and identit
 |---|---|---|
 | `PORT` | `8787` | Port on 127.0.0.1 the broker listens on. |
 | `CONCURRENCY` | `5` | Most active turns at once. Positive integer; SIGHUP resizes the existing gate. Growth wakes waiters immediately; shrink never kills holders. |
-| `CONFIG_DIR` | `config/` next to `app.py` | Where the `*.json` config files are read from. |
-| `PROMPTS_DIR` | `prompts/` | Where rendered worker prompts are read from. |
-| `APPROVED_PROMPTS` | `approved-prompts.json` | The file of signed prompt hashes. |
-| `BROKER_CONFIG` | `config/broker.yaml`, else `config/broker.json` if it exists | The optional single config file. YAML takes precedence when both exist. An explicit path that doesn't exist stops the broker. |
-| `BROKER_SITE_ENV` | `config/site.env` | The settings file. An explicit path that doesn't exist stops the broker. |
+| `BROKER_CONFIG_DIR` | unset in source; `/etc/eph-broker` in the RPM service | Bootstrap root for site JSON, broker config, `site.env`, `prompts/` and `approved-prompts.json`. Set in the process environment, not in the file it selects. Existing sites are never overwritten or filled in by upgrades. No runtime fallback to packaged files. |
+| `CONFIG_DIR` | `BROKER_CONFIG_DIR`, else `config/` next to `app.py` | Legacy override for site JSON, broker config and `site.env`; does not move prompts or approvals. |
+| `PROMPTS_DIR` | `BROKER_CONFIG_DIR/prompts`, else in-repo `prompts/` | Override for rendered worker prompts. |
+| `APPROVED_PROMPTS` | `BROKER_CONFIG_DIR/approved-prompts.json`, else in-repo `approved-prompts.json` | Override for signed prompt hashes. |
+| `BROKER_CONFIG` | `CONFIG_DIR/broker.yaml`, else `CONFIG_DIR/broker.json` if it exists | The optional single config file. YAML takes precedence when both exist. An explicit path that doesn't exist stops the broker. |
+| `BROKER_SITE_ENV` | `CONFIG_DIR/site.env` | The settings file. An explicit path that doesn't exist stops the broker. |
 | `BROKER_PROVENANCE_PATH` | `CONFIG_DIR/provenance.json` | Which accounts are agents ([configuration.md](configuration.md#who-counts-as-an-agent)). |
 | `BROKER_PROVENANCE_NEUTRAL` | unset | `1` lets the broker start without a provenance file, with only built-in agent names. |
 | `ROUTES_PATH` | `CONFIG_DIR/routes.json` | Your own agent types ([routes.md](routes.md)). |
 | `ROUTING_OVERRIDES_FILE` | `CONFIG_DIR/routing-overrides.json` | Atomic, last-good dashboard routing overrides. |
-| `REPO_COMPANIONS_FILE` | `config/repo-companions.json` beside the broker | Optional per-code-repo read-only source checkouts. Re-read on each cut; an explicit missing file refuses the run. See [configuration.md](configuration.md#companion-source-repositories). |
+| `REPO_COMPANIONS_FILE` | `CONFIG_DIR/repo-companions.json` | Optional per-code-repo read-only source checkouts. Re-read on each cut; an explicit missing file refuses the run. See [configuration.md](configuration.md#companion-source-repositories). |
 | `EVENTS_LOG` | `$TMPDIR/eph-broker/events.jsonl` | Every accepted event, one JSON line each. Its directory also holds the state files below. |
 | `COMPLETED_PATH` | `completed.json` next to `EVENTS_LOG` | Tickets that finished a run. In memory only when `EVENTS_LOG` isn't set. |
 | `BROKER_STATE_PATH` | `broker-state.sqlite3` beside an explicit `COMPLETED_PATH` | Private local journal for durable drain, FIFO intake and scheduler state. Without either path drain control returns 503. See [drain.md](drain.md). |
@@ -546,7 +547,7 @@ for the original deployment and still experimental.
 | `REPO_LOCAL_ROOTS`, `REPO_LOCAL_DIRS`, `REPO_LOCAL_MAP` | unset | Where existing checkouts are found (`REPO_LOCAL_MAP` is `ns/name=/path,...`). |
 | `REPO_CLONE_ROOT` | `~/.cache/eph-repo-cache` | Where repos without a checkout are cloned. |
 | `REPO_CATALOG_CACHE`, `REPO_CATALOG_TTL_S`, `REPO_CATALOG_HTTP_TIMEOUT` | `~/.cache/eph-broker/repo-catalog.json`, `3600`, `15` | Catalog cache and GitLab timeout. |
-| `REPO_ALIASES_FILE` | `config/repo-aliases.json` | Extra names for repos. |
+| `REPO_ALIASES_FILE` | `CONFIG_DIR/repo-aliases.json` | Extra names for repos. |
 | `REPO_SUBPROJECT_REPOS`, `REPO_SUBPROJECT_STOPWORDS` | unset, a built-in list | Repos whose subdirectory names count as aliases, and words never used as one. |
 | `REPO_WEAK_NAMES` | a built-in list | Repo names too common to count as a match on their own. |
 | `REPO_INFER_SHORTLIST_K` | `8` | Candidates passed to the model steps. |

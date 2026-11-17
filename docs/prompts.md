@@ -8,6 +8,15 @@ hash you signed.
 
 This page describes exactly what ships in this repo and how the pieces fit.
 
+Runtime storage is independent of the renderer's source tree. With `BROKER_CONFIG_DIR` set (the RPM service
+uses `/etc/eph-broker`), the broker reads `<dir>/prompts/` and `<dir>/approved-prompts.json`. Render in a source
+checkout, review the result, then copy the rendered file and its operator-approved hash into that directory.
+Do not change packaged files to update the live prompt. The hash gate reads both files on every launch; a changed
+or unsigned prompt refuses, and a missing site file never falls back to packaged approval. No release is needed.
+Built-in rows need no reload; restart for site-defined routes, whose prompts are also checked at startup.
+Existing `PROMPTS_DIR` and `APPROVED_PROMPTS` overrides still win. Upgrades never update existing site prompts
+or signatures, so review and adopt new shipped defaults explicitly.
+
 ## What ships
 
 | Path | What it is |

@@ -1,5 +1,5 @@
-"""Site overlay. Code defaults are neutral; a deployment's own values live in config/broker.yaml or broker.json ($BROKER_CONFIG,
-see read_config) and/or the older KEY=VALUE file $BROKER_SITE_ENV or config/site.env next to this module (private;
+"""Site overlay. Code defaults are neutral; a deployment's own values live in broker.yaml or broker.json ($BROKER_CONFIG,
+see read_config) and/or the older KEY=VALUE file $BROKER_SITE_ENV or site.env in config_paths.config_dir() (private;
 the OSS export leaves both out and ships the .example files; NOT export-ignore, CI builds the RPM from `git archive`).
 Loaded on first import with setdefault: the real environment (systemd drop-ins, tests) always wins, then broker config
 settings, then site.env. Import this before any module that reads env at import time."""
@@ -7,13 +7,14 @@ import json
 import logging
 import os
 import re
+import config_paths
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-SITE_ENV = os.getenv("BROKER_SITE_ENV") or os.path.join(_HERE, "config", "site.env")
+SITE_ENV = os.getenv("BROKER_SITE_ENV") or os.path.join(config_paths.config_dir(), "site.env")
 # The single config file: explicit path, else YAML first, then JSON (no PyYAML needed).
-BROKER_CONFIG = os.getenv("BROKER_CONFIG") or os.path.join(_HERE, "config", "broker.yaml")
+BROKER_CONFIG = os.getenv("BROKER_CONFIG") or os.path.join(config_paths.config_dir(), "broker.yaml")
 if not os.getenv("BROKER_CONFIG") and not os.path.exists(BROKER_CONFIG):
-    _json_config = os.path.join(_HERE, "config", "broker.json")
+    _json_config = os.path.join(config_paths.config_dir(), "broker.json")
     if os.path.exists(_json_config):
         BROKER_CONFIG = _json_config
 # Top-level keys of the broker config. `settings` feeds the environment; every other key is the content of the

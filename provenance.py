@@ -20,6 +20,7 @@ Value-free: identity NAMES only, no secrets, no network calls.
 import json, logging, os, re
 
 import site_env
+import config_paths
 
 log = logging.getLogger("eph-broker.provenance")
 
@@ -27,7 +28,7 @@ log = logging.getLogger("eph-broker.provenance")
 # restart. No hot-reload/watcher loop here on purpose.
 # BROKER_PROVENANCE_PATH: an explicit roster file, e.g. the tests' own fixture
 _OVERRIDE_PATH = os.getenv("BROKER_PROVENANCE_PATH") or os.path.join(
-    os.getenv("CONFIG_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "config")),
+    config_paths.config_dir(),
     "provenance.json",
 )
 

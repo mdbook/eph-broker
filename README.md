@@ -80,6 +80,33 @@ The [first merge request checklist](docs/first-merge-request.md) walks through e
 
 Settings are environment variables plus a few JSON files in `config/`. Start from the examples (`config/site.example.env`, `config/provenance.example.json`) and keep secrets out of `site.env` and git.
 
+**Operator config is separate from code.** The RPM sets `BROKER_CONFIG_DIR=/etc/eph-broker` in the service.
+That directory holds `broker.yaml` or `broker.json`, `site.env`, all site JSON files (including constraints
+and routes), `prompts/<domain>/<class>.md` and `approved-prompts.json`. The first upgrade from an older RPM
+copies the existing `/opt/eph-broker/config`, prompts and approvals there **before** replacing packaged files.
+New installs copy shipped defaults once. Initialization merges only missing paths, preserving existing operator
+files and their modes/ownership, including an EnvironmentFile already in that directory. The completion marker
+`.eph-config-initialized` prevents later upgrades from writing config, even if a file has been removed. Keep this
+marker when backing up or restoring config. Review new packaged defaults explicitly rather than restoring
+constraints after upgrades.
+
+For source installs, in-repo paths remain the working defaults. To opt into a separate directory, seed it once:
+
+```sh
+python3 config_paths.py /path/to/site-config
+BROKER_CONFIG_DIR=/path/to/site-config python3 app.py
+```
+
+Set the directory in the process environment (a systemd drop-in for RPM installs), not inside its own config.
+Existing individual path overrides still win; remove old overrides pointing into `/opt/eph-broker` when migrating.
+No fallback to packaged prompts or signatures occurs for an external config directory. Keep it writable only by
+trusted operators; grant the broker write access to `routing-overrides.json` and its parent only if dashboard
+editing is enabled. To change a prompt, render/review it, copy the rendered file into this directory and update
+its approved SHA256 there after operator sign-off. Both are read on every launch, so no RPM or restart is needed
+for built-in rows. Routes are validated at startup, so restart after changing prompts used by site-defined routes.
+Unsigned or changed prompts still refuse to run. JSON policies reload on SIGHUP; `site.env` and bootstrap paths
+require restart. See [installation](docs/install.md) and [prompts](docs/prompts.md).
+
 Set top-level `model_denylist: ["restricted-family"]` in `broker.yaml` (see
 [`config/broker.example.yaml`](config/broker.example.yaml)) to forbid model ids containing any listed
 case-insensitive literal substring. The default is `[]`. Reload with SIGHUP after changing it. Every worker harness
@@ -147,7 +174,7 @@ lifecycle; [the full settings reference](docs/settings.md) lists defaults and dy
 | `MENTION_HANDOFF_ENABLED`, `MENTION_HANDOFF_DEDUP_S`, `MENTION_HANDOFF_PROJECTS` | Mixed startup/on-demand | **Hot** |
 | `ZULIP_WAKE_ENABLED`, `ZULIP_AUTOREPLY_ENABLED`, `ZULIP_WAKE_SENDERS`, `ZULIP_WAKE_BOT_SENDERS`, `ZULIP_AUTOREPLY_EXCLUDE`, `ZULIP_AUTOREPLY_TEXT`, `ZULIP_AUTOREPLY_WINDOW_S`, `ZULIP_WAKE_POLL`, `ZULIP_AUTOREPLY_POLL`, `ZULIP_RECONCILE_S`, `ZULIP_MAX_AGE_S`, `ZULIP_HISTORY_TIMEOUT_S`, `ZULIP_REGISTRY_TTL_S`, `ZULIP_BOT_CACHE_TTL_S` | On demand | **Hot** on next reconciliation/listener launch; enabling after an all-off startup starts one reconciliation loop; existing listeners keep launch arguments |
 | `BROKER_HMAC_MODE`, `BROKER_STREAM_ENABLED`, `BROKER_STREAM_MAX`, `BROKER_STREAM_MAX_S`, `BROKER_ACTIONS_ENABLED`, `BROKER_STEER_MID_TURN`, `TICKET_URL_TEMPLATE`, `DASH_INSTANCE_NAME`, `AGENT_DM_RECIPIENTS`, `AGENT_DM_DENY` | On demand | **Hot**; new requests/turn grants only |
-| `PORT`, `BROKER_CONFIG`, `BROKER_SITE_ENV`, `CONFIG_DIR`, `PROMPTS_DIR`, `APPROVED_PROMPTS`, `ROUTES_PATH`, `ROUTING_OVERRIDES_FILE`, `BROKER_PROVENANCE_PATH`, `BROKER_PROVENANCE_NEUTRAL`, `BROKER_INBOX_ACCOUNTS`, `BROKER_STATE_PATH`, `BROKER_DRAIN_ON_NEW_JOURNAL`, `EVENTS_LOG`, `COMPLETED_PATH`, `PENDING_MAX_AGE`, `BROKER_MODULES`, `BROKER_MODULE_<NAME>_*`, `XDG_STATE_HOME` | Bootstrap | **Needs restart**: listener, journal recovery, prompt authority and child-process wiring; not runtime policy |
+| `PORT`, `BROKER_CONFIG_DIR`, `BROKER_CONFIG`, `BROKER_SITE_ENV`, `CONFIG_DIR`, `PROMPTS_DIR`, `APPROVED_PROMPTS`, `ROUTES_PATH`, `ROUTING_OVERRIDES_FILE`, `BROKER_PROVENANCE_PATH`, `BROKER_PROVENANCE_NEUTRAL`, `BROKER_INBOX_ACCOUNTS`, `BROKER_STATE_PATH`, `BROKER_DRAIN_ON_NEW_JOURNAL`, `EVENTS_LOG`, `COMPLETED_PATH`, `PENDING_MAX_AGE`, `BROKER_MODULES`, `BROKER_MODULE_<NAME>_*`, `XDG_STATE_HOME` | Bootstrap | **Needs restart**: listener, journal recovery, prompt authority and child-process wiring; not runtime policy |
 | `WORKTREES_ROOT`, `TMPDIR`, `TURN_CAPTURE_DIR`, `FLEET_USAGE_FILE`, `SPAWN_MODELS_JSON`, `VLLM_CC_ENV`, `FLEET_MODEL_SH`, `SPAWN_SH`, `BROKER_MCP_SH`, `NOTIFY_ZBUS`, `NOTIFY_ZBUS_ENV`, `HERMES_BIN`, `HERMES_HOME_ROOT`, `CODEX_BIN`, `CODEX_HOME_ROOT`, `CODEX_AUTH_FILE`, `ZULIP_THREAD_ROOT`, `ZULIP_STATE_DIR`, `ZULIP_REGISTRY_PATH`, `ZULIP_MCP_SCRIPT`, `ZULIP_UV_BIN` | Bootstrap paths | **Needs restart**: executable, credential and storage roots stay fixed |
 | Row `*_REPO`, `*_REPO_PATH`, `*_WORKTREE_BASE`, `*_MCP_CONFIG`, `INBOX_MCP_CONFIG_DIR`, `CODE_BROWSER_MCP_CONFIG`, `WIKI_CONTENT_SUBDIR`, `*_PUBLISH_REF`, `*_MR_TARGET_REF`, `*_BRANCH_PREFIX`, `CODE_REPO_RUNNER_SEEDS`, `TFA_CWD_BASE` | Bootstrap repo wiring | **Needs restart**: repository/publish authority and filesystem roots |
 | Row `*_AGENT`, `*_ASSIGNEE`, `*_ROW_LABEL`, `*_ROW_SOURCE`, `*_ZBUS_ENV`, `INFRA_GENERAL_LABEL`, `GITHUB_ISSUE_SOURCE`, `GITLAB_ISSUE_SOURCE`, `GITHUB_BOT_LOGIN`, `<ROW>_GIT_NAME`, `<ROW>_GIT_EMAIL`, `<ROW>_GIT_IDENTITY_ENABLED`, `DEV_VIKUNJA_UID`, `MENTION_HANDOFF_USER`, `MENTION_HANDOFF_UID`, `RERUN_CALLER`, `PARKED_LABEL_ID` | Bootstrap identities | **Needs restart**: routing, provenance and audit identity must stay consistent |

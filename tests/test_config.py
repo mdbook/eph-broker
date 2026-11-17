@@ -183,6 +183,7 @@ def test_hold_labels_config():
 def test_default_config_selection_without_pyyaml():
     with tempfile.TemporaryDirectory() as d:
         shutil.copyfile(os.path.join(ROOT, "site_env.py"), os.path.join(d, "site_env.py"))
+        shutil.copyfile(os.path.join(ROOT, "config_paths.py"), os.path.join(d, "config_paths.py"))
         # Shadow even an installed PyYAML: default JSON must work in a stdlib-only installation.
         _write(d, "yaml.py", 'raise ImportError("no PyYAML in this test")\n')
         cdir = os.path.join(d, "config"); os.makedirs(cdir)
@@ -235,6 +236,189 @@ def test_model_denylist_only_config_preserves_json_config():
             else:
                 os.environ["BROKER_CONFIG"] = saved_env
     ok("denylist-only broker.json (and YAML when available) parses and leaves every JSON config file unchanged")
+
+
+def test_external_config_is_authoritative_and_prompt_edits_remain_gated():
+    import config_paths
+    from prompts import PromptLoader, PromptNotApproved
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        _write(d, "broker.json", '{"settings": {"CONCURRENCY": 7}}')
+        _write(d, "site.env", "PORT=9898\n")
+        _write(d, "constraints.json", '{"max_turns": 13}')
+        _write(d, "repo-companions.json", '{"example/app": []}')
+        os.makedirs(os.path.join(d, "prompts", "code"))
+        prompt = _write(os.path.join(d, "prompts", "code"), "change-proposer.md", "site prompt")
+        approved = _write(d, "approved-prompts.json", json.dumps({
+            "code/change-proposer": hashlib.sha256(b"site prompt").hexdigest()}))
+        p = _probe({"BROKER_CONFIG_DIR": d, "BROKER_PROVENANCE_NEUTRAL": "1"},
+                   "import app, routing, repo_catalog, repo_companions, inbox_accounts, provenance\n"
+                   "from routing_overrides import RoutingOverrides\n"
+                   "assert app.CONFIG_DIR == os.environ['BROKER_CONFIG_DIR']\n"
+                   "assert app.Config(app.CONFIG_DIR).data['constraints']['max_turns'] == 13\n"
+                   "assert routing.ROUTES_PATH == app.CONFIG_DIR + '/routes.json'\n"
+                   "assert repo_catalog.ALIASES_FILE == app.CONFIG_DIR + '/repo-aliases.json'\n"
+                   "assert repo_companions.load() == {'example/app': []}\n"
+                   "assert inbox_accounts.ACCOUNTS_PATH == app.CONFIG_DIR + '/inbox-accounts.json'\n"
+                   "assert provenance._OVERRIDE_PATH == app.CONFIG_DIR + '/provenance.json'\n"
+                   "assert RoutingOverrides().path == app.CONFIG_DIR + '/routing-overrides.json'\n"
+                   "assert app.PROMPTS_DIR == app.CONFIG_DIR + '/prompts'\n"
+                   "assert app.APPROVED_PROMPTS == app.CONFIG_DIR + '/approved-prompts.json'\n"
+                   "print(os.getenv('CONCURRENCY'), os.getenv('PORT'))")
+        assert p.returncode == 0 and p.stdout.strip() == "7 9898", (p.stdout, p.stderr)
+        with patch.dict(os.environ, {"BROKER_CONFIG_DIR": d}):
+            loader = PromptLoader(config_paths.prompts_dir(), config_paths.approved_path())
+            assert loader.load("change-proposer", "code") == "site prompt"
+            Path(prompt).write_text("changed site prompt")
+            try:
+                loader.load("change-proposer", "code")
+                raise AssertionError("unsigned site edit accepted")
+            except PromptNotApproved:
+                pass
+            Path(approved).write_text(json.dumps({
+                "code/change-proposer": hashlib.sha256(b"changed site prompt").hexdigest()}))
+            assert loader.load("change-proposer", "code") == "changed site prompt"
+            Path(approved).write_text("{}")
+            try:
+                loader.load("change-proposer", "code")
+                raise AssertionError("missing site signature fell back to packaged approval")
+            except PromptNotApproved:
+                pass
+            Path(prompt).unlink()
+            try:
+                loader.load("change-proposer", "code")
+                raise AssertionError("missing site prompt fell back to packaged prompt")
+            except FileNotFoundError:
+                pass
+        # Individual paths remain explicit escape hatches, including legacy CONFIG_DIR.
+        with patch.dict(os.environ, {"BROKER_CONFIG_DIR": d, "CONFIG_DIR": "/custom/json",
+                                    "PROMPTS_DIR": "/custom/prompts", "APPROVED_PROMPTS": "/custom/approved"}):
+            assert config_paths.config_dir() == "/custom/json"
+            assert config_paths.prompts_dir() == "/custom/prompts"
+            assert config_paths.approved_path() == "/custom/approved"
+    ok("external config wins for every reader; prompt edits and signatures reload per launch, unsigned refuses")
+
+
+def test_rpm_migrates_before_upgrade_and_never_clobbers_site_config():
+    _check_rpm_migration("absent")
+
+
+def test_rpm_migrates_when_only_environment_file_exists():
+    _check_rpm_migration("environment")
+
+
+def test_rpm_migration_preserves_existing_operator_files_and_metadata():
+    _check_rpm_migration("operator")
+
+
+def _check_rpm_migration(existing):
+    import config_paths
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        package = Path(d, "package")
+        (package / "config").mkdir(parents=True)
+        (package / "prompts" / "code").mkdir(parents=True)
+        (package / "config" / "constraints.json").write_text('{"max_turns": 17}')
+        (package / "prompts" / "code" / "change-proposer.md").write_text("old signed prompt")
+        (package / "approved-prompts.json").write_text('{"old": "signature"}')
+        (package / "config" / "constraints.json").chmod(0o640)
+        target = Path(d, "site")
+        preserved = {}
+        if existing != "absent":
+            target.mkdir(mode=0o750)
+            (target / "eph-broker.env").write_text("EXAMPLE_SETTING=kept\n")
+            (target / "eph-broker.env").chmod(0o600)
+        if existing == "operator":
+            (target / "constraints.json").write_text('{"max_turns": 23}')
+            (target / "constraints.json").chmod(0o600)
+            (target / "prompts" / "code").mkdir(parents=True, mode=0o700)
+            (target / "prompts" / "code" / "change-proposer.md").write_text("operator prompt")
+            (target / "approved-prompts.json").symlink_to("missing-operator-approvals")
+        if target.exists():
+            for path in [target, *target.rglob("*")]:
+                stat = path.lstat()
+                content = path.readlink() if path.is_symlink() else path.read_bytes() if path.is_file() else None
+                preserved[path] = (stat.st_mode, stat.st_uid, stat.st_gid, stat.st_ino, content)
+        spec = Path(ROOT, "packaging/eph-broker.spec").read_text()
+        migration = spec.split("# BEGIN site config migration\n")[1].split("# END site config migration")[0]
+        migration = migration.replace("/opt/eph-broker", str(package)).replace("/etc/eph-broker", str(target))
+        p = subprocess.run(["sh", "-c", migration], capture_output=True, text=True)
+        assert p.returncode == 0, p.stderr
+        for path, metadata in preserved.items():
+            stat = path.lstat()
+            content = path.readlink() if path.is_symlink() else path.read_bytes() if path.is_file() else None
+            assert (stat.st_mode, stat.st_uid, stat.st_gid, stat.st_ino, content) == metadata
+        assert (target / config_paths.SEED_MARKER).is_file()
+        assert (target / "constraints.json").read_text() == ('{"max_turns": 23}' if existing == "operator"
+                                                           else '{"max_turns": 17}')
+        if existing != "operator":
+            src_stat = (package / "config" / "constraints.json").stat()
+            dst_stat = (target / "constraints.json").stat()
+            assert (src_stat.st_mode, src_stat.st_uid, src_stat.st_gid) == (
+                dst_stat.st_mode, dst_stat.st_uid, dst_stat.st_gid)
+            assert (target / "prompts" / "code" / "change-proposer.md").read_text() == "old signed prompt"
+            assert (target / "approved-prompts.json").read_text() == '{"old": "signature"}'
+        before = {p.relative_to(target): p.read_bytes() for p in target.rglob("*") if p.is_file()}
+        # RPM now replaces its own files, then %post skips the completed migration.
+        (package / "config" / "constraints.json").write_text('{"max_turns": 99}')
+        (package / "prompts" / "code" / "change-proposer.md").write_text("new packaged prompt")
+        (package / "approved-prompts.json").write_text('{}')
+        config_paths.seed_site_config(str(package), str(target))
+        p = subprocess.run(["sh", "-c", migration], capture_output=True, text=True)
+        assert p.returncode == 0, p.stderr
+        assert before == {p.relative_to(target): p.read_bytes() for p in target.rglob("*") if p.is_file()}
+        (target / "approved-prompts.json").unlink()
+        config_paths.seed_site_config(str(package), str(target))
+        p = subprocess.run(["sh", "-c", migration], capture_output=True, text=True)
+        assert p.returncode == 0, p.stderr
+        assert not (target / "approved-prompts.json").exists(), "upgrade must not restore removed approvals"
+        fresh = Path(d, "fresh")
+        config_paths.seed_site_config(str(package), str(fresh))
+        assert (fresh / "config").exists() is False
+        assert (fresh / "constraints.json").read_text() == '{"max_turns": 99}'
+        assert (fresh / "prompts" / "code" / "change-proposer.md").read_text() == "new packaged prompt"
+        assert spec.index("# BEGIN site config migration") < spec.index("%post\n")
+        assert "/usr/bin/python3 /opt/eph-broker/config_paths.py /etc/eph-broker" in spec
+        assert "Environment=BROKER_CONFIG_DIR=/etc/eph-broker" in Path(
+            ROOT, "packaging/eph-broker.service").read_text()
+    ok("RPM migration (%s) preserves operator data and metadata; upgrades never clobber" % existing)
+
+
+def test_config_seed_merges_once_without_changing_existing_metadata():
+    import config_paths
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        source = Path(d, "package")
+        (source / "config" / "nested").mkdir(parents=True)
+        (source / "config" / "nested" / "new.json").write_text("{}")
+        (source / "config" / "constraints.json").write_text('{"max_turns": 99}')
+        (source / "prompts" / "code").mkdir(parents=True)
+        (source / "prompts" / "code" / "agent.md").write_text("packaged prompt")
+        (source / "approved-prompts.json").write_text("{}")
+        for existing in ("environment", "operator"):
+            target = Path(d, existing)
+            target.mkdir(mode=0o750)
+            env = target / "eph-broker.env"
+            env.write_text("EXAMPLE_SETTING=kept\n")
+            env.chmod(0o600)
+            if existing == "operator":
+                (target / "nested").mkdir(mode=0o700)
+                (target / "constraints.json").write_text('{"max_turns": 23}')
+                (target / "prompts").symlink_to("operator-prompts")
+            preserved = {p: p.lstat() for p in [target, *target.rglob("*")]}
+            config_paths.seed_site_config(str(source), str(target))
+            for path, old in preserved.items():
+                new = path.lstat()
+                assert (old.st_mode, old.st_uid, old.st_gid, old.st_ino) == (
+                    new.st_mode, new.st_uid, new.st_gid, new.st_ino)
+            assert env.read_text() == "EXAMPLE_SETTING=kept\n"
+            assert (target / "constraints.json").read_text() == ('{"max_turns": 23}' if existing == "operator"
+                                                               else '{"max_turns": 99}')
+            assert (target / "nested" / "new.json").read_text() == "{}"
+            assert (target / config_paths.SEED_MARKER).is_file()
+            (target / "approved-prompts.json").unlink()
+            config_paths.seed_site_config(str(source), str(target))
+            assert not (target / "approved-prompts.json").exists()
+            if existing == "operator":
+                assert os.readlink(target / "prompts") == "operator-prompts"
+    ok("seeding merges missing paths once, preserving the EnvironmentFile, existing config and directory metadata")
 
 
 def _uncomment(text, key):

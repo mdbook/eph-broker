@@ -44,6 +44,11 @@ See [worker-runtime.md](worker-runtime.md#companion-sources) for worker access a
 
 ## The config file
 
+Paths below use the source checkout layout. The RPM service instead uses `BROKER_CONFIG_DIR=/etc/eph-broker`:
+replace `config/` with that directory. It also contains `prompts/` and `approved-prompts.json`. Shipped files
+remain defaults/examples, never a runtime fallback for an external directory. Individual path settings take
+precedence. See [installation](install.md) for first-upgrade migration and permissions.
+
 The config file is optional. Without it the broker reads `config/site.env` and the json files in `config/`, which
 is all the quick start needs. `config/broker.yaml` (start from `config/broker.example.yaml`, which starts the
 broker as is), or any file named by `BROKER_CONFIG`, gathers them into one file. When `BROKER_CONFIG` is unset,

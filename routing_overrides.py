@@ -5,6 +5,7 @@ import os
 import re
 import tempfile
 import threading
+import config_paths
 from dataclasses import replace
 
 log = logging.getLogger("eph-broker.routing-overrides")
@@ -51,7 +52,7 @@ _CLAUDE_ID = re.compile(r"claude-[a-z0-9][a-z0-9.\-\[\]]*")
 class RoutingOverrides:
     def __init__(self, path=None):
         self.path = path or os.getenv("ROUTING_OVERRIDES_FILE", os.path.join(
-            os.getenv("CONFIG_DIR", os.path.join(os.path.dirname(__file__), "config")),
+            config_paths.config_dir(),
             "routing-overrides.json"))
         self._lock = threading.Lock()
         self._edit_lock = threading.Lock()      # one dashboard edit at a time (read, merge, write, reload)

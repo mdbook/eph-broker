@@ -101,6 +101,11 @@ const CSS = `
 .adir-detail{${VIEW_TOKENS}}
 .adir-view{height:max(480px,calc(100vh - 220px));position:relative;border-radius:0 0 12px 12px}
 .adir-note{padding:16px;color:var(--t2,inherit)}
+.adir-steer{padding:16px;border-bottom:1px solid var(--line,#dce0e6);display:grid;gap:8px}
+.adir-steer textarea{box-sizing:border-box;width:100%;min-height:72px;resize:vertical;font:inherit;
+  background:var(--s1,#fff);color:var(--t1,rgb(20,25,32));border:1px solid var(--line,#dce0e6);border-radius:8px;padding:8px}
+.adir-steer :focus-visible{outline:2px solid var(--brand,#2b57c9);outline-offset:2px}
+.adir-steer button{justify-self:start}.adir-steer ul{margin:0;padding-left:20px;font-size:13px;color:var(--t2,rgb(71,81,96))}
 .adir-empty{padding:12px 14px;color:var(--t2,inherit)}
 @media (max-width:820px){
   .adir{grid-template-columns:1fr}.adir.picked .adir-listcard{display:none}.adir:not(.picked) .adir-detail{display:none}
@@ -178,6 +183,47 @@ export function viewFetch(url, init = {}) {
   });
 }
 
+export function steerState(state) {
+  return state === 'delivered' ? 'Delivered' : 'Waiting for next tool call';
+}
+
+function steerComposer(agent, ctx, base) {
+  const form = el('form', 'adir-steer'), label = el('label', null, 'Message at next tool call');
+  const input = el('textarea'), send = el('button', 'btn pri', 'Send message');
+  input.maxLength = 4000; input.required = true;
+  input.setAttribute('aria-label', 'Message ' + agent.name + ' at next tool call');
+  label.append(input);
+  const note = el('p', 'adir-sub', ctx.canAct ? 'Idle agents wait until their next tool call.'
+    : 'Read-only: sending needs the broker actions permission.');
+  note.setAttribute('role', 'status');
+  const states = el('ul'); states.setAttribute('aria-live', 'polite');
+  input.disabled = send.disabled = !ctx.canAct;
+  form.append(label, send, note, states);
+  const update = (current) => {
+    states.replaceChildren(...(current.steer_messages || []).map((m) =>
+      el('li', null, m.id + ': ' + steerState(m.state))));
+  };
+  update(agent);
+  form.onsubmit = async (event) => {
+    event.preventDefault();
+    if (!ctx.canAct || !input.value.trim()) return;
+    input.disabled = send.disabled = true;
+    try {
+      const response = await viewFetch(base + 'api/agents/' + encodeURIComponent(agent.name) + '/steer', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text: input.value}),
+        signal: ctx.signal,
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'HTTP ' + response.status);
+      input.value = '';
+      note.textContent = steerState('pending');
+      states.append(el('li', null, data.id + ': ' + steerState('pending')));
+    } catch (err) { note.textContent = 'Could not send message: ' + err.message; }
+    finally { input.disabled = send.disabled = !ctx.canAct; }
+  };
+  return {form, update};
+}
+
 export function mount(el0, ctx = {}) {
   const standalone = !ctx.openAgent;
   const navigate = standalone ? (route) => { location.hash = '#' + encodeURIComponent(route); } : ctx.openAgent;
@@ -201,6 +247,7 @@ export function mount(el0, ctx = {}) {
 
   let stopped = false, route = parseRoute(routeNow()), shown = null, view = null, agents = [], unread = {}, pill = null, beat = null;
   const items = new Map();
+  let composer = null;
 
   function renderList() {
     empty.hidden = agents.length > 0;
@@ -241,12 +288,18 @@ export function mount(el0, ctx = {}) {
     if (!pill) return;
     if (!view) { pill.textContent = agent.status; pill.style.color = STATUS_COLOR[agent.status] || 'inherit'; }
     beat.textContent = 'last beat ' + ago(agent.age);
+    if (composer) composer.update(agent);
   }
 
   async function showAgent(agent) {
     shown = agent.name;
+    composer = null;
     detail.replaceChildren(headerFor(agent));
     updateHead(agent);
+    if (agent.can_steer_pull) {
+      composer = steerComposer(agent, ctx, base);
+      detail.append(composer.form);
+    }
     if (agent.can_tail) {
       const host = el('div', 'adir-view');
       detail.append(host);

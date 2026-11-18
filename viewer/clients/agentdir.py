@@ -9,6 +9,7 @@ import urllib.error
 import urllib.request
 
 from .. import auth
+from . import inbox
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -46,6 +47,19 @@ class Client:
         auth.private_write(self.path, json.dumps(self.state).encode())
 
     def call(self, action, data=None, recover=True):
+        data = dict(data or {})
+        if action == 'register':
+            # Only this beat consumer with a local inbox can promise pull delivery.
+            data['caps'] = [cap for cap in data.get('caps', []) if cap != 'steer-pull']
+            if self.state.get('steer_dir'):
+                data['caps'].append('steer-pull')
+        delivered = []
+        if action == 'beat' and self.state.get('steer_dir'):
+            messages = self.state.setdefault('steer_pending', {})
+            inbox.sync(self.state['steer_dir'], messages)
+            self.save()
+            data['steer_queued'] = [mid for mid, m in messages.items() if m['state'] == 'queued']
+            delivered = data['steer_delivered'] = [mid for mid, m in messages.items() if m['state'] == 'delivered']
         path = '/v1/' + action
         body = json.dumps(data or {}, separators=(',', ':')).encode()
         headers = {'Content-Type': 'application/json'}
@@ -74,6 +88,17 @@ class Client:
         elif action == 'register':
             self.state['ttl'] = data['ttl']
             self.state['registration'] = data
+            self.save()
+        elif action == 'beat' and self.state.get('steer_dir'):
+            messages = self.state.setdefault('steer_pending', {})
+            for mid in delivered:
+                messages.pop(mid, None)
+            for message in result.get('steer', []):
+                if message['id'] not in messages:
+                    messages[message['id']] = dict(message, state='pending')
+            # Save before publishing files: a crash must not forget an unacknowledged delivery.
+            self.save()
+            inbox.sync(self.state['steer_dir'], messages)
             self.save()
         elif action == 'deregister':
             self.state = {}
@@ -111,6 +136,7 @@ def main(argv=None):
     register.add_argument('--caps', default='', help='comma-separated view,steer,tail')
     register.add_argument('--view-url')
     register.add_argument('--ttl', type=int, default=60)
+    register.add_argument('--steer-dir', help='private per-agent inbox/log directory for the PostToolUse hook')
     beat = commands.add_parser('beat')
     beat.add_argument('--every', type=float, help='defaults to registered ttl/3')
     lifetime = beat.add_mutually_exclusive_group()
@@ -141,6 +167,12 @@ def main(argv=None):
                         caps=list(filter(None, args.caps.split(','))), ttl=args.ttl)
             if args.view_url is not None:
                 data['view_url'] = args.view_url
+            if args.steer_dir:
+                if client.state.get('steer_pending') and client.state.get('steer_dir') != os.path.abspath(args.steer_dir):
+                    raise ValueError('cannot move steer directory with pending messages')
+                inbox.sync(args.steer_dir, {})
+                client.state['steer_dir'] = os.path.abspath(args.steer_dir)
+                client.save()
             client.call('register', data)
         elif args.command == 'beat':
             interval = args.every if args.every is not None else client.state.get('ttl', 60) / 3

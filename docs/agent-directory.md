@@ -77,6 +77,86 @@ while a turn sent from a view is running, **Stop** ends it and **Steer** passes 
 The composer is disabled with a hint for viewers without the broker actions permission or agents
 that did not register `steer`. Closing the card closes its stream, so a tab holds at most one.
 
+## Mid-turn steering (PostToolUse)
+
+Claude Code, Codex and other hook-capable agents can receive a message at their next tool
+call without an inbound listener or a live view. Start with enrollment above, enable the
+Agents module, and grant senders the broker's existing actions permission as described in
+[module permissions](modules.md). Standalone mode stays read-only, even with a forged
+`X-Viewer-Can-Act` header.
+
+From the checkout or `/opt/eph-broker`, register a private directory unique to
+this agent (use absolute paths):
+
+```sh
+python3 -m viewer.clients.agentdir --state agentdir-state/demo.json register \
+  --kind claude-code --ttl 30 --steer-dir "$PWD/agentdir-state/demo-steer"
+python3 -m viewer.clients.agentdir --state agentdir-state/demo.json beat --every 10
+```
+
+The CLI advertises `steer-pull` only when it has a configured steer directory and consumes
+messages on beats. The existing `steer` cap is for sidecar actions, not pull delivery.
+Hermes plugin registrations with only `view,steer` get no next-tool-call composer and
+cannot queue pull messages. Sidecar controls are unchanged.
+
+Install this command as the main agent's **PostToolUse** hook, replacing the paths with
+your installation and the directory passed to `--steer-dir`:
+
+```text
+python3 -I /opt/eph-broker/viewer/steer.py /absolute/path/agentdir-state/demo-steer
+```
+
+For Claude Code, the corresponding settings fragment is:
+
+```json
+{"hooks":{"PostToolUse":[{"matcher":"","hooks":[{"type":"command","command":"python3 -I /opt/eph-broker/viewer/steer.py /absolute/path/agentdir-state/demo-steer"}]}]}}
+```
+
+Use the same command in a Codex harness that supports PostToolUse. Hook installation for
+broker-spawned workers is separate; this feature does not alter their launch settings.
+`viewer/steer.py` ships with the viewer subpackage as a standalone hook, so it runs in
+isolated mode without importing the broker or its configuration. Its output-confirmation
+ordering supports retry-safe pull delivery; the broker's own hook is separate.
+Keep that script read-only to the agent. The sandbox must allow the hook to read and write
+only this agent's steer directory. Use one beat process per state file, and never share a
+state file or steer directory between agents or runs.
+
+In the Agents tab, pick the registered agent and use **Message at next tool call**. The
+composer accepts up to 4000 characters. It shows **Waiting for next tool call**, then
+**Delivered** after the hook's log record reaches the directory on a beat. Idle agents keep
+messages queued until a tool call; there is no Stop-hook injection or automatic new turn.
+The hook frames text as UNTRUSTED data, ignores subagent calls carrying `agent_id`, and
+always exits successfully. Hermes sidecar Send/Steer controls are a separate mechanism;
+use the next-tool-call composer only for agents running this hook and beat client.
+
+Protocol and recovery:
+
+* Action-gated `POST /api/agents/NAME/steer` accepts JSON `{text: "..."}` and returns
+  `{ok: true, id: "..."}`; agents without `steer-pull` receive 403. The authenticated host supplies the sender identity, not the
+  request body. There are at most 32 outstanding messages and 32 recent status records
+  per registration; a full queue returns 409. Queue entries are bound to the enrolled kid,
+  so a replacement agent with the same name does not receive the old agent's messages.
+* Signed beat responses include `steer: [{id, ns, text, doer}]` until acknowledged. The
+  client first saves the pending messages in its 0600 state file, then writes
+  `<steer dir>/inbox/<ns>-<id>.msg` as JSON `{id, doer, text}`, byte-compatible with
+  `steer.enqueue`: dotfile, fsync, atomic rename, 0700 directories and 0600 files.
+  All steer-path components refuse symlinks. The next beat includes `steer_queued: [id]`.
+* The client tails `log.jsonl` and reports `steer_delivered: [id]` on the beat. List
+  snapshots expose only `steer_messages: [{id, state}]`, not message text or sender names.
+  The hook prints and flushes context first, then writes a delivered record with
+  `output_confirmed: true`, then removes its `.delivered` claim. A normal delivery is
+  once, including retrying a lost beat response. Delivery across crashes is at-least-once:
+  a hook killed after output but before logging can cause a duplicate. After observing a
+  leftover claim for 30 seconds the client returns it to `.msg`; missing files without
+  an output-confirmed record are recreated. Legacy delivered records without output
+  confirmation are not sufficient to acknowledge a message. No message is acknowledged
+  before hook output. Partial inbox writes are retried as well.
+* Pending local state and the server's private `steering.json` survive restarts. Reaping
+  presence hides the agent but retains its queue for re-registration with the same kid.
+  Explicit deregistration clears that registration's server queue; finish outstanding
+  deliveries first. Treat both state directories as private message storage and remove
+  obsolete local steer directories when retiring an agent.
+
 ## Claude Code and Codex transcript tail
 
 Complete the standalone setup above, or enroll against the broker module's agent listener.
@@ -213,9 +293,10 @@ broker dashboard or install a second service; a module supervisor can watch `vie
 
 ## State, protocol and adapters
 
-`AGENTDIR_STATE_DIR` (or `--state-dir`, default `agentdir-state` standalone) holds only the
-server's 0600 `revoked.json` and `used-tokens.json` (used token ids and their expiry, never
-keys). Keep the enrollment key stable across restarts. The directory and replay timestamps
+`AGENTDIR_STATE_DIR` (or `--state-dir`, default `agentdir-state` standalone) holds the
+server's 0600 `revoked.json`, `used-tokens.json` (used token ids and their expiry, never
+keys), and `steering.json` (per-kid messages and recent delivery states, created on first send).
+Keep the enrollment key stable across restarts. Presence and replay timestamps
 are in memory. After restart agents must register again; the CLI saves its registration and
 automatically re-registers on the next beat when the server reports a missing entry. A used
 token stays refused across restarts until it expires; deregistered kids remain revoked.
@@ -236,7 +317,7 @@ Signing headers: `X-Agentdir-Kid`, `X-Agentdir-Ts` (Unix seconds, fractional sec
 Skew must be within 60 seconds; timestamps must strictly increase. The CLI uses microsecond
 precision so consecutive commands work within one second. JSON bodies are limited to 16 KiB.
 Register includes `{name,kind,caps,ttl,view_url?}`; TTL is 3..86400 seconds. Allowed kinds are
-`hermes`, `claude-code`, `codex`, `generic`; caps are `view`, `steer`, `tail`. A name owned by
+`hermes`, `claude-code`, `codex`, `generic`; caps are `view`, `steer`, `steer-pull`, `tail`. A name owned by
 another live/grey kid cannot be replaced. Beat optionally includes `{status:"busy"|"idle"}`.
 
 `AGENTDIR_VIEW_ALLOW` defaults empty (no view URLs accepted). Comma-separated rules are

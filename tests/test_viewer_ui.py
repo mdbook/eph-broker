@@ -69,6 +69,53 @@ def agent_listener(directory, timeout=10):
 
 
 class UI(ViewerTest):
+    def test_pull_steer_route_is_action_gated_and_presence_only(self):
+        directory = Directory(KEY, self.tmp_path, clock=lambda: 100)
+        credentials = enrolled(directory)
+        directory.request('/v1/register', *signed(credentials, '/v1/register',
+                          dict(name='demo', kind='claude-code', caps=['steer-pull'], ttl=30)))
+        body = json.dumps({'text': 'Check the next tool result'}).encode()
+        headers = 'X-Forwarded-User: operator\r\nContent-Type: application/json\r\nContent-Length: %d\r\n' % len(body)
+        route = '/api/agents/demo/steer'
+        assert request(directory, route, headers, method='POST', body=body)[0] == 403
+        headers += 'X-Viewer-Can-Act: 1\r\n'
+        status, data = request(directory, route, headers, method='POST', body=body)
+        assert status == 200 and json.loads(data)['ok']
+        message = directory.entries['demo']['messages'][0]
+        assert message['text'] == 'Check the next tool result' and message['doer'] == 'operator'
+        assert directory.snapshot()[0]['can_steer_pull']
+        # No credential, text, identity or inbox filename leaks in the list API.
+        public = json.dumps(directory.snapshot())
+        assert message['text'] not in public and 'operator' not in public and message['ns'] not in public
+        # The limit is Unicode characters, not bytes or UTF-16 code units.
+        body = json.dumps({'text': '𝒜' * 4000}).encode()
+        headers = ('X-Forwarded-User: operator\r\nX-Viewer-Can-Act: 1\r\n'
+                   'Content-Type: application/json\r\nContent-Length: %d\r\n') % len(body)
+        assert request(directory, route, headers, method='POST', body=body)[0] == 200
+        directory.entries['demo']['caps'] = []
+        assert request(directory, route, headers, method='POST', body=body)[0] == 403
+        assert request(directory, '/api/agents/missing/steer', headers, method='POST', body=body)[0] == 404
+        # Standalone users cannot manufacture the host's action grant.
+        assert not UIAuth(socket_peer=False, basic=b'demo:password').can_act({'X-Viewer-Can-Act': '1'})
+        script = request(directory, '/ui.js', 'X-Forwarded-User: operator\r\n')[1]
+        assert b'Waiting for next tool call' in script and b'Delivered' in script
+        assert b'input.maxLength = 4000' in script and b'composer.update(agent)' in script
+        assert b'if (agent.can_steer_pull)' in script and b'input.disabled = send.disabled = !ctx.canAct' in script
+
+    def test_legacy_steer_cap_has_no_pull_composer_or_queue_access(self):
+        directory = Directory(KEY, self.tmp_path, clock=lambda: 100)
+        credentials = enrolled(directory)
+        directory.request('/v1/register', *signed(credentials, '/v1/register',
+                          dict(name='demo', kind='hermes', caps=['view', 'steer'], ttl=30)))
+        assert directory.snapshot()[0]['can_steer']  # existing sidecar actions are unchanged
+        assert not directory.snapshot()[0]['can_steer_pull']
+        body = json.dumps({'text': 'Cannot deliver via pull'}).encode()
+        headers = ('X-Forwarded-User: operator\r\nX-Viewer-Can-Act: 1\r\n'
+                   'Content-Type: application/json\r\nContent-Length: %d\r\n') % len(body)
+        status, response = request(directory, '/api/agents/demo/steer', headers, method='POST', body=body)
+        assert status == 403 and not json.loads(response)['ok']
+        assert directory.entries['demo']['messages'] == []
+
     def test_agent_timeout_covers_idle_request_line_headers_and_body(self):
         directory = Directory(KEY, self.tmp_path, clock=lambda: 100)
         assert handler(directory, agent_api=True).timeout == 10

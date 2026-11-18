@@ -179,6 +179,26 @@ def handler(directory, agent_api=False, auth=None, standalone=False):
             if not agent_api:
                 if not self.authorized():
                     return None
+                segments = urlsplit(self.path).path.split('/')
+                if len(segments) == 5 and segments[:3] == ['', 'api', 'agents'] and segments[4] == 'steer':
+                    self.close_connection = True
+                    if not auth.can_act(self.headers):
+                        return self.send(403, {'ok': False, 'error': 'read-only viewer'})
+                    if self.headers.get('Content-Type', '').split(';')[0].strip().lower() != 'application/json':
+                        return self.send(415, {'ok': False, 'error': 'send application/json'})
+                    body = self.body(65536)  # 4000 characters, including escaped surrogate pairs
+                    if body is None:
+                        return None
+                    try:
+                        data = json.loads(body)
+                        if not isinstance(data, dict):
+                            raise Refused('expected a JSON object')
+                        return self.send(200, directory.queue_message(
+                            unquote(segments[3]), data.get('text'), auth.user(self.headers, self.peer())))
+                    except (ValueError, RecursionError) as exc:
+                        return self.send(getattr(exc, 'status', 400), {'ok': False, 'error': str(exc)})
+                    except OSError:
+                        return self.send(503, {'ok': False, 'error': 'steering queue storage unavailable'})
                 return self.agent_view('POST')
             if self.path not in ('/v1/enroll', '/v1/register', '/v1/beat', '/v1/deregister', '/v1/events'):
                 self.close_connection = True
@@ -192,7 +212,11 @@ def handler(directory, agent_api=False, auth=None, standalone=False):
                 body = self.rfile.read(length)
                 if len(body) != length:
                     raise Refused('incomplete body')
-                result = directory.request(self.path, body, self.headers)
+                try:
+                    result = directory.request(self.path, body, self.headers)
+                except OSError:
+                    self.close_connection = True
+                    return self.send(503, {'ok': False, 'error': 'agent directory storage unavailable'})
                 self.send(200, result)
             except (Refused, ValueError) as exc:
                 self.close_connection = True

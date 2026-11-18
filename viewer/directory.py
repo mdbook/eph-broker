@@ -1,4 +1,4 @@
-"""In-memory directory with durable revocation only; clock injected for reaping."""
+"""In-memory presence with durable revocation and steering queues; clock injected for reaping."""
 import hmac
 import json
 import re
@@ -9,6 +9,9 @@ from pathlib import Path
 
 from . import adapters, auth, transcripts
 from .allowlist import Allowlist
+from .steer import TEXT_MAX_CHARS
+
+MESSAGE_LIMIT = 32
 
 
 class Refused(ValueError):
@@ -46,6 +49,15 @@ class Directory:
             self.seen = seen
         except FileNotFoundError:
             pass
+        self.steering_path = Path(state_dir) / 'steering.json'
+        try:
+            self.steering = json.loads(auth.private_read(self.steering_path))
+            if not isinstance(self.steering, dict) or not all(
+                    isinstance(k, str) and isinstance(v, list) and len(v) <= MESSAGE_LIMIT
+                    for k, v in self.steering.items()):
+                raise ValueError('invalid steering queue file')
+        except FileNotFoundError:
+            self.steering = {}
 
     def reap(self):
         with self.lock:
@@ -116,6 +128,7 @@ class Directory:
                             raise Refused('status must be busy or idle')
                         entry['status'] = data['status']
                     entry['last_beat'] = self.clock()
+                    return self._beat_messages(entry, data)
                 elif path == '/v1/deregister':
                     # {"revoke": false} only removes the entry, for agents that restart with their key.
                     if type(data.get('revoke', True)) is not bool:
@@ -127,6 +140,8 @@ class Directory:
                     if name in self.entries and self.entries[name]['kid'] == kid:
                         del self.entries[name]
                         self.tails.pop(name, None)
+                    if kid in self.steering:
+                        self._save_messages(kid, [])
                 else:
                     raise Refused('unknown agent endpoint', 404)
                 if path != '/v1/register':
@@ -145,7 +160,7 @@ class Directory:
         if (data.get('name') != name or data.get('kind') not in adapters.KINDS or
                 type(ttl) is not int or not 3 <= ttl <= 86400 or
                 not isinstance(caps, list) or
-                not all(c in ('view', 'steer', 'tail') for c in caps)):
+                not all(c in ('view', 'steer', 'steer-pull', 'tail') for c in caps)):
             raise Refused('invalid name, kind, caps, or ttl (3..86400 seconds)')
         url = data.get('view_url')
         if 'tail' in caps and data['kind'] in ('claude-code', 'codex'):
@@ -166,12 +181,70 @@ class Directory:
                 raise Refused('registration superseded by a newer request', 409)
             if name in self.entries and self.entries[name]['kid'] != kid:
                 raise Refused('name is registered to another kid', 409)
+            messages = self.steering.get(kid, [])
             previous = self.entries.get(name)
             if previous and (previous['kind'] != data['kind'] or 'tail' not in caps):
                 self.tails.pop(name, None)
             self.entries[name] = dict(name=name, kid=kid, kind=data['kind'], caps=caps,
-                                      view_url=url, ttl=ttl, status='live', last_beat=self.clock())
+                                      view_url=url, ttl=ttl, status='live', last_beat=self.clock(), messages=messages)
         return {'ok': True}
+
+    def queue_message(self, name, text, doer):
+        """Called only by the action-gated module listener. IDs belong to this registration, not the browser."""
+        from . import steer
+        with self.lock:
+            self.reap()
+            entry = self.entries.get(name)
+            if entry is None:
+                raise Refused('agent not found', 404)
+            if 'steer-pull' not in entry['caps']:
+                raise Refused('this agent does not accept pull steering', 403)
+            if not isinstance(text, str) or not text.strip() or len(text) > TEXT_MAX_CHARS:
+                raise Refused('message must contain 1..4000 characters')
+            messages = list(entry['messages'])
+            if sum(m['state'] != 'delivered' for m in messages) >= MESSAGE_LIMIT:
+                raise Refused('agent message queue is full', 409)
+            message = dict(id=steer.new_id(), ns=str(time.time_ns()), text=text,
+                           doer=str(doer)[:64], state='pending')
+            messages.append(message)
+            # Keep a bounded recent history without evicting undelivered messages.
+            while len(messages) > MESSAGE_LIMIT:
+                messages.remove(next(m for m in messages if m['state'] == 'delivered'))
+            self._save_messages(entry['kid'], messages)
+            entry['messages'] = messages
+            return {'ok': True, 'id': message['id']}
+
+    def _save_messages(self, kid, messages):
+        updated = dict(self.steering)
+        if messages:
+            updated[kid] = messages
+        else:
+            updated.pop(kid, None)
+        auth.private_write(self.steering_path, json.dumps(updated).encode())
+        self.steering = updated
+
+    def _beat_messages(self, entry, data):
+        if 'steer-pull' not in entry['caps']:
+            return {'ok': True}
+        reports = {}
+        for field in ('steer_queued', 'steer_delivered'):
+            ids = data.get(field, [])
+            if (not isinstance(ids, list) or len(ids) > MESSAGE_LIMIT or
+                    not all(isinstance(mid, str) and len(mid) <= 64 for mid in ids)):
+                raise Refused('invalid steering acknowledgement')
+            reports[field] = set(ids)
+        messages = [dict(m) for m in entry['messages']]
+        for message in messages:
+            if message['id'] in reports['steer_delivered']:
+                message['state'] = 'delivered'
+            elif message['id'] in reports['steer_queued'] and message['state'] == 'pending':
+                message['state'] = 'queued'
+        if messages != entry['messages']:
+            self._save_messages(entry['kid'], messages)
+            entry['messages'] = messages
+        pending = [{k: m[k] for k in ('id', 'ns', 'text', 'doer')}
+                   for m in entry['messages'] if m['state'] == 'pending']
+        return dict(ok=True, steer=pending) if pending else {'ok': True}
 
     def _events(self, kid, name, data):
         entry = self.entries.get(name)
@@ -202,14 +275,16 @@ class Directory:
             now = self.clock()
             result = []
             for entry in sorted(self.entries.values(), key=lambda e: e['name']):
-                public = {k: v for k, v in entry.items() if k not in ('kid', 'view_url')}
+                public = {k: v for k, v in entry.items() if k not in ('kid', 'view_url', 'messages')}
+                public['steer_messages'] = [dict(id=m['id'], state=m['state']) for m in entry['messages']]
                 public['age'] = max(0, now - entry['last_beat'])
                 if public['age'] >= entry['ttl']:
                     public['status'] = 'grey'
                 adapter = adapters.get(entry['kind'])
                 public['can_view'] = bool(entry['view_url'] and 'view' in entry['caps'] and
                                           callable(getattr(adapter, 'view', None)))
-                public['can_steer'] = public['can_view'] and 'steer' in entry['caps']
+                public['can_steer'] = 'steer' in entry['caps']
+                public['can_steer_pull'] = 'steer-pull' in entry['caps']
                 public['can_tail'] = 'tail' in entry['caps'] and entry['kind'] in ('claude-code', 'codex')
                 result.append(public)
             return result

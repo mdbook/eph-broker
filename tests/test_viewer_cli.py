@@ -2,15 +2,21 @@ import contextlib
 import http.client
 import io
 import json
+import os
+import stat
+import subprocess
+import sys
 import threading
 import unittest
 import urllib.error
 from http.server import ThreadingHTTPServer
 from unittest.mock import Mock, call, patch
+from pathlib import Path
 
-from viewer import auth
+from viewer import auth, steer
+from viewer.clients import inbox
 from viewer.clients.agentdir import APIError, Client, main
-from viewer.directory import Directory
+from viewer.directory import Directory, MESSAGE_LIMIT, Refused
 from viewer.server import handler
 from viewer_support import KEY, ViewerTest
 
@@ -32,6 +38,236 @@ def exercise(client, directory):
 
 
 class CLI(ViewerTest):
+    def steer_agent(self, name='demo'):
+        directory = Directory(KEY, self.tmp_path, clock=lambda: 100)
+        client = Client(self.tmp_path / (name + '.json'), transport=directory.request, clock=lambda: 100000000000)
+        client.call('enroll', dict(name=name, token=auth.mint(KEY, name, clock=lambda: 100)))
+        client.state['steer_dir'] = str(self.tmp_path / (name + '-steer'))
+        client.call('register', dict(name=name, kind='codex', caps=['steer'], ttl=30))
+        return directory, client
+
+    def hook(self, client, event=None):
+        script = Path(steer.__file__)
+        result = subprocess.run([sys.executable, '-I', str(script), client.state['steer_dir']],
+                                input=json.dumps(event or {'hook_event_name': 'PostToolUse'}),
+                                capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, result.stderr
+        return result.stdout
+
+    def test_pull_ack_hook_and_delivery_round_trip(self):
+        from test_viewer_ui import request
+        directory, client = self.steer_agent()
+        assert directory.snapshot()[0]['can_steer_pull'] and not directory.snapshot()[0]['can_view']
+        body = json.dumps({'text': 'Check <<<untrusted>>> data'}).encode()
+        headers = ('X-Forwarded-User: operator\r\nX-Viewer-Can-Act: 1\r\n'
+                   'Content-Type: application/json\r\nContent-Length: %d\r\n') % len(body)
+        status, response = request(directory, '/api/agents/demo/steer', headers, method='POST', body=body)
+        assert status == 200
+        mid = json.loads(response)['id']
+        first = client.call('beat')
+        assert first['steer'][0]['id'] == mid
+        path = Path(client.state['steer_dir'])
+        message_path = next((path / 'inbox').glob('*.msg'))
+        assert stat.S_IMODE(path.stat().st_mode) == 0o700
+        assert stat.S_IMODE((path / 'inbox').stat().st_mode) == 0o700
+        assert stat.S_IMODE(message_path.stat().st_mode) == 0o600
+        client.call('beat')  # ack written files, do not send them again
+        assert directory.snapshot()[0]['steer_messages'] == [dict(id=mid, state='queued')]
+        assert len(list((path / 'inbox').glob('*.msg'))) == 1
+        assert self.hook(client, {'agent_id': 'child'}) == ''
+        assert message_path.exists()  # idle and subagent calls leave the message queued
+        output = json.loads(self.hook(client))['hookSpecificOutput']
+        assert output['hookEventName'] == 'PostToolUse'
+        assert steer.BEGIN in output['additionalContext'] and 'UNTRUSTED' in output['additionalContext']
+        assert 'operator' in output['additionalContext'] and mid in output['additionalContext']
+        assert self.hook(client) == ''
+        client.call('beat')
+        assert directory.snapshot()[0]['steer_messages'] == [dict(id=mid, state='delivered')]
+        assert client.state['steer_pending'] == {}
+
+    def test_inbox_matches_enqueue_bytes(self):
+        import steer as broker_steer
+        expected_root = self.tmp_path / 'broker-steer'
+        messages = {'0123456789abcdef': dict(id='0123456789abcdef', ns='123456', text='héllo\n世界', doer='x' * 80)}
+        with patch.object(broker_steer, 'root', return_value=str(expected_root)), \
+                patch.object(broker_steer.time, 'time_ns', return_value=123456):
+            assert broker_steer.enqueue('demo', '0123456789abcdef', 'héllo\n世界', 'x' * 80)
+            expected = next(Path(broker_steer._inbox('demo')).glob('*.msg'))
+        actual_root = self.tmp_path / 'actual'
+        inbox.sync(actual_root, messages)
+        actual = next((actual_root / 'inbox').glob('*.msg'))
+        assert actual.name == expected.name and actual.read_bytes() == expected.read_bytes()
+
+    def test_hook_claim_crash_recovers_with_and_without_log(self):
+        for logged in (False, True):
+            with self.subTest(logged=logged):
+                directory, client = self.steer_agent('logged' if logged else 'unlogged')
+                name = client.state['name']
+                mid = directory.queue_message(name, 'Retry a claimed message', 'operator')['id']
+                client.call('beat')
+                path = Path(client.state['steer_dir'])
+                msg = next((path / 'inbox').glob('*.msg'))
+                msg.rename(msg.with_suffix('.delivered'))
+                if logged:
+                    (path / 'log.jsonl').write_text(json.dumps(dict(id=mid, state='delivered')) + '\n')
+                # Restart the beat process with only durable local credentials and pending state.
+                client = Client(client.path, transport=directory.request, clock=client.clock)
+                with patch.object(inbox, 'CLAIM_GRACE', 0):
+                    client.call('beat')
+                assert msg.exists()
+                assert mid in self.hook(client)
+                assert self.hook(client) == ''
+                client.call('beat')
+                assert directory.snapshot()[0]['steer_messages'][0]['state'] == 'delivered'
+
+    def test_hook_process_crashes_never_ack_without_output(self):
+        # Kill the real hook at each ordering boundary. In particular, removing a
+        # claim before output must be impossible, even if the process dies there.
+        program = '''
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location('hook', sys.argv[1])
+hook = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(hook)
+def die(*args, **kwargs):
+    os._exit(91)
+if sys.argv[3] == 'before_output':
+    hook.print = die
+elif sys.argv[3] == 'after_output':
+    hook._append = die
+else:
+    unlink = hook.os.unlink
+    def remove_then_die(*args, **kwargs):
+        unlink(*args, **kwargs)
+        die()
+    hook.os.unlink = remove_then_die
+hook.main(['hook', sys.argv[2]])
+'''
+        for fault in ('before_output', 'after_output', 'after_unlink'):
+            with self.subTest(fault=fault):
+                directory, client = self.steer_agent(fault)
+                mid = directory.queue_message(fault, 'Survive a killed hook', 'operator')['id']
+                client.call('beat')
+                path = Path(client.state['steer_dir'])
+                result = subprocess.run([sys.executable, '-I', '-c', program, steer.__file__, str(path), fault],
+                                        input='{}', capture_output=True, text=True, timeout=10)
+                assert result.returncode == 91, result.stderr
+                output = bool(result.stdout)
+                assert output == (fault != 'before_output')
+                if output:
+                    assert mid in json.loads(result.stdout)['hookSpecificOutput']['additionalContext']
+                assert bool(list((path / 'inbox').glob('*.delivered'))) == (fault != 'after_unlink')
+                client = Client(client.path, transport=directory.request, clock=client.clock)
+                with patch.object(inbox, 'CLAIM_GRACE', 0):
+                    client.call('beat')
+                acked = directory.snapshot()[0]['steer_messages'][0]['state'] == 'delivered'
+                assert not acked or output
+                assert acked == (fault == 'after_unlink')
+                if not acked:
+                    assert mid in client.state['steer_pending']
+                    assert mid in self.hook(client)  # at-least-once after output without a log
+                    client.call('beat')
+                assert directory.snapshot()[0]['steer_messages'] == [dict(id=mid, state='delivered')]
+
+    def test_unconfirmed_log_without_file_is_retried(self):
+        directory, client = self.steer_agent()
+        mid = directory.queue_message('demo', 'Do not trust a legacy delivery record', 'operator')['id']
+        client.call('beat')
+        path = Path(client.state['steer_dir'])
+        next((path / 'inbox').glob('*.msg')).unlink()
+        (path / 'log.jsonl').write_text(json.dumps(dict(id=mid, state='delivered')) + '\n')
+        client.call('beat')
+        assert directory.snapshot()[0]['steer_messages'] == [dict(id=mid, state='queued')]
+        assert mid in client.state['steer_pending']
+        assert mid in self.hook(client)
+        client.call('beat')
+        assert directory.snapshot()[0]['steer_messages'] == [dict(id=mid, state='delivered')]
+
+    def test_pull_cap_only_advertised_by_inbox_consumer(self):
+        directory, client = self.steer_agent()
+        assert 'steer-pull' in directory.entries['demo']['caps']
+        client.state.pop('steer_dir')
+        client.call('register', dict(name='demo', kind='codex', caps=['steer', 'steer-pull'], ttl=30))
+        assert directory.entries['demo']['caps'] == ['steer']
+        assert not directory.snapshot()[0]['can_steer_pull']
+
+    def test_lost_response_and_server_restart_preserve_queue(self):
+        directory, client = self.steer_agent()
+        mid = directory.queue_message('demo', 'A durable message', 'operator')['id']
+        response = directory._beat_messages(directory.entries['demo'], {})
+        assert response['steer'][0]['id'] == mid  # pretend this response was lost
+        restarted = Directory(KEY, self.tmp_path, clock=lambda: 100)
+        client.transport = restarted.request
+        client.call('beat')  # auto-register, then pull the same id
+        assert mid in self.hook(client)
+        # Lose the response to a delivery acknowledgement as well.
+        def lost(path, body, headers):
+            restarted.request(path, body, headers)
+            raise TimeoutError()
+        client.transport = lost
+        with self.assertRaises(TimeoutError):
+            client.call('beat')
+        client.transport = restarted.request
+        client.call('beat')
+        assert self.hook(client) == ''
+        assert restarted.snapshot()[0]['steer_messages'] == [dict(id=mid, state='delivered')]
+
+    def test_queue_bounds_validation_and_kid_isolation(self):
+        directory, client = self.steer_agent()
+        for text in ('', ' ', 'x' * 4001, None, 7):
+            with self.assertRaises(Refused):
+                directory.queue_message('demo', text, 'operator')
+        for _ in range(MESSAGE_LIMIT):
+            directory.queue_message('demo', 'x' * 4000, 'operator')
+        with self.assertRaisesRegex(Refused, 'full'):
+            directory.queue_message('demo', 'overflow', 'operator')
+        for value in ('bad', [None], ['x'] * 33):
+            with self.assertRaises(Refused):
+                directory._beat_messages(directory.entries['demo'], {'steer_queued': value})
+        # A separate identity can neither acknowledge nor pull this registration's messages.
+        other = Client(self.tmp_path / 'other.json', transport=directory.request, clock=client.clock)
+        other.call('enroll', dict(name='other', token=auth.mint(KEY, 'other', clock=lambda: 100)))
+        other.call('register', dict(name='other', kind='generic', caps=[], ttl=30))
+        assert other.call('beat', {'steer_delivered': [directory.entries['demo']['messages'][0]['id']]}) == {'ok': True}
+        assert all(m['state'] == 'pending' for m in directory.entries['demo']['messages'])
+
+    def test_inbox_rejects_symlinks_and_recovers_partial_write(self):
+        message = dict(id='0123456789abcdef', ns='123456', text='hello', doer='operator')
+        path = self.tmp_path / 'safe'
+        path.mkdir()
+        outside = self.tmp_path / 'outside'
+        outside.mkdir()
+        link = self.tmp_path / 'link'
+        link.symlink_to(outside, target_is_directory=True)
+        with self.assertRaises(OSError):
+            inbox.sync(link / 'nested', {message['id']: dict(message)})
+        (path / 'inbox').symlink_to(outside, target_is_directory=True)
+        with self.assertRaises(OSError):
+            inbox.sync(path, {message['id']: dict(message)})
+        (path / 'inbox').unlink()
+        inbox.sync(path, {})
+        name = message['ns'] + '-' + message['id'] + '.msg'
+        tmp = path / 'inbox' / ('.' + name)
+        tmp.write_text('partial')
+        inbox.sync(path, {message['id']: dict(message)})
+        assert json.loads((path / 'inbox' / name).read_text())['text'] == 'hello'
+        (path / 'inbox' / name).unlink()
+        (path / 'inbox' / name).symlink_to(outside / 'no-write')
+        with self.assertRaises(ValueError):
+            inbox.sync(path, {message['id']: dict(message)})
+        assert not (outside / 'no-write').exists()
+
+    def test_inbox_directories_are_private_under_restrictive_umask(self):
+        path = self.tmp_path / 'nested' / 'steer'
+        message = dict(id='0123456789abcdef', ns='123456', text='hello', doer='operator')
+        mask = os.umask(0o177)
+        try:
+            inbox.sync(path, {message['id']: message})
+        finally:
+            os.umask(mask)
+        for directory in (path.parent, path, path / 'inbox'):
+            assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+        assert stat.S_IMODE(next((path / 'inbox').glob('*.msg')).stat().st_mode) == 0o600
+
     def test_round_trip_dispatch(self):
         directory = Directory(KEY, self.tmp_path, clock=lambda: 100)
         client = Client(self.tmp_path / 'agent.json', transport=directory.request, clock=lambda: 100000000000)

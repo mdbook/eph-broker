@@ -201,7 +201,7 @@ the running broker. Bootstrap/unknown keys in a reload are logged when changed a
   ([dashboard guide](docs/operations.md#health-and-the-dashboard)), [operator messages with worker replies](docs/configuration.md#dashboard-actions),
   plus [signed run events](docs/events.md) for your own automation.
 - **Optional UI modules.** [Add a tab](docs/modules.md#try-it-in-ten-minutes) without embedding another app in the broker.
-- **Agent directory.** An optional [Agents tab](docs/agent-directory.md) lists agents that enroll once and send signed heartbeats, including agents the broker did not start. Claude Code and Codex agents can push a read-only live transcript with `python3 -m viewer.clients.agentdir --state agentdir-state/demo.json tail --transcript /path/to/session.jsonl` after registering `--caps tail`. Follow the [ten-minute setup and transcript steps](docs/agent-directory.md#claude-code-and-codex-transcript-tail).
+- **Agent directory.** An optional [Agents tab](docs/agent-directory.md) lists agents that enroll once and send signed heartbeats, including agents the broker did not start. [Mid-turn steering](docs/agent-directory.md#mid-turn-steering-posttooluse) sends a message to a registered agent at its next tool call, using a local PostToolUse hook and outbound beats only. Claude Code and Codex agents can push a read-only live transcript with `python3 -m viewer.clients.agentdir --state agentdir-state/demo.json tail --transcript /path/to/session.jsonl` after registering `--caps tail`. Follow the [ten-minute setup and transcript steps](docs/agent-directory.md#claude-code-and-codex-transcript-tail).
 
 ![The dashboard's worker view](docs/images/dashboard-workers.png)
 

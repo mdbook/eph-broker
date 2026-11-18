@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 import unittest
 import urllib.error
 from http.server import ThreadingHTTPServer
@@ -229,6 +230,39 @@ hook.main(['hook', sys.argv[2]])
         other.call('register', dict(name='other', kind='generic', caps=[], ttl=30))
         assert other.call('beat', {'steer_delivered': [directory.entries['demo']['messages'][0]['id']]}) == {'ok': True}
         assert all(m['state'] == 'pending' for m in directory.entries['demo']['messages'])
+
+    def test_processes_sharing_state_serialize_and_keep_each_others_writes(self):
+        # A transcript tail and the busy/idle/steer beats run as separate processes on one file.
+        directory, client = self.steer_agent()
+        directory.entries['demo']['caps'].append('tail')
+        directory.entries['demo']['kind'] = 'claude-code'
+        tail = Client(client.path, transport=directory.request, clock=client.clock)
+        directory.queue_message('demo', 'hello', 'operator')
+        client.call('beat')  # pulls the message into steer_pending
+        mid = next(iter(client.state['steer_pending']))
+        # Same clock: the stale copy must stamp after the other process, not replay its timestamp.
+        tail.call('events', dict(epoch=None, source='s', start=0, lines=[]))
+        assert mid in json.loads(auth.private_read(client.path))['steer_pending']
+        client.call('beat')
+        assert mid in client.state['steer_pending']
+
+        slow = lambda path, body, headers: (threading.Event().wait(0.002), directory.request(path, body, headers))[1]
+        clients = [Client(client.path, transport=slow, clock=time.time_ns) for _ in range(2)]
+        failures = []
+
+        def hammer(c):
+            for _ in range(25):
+                try:
+                    c.call('beat', {'status': 'busy'})
+                except Exception as exc:  # pragma: no cover - reported below
+                    failures.append(exc)
+        directory.clock = time.time
+        threads = [threading.Thread(target=hammer, args=(c,)) for c in clients]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert failures == []
 
     def test_inbox_rejects_symlinks_and_recovers_partial_write(self):
         message = dict(id='0123456789abcdef', ns='123456', text='hello', doer='operator')

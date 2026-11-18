@@ -186,7 +186,9 @@ For Claude Code, use the `transcript_path` from the SessionStart hook's JSON inp
 `--while-pid PID` or `--while-tmux SESSION` stops following when its owner disappears.
 For Codex, register `--kind codex --caps tail` and supply the session rollout JSONL under
 `$CODEX_HOME/sessions/` (or a Codex `--json` event file). There is no implicit session discovery.
-Run one tail process per credential file; do not run `beat` concurrently against that file.
+Run one tail process per credential file. Other CLI calls on that file (`status`, a steer
+`beat`) may run beside it: every call takes `<state>.sign.lock` and adopts a file another
+process replaced, so timestamps stay in order and steer state is never overwritten.
 Ctrl-C stops tailing without revoking enrollment. Presence expires normally, or use `deregister`.
 
 The client follows appends, partial lines, rename/create rotation and truncation. It initially

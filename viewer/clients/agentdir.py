@@ -1,5 +1,7 @@
 """Run with python3 -m viewer.clients.agentdir; credentials never printed except mint."""
 import argparse
+import contextlib
+import fcntl
 import http.client
 import json
 import os
@@ -27,10 +29,41 @@ class Client:
     def __init__(self, state, server='http://127.0.0.1:8790', transport=None, clock=time.time_ns):
         self.path, self.server, self.clock = state, server.rstrip('/'), clock
         self.transport = transport or self.http
+        self.seen = None
+        self.load()
+
+    def identity(self):
         try:
-            self.state = json.loads(auth.private_read(state))
+            info = os.stat(self.path)
+        except FileNotFoundError:
+            return None
+        return info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size
+
+    def load(self):
+        seen = self.identity()
+        try:
+            self.state = json.loads(auth.private_read(self.path))
         except FileNotFoundError:
             self.state = {}
+        self.seen = seen
+
+    @contextlib.contextmanager
+    def locked(self):
+        """Serialize calls from every process sharing this state file (a tail beside busy/idle beats).
+
+        The server refuses a timestamp at or below the kid's last one, and each save replaces the
+        whole file, so unserialized processes would refuse each other or drop steer state. A file
+        another process replaced since this one last read or wrote it is adopted first. The lock
+        is a separate file because the state is replaced atomically on every save.
+        """
+        fd = os.open(str(self.path) + '.sign.lock', os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            if self.identity() != self.seen:
+                self.load()
+            yield
+        finally:
+            os.close(fd)
 
     def http(self, path, body, headers):
         request = urllib.request.Request(self.server + path, body, headers, method='POST')
@@ -45,8 +78,13 @@ class Client:
 
     def save(self):
         auth.private_write(self.path, json.dumps(self.state).encode())
+        self.seen = self.identity()
 
     def call(self, action, data=None, recover=True):
+        with self.locked():
+            return self._call(action, data, recover)
+
+    def _call(self, action, data=None, recover=True):
         data = dict(data or {})
         if action == 'register':
             # Only this beat consumer with a local inbox can promise pull delivery.
@@ -79,8 +117,8 @@ class Client:
             if (action in ('beat', 'events') and recover and getattr(exc, 'status', None) == 409 and
                     self.state.get('registration')):
                 # The server intentionally forgets entries on restart or TTL expiry.
-                self.call('register', self.state['registration'])
-                return self.call(action, data, recover=False)
+                self._call('register', self.state['registration'])
+                return self._call(action, data, recover=False)
             raise
         if action == 'enroll':
             self.state = dict(result, name=data['name'])

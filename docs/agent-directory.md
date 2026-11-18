@@ -125,8 +125,22 @@ In the Agents tab, pick the registered agent and use **Message at next tool call
 composer accepts up to 4000 characters. It shows **Waiting for next tool call**, then
 **Delivered** after the hook's log record reaches the directory on a beat. Idle agents keep
 messages queued until a tool call; there is no Stop-hook injection or automatic new turn.
-The hook frames text as UNTRUSTED data, ignores subagent calls carrying `agent_id`, and
-always exits successfully. Hermes sidecar Send/Steer controls are a separate mechanism;
+The hook labels each message as operator feedback sent via the Agents tab, with the sender
+and UTC queue time, separately from the tool's output. Existing permissions and constraints
+still apply. Message delimiters are neutralised in the body, and sender metadata is kept
+on one line. This framing does not authenticate local files: anyone who can write the steer
+directory can impersonate an operator. Keep it private.
+
+For Claude Code, the hook emits JSON on stdout using
+`hookSpecificOutput.additionalContext` with `hookEventName: "PostToolUse"`. This is the
+[PostToolUse model-context channel](https://code.claude.com/docs/en/hooks#posttooluse-decision-control),
+not plain stdout (which is only visible in verbose mode). Hooks cannot create a user-role
+turn; the explicit attribution identifies who sent the feedback without claiming a higher
+instruction priority. Queue time comes from the inbox filename's nanosecond prefix and
+stays the same on retries; missing or invalid times are shown as `unknown`.
+
+The hook ignores subagent calls carrying `agent_id` and always exits successfully.
+Hermes sidecar Send/Steer controls are a separate mechanism;
 use the next-tool-call composer only for agents running this hook and beat client.
 
 Protocol and recovery:

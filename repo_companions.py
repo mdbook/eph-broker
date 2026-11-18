@@ -13,6 +13,19 @@ DIRECTORY = ".companions"
 _REPO = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_-][A-Za-z0-9_.-]*)+\Z")
 _NAME = re.compile(r"[a-z][a-z0-9_]*\Z")
 _REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./-]*\Z")
+# Reviewed source-selection knobs, not arbitrary loader/runtime environment variables.
+TEST_ENV_NAMES = frozenset({"PORTCULLIS_SRC"})
+
+
+def _test_env(entry):
+    bindings = entry.get("test_env", {})
+    if (not isinstance(bindings, dict) or any(
+            name not in TEST_ENV_NAMES or not isinstance(path, str)
+            or not path or "\\" in path or "\x00" in path
+            or any(part in ("", ".", "..") for part in path.split("/"))
+            for name, path in bindings.items())):
+        raise ValueError("companion test_env needs reviewed names and relative source directory paths")
+    return bindings
 
 
 def load(path=None):
@@ -31,14 +44,20 @@ def load(path=None):
         if not _REPO.fullmatch(repo) or not isinstance(entries, list):
             raise ValueError("repo companions need full namespace/repo keys and lists")
         names = set()
+        env_names = set()
         for entry in entries:
-            if (not isinstance(entry, dict) or set(entry) != {"repo", "ref", "as"}
-                    or not all(isinstance(v, str) for v in entry.values())
+            if (not isinstance(entry, dict) or not {"repo", "ref", "as"} <= set(entry)
+                    or set(entry) - {"repo", "ref", "as", "test_env"}
+                    or not all(isinstance(entry[k], str) for k in ("repo", "ref", "as"))
                     or not _REPO.fullmatch(entry["repo"]) or not _NAME.fullmatch(entry["as"])
                     or not _REF.fullmatch(entry["ref"]) or ".." in entry["ref"]
                     or entry["ref"].endswith(("/", ".")) or entry["as"] in names):
                 raise ValueError("invalid or duplicate repo companion (expected repo, ref, lowercase snake_case as)")
             names.add(entry["as"])
+            bindings = _test_env(entry)
+            if env_names.intersection(bindings):
+                raise ValueError("duplicate companion test_env name")
+            env_names.update(bindings)
     return mapping
 
 
@@ -96,6 +115,10 @@ def cut(path, base_repo):
             # Never send subprocess argv/stderr (credential helper or server output) to the worker.
             raise RuntimeError("companion checkout failed: " + repo.path) from None
         shutil.rmtree(os.path.join(dest, ".git"))
+        for relative in _test_env(entry).values():
+            source_dir = os.path.realpath(os.path.join(dest, relative))
+            if not source_dir.startswith(os.path.realpath(dest) + os.sep) or not os.path.isdir(source_dir):
+                raise ValueError("companion test_env must select a directory inside its snapshot")
         records.append({**entry, "sha": sha, "path": dest})
     # Permission bits are a second belt, not a same-uid sandbox. Never chmod through source symlinks.
     for directory, dirs, files in os.walk(root, followlinks=False):
@@ -117,7 +140,16 @@ def record_run(store, key, run_id, cut_sha, companions):
 
 
 def environment(worker):
-    return {"COMPANION_" + c["as"].upper(): c["path"] for c in getattr(worker, "companions", [])}
+    companions = getattr(worker, "companions", [])
+    env = {"COMPANION_" + c["as"].upper(): c["path"] for c in companions}
+    env.update(test_environment(companions))
+    return env
+
+
+def test_environment(companions):
+    """Bind only operator-configured knobs to this run's pinned, read-only sources."""
+    return {name: os.path.join(c["path"], relative)
+            for c in companions for name, relative in _test_env(c).items()}
 
 
 def prepare_remove(path):

@@ -27,7 +27,8 @@ Use `config/repo-companions.json` (or `REPO_COMPANIONS_FILE`, an operator-owned 
 repo's tests need sources from another repo. For example:
 
 ```json
-{"example/widget-site": [{"repo": "example/widget-core", "ref": "main", "as": "core"}]}
+{"example/widget-site": [{"repo": "example/widget-core", "ref": "main", "as": "core",
+                          "test_env": {"PORTCULLIS_SRC": "src"}}]}
 ```
 
 Keys and `repo` values are full catalog namespace/repo names. `as` is a unique lowercase snake_case
@@ -35,6 +36,18 @@ name within that list; it becomes `.companions/core` and `COMPANION_CORE`. `ref`
 commit SHA. Configure the repo catalog and its local mappings even if repo inference is disabled;
 denied, archived or unknown companions are refused. The broker uses catalog origin/clone URLs and its own
 fetch credentials, never worker credentials or ticket-supplied URLs.
+
+For a portcullis-site repo row, optional `test_env: {"PORTCULLIS_SRC": "src"}` binds the site's core
+selector to `<worktree>/.companions/core/src`. This is the only reviewed `test_env` name; arbitrary
+runtime or loader variables are refused. Values must be relative directory paths within that companion,
+without `.` or `..` components or escaping symlinks. Duplicate bindings across companions are refused.
+The binding reaches the worker and test shells on all harnesses, including warm turns, so the worker runs
+`./run-tests.sh` without an env prefix or a global `EPH_GATE_TEST_ENV_ALLOW` change. On hermes and Codex,
+an explicit `PORTCULLIS_SRC=<literal path from the brief> ./run-tests.sh` is also allowed, but only for
+that pinned value and the granted test runner. Read-root, secret-file and companion write denies still apply.
+Use `ref: "main"` for core main, or set `ref` to a reviewed ticket's core commit SHA in this operator-owned
+row before the cut. Tickets cannot supply arbitrary checkouts. The brief and run record retain the resolved
+SHA; include it and the suite summary in the MR so reviewers can identify the tested core.
 
 The file is re-read on each code worktree cut, not on warm forwards. An absent default file disables
 companions. An explicitly named missing file, invalid configuration, checkout failure or an existing

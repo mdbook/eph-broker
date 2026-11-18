@@ -22,7 +22,7 @@ os.environ.setdefault("BROKER_INBOX_ACCOUNTS", str(HERE / "fixtures" / "inbox-ac
 
 import repo_companions as C
 import repo_catalog
-from adapters import cc, codex, codex_gate
+from adapters import cc, codex, codex_gate, hermes
 from adapters.hermes_gate import gate as G
 from broker_state import BrokerState
 from hooks.companion_guard import reason
@@ -191,6 +191,84 @@ def test_invalid_config_refuses():
                 C.load(str(config))
 
 
+def test_source_bindings_validate_names_paths_and_duplicates():
+    with workspace() as (tmp_path, patches):
+        entry = {"repo": "example/core", "ref": "main", "as": "core"}
+        config = tmp_path / "companions.json"
+        invalid = [None, [], {"PATH": "src"}, {"PYTHONPATH": "src"}]
+        invalid += [{"PORTCULLIS_SRC": p} for p in
+                    (None, "", "/src", "../src", "src/../src", "./src", "src//core", "src\\core", "src\x00")]
+        for bindings in invalid:
+            config.write_text(json.dumps({"example/site": [{**entry, "test_env": bindings}]}))
+            with raises(ValueError):
+                C.load(str(config))
+        entries = [{**entry, "as": name, "test_env": {"PORTCULLIS_SRC": "src"}}
+                   for name in ("core", "other")]
+        config.write_text(json.dumps({"example/site": entries}))
+        with raises(ValueError):
+            C.load(str(config))
+
+
+def test_site_runner_uses_pinned_core_main_or_sha_and_scoped_env_grant():
+    with workspace() as (d, patches):
+        base, core, config, cat = configured(d, patches)
+        (core / "src").mkdir()
+        (core / "src" / "source.txt").write_text("selected core\n")
+        git(core, "add", "src")
+        git(core, "commit", "-qm", "core sources")
+        sha = git(core, "rev-parse", "HEAD")
+        manager = WorktreeManager(str(base), str(d / "workers"))
+        for ref in ("main", sha):
+            config.write_text(json.dumps({"example/site": [
+                {"repo": "example/core", "ref": ref, "as": "core", "test_env": {"PORTCULLIS_SRC": "src"}}]}))
+            path = manager.make("sample")
+            try:
+                records = C.cut(path, str(base))
+                assert records[0]["sha"] == sha
+                env = C.environment(SimpleNamespace(companions=records))
+                source = str(Path(path) / ".companions" / "core" / "src")
+                assert env == {"COMPANION_CORE": str(Path(source).parent), "PORTCULLIS_SRC": source}
+                # A local stand-in for the site's runner proves bare ./run-tests.sh consumes the binding.
+                runner = Path(path) / "run-tests.sh"
+                runner.write_text('#!/bin/sh\ncat "$PORTCULLIS_SRC/source.txt" || exit 1\necho "1 passed"\n')
+                runner.chmod(0o700)
+                result = subprocess.run(["./run-tests.sh"], cwd=path, env={**os.environ, **env},
+                                        capture_output=True, text=True, check=True)
+                assert result.stdout == "selected core\n1 passed\n"
+                for policy_builder in (hermes.gate_policy, codex.gate_policy):
+                    policy = G.Policy(policy_builder("code", path, "repo-test", companions=records))
+                    assert G.decide("terminal", {"command": "./run-tests.sh"}, policy).allowed
+                    command = "PORTCULLIS_SRC=" + source + " ./run-tests.sh"
+                    assert G.decide("terminal", {"command": command}, policy).allowed
+                    codex_command = codex_gate._cd_prefix(path) + command
+                    assert codex_gate.evaluate({"tool_name": "exec_command", "tool_input": {
+                        "cmd": codex_command}}, policy)[2].allowed
+                    for cmd in ("PORTCULLIS_SRC=/outside/src ./run-tests.sh",
+                                "PORTCULLIS_SRC=" + path + " ./run-tests.sh",
+                                "PORTCULLIS_SRC=" + source + " git status"):
+                        assert not G.decide("terminal", {"command": cmd}, policy).allowed
+                    assert not G.decide("write_file", {"path": source + "/new", "content": "bad"}, policy).allowed
+                    other = G.Policy(policy_builder("code", path, "repo-test"))
+                    assert not G.decide("terminal", {"command": command}, other).allowed
+                shell = codex.codex_config("model", None, "workspace-write", "/instructions", companion_env=env)
+                assert 'PORTCULLIS_SRC = ' + json.dumps(source) in shell
+            finally:
+                manager.remove("sample")
+
+
+def test_source_binding_missing_directory_and_escaping_symlink_refuse():
+    for target in ("missing", "source.txt", "outside"):
+        with workspace() as (d, patches):
+            base, core, config, cat = configured(d, patches)
+            (core / "outside").symlink_to(d, target_is_directory=True)
+            git(core, "add", "outside")
+            git(core, "commit", "-qm", "escaping fixture")
+            config.write_text(json.dumps({"example/site": [
+                {"repo": "example/core", "ref": "main", "as": "core", "test_env": {"PORTCULLIS_SRC": target}}]}))
+            with raises(ValueError):
+                C.cut(str(base), str(base))
+
+
 def test_missing_duplicate_denied_and_collision_refuse():
     with workspace() as (tmp_path, patches):
         base, core, config, cat = configured(tmp_path, patches)
@@ -274,7 +352,7 @@ def test_code_spawn_cuts_and_passes_provenance_to_worker():
         patches.setattr(cc, "_MCP_DIR", str(tmp_path))
         patches.setenv("PATH", os.defpath)
         records = [{"repo": "example/core", "ref": "main", "as": "core", "sha": "b" * 40,
-                    "path": "/worker/.companions/core"}]
+                    "path": "/worker/.companions/core", "test_env": {"PORTCULLIS_SRC": "src"}}]
         launches = []
         popen = subprocess.Popen
 
@@ -292,6 +370,7 @@ def test_code_spawn_cuts_and_passes_provenance_to_worker():
         brief = next(b for name, b in calls if name == "brief")
         assert brief["companions"] == records
         assert launches and launches[0][1]["COMPANION_CORE"] == records[0]["path"]
+        assert launches[0][1]["PORTCULLIS_SRC"] == records[0]["path"] + "/src"
         assert cc.shutil.which("mcp-ro.sh", path=launches[0][1]["PATH"]) == str(mcp_ro)
         assert not any("silent-127" in alert for alert in alerts), alerts
         assert any("fixed" in text for _, text in comments), alerts

@@ -359,6 +359,11 @@ class Policy(object):
         self.deny = [parse_rule(r) for r in d.get("deny") or []]
         self.test_allow = [parse_rule(r) for r in d.get("test_allow") or []]
         self.test_env_allow = test_env_names(d.get("test_env_allow", []))
+        self.test_env_bindings = d.get("test_env_bindings", {})
+        if (not isinstance(self.test_env_bindings, dict) or any(
+                name != "PORTCULLIS_SRC" or not isinstance(path, str) or not os.path.isabs(path)
+                for name, path in self.test_env_bindings.items())):
+            raise ValueError("test_env_bindings must map reviewed source knobs to absolute paths")
         self.dm_recipients = d.get("dm_recipients", [])
         from .dm import DEFAULT_DM_DENY, recipients
         self.dm_deny = d.get("dm_deny", recipients(DEFAULT_DM_DENY))
@@ -885,7 +890,12 @@ def check_segment(policy, argv, cwd):
             return "environment assignments may only prefix the granted test runner"
         checked_assignments = []
         for a in assignments:
-            name = a.split("=", 1)[0]
+            name, value = a.split("=", 1)
+            if name in policy.test_env_bindings:
+                if value != policy.test_env_bindings[name]:
+                    return "test environment variable %r must name the pinned companion source exactly" % name
+                checked_assignments.append(a)
+                continue
             if name == "PORTCULLIS_PYTHON":
                 if a != "PORTCULLIS_PYTHON=" + PORTCULLIS_PYTHON:
                     return "PORTCULLIS_PYTHON must name the reviewed test venv exactly"

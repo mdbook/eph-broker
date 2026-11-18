@@ -1094,7 +1094,8 @@ class CodexHarness:
         test_repo = getattr(worker, "repo", None) if test_runner == "venv" else None
         try:
             policy = gate_policy(capability, cwd, test_runner, test_repo,
-                                 bus_enabled=bool(getattr(route, "env", {}).get("ZBUS_ENV")))
+                                 bus_enabled=bool(getattr(route, "env", {}).get("ZBUS_ENV")),
+                                 companions=getattr(worker, "companions", []))
         except ValueError as e:
             raise CodexRefused(f"codex adapter: {e}")
         instructions = os.path.join(home, INSTRUCTIONS_FILE)

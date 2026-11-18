@@ -404,7 +404,7 @@ def _nonsecret_paths(root):
     return []
 
 
-def gate_policy(capability, cwd, test_runner=None, test_repo=None, nonce=None, bus_enabled=None):
+def gate_policy(capability, cwd, test_runner=None, test_repo=None, nonce=None, bus_enabled=None, companions=()):
     """The CC grant for the SAME capability, plus read extensions requiring eph-gate's parsed path checks."""
     if bus_enabled is None:
         bus_enabled = capability in _cc._LEGACY_BUS_CAPABILITIES
@@ -457,6 +457,7 @@ def gate_policy(capability, cwd, test_runner=None, test_repo=None, nonce=None, b
         if capability == "code":
             extra = [n.strip() for n in os.getenv("EPH_GATE_TEST_ENV_ALLOW", "").split(",") if n.strip()]
             pol["test_env_allow"] = sorted(_gate.test_env_names(extra))
+            pol["test_env_bindings"] = _cc.repo_companions.test_environment(companions)
         pol["floor"] = _providers.floor()
         judge = _providers.judge_config() if general else None
     except ValueError as e:
@@ -896,7 +897,8 @@ class HermesHarness:
         if gated:
             env["TERMINAL_CWD"] = cwd                      # hermes' terminal/file base dir == the gate's cwd
             nonce = self._install_gate(home, gate_policy(capability, cwd, test_runner, test_repo,
-                                       bus_enabled=bool(getattr(route, "env", {}).get("ZBUS_ENV"))), env, cwd, argv)
+                                       bus_enabled=bool(getattr(route, "env", {}).get("ZBUS_ENV")),
+                                       companions=getattr(worker, "companions", [])), env, cwd, argv)
             # The probe checks startup + hook dispatch, never starts a terminal or sources shell_init_files.
             # Let its security refusal win over a stale init file if the home sweep regresses (B2). Still create
             # exclusively BEFORE the real run: any re-plant after the sweep, even during the probe, refuses.

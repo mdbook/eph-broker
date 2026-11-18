@@ -39,6 +39,10 @@ exact, case-sensitive names (no wildcard patterns). These ride in the per-turn p
 list, not the worker's environment. Only add benign test flags: adding a runtime/loader configuration name
 would explicitly trust that variable to change how tests execute. Invalid names refuse the code turn.
 
+For a repo-specific `PORTCULLIS_SRC` selector, prefer a [companion `test_env` binding](configuration.md#companion-source-repositories).
+It exports the pinned source path to test shells and allows only that exact value in a runner prefix,
+without adding a global environment-name exception for other repos.
+
 ## Non-secret filename exceptions (hermes and Codex)
 
 The secret-name floor is intentionally conservative. An operator may declare reviewed, non-secret files

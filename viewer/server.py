@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
-from . import adapters
+from . import adapters, assets, transcripts
 from .directory import Refused
 
 ASSETS = Path(__file__).parent
@@ -180,14 +180,15 @@ def handler(directory, agent_api=False, auth=None, standalone=False):
                 if not self.authorized():
                     return None
                 return self.agent_view('POST')
-            if self.path not in ('/v1/enroll', '/v1/register', '/v1/beat', '/v1/deregister'):
+            if self.path not in ('/v1/enroll', '/v1/register', '/v1/beat', '/v1/deregister', '/v1/events'):
                 self.close_connection = True
                 return self.send(404, {'error': 'not found'})
             try:
+                limit = transcripts.BATCH_BYTES if self.path == '/v1/events' else 16384
                 length = int(self.headers.get('Content-Length', '-1'))
                 if (self.headers.get('Transfer-Encoding') or
-                        len(self.headers.get_all('Content-Length', [])) != 1 or not 0 <= length <= 16384):
-                    raise Refused('body must have Content-Length, at most 16 KiB', 413)
+                        len(self.headers.get_all('Content-Length', [])) != 1 or not 0 <= length <= limit):
+                    raise Refused('body must have Content-Length, at most %d bytes' % limit, 413)
                 body = self.rfile.read(length)
                 if len(body) != length:
                     raise Refused('incomplete body')
@@ -209,6 +210,18 @@ def handler(directory, agent_api=False, auth=None, standalone=False):
                 return self.agent_view('GET')
             if path == '/ui.js':
                 return self.send(200, (ASSETS / 'ui.js').read_bytes(), 'text/javascript; charset=utf-8')
+            if path == '/transcript.js':
+                try:
+                    script = assets.transcript_module().encode()
+                except ImportError:
+                    return self.send(503, {'error': 'install the core eph-broker package for transcript rendering'})
+                return self.send(200, script, 'text/javascript; charset=utf-8')
+            if path == '/transcript.css':
+                try:
+                    css = assets.transcript_css().encode()
+                except ImportError:
+                    return self.send(503, {'error': 'install the core eph-broker package for transcript rendering'})
+                return self.send(200, css, 'text/css; charset=utf-8')
             if path in VIEW_UI:
                 return self.view_ui(path)
             if path == '/' and standalone:
@@ -224,6 +237,10 @@ def handler(directory, agent_api=False, auth=None, standalone=False):
                 entries = [e for e in directory.snapshot() if e['name'] == name]
                 if not entries:
                     return self.send(404, {'error': 'agent not found'})
+                if action == 'transcript':
+                    if not entries[0]['can_tail']:
+                        return self.send(403, {'error': 'agent has no tail capability'})
+                    return self.tail_stream(name)
                 if action == 'events':
                     self.send_response(200)
                     self.send_header('Content-Type', 'text/event-stream')
@@ -243,6 +260,42 @@ def handler(directory, agent_api=False, auth=None, standalone=False):
                     except (BrokenPipeError, ConnectionError, OSError):
                         return
             self.send(404, {'error': 'not found'})
+
+        def tail_stream(self, name):
+            # The module host owns the stream semaphore and lifetime deadline, just
+            # as for adapter SSE. Keepalive stays below its upstream idle timeout.
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Accel-Buffering', 'no')
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            self.close_connection = True
+            cursor = self.headers.get('Last-Event-ID', '')[:128]
+            try:
+                while True:
+                    with directory.lock:
+                        directory.reap()
+                        entry = directory.entries.get(name)
+                        available = entry and 'tail' in entry['caps'] and entry['kind'] in ('claude-code', 'codex')
+                        tail = directory.tails.get(name)
+                        reset, frames, next_cursor = tail.replay(cursor) if tail else (False, [], '')
+                    if not available:
+                        self.wfile.write(b'event: end\ndata: {}\n\n')
+                        self.wfile.flush()
+                        return
+                    if reset:
+                        self.wfile.write(b'event: reset\ndata: {}\n\n')
+                    for event_id, line in frames:
+                        self.wfile.write(('id: %s\ndata: %s\n\n' % (event_id, line)).encode())
+                    # Advance even on an empty buffer. A reset frame also carries
+                    # a cursor so reconnects do not repeatedly reset an empty view.
+                    self.wfile.write(('id: %s\nevent: cursor\ndata: {}\n\n' % next_cursor).encode())
+                    self.wfile.flush()
+                    cursor = next_cursor
+                    time.sleep(1)
+            except (BrokenPipeError, ConnectionError, OSError):
+                return
 
     return Handler
 

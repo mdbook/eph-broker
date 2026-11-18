@@ -465,6 +465,7 @@ The optional [agent directory](agent-directory.md#listeners-and-authentication) 
 | Variable | Default | Meaning |
 |---|---|---|
 | `AGENTDIR_AGENT_BIND` | `127.0.0.1:8790` | Agent API TCP listener, separate from the UI socket. |
+| `AGENTDIR_TAIL_LINES` | `2000` | Per-agent in-memory transcript ring, 1..10000 lines. Each line is at most 24 KiB. Invalid values refuse startup. Restart to apply. The tail client's separate `--lines` replay ring also defaults to 2000. |
 | `AGENTDIR_AGENT_MAX_CONNECTIONS` | `64` | Positive maximum concurrent agent API connections, including idle and keep-alive connections. Excess connections close immediately without an HTTP response. Invalid values log an error and use 64. Each connection has a 10-second socket idle timeout from setup, covering request lines, headers and bodies. UI listeners are unchanged. Restart to apply. |
 
 ## Other built-in rows

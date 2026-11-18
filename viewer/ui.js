@@ -247,6 +247,19 @@ export function mount(el0, ctx = {}) {
     shown = agent.name;
     detail.replaceChildren(headerFor(agent));
     updateHead(agent);
+    if (agent.can_tail) {
+      const host = el('div', 'adir-view');
+      detail.append(host);
+      try {
+        const mod = await import(base + 'transcript.js');
+        if (shown !== agent.name || stopped) return;
+        view = mod.mount(host, {url: base + 'api/agents/' + encodeURIComponent(agent.name) + '/transcript',
+          css: base + 'transcript.css'});
+      } catch (err) {
+        if (shown === agent.name && !stopped) detail.append(el('p', 'adir-note', 'Transcript unavailable: ' + err.message));
+      }
+      return;
+    }
     if (!agent.can_view) {
       detail.append(el('p', 'adir-note', agent.kind === 'hermes'
         ? agent.name + ' has not registered a live view, so only its presence shows here.'

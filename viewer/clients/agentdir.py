@@ -62,11 +62,11 @@ class Client:
         try:
             result = self.transport(path, body, headers)
         except ValueError as exc:
-            if (action == 'beat' and recover and getattr(exc, 'status', None) == 409 and
+            if (action in ('beat', 'events') and recover and getattr(exc, 'status', None) == 409 and
                     self.state.get('registration')):
                 # The server intentionally forgets entries on restart or TTL expiry.
                 self.call('register', self.state['registration'])
-                return self.call('beat', data, recover=False)
+                return self.call(action, data, recover=False)
             raise
         if action == 'enroll':
             self.state = dict(result, name=data['name'])
@@ -118,6 +118,12 @@ def main(argv=None):
     lifetime.add_argument('--while-tmux')
     status = commands.add_parser('status')
     status.add_argument('status', choices=('busy', 'idle'))
+    tail = commands.add_parser('tail', help='follow and push a Claude Code or Codex transcript')
+    tail.add_argument('--transcript', required=True)
+    tail.add_argument('--lines', type=int, default=2000, help='local replay ring (1..10000)')
+    owner = tail.add_mutually_exclusive_group()
+    owner.add_argument('--while-pid', type=int)
+    owner.add_argument('--while-tmux')
     commands.add_parser('deregister')
     args = parser.parse_args(argv)
     try:
@@ -164,6 +170,13 @@ def main(argv=None):
             client.call('deregister')
         elif args.command == 'status':
             client.call('beat', {'status': args.status})
+        elif args.command == 'tail':
+            from .tail import follow
+            if not 1 <= args.lines <= 10000:
+                raise ValueError('--lines must be 1..10000')
+            if args.while_pid is not None and args.while_pid <= 0:
+                raise ValueError('--while-pid must be positive')
+            follow(client, args.transcript, lambda: alive(args.while_pid, args.while_tmux), lines=args.lines)
         else:
             client.call('deregister')
     except KeyboardInterrupt:

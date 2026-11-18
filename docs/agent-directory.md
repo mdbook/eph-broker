@@ -77,6 +77,73 @@ while a turn sent from a view is running, **Stop** ends it and **Steer** passes 
 The composer is disabled with a hint for viewers without the broker actions permission or agents
 that did not register `steer`. Closing the card closes its stream, so a tab holds at most one.
 
+## Claude Code and Codex transcript tail
+
+Complete the standalone setup above, or enroll against the broker module's agent listener.
+RPM users need both `eph-broker` and `eph-broker-viewer` for transcript tailing: the core
+package supplies the pure shared renderer and redaction code. Presence-only viewer installs
+remain independent. The source checkout includes everything, with no additional setup.
+Then register the harness and start the tail in place of the separate `beat` process:
+
+```sh
+python3 -m viewer.clients.agentdir --state agentdir-state/demo.json register --kind claude-code --caps tail --ttl 30
+python3 -m viewer.clients.agentdir --state agentdir-state/demo.json tail --transcript /path/to/session.jsonl
+```
+
+Open the Agents tab and pick `demo`. The same timeline and tool-card JavaScript used for broker
+workers renders its transcript. This is read-only and requires no view sidecar or action access.
+For a quick fake-agent smoke test, create a file, tail it, then append another line:
+
+```sh
+printf '%s\n' '{"type":"assistant","message":{"content":"Hello from the fake agent."}}' > demo.jsonl
+python3 -m viewer.clients.agentdir --state agentdir-state/demo.json tail --transcript "$PWD/demo.jsonl"
+# In another terminal:
+printf '%s\n' '{"type":"assistant","message":{"content":"A live update."}}' >> demo.jsonl
+```
+
+For Claude Code, use the `transcript_path` from the SessionStart hook's JSON input as the
+`--transcript` argument. Run the tail as a supervised background process owned by that session;
+`--while-pid PID` or `--while-tmux SESSION` stops following when its owner disappears.
+For Codex, register `--kind codex --caps tail` and supply the session rollout JSONL under
+`$CODEX_HOME/sessions/` (or a Codex `--json` event file). There is no implicit session discovery.
+Run one tail process per credential file; do not run `beat` concurrently against that file.
+Ctrl-C stops tailing without revoking enrollment. Presence expires normally, or use `deregister`.
+
+The client follows appends, partial lines, rename/create rotation and truncation. It initially
+reads at most the last 8 MiB, discards incomplete/oversized source records and keeps the last
+2000 projected lines for re-push (`--lines 1..10000`). The module's independent ring defaults
+to 2000 lines (`AGENTDIR_TAIL_LINES=1..10000`). No transcript is persisted on the module host.
+After module reload or TTL expiry the client re-registers and re-pushes its local ring, even
+if the source file is idle. A stopped client backfills again when restarted. Rotation starts
+a new transcript and resets the browser timeline. A bounded 4 KiB content anchor before the
+read cursor also detects same-inode rewrites that regrow to the same or a larger size between
+polls. A changed anchor resets the transcript, including partial records and command tracking.
+
+`POST /v1/events` uses the same name-bound HMAC, timestamp and replay checks as register/beat.
+The body is `{epoch, source, start, lines}`: a source identifier, zero-based starting sequence
+and up to 100 JSONL strings. An absent/stale epoch returns `{ok:true, epoch, replay:true}`
+without ingesting; resend the bounded local ring with that epoch and a fresh source identifier.
+Accepted batches return `replay:false`; source/sequence suppress ambiguous retries. Gaps request
+replay. Only registered `claude-code`/`codex` agents with `tail` may push. Bodies above 64 KiB
+are refused (413); projected lines are limited to 24 KiB. The server allows four batches/second
+per agent with a burst of eight, then returns 429. Clients send at most two/second and retry
+transient errors without discarding unacknowledged lines or credentials. Events refresh presence.
+
+Both client and server apply the broker's shared secret-shaped redaction. Codex messages,
+reasoning summaries, command lines/output tails, file paths, plans and tool names use the
+broker's projection; MCP arguments/results, encrypted reasoning and unknown rollout payloads
+are not forwarded. Claude JSONL keeps its existing record shape. Oversized projected records
+become size-limit notices. Redaction is best effort, not a substitute for access control.
+Codex rollout command completions with a tracked function-call ID reuse that call's tool card
+instead of adding a duplicate command card.
+Use loopback or a trusted TLS reverse proxy for remote agents: HMAC authenticates, not encrypts.
+
+The authenticated UI route `GET /api/agents/NAME/transcript` streams SSE. `Last-Event-ID`
+resumes within the ring; stale epochs or evicted cursors emit `reset` and bounded replay.
+There are one-second cursor keepalives and an `end` event on deregistration/expiry. Module
+streams consume `BROKER_MODULE_AGENTS_MAX_STREAMS` slots and the host's stream deadline,
+just like other module streams. All viewers allowed into the module may read every tail.
+
 ## Hermes agents (plugin)
 
 `viewer/clients/hermes-plugin/agentdir/` is a stdlib Hermes plugin that keeps a gateway listed.

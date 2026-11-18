@@ -7,7 +7,7 @@ import time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from . import adapters, auth
+from . import adapters, auth, transcripts
 from .allowlist import Allowlist
 
 
@@ -25,6 +25,8 @@ class Directory:
         self.allowlist = allowlist if allowlist is not None else Allowlist()
         self.lock = threading.RLock()
         self.entries, self.seen, self.timestamps = {}, {}, {}
+        self.tails = {}
+        self.tail_lines = transcripts.line_limit()
         auth.private_dir(state_dir)
         self.revocation_path = Path(state_dir) / 'revoked.json'
         try:
@@ -50,6 +52,7 @@ class Directory:
             now = self.clock()
             self.entries = {n: e for n, e in self.entries.items()
                             if now - e['last_beat'] < 3 * e['ttl']}
+            self.tails = {n: t for n, t in self.tails.items() if n in self.entries}
             self.seen = {j: exp for j, exp in self.seen.items() if exp > now}
             # Timestamps older than the skew window can no longer be replayed.
             self.timestamps = {k: ts for k, ts in self.timestamps.items() if ts >= now - 60}
@@ -90,6 +93,8 @@ class Directory:
     def request(self, path, body, headers):
         """Single dispatch seam shared by HTTP and socket-free protocol tests."""
         try:
+            if path == '/v1/events' and len(body) > transcripts.BATCH_BYTES:
+                raise Refused('transcript batch exceeds 64 KiB', 413)
             data = json.loads(body)
             if not isinstance(data, dict):
                 raise Refused('expected a JSON object')
@@ -100,6 +105,8 @@ class Directory:
                 self.reap()
                 if path == '/v1/register':
                     stamp = self.timestamps[kid]
+                elif path == '/v1/events':
+                    return self._events(kid, name, data)
                 elif path == '/v1/beat':
                     entry = self.entries.get(name)
                     if entry is None or entry['kid'] != kid:
@@ -119,6 +126,7 @@ class Directory:
                         self.revoked = revoked
                     if name in self.entries and self.entries[name]['kid'] == kid:
                         del self.entries[name]
+                        self.tails.pop(name, None)
                 else:
                     raise Refused('unknown agent endpoint', 404)
                 if path != '/v1/register':
@@ -140,6 +148,11 @@ class Directory:
                 not all(c in ('view', 'steer', 'tail') for c in caps)):
             raise Refused('invalid name, kind, caps, or ttl (3..86400 seconds)')
         url = data.get('view_url')
+        if 'tail' in caps and data['kind'] in ('claude-code', 'codex'):
+            try:
+                transcripts.require_shared()
+            except ImportError:
+                raise Refused('transcript tail needs the core eph-broker package or a source checkout', 503) from None
         if url is not None:
             if not isinstance(url, str) or len(url) > 2048:
                 raise Refused('invalid view_url')
@@ -153,9 +166,35 @@ class Directory:
                 raise Refused('registration superseded by a newer request', 409)
             if name in self.entries and self.entries[name]['kid'] != kid:
                 raise Refused('name is registered to another kid', 409)
+            previous = self.entries.get(name)
+            if previous and (previous['kind'] != data['kind'] or 'tail' not in caps):
+                self.tails.pop(name, None)
             self.entries[name] = dict(name=name, kid=kid, kind=data['kind'], caps=caps,
                                       view_url=url, ttl=ttl, status='live', last_beat=self.clock())
         return {'ok': True}
+
+    def _events(self, kid, name, data):
+        entry = self.entries.get(name)
+        if entry is None or entry['kid'] != kid:
+            raise Refused('register before pushing events', 409)
+        if 'tail' not in entry['caps'] or entry['kind'] not in ('claude-code', 'codex'):
+            raise Refused('agent requires tail capability and a transcript harness', 403)
+        lines, source, start = data.get('lines'), data.get('source'), data.get('start')
+        if (not isinstance(lines, list) or len(lines) > transcripts.BATCH_LINES or
+                not all(isinstance(s, str) and len(s.encode()) <= transcripts.LINE_BYTES for s in lines) or
+                not isinstance(source, str) or not re.fullmatch(r'[a-zA-Z0-9_-]{1,64}', source) or
+                type(start) is not int or not 0 <= start <= 2 ** 53):
+            raise Refused('invalid transcript source, start or lines')
+        tail = self.tails.setdefault(name, transcripts.Buffer(self.tail_lines))
+        if not tail.admit(self.clock()):
+            raise Refused('transcript rate limit (4 batches/s, burst 8)', 429)
+        if data.get('epoch') != tail.epoch:
+            return dict(ok=True, epoch=tail.epoch, replay=True)
+        normalized = [transcripts.normalize(line, entry['kind']) for line in lines]
+        if not tail.append(source, start, normalized):
+            return dict(ok=True, epoch=tail.epoch, replay=True)
+        entry['last_beat'] = self.clock()
+        return dict(ok=True, epoch=tail.epoch, replay=False)
 
     def snapshot(self):
         with self.lock:
@@ -171,5 +210,6 @@ class Directory:
                 public['can_view'] = bool(entry['view_url'] and 'view' in entry['caps'] and
                                           callable(getattr(adapter, 'view', None)))
                 public['can_steer'] = public['can_view'] and 'steer' in entry['caps']
+                public['can_tail'] = 'tail' in entry['caps'] and entry['kind'] in ('claude-code', 'codex')
                 result.append(public)
             return result

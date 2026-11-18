@@ -70,12 +70,24 @@ first, then the agent with a back link). The address bar follows the pick
 (`#module/agents/NAME`, plus the session and a message id), so links to an agent, a session or
 a message work. A `hermes` agent with a view shows its live view, below.
 
-On the Fleet page, **Quick view** on a listed agent opens a small card: status, kind and the last
-beat (with its local time). For an agent with a view it adds the last five transcript lines
-streaming live, the turn's working state and a one-line composer: **Send** starts a turn, and
-while a turn sent from a view is running, **Stop** ends it and **Steer** passes it the typed text.
-The composer is disabled with a hint for viewers without the broker actions permission or agents
-that did not register `steer`. Closing the card closes its stream, so a tab holds at most one.
+An agent's page opens with a compact header: its status, what it says it is doing now (a
+"waiting on" or "blocked by" part is called out on its own line), then kind, model, a context
+meter and the last activity. Status, the doing-now line, model and context come from the Fleet
+view when it lists the agent (see `agentSummary` in [modules](modules.md)); otherwise the header
+shows directory presence only. Below it, a tailing agent's transcript fills the page with a
+**Conversation** / **Everything** switch: Conversation hides harness records and routine system
+rows and says how many it hid. The log follows the newest line until you scroll up; **Latest**
+jumps back. A message box is docked at the bottom for agents that registered `steer`; sent
+messages appear in the transcript as queued, then delivered.
+
+On the Fleet page, **Quick view** on a listed agent opens a card (a bottom sheet on a phone): its
+status, what it is doing and waiting on, last activity, model and context, the last few
+transcript lines streaming live, and the same message box with one-tap quick replies
+(`AGENTDIR_QUICK_REPLIES` in [settings](settings.md)). For a `hermes` agent with a view the box
+also starts turns: **Send** starts one, and while a turn sent from a view is running, **Stop** ends
+it and **Steer** passes it the typed text. **Full view** opens the agent's page. The box is
+disabled with a hint for viewers without the broker actions permission or agents that did not
+register `steer`. Closing the card closes its stream, so a tab holds at most one.
 
 ## Mid-turn steering (PostToolUse)
 

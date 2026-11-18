@@ -532,7 +532,7 @@ def test_dashboard_module_shell_and_fleet_contract():
     assert "</b>' + moduleAffordance(name)" in page
     assert "header nav" in page and "$('tabbar')" in page
     assert "js.mount(content, viewerContext" in page and "js.quickView(content, name" in page
-    assert "Agent viewer is down" in page and "Open full view" in page
+    assert "Agent viewer is down" in page and "Full view ›" in page
     assert "if(can && m.child)" in page and "module_reload" in page
     assert "new Date(s.since * 1000).toLocaleString()" in page
     assert "function paintModuleSettings()" in page and "Disable or enable" in page

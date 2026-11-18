@@ -569,7 +569,7 @@ def test_dash_detail_surfaces():
     """Quick views and run previews share a bounded native modal; routed details remember the list's place."""
     page = dash.module_page([{"name": "agents", "label": "Agents"}])
     assert "$('fleet-view').appendChild(quickPanel)" not in page
-    for needle in ("openDetailSheet('Quick view: ' + name", "openDetailSheet('Run details', p",
+    for needle in ("openDetailSheet(name, button", "openDetailSheet('Run details', p",
                    "dialog.showModal()", "dialog.addEventListener('cancel'", "aria-labelledby",
                    "max-height:calc(100dvh - 32px)", "body.detail-open{overflow:hidden}",
                    "#r-side{position:sticky", "focusDetailRoute($('d-title'))", "focusDetailRoute(content)",

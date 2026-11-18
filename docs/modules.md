@@ -139,6 +139,11 @@ aborted. A reload or navigation aborts and unmounts the old view.
 - `canAct`: whether `/actions` allowed this browser. A hint, not authorization.
 - `agentName`: decoded agent selected by a full-view link, or null.
 - `openAgent(name)`: navigate to the module tab and select that agent.
+- `agentSummary(name)`: what the Fleet view knows about that agent, or null when
+  Fleet does not list it. Returns `{state, label, doing, model, context_tokens,
+  context_limit, detail}`: `state` is one of `run`, `wait`, `idle`, `block`,
+  `off` and `label` is the Fleet status text, `doing` is the agent's own one-line status when it publishes one,
+  `context_tokens`/`context_limit` are numbers or null. Plain text only.
 - `signal`: AbortSignal for this mount.
 
 Use the broker's CSS variables (`--t1`, `--t2`, `--t3`, etc.) and semantic HTML.
@@ -148,7 +153,7 @@ never ask browser code to hold a proxy secret. The SSO proxy injects it.
 
 Quick view buttons appear only for Fleet rows whose exact name is in a module's
 authorized index. Clicking opens an in-page container and calls `quickView`.
-**Open full view** navigates to `#module/<name>/<encoded-agent>` and passes that
+**Full view** navigates to `#module/<name>/<encoded-agent>` and passes that
 agent to `mount`. If more than one module advertises a name, the first configured
 module supplies its Quick view.
 

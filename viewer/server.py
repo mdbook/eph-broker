@@ -29,6 +29,41 @@ import {mount} from '/ui.js'; mount(document.getElementById('agents'), {});
 </script>'''
 
 
+# One-tap messages offered beside the composer. AGENTDIR_QUICK_REPLIES is a JSON list of strings (the label is
+# the message) or {"label", "text"} objects; [] turns them off. A bad value logs once and keeps the defaults.
+QUICK_REPLIES = [
+    {'label': 'Ask for status', 'text': 'Reply with a short status: what you are doing now and what you are waiting on.'},
+    {'label': 'Wrap up', 'text': 'Wrap up at the next clean point and report what is done and what is left.'},
+    {'label': 'Pause after this step', 'text': 'Pause after the current step and wait for my next message.'},
+]
+_quick_cache = [None, QUICK_REPLIES]
+
+
+def quick_replies(raw=None):
+    raw = os.environ.get('AGENTDIR_QUICK_REPLIES') if raw is None else raw
+    if raw == _quick_cache[0]:
+        return _quick_cache[1]
+    value = QUICK_REPLIES
+    if raw is not None and raw.strip():
+        try:
+            items = json.loads(raw)
+            if not isinstance(items, list) or len(items) > 8:
+                raise ValueError('expected a JSON list of at most 8 items')
+            value = []
+            for item in items:
+                if isinstance(item, str):
+                    item = {'label': item, 'text': item}
+                if not (isinstance(item, dict) and isinstance(item.get('label'), str) and isinstance(item.get('text'), str)
+                        and 0 < len(item['label'].strip()) <= 40 and 0 < len(item['text'].strip()) <= 4000):
+                    raise ValueError('each item needs a label up to 40 characters and a text up to 4000')
+                value.append({'label': item['label'].strip(), 'text': item['text'].strip()})
+        except ValueError as e:
+            log.error('AGENTDIR_QUICK_REPLIES: %s; using the defaults', e)
+            value = QUICK_REPLIES
+    _quick_cache[:] = [raw, value]
+    return value
+
+
 class UIAuth:
     def __init__(self, socket_peer=True, header='X-Forwarded-User', proxies='', basic=None):
         self.socket_peer, self.header, self.basic = socket_peer, header, basic
@@ -251,7 +286,7 @@ def handler(directory, agent_api=False, auth=None, standalone=False):
             if path == '/' and standalone:
                 return self.send(200, PAGE, 'text/html; charset=utf-8')
             if path == '/api/agents':
-                return self.send(200, {'agents': directory.snapshot()})
+                return self.send(200, {'agents': directory.snapshot(), 'quick_replies': quick_replies()})
             if path == '/fleet-index':
                 # Module host contract: names this viewer can show in a Fleet quick view.
                 return self.send(200, [e['name'] for e in directory.snapshot()])

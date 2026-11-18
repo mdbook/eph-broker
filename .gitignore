@@ -12,3 +12,10 @@ agentdir-state/
 # normally, but a test that calls a hook with no HERMES_HOME set writes it here instead (belt-and-
 # suspenders alongside the test-side fix that points HERMES_HOME at a tempdir for the whole suite).
 eph-gate-denials.jsonl
+# Many tests create scratch dirs under the repo root on purpose (sandbox paths off the host root),
+# and cc.py puts a worker's ssh shim dir (s-*) beside its worktree. Never stage them mid-run.
+/tmp*/
+/s-*/
+/sandbox-events-*/
+/quickstart-*/
+/.screenshots-*/

@@ -293,15 +293,17 @@ class Tail(ViewerTest):
         script = r'''
 const {mount} = await import(URL);
 function mk(tag) { return {tag, children: [], className: '', textContent: '', scrollTop: 0,
-  scrollHeight: 0, clientHeight: 0, setAttribute() {},
+  scrollHeight: 0, clientHeight: 0, setAttribute() {}, addEventListener(k, fn) {this.on = fn;},
+  querySelectorAll() {return [];},
   get childNodes() {return this.children;},
   append(...nodes) {for (const n of nodes) this.appendChild(n);},
   appendChild(n) {this.children.push(n); n.parent = this; return n;},
   replaceChildren(...nodes) {this.children = []; this.append(...nodes);},
   set innerHTML(s) {this.markup = s; if (!s) this.children = [];},
-  get classList() {return {toggle: () => true};}
+  get classList() {return {toggle: () => true, contains: () => false};}
 }; }
 globalThis.document = {createElement: mk};
+globalThis.requestAnimationFrame = fn => fn();
 let stream;
 let reconnect;
 globalThis.setTimeout = fn => {reconnect = fn; return 1;};
@@ -315,13 +317,20 @@ globalThis.EventSource = class {
 const host = mk('host'); host.attachShadow = () => host;
 const mounted = mount(host, {url: '/live', css: '/transcript.css'});
 stream.onopen();
-const log = host.children.at(-1);
+const log = host.children.at(-2), latest = host.children.at(-1);
+if (latest.textContent !== 'Latest') throw Error('Latest pill follows the log');
+log.scrollHeight = 500; log.clientHeight = 100;
 stream.onmessage({data: JSON.stringify({type:'assistant', message:{content:'hello <script>bad()</script>'}})});
 stream.onmessage({data: JSON.stringify({type:'system', subtype:'codex', content:JSON.stringify({
   type:'item.completed', item_type:'agent_message', text:'Codex says hello'})})});
 stream.onmessage({data: JSON.stringify({type:'system', subtype:'codex', content:JSON.stringify({
   type:'turn.completed', usage:{input_tokens:12, output_tokens:4}})})});
 if (log.children.length !== 3) throw Error('both harnesses and usage render live');
+if (log.scrollTop !== 500) throw Error('follows the newest line until the reader scrolls up');
+log.scrollTop = 100; log.on();
+stream.onmessage({data: JSON.stringify({type:'assistant', message:{content:'later'}})});
+if (log.scrollTop !== 100 || latest.hidden) throw Error('scrolled up: stay put, offer Latest');
+log.children.pop();
 const body = log.children[0].children.at(-1);
 if (body.markup.includes('<script>') || !body.markup.includes('&lt;script&gt;')) throw Error('escape first');
 stream.listeners.reset();

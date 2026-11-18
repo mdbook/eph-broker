@@ -1239,6 +1239,9 @@ CSS = r"""  /* ---- timeline */
 """
 
 MOUNT = r"""// The same renderer the broker inlines, scoped to this read-only agent view.
+// Conversation (the default) hides harness bookkeeping and system rows; Everything shows them. System rows that
+// report an error stay visible in both. note(record) adds a record the page itself knows about (a message sent
+// from here) through the same renderer, so it reads like any other transcript line.
 export function mount(host, {url, css}) {
   const root = host.attachShadow({mode: 'open'});
   const style = document.createElement('link');
@@ -1246,28 +1249,66 @@ export function mount(host, {url, css}) {
   const local = document.createElement('style');
   local.textContent = `:host{--panel:var(--s1);--panel2:var(--s2);--ink:var(--t1);
     --muted:var(--t2);--faint:var(--t3);--accent:var(--brand);--green:var(--run);
-    --amber:var(--wait);--red:var(--block);--user:var(--s1);--code:var(--s2);color:var(--t1)}
-    *{box-sizing:border-box} .tl{max-height:none;height:calc(100% - 48px)}
-    .controls{height:48px;display:flex;align-items:center;gap:12px;padding:8px 16px}
-    button{font:inherit;color:var(--t1);background:var(--s1);border:1px solid var(--line);
-      border-radius:8px;min-height:36px;padding:0 12px;cursor:pointer}
+    --amber:var(--wait);--red:var(--block);--user:var(--s1);--code:var(--s2);color:var(--t1);
+    display:flex;flex-direction:column;position:relative;min-height:0}
+    *{box-sizing:border-box} .tl{flex:1;max-height:none;height:auto;background:var(--bg)}
+    .controls{flex:none;display:flex;align-items:center;gap:12px;padding:8px 16px;border-bottom:1px solid var(--line)}
+    .seg{display:inline-flex;padding:2px;border-radius:9px;background:var(--s3)}
+    .seg button{font:inherit;font-size:13px;font-weight:600;color:var(--t2);background:none;border:0;border-radius:7px;
+      min-height:32px;padding:0 12px;cursor:pointer}
+    .seg button[aria-pressed=true]{background:var(--s1);color:var(--t1);box-shadow:0 1px 2px rgba(20,25,32,.12)}
+    .hidden-n{font-size:12px;color:var(--t2);flex:1;min-width:0}
     :focus-visible{outline:2px solid var(--brand);outline-offset:2px}
-    .harness{display:none}.show-harness .harness{display:block}
-    .pill{font-size:12px;color:var(--t2)}
+    .tl:not(.show-harness) .harness,.tl:not(.show-harness) .meta-row:not(.err){display:none}
+    .pill{font-size:12px;color:var(--t2);white-space:nowrap}
+    .latest{position:absolute;left:50%;bottom:16px;transform:translateX(-50%);font:inherit;font-size:13px;font-weight:600;
+      color:var(--onbrand);background:var(--brand);border:0;border-radius:999px;min-height:32px;padding:0 14px;
+      box-shadow:0 2px 8px rgba(20,25,32,.2);cursor:pointer}
+    .latest[hidden]{display:none}
+    @media(max-width:720px){.controls{padding:6px 12px}.seg button{min-height:36px}.tl{padding:12px}.hidden-n .wide{display:none}}
     @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}`;
   const controls = el('div', 'controls'), status = el('span', 'pill', 'Connecting');
   status.setAttribute('role', 'status');
-  const toggle = el('button', null, 'Everything'), count = el('span');
-  toggle.type = 'button'; toggle.setAttribute('aria-pressed', 'false');
-  controls.append(status, toggle);
+  const seg = el('div', 'seg'), conv = el('button', null, 'Conversation'), all = el('button', null, 'Everything');
+  seg.setAttribute('role', 'group'); seg.setAttribute('aria-label', 'Transcript filter');
+  const hidden = el('span', 'hidden-n'), count = el('span');
+  for(const b of [conv, all]) b.type = 'button';
+  seg.append(conv, all);
+  controls.append(seg, hidden, status);
   const log = el('div', 'tl');
   log.setAttribute('aria-label', 'Live transcript');
-  root.append(style, local, controls, log);
+  const latest = el('button', 'latest', 'Latest');
+  latest.type = 'button'; latest.hidden = true;
+  root.append(style, local, controls, log, latest);
   const renderer = createTranscript(id => id === 'sv-log' ? log : count);
-  toggle.onclick = () => {
-    const on = log.classList.toggle('show-harness');
-    toggle.setAttribute('aria-pressed', String(on));
-  };
+  // Follow the newest line until the reader scrolls up. Per-line checks miss bursts that land before layout.
+  let counting = false, follow = true;
+  function recount(){
+    // Batched: a reconnect replays the whole ring in one burst.
+    if(counting) return;
+    counting = true;
+    requestAnimationFrame(() => {
+      counting = false;
+      if(follow) log.scrollTop = log.scrollHeight;
+      const n = log.querySelectorAll('details.harness .ln, .meta-row:not(.err)').length;
+      const off = log.classList.contains('show-harness') || !n, words = n === 1 ? 'system event' : 'system events';
+      hidden.replaceChildren(...(off ? [] : [n + ' ', el('span', 'wide', words + ' '), 'hidden']));
+      hidden.title = off ? '' : n + ' ' + words + ' hidden';
+      latest.hidden = log.scrollTop + log.clientHeight >= log.scrollHeight - 40;
+    });
+  }
+  function filter(everything){
+    log.classList.toggle('show-harness', everything);
+    conv.setAttribute('aria-pressed', String(!everything));
+    all.setAttribute('aria-pressed', String(everything));
+    recount();
+  }
+  conv.onclick = () => filter(false);
+  all.onclick = () => filter(true);
+  filter(false);
+  log.addEventListener('scroll', () => { follow = log.scrollTop + log.clientHeight >= log.scrollHeight - 40; recount(); }, {passive: true});
+  latest.onclick = () => { log.scrollTop = log.scrollHeight; recount(); };
+  const add = line => { renderer.addLine(line); recount(); };
   let stream = null, retry = null, stopped = false;
   function reconnect() {
     if (stopped || retry !== null) return;
@@ -1280,8 +1321,8 @@ export function mount(host, {url, css}) {
     if (stream) stream.close();
     const current = stream = new EventSource(url);
     current.onopen = () => { status.textContent = 'Live'; };
-    current.onmessage = e => renderer.addLine(e.data);
-    current.addEventListener('reset', () => renderer.resetLog());
+    current.onmessage = e => add(e.data);
+    current.addEventListener('reset', () => { renderer.resetLog(); recount(); });
     current.addEventListener('end', () => { status.textContent = 'Agent unavailable'; current.close(); reconnect(); });
     current.onerror = () => {
       status.textContent = 'Reconnecting';
@@ -1289,7 +1330,8 @@ export function mount(host, {url, css}) {
     };
   }
   connect();
-  return {destroy() { stopped = true; clearTimeout(retry); stream.close(); host.replaceChildren(); }, seek() {}};
+  return {destroy() { stopped = true; clearTimeout(retry); stream.close(); host.replaceChildren(); }, seek() {},
+    note(record) { add(JSON.stringify(record)); }};
 }
 """
 

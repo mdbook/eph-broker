@@ -2,10 +2,14 @@
 // ctx.baseUrl prefixes UI routes and ctx.signal aborts on unmount.
 // The Agents tab: the directory on the left, the picked agent on the right. A hermes agent with a view shows its
 // live view: the sidecar's renderer (hermes-ui/view.js, the sidecar's web/ installed by the operator) mounted in a
-// shadow root, fed only through this module's re-typed JSON/SSE proxy (api/a/NAME/...).
-const STATUS_COLOR = {busy: 'var(--run,inherit)', idle: 'var(--t2,inherit)',
-  live: 'var(--t1,inherit)', grey: 'var(--t3,inherit)'};
-const VIEW_STATUS = {'': 'idle', busy: 'busy', compact: 'compacting', unread: 'unread reply', off: 'offline'};
+// shadow root, fed only through this module's re-typed JSON/SSE proxy (api/a/NAME/...). A claude-code or codex
+// agent with the tail cap shows its transcript (transcript.js) and, with steer-pull, a composer under it.
+// The optional host hook ctx.agentSummary(name) adds what the host knows (what it is doing, model, context).
+const VIEW_STATUS = {'': ['idle', 'Idle'], busy: ['run', 'Working'], compact: ['run', 'Compacting'],
+  unread: ['wait', 'Unread reply'], off: ['off', 'Offline']};
+const DIR_STATE = {busy: ['run', 'Working'], idle: ['idle', 'Idle'], live: ['run', 'Online'], grey: ['off', 'Offline']};
+const STATES = new Set(['run', 'wait', 'idle', 'block', 'off']);
+const KIND = {'claude-code': 'Claude Code', codex: 'Codex', hermes: 'Hermes', generic: 'Agent'};
 // Public renderer seam. Keep these as CSS references, not computed color snapshots: changing the broker's
 // light/dark/auto theme must update an already open view without remounting it or losing composer state.
 const VIEW_TOKENS = `
@@ -77,10 +81,33 @@ export function themeView(host) {
   }
 }
 
+const COMPOSER_CSS = `
+.ad-comp{flex:none;display:grid;gap:8px;padding:10px 16px calc(10px + env(safe-area-inset-bottom));
+  border-top:1px solid var(--line);background:var(--s1)}
+.ad-qr{display:flex;gap:8px;overflow-x:auto;scrollbar-width:none;margin:0 -16px;padding:0 16px}
+.ad-qr::-webkit-scrollbar{display:none}
+.ad-qr button{flex:none;font:inherit;font-size:13px;font-weight:600;color:var(--t1);background:var(--s1);
+  border:1px solid var(--line);border-radius:999px;min-height:32px;padding:0 14px;cursor:pointer;white-space:nowrap}
+.ad-qr button:hover:not(:disabled){background:var(--s2)}
+.ad-row{display:flex;align-items:flex-end;gap:8px}
+.ad-row textarea{flex:1;min-width:0;box-sizing:border-box;resize:none;font:inherit;line-height:20px;max-height:140px;
+  min-height:40px;padding:9px 14px;border-radius:20px;border:1px solid var(--line);background:var(--s2);color:var(--t1)}
+.ad-send{flex:none;width:40px;height:40px;border-radius:50%;border:0;font:inherit;font-size:18px;font-weight:700;cursor:pointer;
+  background:var(--brand);color:var(--onbrand)}
+.ad-send:disabled,.ad-qr button:disabled{opacity:.5;cursor:not-allowed}
+.ad-comp :focus-visible{outline:2px solid var(--brand);outline-offset:2px}
+.ad-hint{margin:0;font-size:12px;color:var(--t2)}
+.ad-sent{list-style:none;margin:0;padding:0;display:grid;gap:4px;font-size:13px}
+.ad-sent li{display:flex;gap:8px;justify-content:space-between}.ad-sent span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ad-sent b{flex:none;font-weight:600;color:var(--t2)}.ad-sent b.ok{color:var(--run)}
+.ad-extra{display:flex;gap:8px}
+@media (max-width:720px){.ad-qr button{min-height:36px}.ad-row textarea{font-size:16px}.ad-send{width:44px;height:44px}}`;
+
 const CSS = `
 .adir{display:grid;grid-template-columns:260px 1fr;gap:16px;align-items:start;color:var(--t1,inherit)}
 .adir-card{background:var(--s1,transparent);border:1px solid var(--line,currentColor);border-radius:12px;box-shadow:var(--shadow,none);min-width:0}
 .adir-detail{position:sticky;top:80px;max-height:calc(100dvh - 96px);overflow:auto}
+.adir-detail.full{display:flex;flex-direction:column;height:calc(100dvh - 96px);overflow:hidden}
 .adir-list{padding:4px 0}
 .adir-it{display:flex;align-items:center;gap:12px;padding:14px 20px;border-left:3px solid transparent;
   color:inherit;text-decoration:none}
@@ -90,33 +117,43 @@ const CSS = `
 .adir-it.grey{color:var(--t2,inherit)}.adir-grow{flex:1;min-width:0}.adir-nm{font-weight:600;overflow-wrap:anywhere}
 .adir-meta,.adir-sub{font-size:13px;color:var(--t2,inherit)}
 .adir-dot{width:8px;height:8px;border-radius:50%;background:var(--brand,currentColor)}
-.adir-head{display:flex;align-items:center;gap:12px;padding:16px 20px;border-bottom:1px solid var(--line,currentColor);
-  flex-wrap:wrap}.adir-head h2{margin:0;font-size:18px;font-weight:650}.adir-sp{flex:1}
-.adir-pill{display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:600;padding:2px 8px;border-radius:999px;
-  background:color-mix(in srgb,currentColor 13%,var(--s1));white-space:nowrap}
-.adir-pill::before{content:'';width:6px;height:6px;border-radius:50%;background:currentColor}
-.adir-back{display:none;color:var(--brand);font-size:14px;font-weight:600;text-decoration:none}
+.adir-head{flex:none;display:grid;gap:6px;padding:14px 20px;border-bottom:1px solid var(--line,currentColor)}
+.adir-top{display:flex;align-items:center;gap:12px;min-width:0}
+.adir-top h2{margin:0;font-size:18px;font-weight:650;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.adir-now{margin:0;font-size:14px;overflow-wrap:anywhere}.adir-now b{color:var(--t2);margin-right:6px}
+.adir-wait{color:var(--wait);font-weight:600}
+.adir-meta2{display:flex;align-items:center;flex-wrap:wrap;gap:4px 12px;font-size:13px;color:var(--t2);font-variant-numeric:tabular-nums}
+.adir-back{display:none;color:var(--brand);font-size:14px;font-weight:600;text-decoration:none;white-space:nowrap}
 .adir-back:hover{text-decoration:underline}
 /* Resolve references outside the renderer host, whose :host styles may redefine the older tokens. */
 .adir-detail{${VIEW_TOKENS}}
 .adir-view{height:max(480px,calc(100vh - 220px));position:relative;border-radius:0 0 12px 12px}
+.adir-detail.full .adir-view{flex:1;height:auto;min-height:0;border-radius:0;overflow:hidden}
 .adir-note{padding:16px;color:var(--t2,inherit)}
-.adir-steer{padding:16px;border-bottom:1px solid var(--line,#dce0e6);display:grid;gap:8px}
-.adir-steer textarea{box-sizing:border-box;width:100%;min-height:72px;resize:vertical;font:inherit;
-  background:var(--s1,#fff);color:var(--t1,rgb(20,25,32));border:1px solid var(--line,#dce0e6);border-radius:8px;padding:8px}
-.adir-steer :focus-visible{outline:2px solid var(--brand,#2b57c9);outline-offset:2px}
-.adir-steer button{justify-self:start}.adir-steer ul{margin:0;padding-left:20px;font-size:13px;color:var(--t2,rgb(71,81,96))}
 .adir-empty{padding:12px 14px;color:var(--t2,inherit)}
+.ad-st{display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:600;padding:2px 10px;border-radius:999px;
+  white-space:nowrap;color:var(--t2);background:color-mix(in srgb,currentColor 13%,var(--s1))}
+.ad-st::before{content:'';flex:none;box-sizing:border-box;width:8px;height:8px;border-radius:50%;border:1.5px solid var(--t3)}
+.ad-st.run{color:var(--run)}.ad-st.run::before{border:0;background:currentColor}
+.ad-st.wait{color:var(--wait)}.ad-st.wait::before{border:2px solid currentColor}
+.ad-st.block{color:var(--block)}.ad-st.block::before{border:0;border-radius:2px;background:currentColor}
+.ad-st.off{color:var(--t3)}.ad-st.off::before{border:0;height:2px;border-radius:1px;background:currentColor}
+.ad-meter{display:inline-block;width:56px;height:6px;border-radius:3px;background:var(--s3);overflow:hidden;vertical-align:middle;margin-right:6px}
+.ad-meter i{display:block;height:100%;background:var(--brand)}.ad-meter.warm i{background:var(--wait)}.ad-meter.hot i{background:var(--block)}
+${COMPOSER_CSS}
 @media (max-width:820px){
   .adir{grid-template-columns:1fr}.adir.picked .adir-listcard{display:none}.adir:not(.picked) .adir-detail{display:none}
   .adir-detail{position:static;max-height:none;overflow:visible}
   .adir-back{display:inline-flex}.adir-view{height:calc(100vh - 160px)}
 }
 @media (max-width:720px){
-  .adir-head{flex-wrap:nowrap;gap:10px;padding:8px 12px}.adir-head h2{font-size:16px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .adir-kind,.adir-beat{display:none}.adir-back{min-height:48px;align-items:center}
+  .adir-head{padding:8px 12px;gap:4px}.adir-top{gap:10px}.adir-top h2{font-size:16px;flex:1}
+  .adir-back{min-height:44px;align-items:center}
+  .adir-meta2{font-size:12px;gap:2px 10px}
   .adir-view{height:calc(100dvh - 132px - env(safe-area-inset-top) - env(safe-area-inset-bottom))}
+  .adir-detail.full{height:calc(100dvh - 80px - env(safe-area-inset-bottom));border-radius:10px}
 }`;
+
 
 function ago(seconds) {
   const s = Math.floor(seconds);
@@ -132,6 +169,9 @@ function el(tag, cls, text) {
   return e;
 }
 
+const kTok = (n) => n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1000 ? Math.round(n / 1000) + 'k' : String(n);
+const num = (v) => typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null;
+
 function poller(ctx, render, error) {
   let stopped = false, timer;
   const controller = new AbortController();
@@ -144,7 +184,7 @@ function poller(ctx, render, error) {
       if (!response.ok) throw new Error('Directory unavailable (' + response.status + ')');
       const data = await response.json();
       if (stopped) return;
-      render(data.agents);
+      render(data.agents, Array.isArray(data.quick_replies) ? data.quick_replies : []);
       error.textContent = '';
     } catch (err) { if (!stopped) error.textContent = err.message; }
     finally { if (!stopped) timer = setTimeout(poll, 5000); }
@@ -184,45 +224,141 @@ export function viewFetch(url, init = {}) {
 }
 
 export function steerState(state) {
-  return state === 'delivered' ? 'Delivered' : 'Waiting for next tool call';
+  return state === 'delivered' ? 'Delivered' : 'Queued';
 }
 
-function steerComposer(agent, ctx, base) {
-  const form = el('form', 'adir-steer'), label = el('label', null, 'Message at next tool call');
-  const input = el('textarea'), send = el('button', 'btn pri', 'Send message');
-  input.maxLength = 4000; input.required = true;
-  input.setAttribute('aria-label', 'Message ' + agent.name + ' at next tool call');
-  label.append(input);
-  const note = el('p', 'adir-sub', ctx.canAct ? 'Idle agents wait until their next tool call.'
-    : 'Read-only: sending needs the broker actions permission.');
-  note.setAttribute('role', 'status');
-  const states = el('ul'); states.setAttribute('aria-live', 'polite');
-  input.disabled = send.disabled = !ctx.canAct;
-  form.append(label, send, note, states);
-  const update = (current) => {
-    states.replaceChildren(...(current.steer_messages || []).map((m) =>
-      el('li', null, m.id + ': ' + steerState(m.state))));
-  };
-  update(agent);
-  form.onsubmit = async (event) => {
-    event.preventDefault();
-    if (!ctx.canAct || !input.value.trim()) return;
-    input.disabled = send.disabled = true;
-    try {
-      const response = await viewFetch(base + 'api/agents/' + encodeURIComponent(agent.name) + '/steer', {
-        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text: input.value}),
-        signal: ctx.signal,
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || 'HTTP ' + response.status);
-      input.value = '';
-      note.textContent = steerState('pending');
-      states.append(el('li', null, data.id + ': ' + steerState('pending')));
-    } catch (err) { note.textContent = 'Could not send message: ' + err.message; }
-    finally { input.disabled = send.disabled = !ctx.canAct; }
-  };
-  return {form, update};
+// A one-line "what it is doing" note split into the work and who it waits on, so the wait can stand out.
+export function splitNow(text) {
+  const s = String(text || '').replace(/\s+/g, ' ').trim();
+  const m = /\b(?:waiting (?:on|for)|blocked (?:on|by))\b/i.exec(s);
+  if (!m) return {doing: s, waiting: ''};
+  const doing = s.slice(0, m.index).replace(/[\s,;:(-]+$/, '');
+  const waiting = s.slice(m.index).replace(/[\s.)]+$/, '');
+  return {doing: doing && !/[.!?]$/.test(doing) ? doing + '.' : doing, waiting: waiting[0].toUpperCase() + waiting.slice(1)};
 }
+
+// Directory presence plus the host's optional summary, in one shape for every view.
+export function describe(agent, summary) {
+  const s = summary && typeof summary === 'object' ? summary : {};
+  const [state, label] = DIR_STATE[agent && agent.status] || ['off', 'Unknown'];
+  return {state: STATES.has(s.state) ? s.state : state, label: typeof s.label === 'string' && s.label ? s.label : label,
+    ...splitNow(typeof s.doing === 'string' ? s.doing : ''), model: typeof s.model === 'string' ? s.model : '',
+    tokens: num(s.context_tokens), limit: num(s.context_limit),
+    detail: typeof s.detail === 'string' && s.detail ? s.detail : agent ? KIND[agent.kind] || agent.kind : '',
+    age: agent ? agent.age : null};
+}
+
+function chip(state, label) {
+  const c = el('span', 'ad-st ' + (STATES.has(state) ? state : 'off'), label);
+  return c;
+}
+
+function meter(info) {
+  const wrap = el('span');
+  if (info.tokens == null) return wrap;
+  if (info.limit) {
+    const pct = info.tokens / info.limit, m = el('span', 'ad-meter' + (pct >= 1 ? ' hot' : pct >= .8 ? ' warm' : ''));
+    const fill = el('i'); fill.style.width = Math.min(100, Math.round(pct * 100)) + '%';
+    m.append(fill); m.title = kTok(info.tokens) + ' of ' + kTok(info.limit) + ' context';
+    wrap.append(m);
+  }
+  wrap.append(kTok(info.tokens) + (info.limit ? '' : ' context'));
+  return wrap;
+}
+
+// One composer for the detail page and the quick view. send(text) resolves to a message id (tracked until
+// delivered), true (sent, nothing to track) or throws. Quick replies send their text in one tap.
+function composer(opts) {
+  const form = el('form', 'ad-comp'), qr = el('div', 'ad-qr'), row = el('div', 'ad-row');
+  const input = el('textarea'), send = el('button', 'ad-send', '↑'), hint = el('p', 'ad-hint');
+  const sent = el('ul', 'ad-sent'), extra = el('div', 'ad-extra');
+  input.rows = 1; input.maxLength = opts.max || 4000; input.placeholder = 'Message ' + opts.name;
+  input.setAttribute('aria-label', 'Message ' + opts.name);
+  send.type = 'submit'; send.setAttribute('aria-label', 'Send'); send.title = 'Send';
+  qr.setAttribute('role', 'group'); qr.setAttribute('aria-label', 'Quick replies');
+  hint.setAttribute('role', 'status'); sent.setAttribute('aria-live', 'polite');
+  row.append(input, send);
+  form.append(qr, extra, row, hint, sent);
+  extra.hidden = true; sent.hidden = !!opts.sink;
+  let busy = false, canSend = false, replies = [], why = '';
+  const mine = new Map();   // id -> {text, state, li}
+  function paint() {
+    for (const b of [input, send, ...qr.children, ...extra.children]) b.disabled = !canSend || busy;
+    hint.textContent = why || opts.hint || '';
+  }
+  function grow() { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight + 2, 140) + 'px'; }
+  async function submit(text) {
+    if (!canSend || busy || !text.trim()) return false;
+    busy = true; why = ''; paint();
+    try {
+      const id = await opts.send(text);
+      if (typeof id === 'string') {
+        const rec = {text, state: 'queued', li: null};
+        mine.set(id, rec);
+        const sink = opts.sink && opts.sink();
+        if (sink) sink({type: 'broker', subtype: 'web_message', id, state: 'queued', via: 'tool', text,
+          timestamp: new Date().toISOString()});
+        else {
+          rec.li = el('li'); rec.li.append(el('span', null, text), el('b', null, steerState('queued')));
+          sent.hidden = false; sent.append(rec.li);
+          while (sent.children.length > 3) sent.firstChild.remove();
+        }
+      }
+      return true;
+    } catch (err) { why = 'Could not send: ' + err.message; return false; }
+    finally { busy = false; paint(); }
+  }
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    if (await submit(input.value)) { input.value = ''; grow(); }
+  };
+  input.addEventListener('input', grow);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && !matchMedia('(pointer:coarse)').matches) {
+      e.preventDefault(); form.requestSubmit();
+    }
+  });
+  return {form, input, submit,
+    // ok: may send now; reason: shown when it may not; list: quick replies; states: the agent's steer_messages.
+    update(ok, reason, list, states) {
+      canSend = !!ok; why = ok ? why : reason || '';
+      const labels = (list || []).map((r) => r.label + '\n' + r.text).join('\n\n');
+      if (labels !== replies) {
+        replies = labels;
+        qr.replaceChildren(...(list || []).map((r) => {
+          const b = el('button', null, r.label); b.type = 'button'; b.title = r.text;
+          b.onclick = () => submit(r.text);
+          return b;
+        }));
+      }
+      qr.hidden = !qr.children.length;
+      for (const m of states || []) {
+        const rec = mine.get(m.id);
+        if (!rec || rec.state === 'delivered' || m.state !== 'delivered') continue;
+        rec.state = 'delivered';
+        const sink = opts.sink && opts.sink();
+        if (sink) sink({type: 'broker', subtype: 'web_message', id: m.id, state: 'delivered', via: 'tool',
+          timestamp: new Date().toISOString()});
+        if (rec.li) { rec.li.lastChild.textContent = steerState('delivered'); rec.li.lastChild.className = 'ok'; }
+      }
+      paint();
+    },
+    extra(buttons) { extra.replaceChildren(...buttons); extra.hidden = !buttons.length; paint(); },
+  };
+}
+
+function steerSend(base, name, signal) {
+  return async (text) => {
+    const response = await viewFetch(base + 'api/agents/' + encodeURIComponent(name) + '/steer', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text}), signal,
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'HTTP ' + response.status);
+    return String(data.id);
+  };
+}
+
+const READ_ONLY = 'Read-only: sending needs the broker actions permission.';
 
 export function mount(el0, ctx = {}) {
   const standalone = !ctx.openAgent;
@@ -234,6 +370,7 @@ export function mount(el0, ctx = {}) {
     try { return decodeURIComponent(location.hash.slice(1)); } catch (e) { return ''; }
   };
   const base = ctx.baseUrl || '/';
+  const summaryOf = (name) => { try { return ctx.agentSummary ? ctx.agentSummary(name) : null; } catch (e) { return null; } };
   const style = el('style', null, CSS);
   const wrap = el('div', 'adir');
   const listCard = el('div', 'adir-card adir-listcard'), list = el('nav', 'adir-list');
@@ -245,9 +382,10 @@ export function mount(el0, ctx = {}) {
   wrap.append(listCard, detail);
   el0.replaceChildren(style, wrap);
 
-  let stopped = false, route = parseRoute(routeNow()), shown = null, view = null, agents = [], unread = {}, pill = null, beat = null;
+  let stopped = false, route = parseRoute(routeNow()), shown = null, view = null, agents = [], unread = {};
+  let head = null, viewStatus = null, replies = [];
   const items = new Map();
-  let composer = null;
+  let comp = null;
 
   function renderList() {
     empty.hidden = agents.length > 0;
@@ -261,11 +399,12 @@ export function mount(el0, ctx = {}) {
         it.firstChild.append(el('div', 'adir-nm'), el('div', 'adir-meta'));
         items.set(agent.name, it);
       }
+      const info = describe(agent, summaryOf(agent.name));
       it.href = hrefOf(agent.name);
       it.classList.toggle('grey', agent.status === 'grey');
       it.setAttribute('aria-current', String(agent.name === route.name));
       it.querySelector('.adir-nm').textContent = agent.name;
-      it.querySelector('.adir-meta').textContent = agent.kind + ', ' + agent.status + ', ' + ago(agent.age);
+      it.querySelector('.adir-meta').textContent = [info.label, KIND[agent.kind] || agent.kind, ago(agent.age)].join(' · ');
       const dot = it.querySelector('.adir-dot');
       dot.hidden = !unread[agent.name];
       dot.title = unread[agent.name] ? unread[agent.name] + ' unread' : '';
@@ -275,48 +414,61 @@ export function mount(el0, ctx = {}) {
   }
 
   function headerFor(agent) {
-    const head = el('div', 'adir-head');
+    const box = el('div', 'adir-head'), top = el('div', 'adir-top');
     const back = el('a', 'adir-back', '‹ Agents');
     back.href = standalone ? '#' : location.hash.split('/').slice(0, 2).join('/');
-    pill = el('span', 'adir-pill');
-    beat = el('span', 'adir-sub adir-beat');
-    head.append(back, el('h2', null, agent.name), el('span', 'adir-sub adir-kind', agent.kind), pill, beat, el('span', 'adir-sp'));
-    return head;
+    const status = el('span'), now = el('p', 'adir-now'), meta = el('div', 'adir-meta2');
+    top.append(back, el('h2', null, agent.name), status);
+    box.append(top, now, meta);
+    head = {box, status, now, meta};
+    return box;
   }
 
   function updateHead(agent) {
-    if (!pill) return;
-    if (!view) { pill.textContent = agent.status; pill.style.color = STATUS_COLOR[agent.status] || 'inherit'; }
-    beat.textContent = 'last beat ' + ago(agent.age);
-    if (composer) composer.update(agent);
+    if (!head) return;
+    const info = describe(agent, summaryOf(agent.name));
+    const [state, label] = viewStatus && !summaryOf(agent.name) ? viewStatus : [info.state, info.label];
+    head.status.replaceChildren(chip(state, label));
+    if (viewStatus && viewStatus[2]) head.status.title = viewStatus[2];
+    head.now.hidden = !info.doing && !info.waiting;
+    head.now.replaceChildren(el('b', null, 'Now'), info.doing + (info.doing && info.waiting ? ' ' : ''),
+      el('span', 'adir-wait', info.waiting));
+    const parts = [info.detail, info.model].filter(Boolean).map((t) => el('span', null, t));
+    if (info.tokens != null) parts.push(meter(info));
+    parts.push(el('span', null, 'Last activity ' + ago(agent.age)));
+    head.meta.replaceChildren(...parts);
+    if (comp) comp.update(ctx.canAct, READ_ONLY, replies, agent.steer_messages);
   }
 
   async function showAgent(agent) {
     shown = agent.name;
-    composer = null;
+    comp = null; viewStatus = null;
+    detail.classList.toggle('full', !!agent.can_tail);
     detail.replaceChildren(headerFor(agent));
-    updateHead(agent);
     if (agent.can_steer_pull) {
-      composer = steerComposer(agent, ctx, base);
-      detail.append(composer.form);
+      comp = composer({name: agent.name, send: steerSend(base, agent.name, ctx.signal),
+        hint: 'Arrives at its next tool call.', sink: () => view && view.note});
     }
+    updateHead(agent);
     if (agent.can_tail) {
       const host = el('div', 'adir-view');
       detail.append(host);
+      if (comp) detail.append(comp.form);
       try {
         const mod = await import(base + 'transcript.js');
         if (shown !== agent.name || stopped) return;
         view = mod.mount(host, {url: base + 'api/agents/' + encodeURIComponent(agent.name) + '/transcript',
           css: base + 'transcript.css'});
       } catch (err) {
-        if (shown === agent.name && !stopped) detail.append(el('p', 'adir-note', 'Transcript unavailable: ' + err.message));
+        if (shown === agent.name && !stopped) host.append(el('p', 'adir-note', 'Transcript unavailable: ' + err.message));
       }
       return;
     }
+    if (comp) detail.append(comp.form);
     if (!agent.can_view) {
       detail.append(el('p', 'adir-note', agent.kind === 'hermes'
         ? agent.name + ' has not registered a live view, so only its presence shows here.'
-        : 'No live view for ' + agent.kind + ' agents yet; this shows presence only.'));
+        : agent.name + ' does not share its transcript, so only its presence shows here.'));
       return;
     }
     const host = el('div', 'adir-view'), note = el('p', 'adir-note', 'Connecting to ' + agent.name + '…');
@@ -347,11 +499,10 @@ export function mount(el0, ctx = {}) {
         permalink: (session, id) => location.origin + location.pathname + hrefOf(makeRoute(agent.name, session, id)),
         storePrefix: 'agentdir.' + agent.name + '.',
         onStatus: (s) => {
-          if (pill) {
-            pill.textContent = VIEW_STATUS[s.kind] || 'idle';
-            pill.title = s.text || '';
-            pill.style.color = s.kind === 'off' ? 'var(--block,inherit)' : s.busy ? 'var(--run,inherit)' : 'var(--t2,inherit)';
-          }
+          const [state, label] = VIEW_STATUS[s.kind] || (s.busy ? VIEW_STATUS.busy : VIEW_STATUS['']);
+          viewStatus = [state, label, s.text || ''];
+          const current = agents.find((a) => a.name === agent.name);
+          if (current) updateHead(current);
           unread[agent.name] = s.unread || 0;
           renderList();
         },
@@ -367,12 +518,16 @@ export function mount(el0, ctx = {}) {
     wrap.classList.toggle('picked', !!route.name);
     const agent = agents.find((a) => a.name === route.name);
     if (!route.name) {
-      shown = null;
+      shown = null; head = null;
+      detail.classList.remove('full');
       detail.replaceChildren(el('p', 'adir-note', 'Pick an agent to see it live.'));
       return;
     }
     if (!agent) {
-      if (shown !== route.name) detail.replaceChildren(el('p', 'adir-note', route.name + ' is not registered.'));
+      if (shown !== route.name) {
+        head = null; detail.classList.remove('full');
+        detail.replaceChildren(el('p', 'adir-note', route.name + ' is not registered.'));
+      }
       return;
     }
     if (shown !== agent.name) showAgent(agent);
@@ -389,7 +544,7 @@ export function mount(el0, ctx = {}) {
     renderList(); showRoute();
   };
   if (standalone) window.addEventListener('hashchange', onHash);
-  const stopPoll = poller(ctx, (data) => { agents = data; renderList(); showRoute(); }, error);
+  const stopPoll = poller(ctx, (data, quick) => { agents = data; replies = quick; renderList(); showRoute(); }, error);
   showRoute();
   const cleanup = () => {
     stopped = true; stopPoll();
@@ -400,22 +555,57 @@ export function mount(el0, ctx = {}) {
   return cleanup;
 }
 
-// Fleet quick view: presence for every agent; a view-capable one adds its last few transcript lines (live over
-// the sidecar's /events), a one-line composer and stop/steer. The broker panel supplies "Open full view".
-const QUICK_ROWS = 5;
+// Fleet quick view: works on its own without opening the full view. What the agent is doing and who it waits on
+// (from the host summary), last activity, model and context, its last few transcript lines streaming live, and a
+// composer with quick replies. Claude Code and Codex lines come from the tail; hermes lines from its sidecar.
+const QUICK_ROWS = 6;
 const QUICK_CSS = `
-.aqv{display:grid;gap:8px;color:var(--t1,inherit)}
-.aqv-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.aqv-head b{font-size:15px}
-.aqv-pill{font-size:12px;padding:2px 8px;border-radius:999px;border:1px solid currentColor}
-.aqv-sub{font-size:12px;color:var(--t3,inherit)}
-.aqv-rows{list-style:none;margin:0;padding:8px 10px;display:grid;gap:4px;background:var(--s2,transparent);
-  border-radius:8px;font-size:13px}
+.aqv{display:grid;gap:14px;color:var(--t1,inherit)}
+.aqv-top{display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:13px;color:var(--t2)}
+.aqv-now{display:grid;gap:8px;padding:14px 16px;border-radius:12px;background:var(--s2)}
+.aqv-now[hidden]{display:none}
+.aqv-lbl{font-size:12px;font-weight:600;color:var(--t2)}
+.aqv-now p{margin:0;font-size:15px;overflow-wrap:anywhere}
+.aqv-wait{display:flex;align-items:center;gap:8px;padding:8px 12px;border-radius:10px;font-weight:600;color:var(--wait);
+  background:color-mix(in srgb,var(--wait) 13%,var(--s1))}
+.aqv-wait::before{content:'';flex:none;width:10px;height:10px;box-sizing:border-box;border-radius:50%;border:2px solid currentColor}
+.aqv-wait:empty{display:none}
+.aqv-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+.aqv-stats div{padding:10px 12px;border:1px solid var(--line);border-radius:10px;min-width:0}
+.aqv-stats span{display:block;font-size:12px;color:var(--t2)}
+.aqv-stats b{display:block;font-size:15px;font-weight:650;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.aqv-stats .ad-meter{display:block;width:100%;margin:6px 0 0}
+.aqv-live{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:var(--t2)}
+.aqv-live::before{content:'';width:8px;height:8px;border-radius:50%;background:var(--t3)}
+.aqv-live.on::before{background:var(--run)}
+.aqv-rows{list-style:none;margin:0;padding:0;display:grid;gap:10px;font-size:14px}
 .aqv-rows:empty{display:none}
-.aqv-rows li{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}
-.aqv-who{font-weight:600;margin-right:6px;color:var(--t2,inherit)}
-.aqv-form{display:flex;gap:6px;flex-wrap:wrap}.aqv-form input{flex:1;min-width:160px}`;
+.aqv-rows li{display:grid;grid-template-columns:22px minmax(0,1fr) auto;gap:10px;align-items:start}
+.aqv-ic{width:22px;height:22px;border-radius:6px;display:grid;place-items:center;font-size:12px;
+  color:var(--brand);background:color-mix(in srgb,var(--brand) 13%,var(--s1))}
+.aqv-ic.agent{color:var(--run);background:color-mix(in srgb,var(--run) 13%,var(--s1))}
+.aqv-ic.user{color:var(--t2);background:var(--s3)}
+.aqv-tx{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}
+.aqv-tx code{font-family:ui-monospace,SFMono-Regular,"JetBrains Mono",Menlo,monospace;font-size:12.5px;color:var(--t2)}
+.aqv-who{font-weight:600;margin-right:6px;color:var(--t2)}
+.aqv-ts{font-size:12px;color:var(--t3);font-variant-numeric:tabular-nums;white-space:nowrap}
+.aqv-sub{margin:0;font-size:12px;color:var(--t2)}
+.aqv .ad-comp{margin:0 -24px -24px;padding-left:24px;padding-right:24px;position:sticky;bottom:0}
+.aqv .ad-qr{margin:0 -24px;padding:0 24px}
+${COMPOSER_CSS}
+.ad-st{display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:600;padding:2px 10px;border-radius:999px;
+  white-space:nowrap;color:var(--t2);background:color-mix(in srgb,currentColor 13%,var(--s1))}
+.ad-st::before{content:'';flex:none;box-sizing:border-box;width:8px;height:8px;border-radius:50%;border:1.5px solid var(--t3)}
+.ad-st.run{color:var(--run)}.ad-st.run::before{border:0;background:currentColor}
+.ad-st.wait{color:var(--wait)}.ad-st.wait::before{border:2px solid currentColor}
+.ad-st.block{color:var(--block)}.ad-st.block::before{border:0;border-radius:2px;background:currentColor}
+.ad-st.off{color:var(--t3)}.ad-st.off::before{border:0;height:2px;border-radius:1px;background:currentColor}
+.ad-meter{height:6px;border-radius:3px;background:var(--s3);overflow:hidden}
+.ad-meter i{display:block;height:100%;background:var(--brand)}.ad-meter.warm i{background:var(--wait)}.ad-meter.hot i{background:var(--block)}
+@media (max-width:720px){.aqv .ad-comp{margin:0 -16px -16px;padding-left:16px;padding-right:16px}
+  .aqv .ad-qr{margin:0 -16px;padding:0 16px}}`;
 
-// One transcript row as [who, text], or null for rows not worth a quick-view line (tool results, empty steps).
+// One hermes transcript row as [who, text], or null for rows not worth a quick-view line (tool results, empty steps).
 export function rowSummary(row, agentName) {
   if (!row || typeof row !== 'object') return null;
   const calls = Array.isArray(row.tool_calls) ? row.tool_calls : [];
@@ -443,46 +633,128 @@ export function tailRows(have, more, n = QUICK_ROWS) {
   return [...byId.values()].sort((a, b) => a.id - b.id).slice(-n);
 }
 
+const base0 = (p) => String(p || '').split('/').filter(Boolean).pop() || '';
+// A tool call in a few words: what ran or what it touched, never its full input.
+export function toolLine(name, input) {
+  const i = input && typeof input === 'object' ? input : {};
+  const short = (v) => String(v).replace(/\s+/g, ' ').slice(0, 120);
+  if (i.description) return [String(name), short(i.description)];
+  if (i.command) return ['Ran', short(i.command)];
+  if (i.file_path || i.notebook_path) return [/^(Edit|MultiEdit|Write|NotebookEdit)$/.test(name) ? 'Edited' : String(name),
+    base0(i.file_path || i.notebook_path)];
+  if (i.pattern) return [String(name), short(i.pattern)];
+  if (i.url || i.query) return [String(name), short(i.url || i.query)];
+  return [String(name), ''];
+}
+
+// Quick-view lines from one Claude Code transcript record: {kind: agent|tool|user, who, text, code, ts}[].
+// Bookkeeping, tool results, meta prompts and harness tags are not conversation and give no line.
+export function transcriptLines(record, agentName) {
+  if (!record || typeof record !== 'object' || record.isMeta || record.isSidechain) return [];
+  const m = record.message, ts = Date.parse(record.timestamp || '') || null;
+  if (!m || typeof m !== 'object') return [];
+  const blocks = typeof m.content === 'string' ? [{type: 'text', text: m.content}] : Array.isArray(m.content) ? m.content : [];
+  const out = [];
+  for (const b of blocks) {
+    if (!b || typeof b !== 'object') continue;
+    if (record.type === 'assistant' && b.type === 'text' && b.text && b.text.trim())
+      out.push({kind: 'agent', who: agentName || 'agent', text: plainText(b.text.trim()), ts});
+    else if (record.type === 'assistant' && b.type === 'tool_use') {
+      const [verb, code] = toolLine(b.name || 'tool', b.input);
+      out.push({kind: 'tool', who: 'tool', text: verb, code, ts});
+    } else if (record.type === 'user' && b.type === 'text' && b.text && !/^\s*</.test(b.text) && b.text.trim())
+      out.push({kind: 'user', who: 'user', text: plainText(b.text.trim()), ts});
+  }
+  return out;
+}
+
 const clock = (ms) => new Date(ms).toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'});
-const beatText = (age) => 'last beat ' + ago(age) + ' (' + clock(Date.now() - age * 1000) + ')';
 
 export function quickView(el0, agentName, ctx = {}) {
   const base = ctx.baseUrl || '/';
   const api = base + 'api/a/' + encodeURIComponent(agentName) + '/';
-  const wrap = el('div', 'aqv'), head = el('div', 'aqv-head');
-  const pill = el('span', 'aqv-pill'), beat = el('span', 'aqv-sub'), kind = el('span', 'aqv-sub');
-  head.append(el('b', null, agentName), kind, pill, beat);
-  const rowsEl = el('ol', 'aqv-rows'); rowsEl.setAttribute('aria-live', 'polite');
-  // Presence errors (the poller clears its own on every success) and action/stream errors stay separate.
+  const summaryOf = () => { try { return ctx.agentSummary ? ctx.agentSummary(agentName) : null; } catch (e) { return null; } };
+  const wrap = el('div', 'aqv'), top = el('div', 'aqv-top'), status = el('span'), detailT = el('span');
+  top.append(status, detailT);
+  const nowBox = el('div', 'aqv-now'), doing = el('p'), waiting = el('div', 'aqv-wait');
+  nowBox.append(el('span', 'aqv-lbl', 'Doing now'), doing, waiting);
+  const stats = el('div', 'aqv-stats');
+  const stat = (label) => { const d = el('div'), v = el('b'); d.append(el('span', null, label), v); stats.append(d); return [d, v]; };
+  const [, lastV] = stat('Last activity'), [, modelV] = stat('Model'), [ctxD, ctxV] = stat('Context');
+  const ctxBar = el('span'); ctxD.append(ctxBar);
+  const liveEl = el('div', 'aqv-live', 'Live'), rowsEl = el('ol', 'aqv-rows');
+  rowsEl.setAttribute('aria-live', 'polite');
+  // Presence errors (the poller clears its own on every success) and stream errors stay separate.
   const live = el('p', 'aqv-sub'), error = el('p', 'aqv-sub'), note = el('p', 'aqv-sub');
   error.setAttribute('role', 'status'); note.setAttribute('role', 'status');
-  const form = el('form', 'aqv-form'), input = el('input');
-  input.type = 'text'; input.maxLength = 8000; input.setAttribute('aria-label', 'Message ' + agentName);
-  input.placeholder = 'Message ' + agentName + '…';
-  const send = el('button', 'btn', 'Send'), steer = el('button', 'btn', 'Steer'), stopB = el('button', 'btn', 'Stop');
-  send.type = 'submit'; steer.type = 'button'; stopB.type = 'button';
-  form.append(input, send, steer, stopB); form.hidden = true;
-  wrap.append(head, rowsEl, live, form, note, error);
+  wrap.append(top, nowBox, stats, liveEl, rowsEl, live, note, error);
   el0.replaceChildren(el('style', null, QUICK_CSS), wrap);
 
-  let stopped = false, started = false, es = null, session = null, rows = [], running = false, canAct = false,
-    busyPost = false;
+  let stopped = false, started = false, es = null, session = null, rows = [], lines = [], running = false, agent = null,
+    replies = [], comp = null, mode = null;
   const controller = new AbortController();
 
-  function paintControls() {
-    for (const b of [send, steer, stopB, input]) b.disabled = !canAct || busyPost;
-    steer.hidden = stopB.hidden = !running;
-    send.title = steer.title = stopB.title = input.title = canAct ? '' : ctx.canAct
-      ? agentName + ' does not accept messages from here.'
-      : 'Read-only: sending needs the broker actions permission.';
+  function paintSummary() {
+    const info = describe(agent, summaryOf());
+    status.replaceChildren(chip(info.state, info.label));
+    detailT.textContent = info.detail;
+    nowBox.hidden = !info.doing && !info.waiting;
+    doing.textContent = info.doing; doing.hidden = !info.doing;
+    waiting.textContent = info.waiting;
+    lastV.textContent = agent ? ago(agent.age) : '-';
+    modelV.textContent = info.model || (agent ? KIND[agent.kind] || agent.kind : '-');
+    ctxD.hidden = info.tokens == null;
+    ctxV.textContent = info.tokens == null ? '' : kTok(info.tokens);
+    ctxBar.replaceChildren(...[info.tokens != null && info.limit && meter(info).querySelector('.ad-meter')].filter(Boolean));
   }
 
   function paintRows() {
-    rowsEl.replaceChildren(...rows.map((r) => {
-      const [who, text] = rowSummary(r, agentName), li = el('li');
-      li.append(el('span', 'aqv-who', who), document.createTextNode(text));
+    const items = mode === 'tail' ? lines : rows.map((r) => {
+      const [who, text] = rowSummary(r, agentName);
+      return {kind: who === 'tool' ? 'tool' : who === agentName ? 'agent' : 'user', who, text,
+        ts: Number.isFinite(r.ts) ? r.ts * 1000 : null};
+    });
+    rowsEl.replaceChildren(...items.map((it) => {
+      const li = el('li'), tx = el('span', 'aqv-tx');
+      li.append(el('span', 'aqv-ic ' + it.kind, it.kind === 'tool' ? '⚙' : it.kind === 'agent' ? '✦' : '›'));
+      if (it.kind === 'user') tx.append(el('span', 'aqv-who', it.who));
+      tx.append(it.text);
+      if (it.code) tx.append(' ', el('code', null, it.code));
+      li.append(tx, el('span', 'aqv-ts', it.ts ? clock(it.ts) : ''));
       return li;
     }));
+  }
+
+  function paintComposer() {
+    if (!comp || !agent) return;
+    const ok = !!ctx.canAct && (mode === 'tail' ? agent.can_steer_pull : agent.can_steer);
+    comp.update(ok, ctx.canAct ? agentName + ' does not accept messages from here.' : READ_ONLY, replies, agent.steer_messages);
+    if (mode === 'view') comp.extra(running ? [steerB, stopB] : []);
+  }
+
+  // Claude Code / Codex: the tail stream. Keep the newest few conversation lines.
+  function startTail() {
+    mode = 'tail';
+    let retry = null;
+    const connect = () => {
+      if (stopped) return;
+      es = new EventSource(base + 'api/agents/' + encodeURIComponent(agentName) + '/transcript');
+      es.onopen = () => { liveEl.classList.add('on'); note.textContent = ''; };
+      es.onmessage = (m) => {
+        let r; try { r = JSON.parse(m.data); } catch (e) { return; }
+        const more = transcriptLines(r, agentName);
+        if (more.length) { lines = lines.concat(more).slice(-QUICK_ROWS); paintRows(); }
+      };
+      es.addEventListener('reset', () => { lines = []; paintRows(); });
+      es.addEventListener('end', () => { liveEl.classList.remove('on'); es.close(); retry = setTimeout(connect, 2000); });
+      es.onerror = () => {
+        liveEl.classList.remove('on');
+        if (!stopped) note.textContent = 'Reconnecting to ' + agentName + '…';
+        if (es.readyState === EventSource.CLOSED && !retry) retry = setTimeout(() => { retry = null; connect(); }, 2000);
+      };
+    };
+    controller.signal.addEventListener('abort', () => clearTimeout(retry));
+    connect();
   }
 
   function onFrame(p) {
@@ -490,12 +762,9 @@ export function quickView(el0, agentName, ctx = {}) {
     rows = tailRows(rows, p.rows); paintRows();
     const run = p.live && !p.live.ended ? p.live : null;
     running = !!(run && run.run_id && (run.status === 'running' || run.status === 'starting'));
-    const busy = !!(p.waiting || run);
-    pill.textContent = p.compacting ? 'compacting' : busy ? 'busy' : 'idle';
-    pill.style.color = busy ? 'var(--run,inherit)' : 'var(--t2,inherit)';
     live.textContent = run ? 'Working' + (run.stage ? ': ' + run.stage : run.tool ? ': ' + run.tool : '') + '…'
       : p.waiting ? 'Working: ' + (p.phase || 'model') + (Number.isFinite(p.since_ts) ? ' since ' + clock(p.since_ts * 1000) : '') : '';
-    paintControls();
+    paintComposer();
   }
 
   async function backfill() {
@@ -507,7 +776,9 @@ export function quickView(el0, agentName, ctx = {}) {
     } catch (e) { /* the stream still shows new rows */ }
   }
 
-  async function startStream() {
+  // hermes: the sidecar's event stream, through this module's proxy.
+  async function startView() {
+    mode = 'view';
     try {
       const r = await viewFetch(api + 'cfg', {signal: controller.signal});
       const cfg = await r.json();
@@ -515,60 +786,63 @@ export function quickView(el0, agentName, ctx = {}) {
       if (stopped) return;
       session = cfg.session && cfg.session !== '*' ? cfg.session : cfg.main;
       if (!session) { live.textContent = agentName + ' has no session yet.'; return; }
-      form.hidden = false; paintControls();
       let first = true;
       es = new EventSource(api + 'events?session=' + encodeURIComponent(session), {withCredentials: true});
+      es.onopen = () => liveEl.classList.add('on');
       es.onmessage = (m) => {
         let p; try { p = JSON.parse(m.data); } catch (e) { return; }
-        note.textContent = '';
+        note.textContent = ''; liveEl.classList.add('on');
         onFrame(p);
         if (first) { first = false; if (rows.length < QUICK_ROWS) backfill(); }
       };
-      es.onerror = () => { if (!stopped) note.textContent = 'Reconnecting to ' + agentName + '…'; };
+      es.onerror = () => { liveEl.classList.remove('on'); if (!stopped) note.textContent = 'Reconnecting to ' + agentName + '…'; };
     } catch (err) {
       if (!stopped) live.textContent = 'Live view unavailable: ' + err.message;
     }
   }
 
   async function post(route, body) {
-    busyPost = true; paintControls();
-    try {
-      const r = await viewFetch(api + route, {method: 'POST', signal: controller.signal,
-        headers: {'Content-Type': 'application/json'}, body: JSON.stringify({session, ...body})});
-      let j = {}; try { j = await r.json(); } catch (e) { j = {}; }
-      if (!r.ok) throw new Error(j.error || 'HTTP ' + r.status);
-      note.textContent = '';
-      return true;
-    } catch (err) {
-      if (!stopped) note.textContent = 'Could not ' + route + ': ' + err.message;
-      return false;
-    } finally { busyPost = false; if (!stopped) paintControls(); }
+    const r = await viewFetch(api + route, {method: 'POST', signal: controller.signal,
+      headers: {'Content-Type': 'application/json'}, body: JSON.stringify({session, ...body})});
+    let j = {}; try { j = await r.json(); } catch (e) { j = {}; }
+    if (!r.ok) throw new Error(j.error || 'HTTP ' + r.status);
+    return true;
   }
-
-  form.onsubmit = async (e) => {
-    e.preventDefault();
-    const message = input.value.trim();
-    if (message && await post('say', {message})) input.value = '';
-  };
-  steer.onclick = async () => {
-    const message = input.value.trim();
+  const steerB = el('button', 'btn', 'Steer'), stopB = el('button', 'btn', 'Stop');
+  steerB.type = stopB.type = 'button';
+  steerB.title = 'Pass the typed text to the running turn';
+  steerB.onclick = async () => {
+    const message = comp.input.value.trim();
     if (!message) { note.textContent = 'Type the steer message first.'; return; }
-    if (await post('steer', {message})) input.value = '';
+    try { await post('steer', {message}); comp.input.value = ''; note.textContent = ''; }
+    catch (err) { note.textContent = 'Could not steer: ' + err.message; }
   };
-  stopB.onclick = () => post('stop', {});
+  stopB.onclick = async () => {
+    try { await post('stop', {}); note.textContent = ''; } catch (err) { note.textContent = 'Could not stop: ' + err.message; }
+  };
 
-  const stopPoll = poller(ctx, (agents) => {
-    const agent = agents.find((a) => a.name === agentName);
-    if (!agent) { pill.textContent = 'gone'; beat.textContent = ''; kind.textContent = agentName + ' is not registered.'; return; }
-    kind.textContent = agent.kind;
-    beat.textContent = beatText(agent.age);
-    canAct = !!(ctx.canAct && agent.can_steer);
-    if (!agent.can_view) {
-      pill.textContent = agent.status; pill.style.color = STATUS_COLOR[agent.status] || 'inherit';
+  const stopPoll = poller(ctx, (agents, quick) => {
+    agent = agents.find((a) => a.name === agentName) || null;
+    replies = quick;
+    if (!agent) {
+      status.replaceChildren(chip('off', 'Gone')); detailT.textContent = agentName + ' is not registered.';
       return;
     }
-    if (!started) { started = true; startStream(); }
-    paintControls();
+    paintSummary();
+    if (!started) {
+      started = true;
+      if (agent.can_tail) startTail();
+      else if (agent.can_view) startView();
+      else { liveEl.hidden = true; live.textContent = agentName + ' does not share its transcript, so only its presence shows here.'; }
+      if (agent.can_steer_pull && mode === 'tail') {
+        comp = composer({name: agentName, send: steerSend(base, agentName, controller.signal),
+          hint: 'Arrives at ' + agentName + "'s next tool call."});
+      } else if (mode === 'view') {
+        comp = composer({name: agentName, max: 8000, hint: 'Sends a new message.', send: (message) => post('say', {message})});
+      }
+      if (comp) wrap.append(comp.form);
+    }
+    paintComposer();
   }, error);
 
   const cleanup = () => {

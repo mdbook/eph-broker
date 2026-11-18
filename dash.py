@@ -894,6 +894,7 @@ PAGE = r"""<!DOCTYPE html>
   button:disabled{opacity:.5;cursor:default}
   a{color:inherit}
   :focus-visible{outline:2px solid var(--brand);outline-offset:2px}
+  [tabindex="-1"]:focus-visible{outline:none}   /* focused by script for screen readers, not by the keyboard */
 
   /* ---- header: brand, view tabs, paused chip, theme */
   .top{position:sticky;top:0;z-index:5;background:var(--s1);border-bottom:1px solid var(--line)}
@@ -1221,6 +1222,7 @@ PAGE = r"""<!DOCTYPE html>
     .page{padding:8px 12px calc(76px + env(safe-area-inset-bottom))}
     body[data-detail] .page{padding-bottom:calc(16px + env(safe-area-inset-bottom))}
     footer.page{padding:0 16px calc(72px + env(safe-area-inset-bottom))}
+    body[data-detail] footer.page{display:none}
     .toast{bottom:calc(72px + env(safe-area-inset-bottom))}
     /* The view name lives in the top bar; only Fleet (mode chip) and run detail (title) keep a page head. */
     #v-now > .ph,#v-runs > .ph,#v-queue > .ph,#v-settings > .ph{display:none}
@@ -2394,12 +2396,12 @@ function restorePlace(place){
   observer.observe(document.querySelector('main'), {childList: true, subtree: true});
   setTimeout(() => observer.disconnect(), 5000);
 }
-function openDetailSheet(title, origin, cleanup = () => {}){
+function openDetailSheet(title, origin, cleanup = () => {}, ...headExtras){
   if(detailSheet) detailSheet.close();
   const dialog = el('dialog', 'detail-sheet'), head = el('div', 'detail-head');
   const heading = el('h2', null, title), close = el('button', 'btn', 'Close'), content = el('div', 'side');
   heading.id = 'detail-sheet-title'; dialog.setAttribute('aria-labelledby', heading.id);
-  head.append(heading, close); dialog.append(head, content);
+  head.append(heading, ...headExtras, close); dialog.append(head, content);
   const sheet = {dialog, content, place: rememberPlace(origin), closed: false, close: (restore = true) => {
     if(sheet.closed) return;
     sheet.closed = true;
@@ -2485,8 +2487,14 @@ def module_page(modules):
     page = PAGE.replace("function route(){\n", "function route(){\n  if(moduleRoute()) return;\n")
     # A compact button beside the agent name, so it does not crowd the name or push the role line down.
     page = page.replace("</style>", ".ag .an [data-quick-module]{height:26px;min-width:0;padding:0 10px;margin-left:10px;"
-                        "font-size:12.5px;vertical-align:1px}\n@media (max-width:720px){"
-                        + ".tbl td [data-quick-module]{display:inline-flex}}\n</style>")
+                        "font-size:12.5px;vertical-align:1px}\n.detail-sheet.quick .detail-head{gap:12px}"
+                        ".detail-sheet.quick .detail-head h2{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}"
+                        ".detail-sheet.quick .detail-head .lnk{display:inline-flex;align-items:center;white-space:nowrap}"
+                        ".detail-sheet.quick .detail-head .btn{min-width:0;padding:0 14px}\n"
+                        "@media (max-width:720px){.tbl td [data-quick-module]{display:inline-flex}"
+                        # Phone: the quick view rises from the bottom edge, where the thumb already is.
+                        ".detail-sheet.quick{width:100%;max-width:100%;margin:auto 0 0;border-radius:16px 16px 0 0;"
+                        "border-bottom:0;max-height:calc(100dvh - 48px)}}\n</style>")
     page = page.replace("function toggleAgent(e){\n",
                         "function toggleAgent(e){\n  if(e.target.closest('[data-quick-module]')) return;\n")
     page = page.replace("+ '<td><div class=\"an\"><b>' + esc(a.name ?? '?') + '</b>'",
@@ -2514,8 +2522,19 @@ for(const m of viewerModules){
   }
   viewerRuntime.set(m.name, {section, index: new Set(), cleanup: null, abort: null, token: null, js: null});
 }
+// What Fleet knows about an agent, for module views: status, its NOW line, model and context.
+function agentSummary(name){
+  const a = ((lastState && lastState.fleet && lastState.fleet.agents) || []).find(x => String(x.name) === name);
+  if(!a) return null;
+  const [state, label] = agentStatus(a), m = effModel(a);
+  return {state, label, doing: a.ledger_source === 'now' && a.ledger ? String(a.ledger) : '', model: m.label || '',
+    context_tokens: a.context_state === 'ok' && a.ctx_tokens != null ? a.ctx_tokens : null,
+    context_limit: a.context_ceiling || a.context_window || null,
+    detail: [a.agent_type === 'tfa' ? 'Temporary' : '', HARNESS[a.runtime] || (a.runtime === 'claude' ? 'Claude Code' : a.runtime)]
+      .filter(Boolean).join(' · ')};
+}
 function viewerContext(m, signal, agentName){
-  return {baseUrl: '/viewer/' + m.name + '/', canAct: can, signal, agentName,
+  return {baseUrl: '/viewer/' + m.name + '/', canAct: can, signal, agentName, agentSummary,
     openAgent: name => { location.hash = '#module/' + m.name + '/' + encodeURIComponent(name); }};
 }
 function moduleRoute(){
@@ -2606,14 +2625,14 @@ $('f-rows').addEventListener('click', async e => {
   const m = viewerModules.find(m => m.name === button.dataset.quickModule), name = button.dataset.quickAgent;
   closeQuickViewer(); quickAbort = new AbortController(); const abort = quickAbort;
   quickName = m.name; quickStatus = JSON.stringify(viewerStatus[m.name]);
-  quickSheet = openDetailSheet('Quick view: ' + name, button, () => {
+  const full = el('a', 'lnk', 'Full view ›');
+  full.href = '#module/' + m.name + '/' + encodeURIComponent(name);
+  quickSheet = openDetailSheet(name, button, () => {
     abort.abort();
     if(typeof quickCleanup === 'function'){ try{ quickCleanup(); }catch(e){} }
     quickCleanup = null; quickAbort = null; quickName = null; quickSheet = null;
-  });
-  const full = el('a', 'btn', 'Open full view');
-  full.href = '#module/' + m.name + '/' + encodeURIComponent(name);
-  quickSheet.content.appendChild(full);
+  }, full);
+  quickSheet.dialog.classList.add('quick');
   const content = el('div'); quickSheet.content.appendChild(content);
   try{
     const js = await viewerCode(m, viewerStatus[m.name]);

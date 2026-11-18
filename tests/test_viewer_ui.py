@@ -98,9 +98,10 @@ class UI(ViewerTest):
         # Standalone users cannot manufacture the host's action grant.
         assert not UIAuth(socket_peer=False, basic=b'demo:password').can_act({'X-Viewer-Can-Act': '1'})
         script = request(directory, '/ui.js', 'X-Forwarded-User: operator\r\n')[1]
-        assert b'Waiting for next tool call' in script and b'Delivered' in script
-        assert b'input.maxLength = 4000' in script and b'composer.update(agent)' in script
-        assert b'if (agent.can_steer_pull)' in script and b'input.disabled = send.disabled = !ctx.canAct' in script
+        assert b'Queued' in script and b'next tool call' in script and b'Delivered' in script
+        assert b'input.maxLength = opts.max || 4000' in script and b'comp.update(ctx.canAct, READ_ONLY' in script
+        assert b'if (agent.can_steer_pull)' in script and b'b.disabled = !canSend || busy' in script
+        assert b"const ok = !!ctx.canAct && (mode === 'tail' ? agent.can_steer_pull : agent.can_steer)" in script
 
     def test_legacy_steer_cap_has_no_pull_composer_or_queue_access(self):
         directory = Directory(KEY, self.tmp_path, clock=lambda: 100)
@@ -452,7 +453,8 @@ console.log('ok');
         if not node:
             self.skipTest('node unavailable')
         script = """
-import {parseRoute, makeRoute, viewFetch, rowSummary, tailRows, plainText} from %s;
+import {parseRoute, makeRoute, viewFetch, rowSummary, tailRows, plainText, splitNow, describe, toolLine,
+  transcriptLines} from %s;
 const assert = (c, m) => { if (!c) { console.error('FAIL', m); process.exit(1); } };
 const r = makeRoute('books', 'a/b c', '42');
 assert(JSON.stringify(parseRoute(r)) === JSON.stringify({name: 'books', session: 'a/b c', id: '42'}), r);
@@ -479,10 +481,41 @@ let tail = tailRows([], [user, call, result], 2);
 assert(tail.map((r) => r.id).join() === '1,2', 'results dropped, order kept');
 tail = tailRows(tail, [{...call, content: 'edited'}, said, img], 3);
 assert(tail.map((r) => r.id).join() === '2,4,5' && tail[0].content === 'edited', 'merge by id, newest n');
+let now = splitNow('Fixing  sync, waiting on Sam to test (TV).');
+assert(now.doing === 'Fixing sync.' && now.waiting === 'Waiting on Sam to test (TV', JSON.stringify(now));
+assert(JSON.stringify(splitNow('Idle. Last: shipped X.')) === '{"doing":"Idle. Last: shipped X.","waiting":""}', 'no wait');
+assert(splitNow('blocked by #12').waiting === 'Blocked by #12' && splitNow(null).doing === '', 'blocked, empty');
+let d = describe({status: 'busy', kind: 'codex', age: 3}, null);
+assert(d.state === 'run' && d.label === 'Working' && d.detail === 'Codex' && d.tokens === null && d.age === 3, 'presence only');
+d = describe({status: 'idle', kind: 'claude-code'}, {state: 'wait', label: 'Needs you', doing: 'Shipping, waiting for CI',
+  model: 'opus', context_tokens: 70000, context_limit: 200000, detail: 'Temporary'});
+assert(d.state === 'wait' && d.label === 'Needs you' && d.waiting === 'Waiting for CI' && d.limit === 200000, 'summary wins');
+assert(describe({status: 'grey'}, {state: 'evil', doing: 7}).state === 'off' && describe(null, null).label === 'Unknown', 'untrusted');
+assert(JSON.stringify(toolLine('Bash', {command: 'ls', description: 'List files'})) === '["Bash","List files"]', 'desc');
+assert(JSON.stringify(toolLine('Edit', {file_path: '/a/b/ui.js', old_string: 'secret'})) === '["Edited","ui.js"]', 'edit');
+assert(toolLine('Bash', {command: 'x'.repeat(500)})[1].length === 120 && toolLine('Task', 5)[1] === '', 'short, odd input');
+const rec = (type, content, extra = {}) => ({type, timestamp: '2026-01-01T00:00:00Z', message: {content}, ...extra});
+let ls = transcriptLines(rec('assistant', [{type: 'text', text: '**Done**'}, {type: 'tool_use', name: 'Read',
+  input: {file_path: '/x/y.py'}}]), 'tail');
+assert(ls.length === 2 && ls[0].who === 'tail' && ls[0].text === 'Done' && ls[1].code === 'y.py' && ls[0].ts, 'assistant');
+assert(transcriptLines(rec('user', 'hi'))[0].kind === 'user', 'user text');
+assert(!transcriptLines(rec('user', '<command-name>/clear</command-name>')).length, 'harness tags');
+assert(!transcriptLines(rec('user', [{type: 'tool_result', content: 'x'}])).length, 'tool results');
+assert(!transcriptLines(rec('user', 'x', {isMeta: true})).length && !transcriptLines({type: 'system'}).length, 'meta');
 console.log('ok');
 """ % json.dumps((Path(__file__).parent.parent / 'viewer' / 'ui.js').as_uri())
         out = subprocess.run([node, '--input-type=module', '-e', script], capture_output=True, text=True, timeout=60)
         assert out.returncode == 0 and out.stdout.strip() == 'ok', out.stderr + out.stdout
+
+    def test_quick_replies_setting(self):
+        from viewer import server
+        assert server.quick_replies('') == server.QUICK_REPLIES and len(server.QUICK_REPLIES) == 3
+        assert server.quick_replies('[]') == []
+        assert server.quick_replies('["Status?", {"label": " Go ", "text": "Proceed"}]') == [
+            {'label': 'Status?', 'text': 'Status?'}, {'label': 'Go', 'text': 'Proceed'}]
+        for bad in ('{"a": 1}', 'not json', '[{"label": ""}]', '[%s]' % ','.join(['"x"'] * 9), '["%s"]' % ('x' * 41)):
+            with self.assertLogs('eph-broker.viewer', 'ERROR'):
+                assert server.quick_replies(bad) == server.QUICK_REPLIES, bad
 
     def test_http_signed_dispatch_and_body_limit(self):
         directory = Directory(KEY, self.tmp_path, clock=lambda: 100)

@@ -1136,7 +1136,7 @@ CSS = r"""  /* ---- timeline */
   .ev.user{background:var(--user);border-color:color-mix(in srgb,var(--accent) 22%,var(--line));align-self:flex-end;max-width:760px}
   .ev.user.you{align-self:stretch;max-width:880px}
   .ev.err{border-color:var(--red);background:color-mix(in srgb,var(--red) 7%,var(--panel))}
-  .ev-meta{display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--muted);margin-bottom:4px}
+  .ev-meta{display:flex;flex-wrap:wrap;align-items:center;gap:4px 8px;font-size:11.5px;color:var(--muted);margin-bottom:4px}
   .who{font-weight:650;color:var(--ink)}
   .ev.user .who{color:var(--accent)}
   .ev.you.pending{border-style:dashed}

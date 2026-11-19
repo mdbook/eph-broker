@@ -82,7 +82,7 @@ export function themeView(host) {
 }
 
 const COMPOSER_CSS = `
-.ad-comp{flex:none;display:grid;gap:8px;padding:10px 16px calc(10px + env(safe-area-inset-bottom));
+.ad-comp{flex:none;display:grid;grid-template-columns:minmax(0,1fr);gap:8px;padding:10px 16px calc(10px + env(safe-area-inset-bottom));
   border-top:1px solid var(--line);background:var(--s1)}
 .ad-qr{display:flex;gap:8px;overflow-x:auto;scrollbar-width:none;margin:0 -16px;padding:0 16px}
 .ad-qr::-webkit-scrollbar{display:none}
@@ -97,7 +97,7 @@ const COMPOSER_CSS = `
 .ad-send:disabled,.ad-qr button:disabled{opacity:.5;cursor:not-allowed}
 .ad-comp :focus-visible{outline:2px solid var(--brand);outline-offset:2px}
 .ad-hint{margin:0;font-size:12px;color:var(--t2)}
-.ad-sent{list-style:none;margin:0;padding:0;display:grid;gap:4px;font-size:13px}
+.ad-sent{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:minmax(0,1fr);gap:4px;font-size:13px}
 .ad-sent li{display:flex;gap:8px;justify-content:space-between}.ad-sent span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .ad-sent b{flex:none;font-weight:600;color:var(--t2)}.ad-sent b.ok{color:var(--run)}
 .ad-extra{display:flex;gap:8px}
@@ -560,7 +560,7 @@ export function mount(el0, ctx = {}) {
 // composer with quick replies. Claude Code and Codex lines come from the tail; hermes lines from its sidecar.
 const QUICK_ROWS = 6;
 const QUICK_CSS = `
-.aqv{display:grid;gap:14px;color:var(--t1,inherit)}
+.aqv{display:grid;grid-template-columns:minmax(0,1fr);gap:14px;color:var(--t1,inherit)}
 .aqv-top{display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:13px;color:var(--t2)}
 .aqv-now{display:grid;gap:8px;padding:14px 16px;border-radius:12px;background:var(--s2)}
 .aqv-now[hidden]{display:none}

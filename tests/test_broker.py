@@ -14513,7 +14513,8 @@ def test_codex_context_rendering():
 const assert = require('node:assert/strict');
 const esc = v => String(v).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmtNum = String, badge = () => '', clip = String;
-let fleetFilter = 'all', fleetBench = false;
+const PHONE = {matches: false};
+let fleetFilter = 'all', fleetBench = false, fleetIdle = false;
 const fleetOpen = new Set();
 const HARNESS = {cc: 'Claude Code', codex: 'Codex', hermes: 'Hermes'};
 const dom = {}, $ = id => dom[id] ||= {};
@@ -14557,6 +14558,11 @@ assert(!dom['f-rows'].innerHTML.includes('tfa-&lt;review&gt;') && dom['f-rows'].
 fleetBench = true;
 paintFleet({agents:[{...tfa, stood_down:true}]});
 assert(dom['f-rows'].innerHTML.includes('Stood down') && dom['f-rows'].innerHTML.includes('tfa-&lt;review&gt;'));
+PHONE.matches = true;
+paintFleet({agents:[a, {...a, name:'idle', busy:false, context_ceiling:250000}]});
+assert(dom['f-rows'].innerHTML.includes('class="grp-h"><td colspan="6">Needs attention 1'));
+assert(dom['f-rows'].innerHTML.includes('class="grp-h"><td colspan="6">Idle 1'));
+assert(dom['f-rows'].innerHTML.includes('222k of 250k'));
 console.log('context renderers: OK');
 '''
     result = subprocess.run([node, "-e", js + harness], capture_output=True, text=True, timeout=10)

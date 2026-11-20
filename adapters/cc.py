@@ -3669,6 +3669,18 @@ class CCAdapter(Adapter):
                 # mark completed, same as a real run; it just never needed the worktree cut to know that.
                 attempted = True
                 return
+            if getattr(route, "row_key", None) == "code/ui" and not route.browser_mcp_config:
+                # Missing UI plumbing is fixable, not a completed run. Never cut a worktree or silently
+                # launch a browser-free UI worker; use the existing waiting-on-operator ticket label.
+                log.warning("code UI spawn parked key=%s: CODE_BROWSER_MCP_CONFIG is unset", key)
+                self._post_ticket_note(key, (
+                    "<p><b>WAITING ON YOU:</b> no UI code worker was spawned (fail-closed). "
+                    "<code>CODE_BROWSER_MCP_CONFIG</code> is unset. This row requires an isolated "
+                    "Playwright browser.</p><p>Configure the browser MCP file, restart the broker, "
+                    "then re-trigger this ticket.</p>"), run_id, parked=True)
+                self._alert_ops(f"UI code worker {key} parked: CODE_BROWSER_MCP_CONFIG is unset "
+                                f"(browser required){self._dash_url(_ref)}", subject=f"reject:{key}")
+                return
             # A `model:<name>` ticket label picks this worker's model/backend (routing.apply_model_label:
             # pin wins, unknown name / untrusted creator picking a non-Anthropic backend: fail-closed). Read
             # off the FETCHED ticket (labels/created_by), so it holds even when the coalesced brief lost them.

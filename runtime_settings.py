@@ -261,6 +261,7 @@ ROWS = (
     ("_ANSIBLE_ROW", "ANSIBLE", "ANSIBLE"), ("_WIKI_DOCS_ROW", "WIKI_DOCS", "WIKI_DOCS"),
     ("_INBOX_ROW", "INBOX_TRIAGE", "INBOX_TRIAGE"), ("_ZULIP_INBOX_ROW", "INBOX_CHAT", "INBOX_CHAT"),
     ("_CODE_ROW", "CODE_CHANGE", "CODE_CHANGE"), ("_ISSUE_CODE_ROW", "ISSUE_CODE", "ISSUE_CODE"),
+    ("_CODE_UI_ROW", "CODE_UI", None),   # UI browser harness is fixed to cc
     ("_INFRA_ROW", "INFRA", "INFRA"), ("_INFRA_GENERAL_ROW", "INFRA_GENERAL", "INFRA_GENERAL"),
     ("_MR_REVIEW_ROW", "MR_REVIEWER", "MR_REVIEW"), ("_GENERAL_ROW", "GENERAL", "GENERAL"),
     ("_TFA_ROW", "TFA", None),
@@ -289,7 +290,8 @@ class RuntimeSettings:
             fields[backend + "_PIN"] = ("pin", flag)
             if backend == "MR_REVIEWER":
                 fields["MR_REVIEWER_MODEL"] = ("model_pin", text)
-            runner = {"CODE_CHANGE": "CODE", "ISSUE_CODE": "ISSUE_CODE", "INFRA": "INFRA"}.get(backend)
+            runner = {"CODE_CHANGE": "CODE", "CODE_UI": "CODE_UI", "ISSUE_CODE": "ISSUE_CODE",
+                      "INFRA": "INFRA"}.get(backend)
             if runner:
                 from adapters.cc import _CODE_TEST_RUNNERS
                 fields[runner + "_TEST_RUNNER"] = ("test_runner", choice("", *_CODE_TEST_RUNNERS))

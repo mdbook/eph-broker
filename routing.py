@@ -60,6 +60,8 @@ INBOX_CHAT_OPS_DM = os.getenv("OPS_HANDLE", "")
 # as the ansible/wiki rows). A Vikunja ticket carrying this label routes to the code-capable profile; its
 # absence stays read-only (capability is label-DECLARED, never inferred). See _CODE_ROW below.
 CODE_ROW_LABEL = os.getenv("CODE_ROW_LABEL", "eph:code-change")
+# A narrower UI label selects the browser-required Claude Code row before the generic code row.
+CODE_UI_ROW_LABEL = os.getenv("CODE_UI_ROW_LABEL", "eph:code-ui")
 
 # Assignee tier: the ASSIGNEE username that routes a Vikunja task to the code change-proposer
 # row WITHOUT requiring the eph:code-change LABEL. Unlike the *_ROW_LABEL knobs (matched against the
@@ -1008,6 +1010,8 @@ class Route:
         if self.adapter not in ADAPTERS:
             raise ValueError(f"Route {self.domain!r}: unknown adapter {self.adapter!r} "
                              f"(known: {', '.join(ADAPTERS)}) - refusing (fail-closed)")
+        if self.row_key == "code/ui" and self.adapter != "cc":
+            raise ValueError("Route 'code/ui': the UI browser row requires the cc harness (fail-closed)")
         if self.browser_mcp_config:
             # Fail at start, not mid-lane: the playwright grant is Claude Code only, and the
             # config it loads must be an isolated, logged-out, origin-restricted stdio server.
@@ -1180,8 +1184,10 @@ def apply_model_choice(route, name, trusted, backend_resolvable, creator=None):
 
 
 def _check_site_capability_adapter(route, adapter, source):
-    """Refuse choices that would drop the site capability's cc-only allow/deny rules.
+    """Refuse choices that would drop cc-only browser or site capability grants.
     Call before changing the route; the caller logs the refusal and aborts the spawn."""
+    if adapter != "cc" and getattr(route, "row_key", None) == "code/ui":
+        raise ValueError(f"{source}: the UI browser row requires the cc harness (fail-closed)")
     if adapter != "cc" and getattr(route, "site_capability", ""):
         raise ValueError(f"{source}: site capability {route.site_capability!r} runs on the cc harness only "
                          "(fail-closed)")
@@ -1553,14 +1559,9 @@ _ZULIP_INBOX_ROW = Route(
 # semantics UNCHANGED. The inbox row carries an explicit factory (`_source_signal_predicates`) because
 # mail-tap events have no label; `signal` there is the event SOURCE, not a label. First-match-wins order
 # is preserved: ansible, then wiki, then inbox.
-# The code lane's OPT-IN browser (playwright MCP). Unset (default) = no browser on any code
-# row, argv byte-identical to before. When set to the path of a playwright MCP config file, cc.build_argv
-# loads ONLY that server (--strict-mcp-config) and adds the reviewed cc._PLAYWRIGHT_TOOLS ids to the code
-# grant, so a dispatched code worker can navigate/click/screenshot a real page and return console/UI
-# evidence for a UI change. The config file is authored/placed out of band (ops), exactly like
-# GENERAL_MCP_CONFIG; this code only EXPOSES the path and fails closed if it is absent. Kept a single
-# module-level constant (not a per-row literal) so the ONE knob turns it on for the whole code lane and a
-# later routing edit cannot silently drop it from one row while leaving it on another.
+# Only the label-routed UI row gets the playwright MCP. Ordinary code/issue rows must stay browser-free,
+# even when they use codex and this knob is set (ticket 2960). An unset knob parks UI tickets at spawn,
+# not at import: the neutral quick start and every other row still work without a browser config.
 CODE_BROWSER_MCP_CONFIG = os.getenv("CODE_BROWSER_MCP_CONFIG", "")
 
 # The code change-proposer write row. Routes an `eph:code-change`-labelled ticket to
@@ -1584,7 +1585,6 @@ _CODE_ROW = Route(
     read_only=False,
     capability="code",                  # ENFORCED by cc.build_argv: acceptEdits + git-commit + scoped test-Bash, NO push
     test_runner=os.getenv("CODE_TEST_RUNNER", "pytest"),   # KEY into cc._CODE_TEST_RUNNERS; FALLBACK only, CODE_REPO_RUNNERS per-repo wins
-    browser_mcp_config=CODE_BROWSER_MCP_CONFIG,   # OPT-IN playwright MCP; "" = no browser
     env=_zbus_env("CODE_ZBUS_ENV"),   # LITERAL path (no slug resolution)
     publish={                           # filled by the publisher; code MRs push a FEATURE BRANCH and open an MR, NEVER push to main
         "code_repo_path": "",           # resolved per ticket before cutting a worktree
@@ -1598,6 +1598,25 @@ _CODE_ROW = Route(
     pin=_row_pin("CODE_CHANGE_PIN"),
     backend_from_mode=True,             # every row follows FLEET_MODE; a pin wins
     adapter=_row_adapter("CODE_CHANGE_ADAPTER"),
+)
+
+# Reuse the signed prompt, agent and feature-branch MR shape, but not the generic row's harness/backend.
+# A distinct stamp keeps collapsed briefs on the UI row and shares the code concurrency group.
+_CODE_UI_ROW = replace(
+    _CODE_ROW,
+    row_id="code/ui",
+    adapter="cc",                      # fixed, never CODE_CHANGE_ADAPTER (nor a per-ticket harness choice)
+    browser_mcp_config=CODE_BROWSER_MCP_CONFIG,
+    test_runner=os.getenv("CODE_UI_TEST_RUNNER", "pytest"),   # shared per-repo runner maps still win
+    env=_zbus_env("CODE_UI_ZBUS_ENV"),
+    publish={
+        "code_repo_path": "",
+        "mr_target_ref": os.getenv("CODE_UI_MR_TARGET_REF", "main"),
+        "branch_prefix": os.getenv("CODE_UI_BRANCH_PREFIX", "eph/code-change"),
+        "worktree_base": os.getenv("CODE_UI_WORKTREE_BASE", os.path.expanduser("~/.cache/ew/c")),
+    },
+    backend=os.getenv("CODE_UI_BACKEND", ""),
+    pin=_row_pin("CODE_UI_PIN"),
 )
 
 # GitHub/GitLab issue to code change-proposer row. Unlike _CODE_ROW (a Vikunja LABEL row), an issue
@@ -1617,7 +1636,6 @@ _ISSUE_CODE_ROW = Route(
     read_only=False,
     capability="code",                  # ENFORCED by cc.build_argv: acceptEdits + git-commit + test-Bash, NO push
     test_runner=os.getenv("ISSUE_CODE_TEST_RUNNER", ""),   # per-issue repos vary; empty means no test Bash (fail-closed)
-    browser_mcp_config=CODE_BROWSER_MCP_CONFIG,   # OPT-IN playwright MCP; "" = no browser
     env=_zbus_env("ISSUE_CODE_ZBUS_ENV"),   # LITERAL path
     publish={                           # feature-branch MR; target repo resolved per issue in cc
         "code_repo_path": "",
@@ -2265,10 +2283,36 @@ def _build_profiles():
     return list(_BASE_PROFILES)
 
 
+def _exact_label_signal_predicates(label):
+    """LABEL-only matcher for UI and config rows. Same lenient/strict split as `_label_signal_predicates`,
+    but EXACT lowercased membership in LABELS only: a superstring or same-named assignee never admits."""
+    want = str(label).strip().lower()
+
+    def _match(evt):
+        labels = evt.get("labels") or []
+        if isinstance(labels, str):
+            labels = [labels]
+        return want in [str(x).strip().lower() for x in labels]
+
+    def route_pred(evt):
+        if not _routing_fields(evt):
+            return True
+        return _match(evt)
+
+    def classify_pred(evt):
+        if not _routing_fields(evt):
+            return False
+        return _match(evt)
+
+    route_pred.namespace_fallback = True   # no signal = True; Router.route only lets that pick a read row
+    return route_pred, classify_pred
+
+
 _BASE_PROFILES = [
     ("vikunja:task", ANSIBLE_ROW_LABEL, _ANSIBLE_ROW),
     ("vikunja:task", WIKI_ROW_LABEL, _WIKI_DOCS_ROW),
     ("gmail", INBOX_ROW_SOURCE, _INBOX_ROW, _source_signal_predicates),
+    ("vikunja:task", CODE_UI_ROW_LABEL, _CODE_UI_ROW, _exact_label_signal_predicates),
     ("vikunja:task", CODE_ROW_LABEL, _CODE_ROW),
     # @dev ASSIGNEE (no label) routes to the SAME code change-proposer row. Assignee-ONLY, exact
     # membership (_assignee_signal_predicates). Placed AFTER the narrow-label rows so an explicit label
@@ -2427,33 +2471,6 @@ ROUTES_PATH = os.getenv("ROUTES_PATH", os.path.join(config_paths.config_dir(),
 
 class RoutesConfigError(ValueError):
     """routes.json is present but invalid. Raised at import, so the broker refuses to start (fail-closed)."""
-
-
-def _exact_label_signal_predicates(label):
-    """routes.json matcher FACTORY for a LABEL-only config row. Same lenient/strict split as
-    `_label_signal_predicates` (route_pred: no signal at all -> namespace fallback True; classify_pred: no
-    signal -> False), but the match is EXACT lowercased membership in the event's LABELS only: a label
-    superstring or an assignee with the same name never admits (unlike the built-in substring label rows)."""
-    want = str(label).strip().lower()
-
-    def _match(evt):
-        labels = evt.get("labels") or []
-        if isinstance(labels, str):
-            labels = [labels]
-        return want in [str(x).strip().lower() for x in labels]
-
-    def route_pred(evt):
-        if not _routing_fields(evt):
-            return True
-        return _match(evt)
-
-    def classify_pred(evt):
-        if not _routing_fields(evt):
-            return False
-        return _match(evt)
-
-    route_pred.namespace_fallback = True   # no signal = True; Router.route only lets that pick a read row
-    return route_pred, classify_pred
 
 
 def _builtin_row_keys():

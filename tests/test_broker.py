@@ -5258,13 +5258,14 @@ def test_code_browser_config_validator_refusals():
 
 
 def test_code_browser_route_wiring_only_code_rows():
-    """The knob is OFF by default (env default is empty), is wired ONLY onto the two code rows
-    (_CODE_ROW, _ISSUE_CODE_ROW) - not infra rows, not config-row templates, not general - and the OPT-IN
+    """The knob is OFF by default (env default is empty), is wired ONLY onto the UI code row
+    (not ordinary code, issue, infra, config-row templates or general) and the OPT-IN
     reaches build_argv through a real _one_turn; a non-cc harness refuses it."""
     import routing
     assert routing.CODE_BROWSER_MCP_CONFIG == "", "the knob must default OFF (empty)"
-    assert routing._CODE_ROW.browser_mcp_config == routing.CODE_BROWSER_MCP_CONFIG
-    assert routing._ISSUE_CODE_ROW.browser_mcp_config == routing.CODE_BROWSER_MCP_CONFIG
+    assert routing._CODE_UI_ROW.browser_mcp_config == routing.CODE_BROWSER_MCP_CONFIG
+    assert routing._CODE_ROW.browser_mcp_config == ""
+    assert routing._ISSUE_CODE_ROW.browser_mcp_config == ""
     # the infra rows run capability=code but must NOT inherit the knob (config rows: see the router test below)
     assert routing._INFRA_ROW.browser_mcp_config == ""
     assert routing._INFRA_GENERAL_ROW.browser_mcp_config == ""
@@ -5296,8 +5297,98 @@ def test_code_browser_route_wiring_only_code_rows():
                 assert False, f"browser route on {harness} must refuse (fail-closed)"
             except ValueError:
                 pass
-    ok("CODE_BROWSER_MCP_CONFIG defaults off, flows onto ONLY the two code rows; reaches build_argv; "
+    ok("CODE_BROWSER_MCP_CONFIG defaults off, flows onto ONLY the UI code row; reaches build_argv; "
        "non-cc harness refuses (fail-closed)")
+
+
+def test_code_ui_label_routing_and_independent_knobs():
+    """A configured UI row wins over both generic code triggers, even when those workers use codex.
+    A fresh interpreter checks the actual env wiring, not a patched copy of a startup template."""
+    probe = '''import json, routing as R
+r = R.Router()
+key = 'vikunja:task:9855'
+ui = {'labels': [R.CODE_UI_ROW_LABEL, R.CODE_ROW_LABEL], 'assignees': [R.DEV_ASSIGNEE]}
+assert r.classify(key, ui) == 'code/ui'
+r.stamps = {key: 'code/ui'}
+assert r.route(key, {}).row_key == 'code/ui'
+r.stamps = None
+assert r.route(key, {'labels': [R.CODE_ROW_LABEL]}).row_key == 'code'
+assert r.route(key, {'assignees': [R.DEV_ASSIGNEE]}).row_key == 'code'
+assert r.classify(key, {'assignees': [R.CODE_UI_ROW_LABEL]}) is None
+assert r.classify(key, {'labels': [R.CODE_UI_ROW_LABEL + '-other']}) is None
+assert R._CODE_ROW.adapter == R._ISSUE_CODE_ROW.adapter == 'codex'
+assert R._CODE_ROW.browser_mcp_config == R._ISSUE_CODE_ROW.browser_mcp_config == ''
+u = R._CODE_UI_ROW
+assert u.domain == 'code' and u.prompt_class == 'change-proposer' and u.capability == 'code'
+assert u.agent == R._CODE_ROW.agent == 'code-worker' and not u.read_only
+assert u.adapter == 'cc' and u.browser_mcp_config == R.CODE_BROWSER_MCP_CONFIG
+assert u.test_runner == 'npm' and u.env == {'ZBUS_ENV': '/example/ui-bus'}
+assert u.backend == 'claude' and u.pin
+assert u.publish == {'code_repo_path': '', 'mr_target_ref': 'main',
+                     'branch_prefix': 'eph/ui-test', 'worktree_base': '/example/ui-worktrees'}
+print('ok')
+'''
+    keep = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "LANG", "TMPDIR")}
+    base = {**keep, **_FIXTURE_ROSTERS, "BROKER_SITE_ENV": os.devnull,
+            "BROKER_CONFIG": os.path.join(HERE, "fixtures", "broker.test.json"),
+            "ROUTES_PATH": "/nonexistent/eph-test/routes.json", "CODE_CHANGE_ADAPTER": "codex",
+            "ISSUE_CODE_ADAPTER": "codex", "CODE_UI_TEST_RUNNER": "npm", "CODE_UI_ZBUS_ENV": "/example/ui-bus",
+            "CODE_UI_BACKEND": "claude", "CODE_UI_PIN": "true", "CODE_UI_BRANCH_PREFIX": "eph/ui-test",
+            "CODE_UI_WORKTREE_BASE": "/example/ui-worktrees"}
+    with tempfile.TemporaryDirectory() as d:
+        cfg = _write_browser_cfg(d)
+        for label in ("eph:code-ui", "custom:ui"):
+            out = subprocess.run([sys.executable, "-c", probe], cwd=ROOT, capture_output=True, text=True, timeout=60,
+                                 env={**base, "CODE_BROWSER_MCP_CONFIG": cfg, "CODE_UI_ROW_LABEL": label})
+            assert out.returncode == 0 and out.stdout.strip() == "ok", (out.stdout, out.stderr[-2000:])
+        # Keeping file validation fail-closed still refuses a set-but-missing browser config.
+        out = subprocess.run([sys.executable, "-c", "import routing"], cwd=ROOT, capture_output=True, text=True,
+                             timeout=60, env={**base, "CODE_BROWSER_MCP_CONFIG": os.path.join(d, "missing.json")})
+        assert out.returncode != 0 and "cannot read/parse" in out.stderr, out.stderr[-2000:]
+    ok("UI label wins first-match and survives stamps; independent CODE_UI knobs; codex code/issue stay browser-free")
+
+
+def test_code_ui_requires_cc_even_without_browser_config():
+    import routing as R
+    from dataclasses import replace
+    u = replace(R._CODE_UI_ROW, browser_mcp_config="", pin=False, backend_pinned=False)
+    for harness in ("codex", "hermes"):
+        try:
+            replace(u, adapter=harness)
+            assert False, "UI routing overrides must not change the harness"
+        except ValueError as e:
+            assert "requires the cc harness" in str(e), e
+        with patch.object(R, "model_label_trusted_creators", return_value={"owner"}):
+            try:
+                R.apply_adapter_label(u, [harness], "owner")
+                assert False, "a UI ticket must not flip harnesses"
+            except ValueError as e:
+                assert "requires the cc harness" in str(e), e
+        with patch.object(R, "_model_adapter", return_value=harness):
+            try:
+                R.apply_model_choice(u, "opus", True, lambda n: True)
+                assert False, "a UI model choice must not flip harnesses"
+            except ValueError as e:
+                assert "requires the cc harness" in str(e), e
+    ok("UI row remains cc under overrides, model choices and harness labels, even before browser setup")
+
+
+def test_code_ui_missing_browser_parks_before_worktree():
+    import routing as R
+    from dataclasses import replace
+    from types import SimpleNamespace
+    comments, labels, alerts, made, settled = [], [], [], [], []
+    a = _triage_adapter("**title:** change UI\n**done:** false\n**description:** <p>repo:/srv/git/sample-app</p>",
+                        comments, labels, alerts, made)
+    u = replace(R._CODE_UI_ROW, browser_mcp_config="")
+    a.router = SimpleNamespace(route=lambda *args: u)
+    a._settle_self = lambda key, **kw: settled.append(kw["mark_completed"])
+    a._run_worker("vikunja:task:9856", {"task_id": 9856}, "run-ui")
+    assert made == [] and settled == [False], (made, settled)
+    assert labels == [9856] and len(comments) == len(alerts) == 1, (comments, labels, alerts)
+    assert "WAITING ON YOU" in comments[0][1] and "CODE_BROWSER_MCP_CONFIG" in comments[0][1]
+    assert "restart the broker" in comments[0][1] and "parked" in alerts[0], (comments, alerts)
+    ok("missing UI browser parks with ticket note, waiting-on-operator label and alert; no cut or completion stamp")
 
 
 def test_code_route_threads_runner_end_to_end():
@@ -17781,13 +17872,14 @@ def test_routing_comment_respawn_domains_and_domain():
     # ansible/wiki (narrow, non-"eph:" labels) and tfa (fleet->tfa, long-lived interactive) are EXCLUDED.
     # infra-eph (assignee tier) -> infra joins the eligible set, like @dev.
     # infra-eph + infra:general (assignee+label tier) -> the infra/general row key joins too.
-    assert routing.comment_respawn_domains() == {"code", "general", "infra", "infra/general"}
+    assert routing.comment_respawn_domains() == {"code", "code/ui", "general", "infra", "infra/general"}
     assert routing.comment_respawn_domain(["infra-eph"], []) == "infra"
     assert routing.comment_respawn_domain(["infra-eph"], ["infra:general"]) == "infra/general"
     assert routing.comment_respawn_domain(["dev"], []) == "code"
     assert routing.comment_respawn_domain(["eph"], []) == "general"
     assert routing.comment_respawn_domain(["fleet"], []) is None, "fleet->tfa is excluded, not just unmatched"
     assert routing.comment_respawn_domain([], ["eph:code-change"]) == "code"
+    assert routing.comment_respawn_domain(["dev"], ["eph:code-ui", "eph:code-change"]) == "code/ui"
     assert routing.comment_respawn_domain([], ["eph:general"]) == "general"
     assert routing.comment_respawn_domain([], ["ansible"]) is None, "a non-eph: label is not eligible"
     assert routing.comment_respawn_domain(["infra"], []) is None
@@ -17797,7 +17889,7 @@ def test_routing_comment_respawn_domains_and_domain():
         assert routing.comment_respawn_enabled() is False
     with _Env(COMMENT_RESPAWN_ENABLED="1"):
         assert routing.comment_respawn_enabled() is True
-    ok("comment_respawn_domains = {code, general, infra, infra/general} (assignee-tier + eph:*-label rows, tfa excluded); "
+    ok("comment_respawn_domains includes code/ui (assignee-tier + exact/eph:*-label rows, tfa excluded); "
        "comment_respawn_domain resolves assignee/label -> domain via the SAME PROFILES predicates; "
        "comment_respawn_enabled defaults ON, env-overridable")
 
@@ -23951,6 +24043,7 @@ def test_builtin_rows_are_neutral_without_a_site():
                          env=base)
     assert out.returncode == 0, out.stderr[-2000:]
     assert json.loads(out.stdout.strip().splitlines()[-1]) == [
+        ["vikunja:task", "eph:code-ui", "code/ui", "change-proposer"],
         ["vikunja:task", "eph:code-change", "code", "change-proposer"],
         ["vikunja:task", "eph-code", "code", "change-proposer"],
         ["vikunja:task", "eph", "general", "agent"],
@@ -23965,6 +24058,7 @@ def test_builtin_rows_are_neutral_without_a_site():
         ["vikunja:task", "ansible", "ansible", "read-report"],
         ["vikunja:task", "wiki", "wiki", "docs"],
         ["gmail", "gmail", "inbox", "triage"],
+        ["vikunja:task", "eph:code-ui", "code/ui", "change-proposer"],
         ["vikunja:task", "eph:code-change", "code", "change-proposer"],
         ["vikunja:task", "dev", "code", "change-proposer"],
         ["vikunja:task", ["infra-eph", "infra:general"], "infra/general", "general"],

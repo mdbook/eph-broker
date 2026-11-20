@@ -265,11 +265,30 @@ own separate repo settings.
 | `CODE_AGENT` | `code-worker` | Agent name passed to `FLEET_MODEL_SH`. |
 | `CODE_CHANGE_BACKEND` | unset | Default registry backend. Unset: `FLEET_MODEL_SH` decides. |
 | `CODE_NONCLAUDE_OK` | off | Lets a code worker run on a non-Anthropic backend or on hermes. |
-| `CODE_BROWSER_MCP_CONFIG` | unset | Isolated, validated Playwright stdio MCP config for code workers; unset leaves browser tools off. |
+| `CODE_BROWSER_MCP_CONFIG` | unset | Isolated, validated Playwright stdio MCP config for the `code/ui` row only. Unset parks UI tickets with a waiting-on-you note and parked label before launch; other code/issue rows never inherit it. Invalid files still fail closed. |
 | `CODE_JUDGED_BASH_ENABLED` | off | Opt into adjudicated code shell calls instead of the legacy allowlist. See the same-UID security tradeoffs in [security-residual-same-uid.md](security-residual-same-uid.md). |
 | `CODE_PORTCULLIS_HOOK` | unset | Hook command for code shell adjudication. Set together with the gate directory; missing/invalid configuration retains the legacy allowlist. |
 | `CODE_PORTCULLIS_GATE_DIR` | unset | Absolute worker-only gate state directory, armed with `mode=enforce` and `full=on`; required with the hook. |
 | `CODE_ZBUS_ENV` | unset | Chat identity file handed to the worker (zbus only). |
+
+### UI code worker
+
+The `code/ui` row matches before generic code labels/assignees. It reuses the signed `code/change-proposer`
+prompt and code capability, shares the code repo allowlist and per-repo runner maps, and publishes only a
+feature-branch MR for human review. Its harness is fixed to `cc`, never `CODE_CHANGE_ADAPTER`; there is no
+`CODE_UI_ADAPTER` setting. Non-cc harness overrides/choices are refused. See
+[The code worker's browser](configuration.md#the-code-workers-browser).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CODE_UI_ROW_LABEL` | `eph:code-ui` | Exact label that selects the browser-required row. Assignees do not match. Empty disables it. |
+| `CODE_UI_TEST_RUNNER` | `pytest` | Fallback runner key when the repo is in neither shared runner map. |
+| `CODE_UI_ZBUS_ENV` | unset | UI worker chat identity file (zbus only). |
+| `CODE_UI_BACKEND` | unset | Independent backend default; unset follows `FLEET_MODEL_SH`. |
+| `CODE_UI_PIN` | `false` | Hard pin for model/backend choices, like `CODE_CHANGE_PIN`; the harness is always fixed to cc. |
+| `CODE_UI_BRANCH_PREFIX` | `eph/code-change` | Feature-branch namespace, never a direct push to main. |
+| `CODE_UI_MR_TARGET_REF` | `main` | Fallback MR target; the repo's own default branch wins when known. |
+| `CODE_UI_WORKTREE_BASE` | `~/.cache/ew/c` | Short worktree root for UI code workers. |
 
 ## General worker
 
@@ -371,7 +390,7 @@ CC local-thinking and upstream fail-fast switches are per-row booleans in `routi
 | Variable | Default | Meaning |
 |---|---|---|
 | `<ROW>_ADAPTER` | `cc` | A built-in row's harness: `cc`, `hermes` or `codex` ([configuration.md](configuration.md#choosing-a-rows-harness)). |
-| `<ROW>_PIN` | `false` | Explicit hard pin: ignore per-ticket model/harness labels and refuse dashboard rerun model picks. Settings: `ANSIBLE_PIN`, `WIKI_DOCS_PIN`, `INBOX_TRIAGE_PIN`, `INBOX_CHAT_PIN`, `CODE_CHANGE_PIN`, `ISSUE_CODE_PIN`, `INFRA_PIN`, `INFRA_GENERAL_PIN`, `MR_REVIEWER_PIN`, `GENERAL_PIN`, `TFA_PIN`. `INFRA_GENERAL_PIN` inherits `INFRA_PIN`. Accepts `1/true/yes/on` and `0/false/no/off`; invalid values stop startup. A row's `model_pin` remains pinned regardless. |
+| `<ROW>_PIN` | `false` | Explicit hard pin: ignore per-ticket model/harness labels and refuse dashboard rerun model picks. Settings: `ANSIBLE_PIN`, `WIKI_DOCS_PIN`, `INBOX_TRIAGE_PIN`, `INBOX_CHAT_PIN`, `CODE_CHANGE_PIN`, `CODE_UI_PIN`, `ISSUE_CODE_PIN`, `INFRA_PIN`, `INFRA_GENERAL_PIN`, `MR_REVIEWER_PIN`, `GENERAL_PIN`, `TFA_PIN`. `INFRA_GENERAL_PIN` inherits `INFRA_PIN`. Accepts `1/true/yes/on` and `0/false/no/off`; invalid values stop startup. A row's `model_pin` remains pinned regardless. |
 | `CODEX_AUTH_FILE` | unset | Absolute path of the Codex login file, symlinked into each worker's home, never read. Unset refuses every Codex worker ([configuration.md](configuration.md#the-codex-harness)). |
 | `CODEX_BACKEND` | unset | Registry backend whose `codex` block gives the model when the row's backend has none. |
 | `CODEX_BIN` | `codex` | The Codex CLI. |

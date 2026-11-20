@@ -164,7 +164,7 @@ into `settings`.
 | `GENERAL_SETTING_SOURCES` | Which Claude Code settings the general worker loads (Claude Code harness only). | `user` |
 | `GENERAL_MCP_CONFIG` | The only MCP config file the general worker may load (`--strict-mcp-config`, Claude Code harness only), see [The general worker](#the-general-worker). | `~/.config/eph-broker/general-mcp.json`; the worker refuses to start if it's missing |
 | `CODE_PORTCULLIS_HOOK` + `CODE_PORTCULLIS_GATE_DIR` | Set BOTH to put the code worker (Claude Code harness only) on the `general` posture: no Bash allow-list, `--permission-mode auto`, a small hard deny-floor (`curl`/`wget`/`ssh` no longer floored), and a PreToolUse(Bash) hook adjudicating every call. The hook is the shell command in `CODE_PORTCULLIS_HOOK`; `CODE_PORTCULLIS_GATE_DIR` (absolute) is passed to it as `PORTCULLIS_GATE_DIR`. The dir must be a worker-only dir holding `mode` = `enforce` AND `full` = `on` (`enforce` alone blocks every call). Unset or half-set: the legacy allow-list grant, unchanged. codex/hermes code workers always keep the allow-list. | Unset (off) |
-| `CODE_BROWSER_MCP_CONFIG` | Opt-in: the playwright MCP config a code worker loads (`--strict-mcp-config`, Claude Code harness only) so it can drive a real browser and return screenshot/console evidence for a UI change. Unset: no browser, argv unchanged. See [The code worker's browser](#the-code-workers-browser). | Unset (off) |
+| `CODE_BROWSER_MCP_CONFIG` | Playwright MCP config loaded only by the label-routed UI code row (`--strict-mcp-config`, Claude Code only). Unset: UI tickets park; ordinary code/issue workers are unchanged. See [The code worker's browser](#the-code-workers-browser). | Unset |
 | `AUTO_MERGE_REPOS` | Repos (`ns/name` list) whose worker MRs merge once the pipeline is green, **with no reviewer**. See [cd-deploy-paths.md](cd-deploy-paths.md#auto-merge-without-a-reviewer-auto_merge_repos). | Off |
 | `CODE_NONCLAUDE_OK` | `1` lets a code worker run on a non-Anthropic backend. Any code worker on the hermes or Codex harness needs it too. | Such a code worker is refused |
 | `<ROW>_ADAPTER` | The harness a built-in row's workers run on: `cc`, `hermes` or `codex`, see [Choosing a row's harness](#choosing-a-rows-harness). Runtime file changes apply to new routes on SIGHUP; invalid values keep the previous policy. | `cc` |
@@ -281,12 +281,30 @@ worker.
 
 ## The code worker's browser
 
-Off by default. Set `CODE_BROWSER_MCP_CONFIG` to the **absolute** path of a Playwright MCP config file and the
-two code rows (the `code-change` row and the GitHub/GitLab issue row) let their worker drive a browser: navigate,
-click, type, screenshot, read the console and network log, and resize. That lets a worker check a UI change
-by looking at it instead of only reasoning about it. Nothing else is widened: the deny list is unchanged, rows
-that are not code rows (including `infra` rows and config-file routes) never get it, and it is Claude Code
-harness only (a row on the `hermes` or `codex` harness with the knob set is refused at start).
+Label a Vikunja UI-change ticket `eph:code-ui` (override with `CODE_UI_ROW_LABEL`) and set
+`CODE_BROWSER_MCP_CONFIG` to the **absolute** path of a Playwright MCP config file. This selects the `code/ui`
+row before the generic code label or assignee row, even when both labels are present. The label must match
+exactly; an assignee with that name does not select it. An empty `CODE_UI_ROW_LABEL` disables the trigger.
+The UI worker can navigate, click, type, screenshot, read console/network logs and resize, so it checks a UI
+change by looking at it instead of only reasoning about it.
+
+This row always uses Claude Code (`cc`), independently of `CODE_CHANGE_ADAPTER`. Harness labels, model choices
+or routing overrides that select another harness are refused, not silently run without a browser. It reuses
+the same signed `code/change-proposer` prompt, `code-worker` agent, code capability and feature-branch MR
+publish path: no new prompt or signature, no push to main, no merge or deploy. The deny list is unchanged.
+Ordinary code, issue, MR-note, infra and config-file rows never inherit the browser knob, so setting it does
+not break codex code rows.
+
+The UI row has independent `CODE_UI_TEST_RUNNER` (default `pytest`, shared per-repo runner maps still win),
+`CODE_UI_ZBUS_ENV` (unset), `CODE_UI_BACKEND` (unset, follows fleet mode), and `CODE_UI_PIN` (false) settings.
+Its publish knobs are `CODE_UI_BRANCH_PREFIX` (default `eph/code-change`), `CODE_UI_MR_TARGET_REF` (`main`,
+repo default wins when known), and `CODE_UI_WORKTREE_BASE` (`~/.cache/ew/c`). The existing code repo allowlist
+and per-ticket repo resolution apply.
+
+With `CODE_BROWSER_MCP_CONFIG` unset, the broker starts normally and non-UI tickets work as before, including
+the README quick start. A UI ticket instead parks before any worktree or worker launch, with a waiting-on-you
+comment, the configured parked label and an operator alert. Configure the file, restart and re-trigger it.
+A set but invalid config is still refused fail-closed at route load; other harnesses still refuse browser grants.
 
 The worker's MCP surface is exactly that one server (`--strict-mcp-config`), and only an enumerated list of
 Playwright tools is allowed. Every other Playwright tool (arbitrary code, file upload, cookies and storage,

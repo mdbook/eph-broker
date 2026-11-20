@@ -2223,6 +2223,37 @@ def test_g1_agent_handoff_other_assignee_drops():
     ok("svc-account + non-dispatch assignee (or other agent doer/comment/done/no task_id) -> still drops")
 
 
+def test_agent_handoff_to_code_ui():
+    """The exact UI label specializes the code assignee's domain without weakening the echo guard."""
+    import routing as R
+    reg = RunRegistry(); router = Router(stamps={}); g = EchoGuard(reg, classify=router.classify)
+    base = {"source": "vikunja", "task_id": 9351, "assignees": [R.DEV_ASSIGNEE]}
+    for doer in ("infra", "ops", "svc-account"):
+        for event in ("task.created", "task.updated"):
+            for labels, domain in (([R.CODE_UI_ROW_LABEL], "code/ui"),
+                                   ([R.CODE_UI_ROW_LABEL, R.CODE_ROW_LABEL], "code/ui"),
+                                   ([R.CODE_ROW_LABEL], "code")):
+                evt = dict(base, doer=doer, event_name=event, labels=labels)
+                assert router.classify(C.normalize(evt), evt) == domain, evt
+                assert domain in R.assignee_dispatch_domains(evt), evt
+                assert g.filter(evt) is evt, evt
+    ui = dict(base, doer="infra", event_name="task.updated", labels=[R.CODE_UI_ROW_LABEL])
+    for assignees in ([], ["infra"], [R.FLEET_ASSIGNEE], [R.DEV_ASSIGNEE + "-other"]):
+        evt = dict(ui, assignees=assignees)
+        assert "code/ui" not in R.assignee_dispatch_domains(evt), evt
+        assert g.filter(evt) is None, evt
+    for changes in ({"event_name": "task.comment.created"}, {"done": True}, {"run_id": "STALE"}):
+        assert g.filter(dict(ui, **changes)) is None, changes
+    reg.open("RID", C.normalize(ui))
+    assert g.filter(ui) is None
+    assert g.filter(dict(ui, run_id="RID")) is None
+    assert g.filter(dict(ui, task_id=9352)) is not None
+    reg.close("RID")
+    assert g.filter(ui) is ui
+    assert g.dropped == 9, g.dropped
+    ok("agent + code assignee + exact UI label admitted; no code assignee, comments, stamps and active runs drop")
+
+
 def test_g1_worker_authored_dev_events_drop():
     """Worker-authored writes on an @dev ticket still drop: a pool (TFA) user doer, any run_id
     stamp (active or not), and ANY svc-account event while a worker is in flight on that subject."""
@@ -5309,6 +5340,8 @@ r = R.Router()
 key = 'vikunja:task:9855'
 ui = {'labels': [R.CODE_UI_ROW_LABEL, R.CODE_ROW_LABEL], 'assignees': [R.DEV_ASSIGNEE]}
 assert r.classify(key, ui) == 'code/ui'
+assert R.assignee_dispatch_domains(ui) == {'code', 'code/ui'}
+assert R.assignee_dispatch_domains({'assignees': ['dev']}) == set()
 r.stamps = {key: 'code/ui'}
 assert r.route(key, {}).row_key == 'code/ui'
 r.stamps = None
@@ -5332,7 +5365,8 @@ print('ok')
     base = {**keep, **_FIXTURE_ROSTERS, "BROKER_SITE_ENV": os.devnull,
             "BROKER_CONFIG": os.path.join(HERE, "fixtures", "broker.test.json"),
             "ROUTES_PATH": "/nonexistent/eph-test/routes.json", "CODE_CHANGE_ADAPTER": "codex",
-            "ISSUE_CODE_ADAPTER": "codex", "CODE_UI_TEST_RUNNER": "npm", "CODE_UI_ZBUS_ENV": "/example/ui-bus",
+            "DEV_ASSIGNEE": "ui-dev", "ISSUE_CODE_ADAPTER": "codex", "CODE_UI_TEST_RUNNER": "npm",
+            "CODE_UI_ZBUS_ENV": "/example/ui-bus",
             "CODE_UI_BACKEND": "claude", "CODE_UI_PIN": "true", "CODE_UI_BRANCH_PREFIX": "eph/ui-test",
             "CODE_UI_WORKTREE_BASE": "/example/ui-worktrees"}
     with tempfile.TemporaryDirectory() as d:

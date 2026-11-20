@@ -2619,8 +2619,9 @@ def _with_config_routes(rows, extra):
 def assignee_dispatch_domains(evt):
     """The row domains the event's ASSIGNEES name via the assignee-tier PROFILES rows (@dev gives code,
     @eph gives general, @fleet gives tfa). echo_guard admits an agent handoff only if classify() lands in this set,
-    i.e. the event routes to the row its assignee actually dispatches to (a narrow label row winning
-    first-match still drops). Derived from PROFILES, so the env knobs stay the single source of truth."""
+    i.e. the event routes to the row its assignee actually dispatches to. The code assignee also dispatches
+    to code/ui when its exact label wins; other narrow label rows still drop. Derived from PROFILES, so
+    the env knobs stay the single source of truth."""
     members = {str(a).strip().lower() for a in _assignee_fields(evt)}
     out = set()
     for e in PROFILES:
@@ -2629,6 +2630,8 @@ def assignee_dispatch_domains(evt):
             out.add(e[2].row_key)
         elif factory is _assignee_label_signal_predicates and str(e[1][0]).strip().lower() in members:
             out.add(e[2].row_key)          # the assignee half names it; classify() still needs the label
+    if _CODE_ROW.row_key in out:
+        out.add(_CODE_UI_ROW.row_key)     # UI is a code specialization; classify() still needs its exact label
     return out
 
 

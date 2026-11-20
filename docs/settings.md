@@ -279,6 +279,9 @@ feature-branch MR for human review. Its harness is fixed to `cc`, never `CODE_CH
 `CODE_UI_ADAPTER` setting. Non-cc harness overrides/choices are refused. See
 [The code worker's browser](configuration.md#the-code-workers-browser).
 
+Agent handoffs work when the ticket has both the exact UI label and the code assignee (`DEV_ASSIGNEE`).
+The UI label alone does not admit an agent handoff, and events still drop while a worker runs on the subject.
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `CODE_UI_ROW_LABEL` | `eph:code-ui` | Exact label that selects the browser-required row. Assignees do not match. Empty disables it. |

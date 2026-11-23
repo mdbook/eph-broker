@@ -179,6 +179,7 @@ run escalations or suppression-tail DMs for duplicate calls.
 | Variable | Default | Meaning |
 |---|---|---|
 | `BROKER_MCP_SH` | unset | The tracker script ([tracker-script.md](tracker-script.md)). Unset: no tracker ticket can start a worker. |
+| `MAX_TICKET_TEXT` | `20000` | Positive integer character cap for rendered ticket text, read at startup. Invalid values log an error and use 20000. Related-task embeds are summarized first. Long descriptions that reach this cap disable label/creator trust, even if their metadata fits before the cut. Labelled tickets with untrusted metadata park with a ticket comment and ops alert instead of using the row default. A matching operator-owned repo model pin still runs on its pin without trusting labels. Ownership checks remain fail-closed for comment respawn and `/rerun`; `/rerun` returns 409 with the cause. Shorten the description or increase the cap and restart, then re-trigger. Duplicate fields and fallback renderings also fail closed; raising the cap does not make those trusted. |
 | `VIKUNJA_URL` | unset | API root used by the optional `tools/vikunja_bridge.py` tracker bridge. Required when using that bridge. |
 | `VIKUNJA_TOKEN` | unset | Token used by that bridge. Required, secret: provision only through the environment. |
 | `TICKET_URL_TEMPLATE` | unset | Ticket link, `{}` is the id. Unset: plain `#<id>`. |

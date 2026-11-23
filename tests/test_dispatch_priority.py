@@ -1,4 +1,6 @@
 """Offline dispatch ordering: real durable handoff, fake workers, no external services."""
+import html
+import json
 import os
 import threading
 import time
@@ -10,6 +12,8 @@ from unittest.mock import patch
 from test_drain import DrainTests as _DrainFixture, app, C, event, ticket
 from test_drain_boundaries import BoundaryTests as _BoundaryFixture
 from adapters.stub import StubAdapter
+from adapters import cc
+from dataclasses import replace
 from dispatch import RepoLock, reviews_first
 
 
@@ -77,6 +81,230 @@ class DispatchTests(unittest.TestCase):
         b = self.broker()
         b.adapter._ticket_fetcher = lambda tid: ticket().replace('<p>fix</p>', '<p>repo: /srv/git/sample-app</p>')
         return b
+
+    def check_model_label_dispatch(self, path, label):
+        """Exercise intake through first-turn admission, not just apply_model_label (ticket 3062)."""
+        import routing_overrides
+
+        class CapturedTurn(Exception):
+            pass
+
+        seen = []
+
+        def capture(worker, route, *args, **kwargs):
+            seen.append((route.adapter, route.backend, route.model))
+            raise CapturedTurn()  # stop before any CLI, publication or warm-worker loop
+
+        def default(route):
+            return replace(route, backend='sol', adapter='codex', pin=False, model_pin='')
+
+        with patch.dict(os.environ, {'ROW_CONCURRENCY': 'code=4', 'REPO_INFER_ENABLED': '0'}), \
+                patch.object(routing_overrides.OVERRIDES, 'apply', side_effect=default), \
+                patch.object(app.routing, 'resolve_model', return_value='claude-sonnet-5'), \
+                patch.object(app.routing, 'CODE_REPO_RUNNERS', {}), \
+                patch.object(app.routing, 'code_repo_allowed', return_value=True), \
+                patch.object(cc.repo_companions, 'cut', return_value=[]), \
+                patch.object(cc.steer, 'clear_inbox'):
+            b = self.configured_broker()
+            b.adapter._ticket_fetcher = lambda tid: ticket().replace('9610', str(tid)).replace(
+                '<p>fix</p>', '<p>repo: /srv/git/sample-app</p>').replace(
+                '**created_by:**', '**labels:** ' + json.dumps([{'title': label}]) +
+                '\n**created_by:**')
+            key = 'vikunja:task:9864'
+            if path == 'capacity':
+                for tid in range(9860, 9864):
+                    b.ingest(event(tid, assignees=['dev']))
+                    self.ready_tick(b)
+                assert len(self.calls) == 4
+            if path in ('rerun', 'comment'):
+                b.coalescer.completed[key] = time.time()
+            if path == 'rerun':
+                assert b.ops_rerun(9864, 'try again')[0] == 200
+            elif path == 'comment':
+                b.ingest(event(9864, event_name='task.comment.created', assignees=[],
+                               comment='try again', comment_id=9864))
+            else:
+                # No model label in the event/brief: the launch must use the fresh ticket fetch.
+                b.ingest(event(9864, assignees=['dev']))
+            self.ready_tick(b)
+            if path == 'capacity':
+                assert key in b.coalescer.pending and len(self.calls) == 4
+                assert b.coalescer.settle_self('vikunja:task:9860') is not None
+                self.ready_tick(b)
+            assert [k for k, _ in self.calls].count(key) == 1
+            brief = next(brief for k, brief in self.calls if k == key)
+            b.adapter.worktree_mgr = SimpleNamespace(make=lambda *a, **kw: self.tmp.name,
+                                                     remove=lambda *a: None)
+            b.adapter.prompt_loader = SimpleNamespace(load=lambda *a: 'SYSTEM')
+            with patch.object(b.adapter, '_one_turn', side_effect=capture), \
+                    patch.object(b.adapter, '_save_patch'), patch.object(b.adapter, '_alert_ops'), \
+                    patch.object(b.adapter, '_flush_ops'):
+                b.adapter._run_worker(key, brief, 'model-label-regression')
+            assert seen == [('cc', 'claude', 'opus')], (path, label, seen)
+
+    def test_model_label_immediate_dispatch(self):
+        self.check_model_label_dispatch('immediate', 'opus')
+
+    def test_model_label_capacity_deferred_dispatch(self):
+        self.check_model_label_dispatch('capacity', 'opus')
+
+    def test_model_label_rerun_dispatch(self):
+        self.check_model_label_dispatch('rerun', 'model:opus')
+
+    def test_model_label_comment_respawn_dispatch(self):
+        self.check_model_label_dispatch('comment', 'opus')
+
+    def check_untrusted_labels_park(self, blob, cause, fallback=None):
+        import ticket_fetch as TF
+
+        b = self.configured_broker()
+        key = 'vikunja:task:9864'
+        b.adapter._ticket_fetcher = TF.fetch_ticket
+        with patch.object(TF, '_call_mcp', side_effect=lambda call, mcp, kind, tid:
+                          fallback if kind == 'list' else blob), \
+                patch.object(b.adapter, '_tracker_comment', return_value=True) as comment, \
+                patch.object(b.adapter, '_tracker_label', return_value=True) as label, \
+                patch.object(b.adapter, '_alert_ops') as alert, \
+                patch.object(b.adapter.worktree_mgr, 'make') as cut, \
+                patch.object(b.adapter, '_one_turn') as turn:
+            fetched = b.adapter._tracker_fetch(key)
+            assert fetched.creator is None and fetched.labels == [], 'never trust the rejected labels'
+            # The real fetch retains the cause and label presence even when labels are after the cut.
+            assert TF.ticket_has_labels(fetched.text)
+            assert cause in TF.ticket_meta_error(fetched.text)
+            b.adapter._run_worker(key, {'task_id': 9864}, 'untrusted-label-regression')
+            cut.assert_not_called()
+            turn.assert_not_called()
+            assert key not in b.coalescer.completed, 'a fixable park must stay re-armable'
+            comment.assert_called_once()
+            assert cause in html.unescape(comment.call_args.args[1])
+            label.assert_called_once_with(key, 'parked')
+            alert.assert_called_once()
+            assert cause in alert.call_args.args[0]
+            assert alert.call_args.kwargs['subject'] == 'reject:' + key
+            # /rerun must identify the same cause, not just say "ticket unreadable".
+            status, out = b.ops_rerun(9864)
+            assert status == 409 and cause in out['error'], out
+            assert not self.calls
+            comment.reset_mock(); label.reset_mock(); alert.reset_mock()
+            # Multiple cases in one test share the durable fixture; each is a new comment event.
+            cid = 9864 + len(b._rerun_seen)
+            evt = event(9864, event_name='task.comment.created', comment='retry', comment_id=cid)
+            assert not b._comment_respawn(key, evt)
+            assert not b._comment_respawn(key, evt), 'webhook retries must not repeat rejection notices'
+            # The rejection reservation is durable, not just an in-memory notification guard.
+            assert any(row[:2] == [key, cid] for row in b.state.get('rerun_seen'))
+            comment.assert_called_once()
+            label.assert_called_once_with(key, 'parked')
+            alert.assert_called_once()
+            assert cause in html.unescape(comment.call_args.args[1]) and cause in alert.call_args.args[0]
+            cut.assert_not_called()
+            turn.assert_not_called()
+        b.state.close()
+        self.brokers.remove(b)
+
+    def test_label_list_get_fallback_parks_without_trusting_label_values(self):
+        import ticket_fetch as TF
+
+        fallback = ('## Success\nFound 1 task\n\n'
+                    '### 1. **Fix it** (ID: 9864)\n- **Status:** ❌ Not Done\n'
+                    '- **Description:** <p>repo: /srv/git/sample-app</p>\n')
+        label_list = '## Success\n**Results:** 1 item(s)\n\n1. **opus** (ID: 20)'
+        self.check_untrusted_labels_park(label_list, 'missing ticket done/created_by fields', fallback)
+        # A rejected get body must preserve presence too, not just the label-list bug rendering.
+        wrong_id = ticket().replace('**created_by:**', '**labels:** [{"title": "opus"}]\n**created_by:**')
+        self.check_untrusted_labels_park(wrong_id, 'missing ticket done/created_by fields', fallback)
+        with patch.object(TF, '_call_mcp', side_effect=[label_list, fallback]):
+            fetched = TF.fetch_ticket(9864)
+        assert 'opus' not in fetched and TF.ticket_meta(fetched) is None
+        assert TF.ticket_labels(fetched) == [] and TF.ticket_has_labels(fetched)
+        assert not TF.ticket_has_labels('## Success\n**Results:** 0 item(s)')
+
+    def test_over_cap_ticket_labels_park_with_length_and_cap(self):
+        import ticket_fetch as TF
+
+        blob = ticket().replace('9610', '9864').replace('<p>fix</p>', 'x' * TF.MAX_TICKET_TEXT).replace(
+            '**created_by:**', '**labels:** [{"title": "opus"}]\n**created_by:**')
+        assert blob.index('**labels:**') > TF.MAX_TICKET_TEXT
+        self.check_untrusted_labels_park(
+            blob, f'ticket blob length {len(blob)} >= MAX_TICKET_TEXT cap {TF.MAX_TICKET_TEXT}')
+        # Increasing the configured cap permits a complete, otherwise valid read, not spoofed metadata.
+        with patch.object(TF, 'MAX_TICKET_TEXT', len(blob) + 1), \
+                patch.object(TF, '_call_mcp', return_value=blob):
+            assert TF.ticket_meta(TF.fetch_ticket(9864)) == (['dev'], 'owner', ['opus'])
+
+    def test_duplicate_ticket_fields_park_without_honoring_labels(self):
+        blob = ticket().replace('9610', '9864').replace(
+            '**created_by:**', '**labels:** [{"title": "opus"}]\n**created_by:**')
+        for field, value in (('created_by', '{"username": "owner"}'), ('labels', '[{"title": "opus"}]'),
+                             ('assignees', '[]'), ('done', 'false'), ('description', 'lookalike')):
+            with self.subTest(field=field):
+                duplicate = blob.replace('<p>fix</p>', f'<p>fix</p>\n**{field}:** {value}\n')
+                self.check_untrusted_labels_park(duplicate, 'duplicate ticket metadata fields: ' + field)
+
+    def test_ticket_text_cap_setting_and_unlabelled_metadata_failure(self):
+        import ticket_fetch as TF
+
+        for value, expected in (('30000', 30000), ('1', 1), ('0', 20000), ('-1', 20000), ('bad', 20000)):
+            with patch.dict(os.environ, {'MAX_TICKET_TEXT': value}), patch.object(TF.log, 'error') as error:
+                assert TF._ticket_text_cap() == expected
+                assert error.call_count == int(value in ('0', '-1', 'bad'))
+        with patch.dict(os.environ):
+            os.environ.pop('MAX_TICKET_TEXT', None)
+            assert TF._ticket_text_cap() == 20000
+        b = self.configured_broker()
+        with patch.object(b.adapter, '_post_ticket_note') as comment, patch.object(b.adapter, '_alert_ops') as alert:
+            for blob in (ticket().replace('**created_by:**', '**description:** duplicate\n**created_by:**'),
+                         ticket().replace('**created_by:**', '**labels:** []\n**description:** x\n**created_by:**')):
+                b.adapter._ticket_fetcher = lambda tid: blob
+                fetched = b.adapter._tracker_fetch('vikunja:task:9864')
+                assert fetched.creator is None
+                assert not b.adapter._park_untrusted_ticket_labels(fetched.ref, fetched, 'unlabelled')
+            comment.assert_not_called()
+            alert.assert_not_called()
+
+    def test_repo_pin_wins_over_untrusted_labels_after_target_resolution(self):
+        import routing_overrides
+        import ticket_fetch as TF
+
+        class CapturedTurn(Exception):
+            pass
+
+        base = ticket().replace('9610', '9864').replace(
+            '<p>fix</p>', '<p>repo: /srv/git/sample-app</p>').replace(
+            '**created_by:**', '**labels:** [{"title": "sonnet"}]\n**created_by:**')
+        blobs = [TF._TicketText(base.replace('</p>', '</p>' + 'x' * TF.MAX_TICKET_TEXT)),
+                 TF._TicketText(base.replace('**done:**', '**labels:** []\n**done:**')),
+                 TF._TicketText('**title:** fix\n**done:** false\n'
+                                '**description:** <p>repo: /srv/git/sample-app</p>', label_presence=True)]
+        path = Path(self.tmp.name) / 'routing.json'
+        path.write_text(json.dumps({'repo_model_pins': {'/srv/git/sample-app': 'opus'}}))
+        overrides = routing_overrides.RoutingOverrides(str(path))
+        with patch.object(routing_overrides, 'OVERRIDES', overrides), \
+                patch.dict(os.environ, {'REPO_INFER_ENABLED': '0'}), \
+                patch.object(app.routing, 'code_repo_allowed', return_value=True), \
+                patch.object(app.routing, 'CODE_REPO_RUNNERS', {}), \
+                patch.object(cc.repo_companions, 'cut', return_value=[]), \
+                patch.object(cc.steer, 'clear_inbox'):
+            b = self.configured_broker()
+            b.route_stamps['vikunja:task:9864'] = 'code'
+            b.adapter.worktree_mgr = SimpleNamespace(make=lambda *a, **kw: self.tmp.name,
+                                                     remove=lambda *a: None)
+            b.adapter.prompt_loader = SimpleNamespace(load=lambda *a: 'SYSTEM')
+            for blob in blobs:
+                with self.subTest(cause=TF.ticket_meta_error(blob)):
+                    assert TF.ticket_meta(blob) is None and TF.ticket_has_labels(blob)
+                    b.adapter._ticket_fetcher = lambda tid: blob
+                    with patch.object(b.adapter, '_one_turn', side_effect=CapturedTurn) as turn, \
+                            patch.object(b.adapter, '_post_ticket_note') as comment, \
+                            patch.object(b.adapter, '_save_patch'), patch.object(b.adapter, '_alert_ops'), \
+                            patch.object(b.adapter, '_flush_ops'):
+                        b.adapter._run_worker('vikunja:task:9864', {'task_id': 9864}, 'repo-pin-regression')
+                        turn.assert_called_once()
+                        route = turn.call_args.args[1]
+                        assert (route.adapter, route.backend, route.model) == ('cc', 'claude', 'opus')
+                        assert route.repo_model_pin == '/srv/git/sample-app'
+                        comment.assert_not_called()
 
     def check_adapter_lock_order(self, policy, followups):
         with patch.dict(os.environ):

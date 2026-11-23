@@ -1338,10 +1338,9 @@ class Broker:
             ticket = self._ticket(tickets.ref_from_key(key))
             if ticket is None:
                 return False                   # unreadable ticket: fail closed, no spawn
-            if ticket.creator is None:
-                return False                   # unreadable/untrusted ownership: fail closed
-            domain = routing.comment_respawn_domain(ticket.assignees, ticket.labels)
-            if domain is None:
+            domain = (routing.comment_respawn_domain(ticket.assignees, ticket.labels)
+                      if ticket.creator is not None else None)
+            if ticket.creator is not None and domain is None:
                 return False                   # this ticket is not one of the eligible rows: plain reject
             seen, now = (key, evt.get("comment_id")), time.time()
             with self._rerun_lock:
@@ -1349,6 +1348,11 @@ class Broker:
                 if evt.get("comment_id") is not None and seen in self._rerun_seen:
                     return False
                 self._rerun_seen[seen] = now
+            if ticket.creator is None:
+                # Reserve rejected comment IDs before any notification too, including across restart.
+                self._save_rerun_seen()
+                self.adapter._park_untrusted_ticket_labels(key, ticket, None)
+                return False                   # unreadable/untrusted ownership: fail closed
             if not self._comment_respawn_allowed(evt, ticket, domain):
                 with self._rerun_lock:
                     self._rerun_seen.pop(seen, None)
@@ -1441,7 +1445,9 @@ class Broker:
         ticket = self._ticket(tickets.ref_from_key(key))
         if ticket is None or ticket.creator is None:
             audit("refused-ticket-unreadable", key)
-            return 409, {"ok": False, "error": "ticket unreadable (fail-closed)"}
+            reason = ticket_fetch.ticket_meta_error(ticket.text if ticket is not None else None)
+            return 409, {"ok": False, "error": "ticket unreadable (fail-closed): " +
+                         (reason or "ticket labels/creator untrusted")}
         if ticket.done:
             audit("refused-ticket-done", key)
             return 409, {"ok": False, "error": "ticket is done"}

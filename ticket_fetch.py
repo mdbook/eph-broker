@@ -27,7 +27,32 @@ TOOL_NAME = "vikunja_task_crud"   # confirmed live via `mcp.sh vikunja-bridge to
 
 # Cap the rendered ticket text so a pathological description can't blow up the worker's first prompt.
 # Related-task embeds are summarized before this cap; they must not crowd out the ticket's own fields.
-MAX_TICKET_TEXT = 20_000
+def _ticket_text_cap():
+    try:
+        value = int(os.getenv("MAX_TICKET_TEXT", "20000"))
+        if value > 0:
+            return value
+    except ValueError:
+        pass
+    log.error("ticket fetch: MAX_TICKET_TEXT must be a positive integer; using 20000")
+    return 20_000
+
+
+MAX_TICKET_TEXT = _ticket_text_cap()
+
+
+class _TicketText(str):
+    """Bounded prompt text with deny-only evidence from BEFORE truncation or fallback reformatting.
+
+    Labels may be outside the cap or omitted by the fallback. Keep only their presence and the trust failure
+    reason, never their values or trusted metadata. Callers may use this evidence to park, not authorize.
+    A str keeps the existing fetch/brief contract (including JSON serialization) unchanged.
+    """
+    def __new__(cls, text, label_presence=False):
+        value = super().__new__(cls, text[:MAX_TICKET_TEXT])
+        value.meta_error = ticket_meta_error(text)
+        value.has_labels = label_presence or ticket_has_labels(text)
+        return value
 
 
 def build_call(task_id):
@@ -201,7 +226,7 @@ def fetch_ticket(task_id, mcp_sh=MCP_SH):
         if blob_id == tid:
             text = _summarize_related_tasks(text)
             log.info("ticket_fetch: fetched task_id=%s via get len=%d", tid, len(text))
-            return text[:MAX_TICKET_TEXT]
+            return _TicketText(text)
         log.warning("ticket_fetch: get blob id-mismatch requested task_id=%s but blob id=%r "
                     "-> REJECT (cross-wired mcp.sh?), falling through to ID-matched list fallback", tid, blob_id)
     else:
@@ -213,7 +238,9 @@ def fetch_ticket(task_id, mcp_sh=MCP_SH):
         log.warning("ticket_fetch: list fallback could not resolve task_id=%s -> None (fail-closed upstream)", tid)
         return None
     log.info("ticket_fetch: fetched task_id=%s via list fallback len=%d", tid, len(blob))
-    return blob[:MAX_TICKET_TEXT]
+    # The get's label-list rendering (or rejected metadata) must not lose its deny-only presence
+    # evidence when the fallback synthesizes only title/done/description. Never carry label VALUES.
+    return _TicketText(blob, label_presence=ticket_has_labels(text))
 
 
 # Who a ticket belongs to, read from a `get` blob. The blob renders
@@ -257,6 +284,46 @@ def _summarize_related_tasks(text):
     return text[:match.start(1)] + " " + json.dumps(summary, indent=2) + "\n" + text[match.end(1):]
 
 
+def ticket_has_labels(text):
+    """Untrusted label presence, ONLY for refusing a spawn, never for model/ownership decisions."""
+    if hasattr(text, "has_labels"):
+        return text.has_labels
+    if not text:
+        return False
+    # The labelled-ticket get bug returns Results + label entries, not a **labels:** task field.
+    # A nonempty result without a task body is enough to refuse, never enough to authorize a label.
+    return (any(block.strip() not in ("", "[]", "null")
+                for block in re.findall(_FIELD_RE.format("labels"), text))
+            or (not _blob_has_task_body(text) and bool(re.search(
+                r'(?im)^\*\*results:\*\*\s*[1-9]\d*\s+item\(s\)', text))))
+
+
+def ticket_meta_error(text):
+    """Safe diagnostic for the fail-closed metadata read, or None. Never includes ticket field values."""
+    if hasattr(text, "meta_error"):
+        return text.meta_error
+    if not text:
+        return "ticket fetch returned no body"
+    if len(text) >= MAX_TICKET_TEXT:
+        return (f"ticket blob length {len(text)} >= MAX_TICKET_TEXT cap {MAX_TICKET_TEXT} "
+                "(possibly truncated; labels/creator untrusted)")
+    fields = {name: _field_starts(text, name)
+              for name in ("description", "done", "created_by", "assignees", "labels")}
+    duplicates = [name for name, hits in fields.items() if len(hits) > 1]
+    if duplicates:
+        return "duplicate ticket metadata fields: " + ", ".join(duplicates)
+    if not fields["done"] or not fields["created_by"]:
+        return "missing ticket done/created_by fields (fallback or incomplete rendering)"
+    done = fields["done"][0]
+    if fields["description"] and fields["description"][0] > done:
+        return "list-fallback or invalid ticket field order (description follows done)"
+    if any(pos < done for name in ("created_by", "assignees", "labels") for pos in fields[name]):
+        return "invalid ticket metadata field order (metadata precedes done)"
+    if not _USERNAME_RE.findall(re.findall(_FIELD_RE.format("created_by"), text)[0]):
+        return "ticket created_by has no username"
+    return None
+
+
 def ticket_meta(text):
     """The ONE trusted read of a ticket's ownership/labels off a fetched blob, shared by every caller
     that makes a trust decision on them (comment rerun, comment respawn, the `model:` label).
@@ -271,20 +338,9 @@ def ticket_meta(text):
       * any field duplicated (more than one created_by/assignees/labels/description/done line; a lookalike
         in the description makes a second one), or created_by missing / without a username.
     Pure. (A structured JSON fetch would be stronger, but vikunja-bridge only exposes the rendered view.)"""
-    if not text or len(text) >= MAX_TICKET_TEXT:
-        return None
-    desc, done = _field_starts(text, "description"), _field_starts(text, "done")
-    creators = _field_starts(text, "created_by")
-    assignees, labels = _field_starts(text, "assignees"), _field_starts(text, "labels")
-    if len(done) != 1 or len(desc) > 1 or len(creators) != 1 or len(assignees) > 1 or len(labels) > 1:
-        return None
-    if desc and desc[0] > done[0]:
-        return None
-    if any(pos < done[0] for pos in creators + assignees + labels):
+    if ticket_meta_error(text):
         return None
     names = _USERNAME_RE.findall(re.findall(_FIELD_RE.format("created_by"), text)[0])
-    if not names:
-        return None
     a_blk = re.findall(_FIELD_RE.format("assignees"), text)
     l_blk = re.findall(_FIELD_RE.format("labels"), text)
     return ([u.lower() for u in _USERNAME_RE.findall(a_blk[0])] if a_blk else [], names[0].lower(),

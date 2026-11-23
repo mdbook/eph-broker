@@ -38,6 +38,7 @@ import test_environment
 import sandbox
 from worktree import PushTargetRefused   # fail-closed push target (BROKER_PUSH_HOSTS only)
 import tickets                        # ticket ref grammar (ref_from_key, vikunja_ref, vikunja_id)
+import ticket_fetch                   # fail-closed rendered metadata diagnostics (deny-only)
 from trackers import Registry         # ticket reads and write-back by ref (docs/trackers.md)
 # The done predicate lives in the Vikunja tracker now; re-exported here, where the tests import it from
 from trackers.gitlab import GitLabTracker   # GitLab issue notes (write-back only; intake is forge.py)
@@ -3328,6 +3329,23 @@ class CCAdapter(Adapter):
             except Exception as e:
                 log.warning("repo-infer parked label failed key=%s: %s", key, e)
 
+    def _park_untrusted_ticket_labels(self, key, ticket, run_id):
+        """Never silently replace unreadable ticket labels with the row default (ticket 3062)."""
+        if ticket is None or ticket.creator is not None or not ticket_fetch.ticket_has_labels(ticket.text):
+            return False
+        reason = ticket_fetch.ticket_meta_error(ticket.text) or "ticket labels/creator untrusted"
+        log.warning("model label: key=%s run_id=%s -> parked: %s", key, run_id, reason)
+        self._post_ticket_note(key, (
+            "<p><b>WAITING ON YOU:</b> no worker was spawned (fail-closed). "
+            "Ticket labels/creator could not be trusted; refusing to use the row default.</p>"
+            f"<p>Cause: {html.escape(reason)}.</p>"
+            "<p>Resolve the rendering issue or shorten the description (or adjust "
+            "<code>MAX_TICKET_TEXT</code> and restart), then re-trigger. Ops has been notified.</p>"),
+            run_id, parked=True)
+        self._alert_ops(f"eph worker {key} parked: {reason}{self._dash_url(ticket.ref)}",
+                        subject=f"reject:{key}")
+        return True
+
     def _refuse_continue_mr(self, key, run_id, reason):
         """a `continue-mr:` line that cannot be honoured -> no worker (fail closed). Say why on the ticket
         and alert ops. Never raises."""
@@ -3710,12 +3728,15 @@ class CCAdapter(Adapter):
                 # pin wins, unknown name / untrusted creator picking a non-Anthropic backend: fail-closed). Read
                 # off the FETCHED ticket (labels/created_by), so it holds even when the coalesced brief lost them.
                 # Via the Ticket's creator/labels (ticket_meta underneath), which fail closed (creator None) on a
-                # truncated / list-fallback / lookalike blob: then NO label is honored (default model), never a
-                # description-spoofed label/creator.
+                # truncated / list-fallback / lookalike blob. Label presence is deny-only evidence: park
+                # instead of silently using the default, unless a repo pin already determines the model.
                 trusted = ticket is not None and ticket.creator is not None
                 repo_pin = getattr(route, "repo_model_pin", "")
                 selection_source = ("repo pin: " + repo_pin if repo_pin else
                                     "pin" if getattr(route, "backend_pinned", False) else "row default")
+                if (_task_id is not None and not repo_pin
+                        and self._park_untrusted_ticket_labels(key, ticket, run_id)):
+                    return False
                 if _task_id is not None and ticket is not None and not trusted:
                     log.info("model label: key=%s run_id=%s -> ticket labels/creator untrusted (truncated/fallback/"
                              "duplicate fields) -> no model label applied", key, run_id)

@@ -1,5 +1,6 @@
 """Atomic, last-good routing overrides; environment-backed Route templates remain defaults."""
 import json
+import fnmatch
 import logging
 import os
 import re
@@ -63,8 +64,19 @@ class RoutingOverrides:
 
     @staticmethod
     def _validate(data):
-        if not isinstance(data, dict) or set(data) - {"rows", "trusted_creators", "row_concurrency"}:
-            raise ValueError("expected rows, trusted_creators and/or row_concurrency")
+        if not isinstance(data, dict) or set(data) - {"rows", "trusted_creators", "row_concurrency", "repo_model_pins"}:
+            raise ValueError("expected rows, trusted_creators, row_concurrency and/or repo_model_pins")
+        pins = data.get("repo_model_pins", {})
+        if not isinstance(pins, dict):
+            raise ValueError("repo_model_pins must be an object")
+        import routing
+        for pattern, model in pins.items():
+            if not isinstance(pattern, str) or not pattern or pattern != pattern.strip():
+                raise ValueError("repo_model_pins keys must be nonempty repo paths or globs without surrounding spaces")
+            if not isinstance(model, str):
+                raise ValueError("repo_model_pins values must be model names")
+            name = RoutingOverrides._pin_name(model)
+            routing._model_adapter(name if backend_ok(name) else "claude")
         rows = data.get("rows", {})
         if not isinstance(rows, dict):
             raise ValueError("rows must be an object")
@@ -297,6 +309,17 @@ class RoutingOverrides:
     def apply(self, route):
         fields = self.reload().get("rows", {}).get(route.row_key, {})
         return replace(route, **fields) if fields else route
+
+    def repo_pin(self, repo=None, project=None):
+        """(pattern, model) matching a resolved checkout path or forge namespace/project. Conflicting
+        matches refuse the spawn rather than depending on JSON key order. No catalog/network lookup."""
+        identities = [value.rstrip("/") for value in (repo, project) if value]
+        hits = [(pattern, self._pin_name(model))
+                for pattern, model in self.reload().get("repo_model_pins", {}).items()
+                if any(fnmatch.fnmatchcase(value, pattern) for value in identities)]
+        if len({model for _, model in hits}) > 1:
+            raise ValueError("repo_model_pins: conflicting matches (fail-closed)")
+        return sorted(hits)[0] if hits else None
 
 
 OVERRIDES = RoutingOverrides()

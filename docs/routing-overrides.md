@@ -5,8 +5,12 @@ To change an existing row's harness, backend, model or repo lock scope without r
 lives under `CONFIG_DIR` (the repo's `config/` directory by default); `ROUTING_OVERRIDES_FILE` selects a
 different path. Unlike `routes.json`, it changes existing rows only, not triggers, prompts or tool grants.
 
-The file accepts three optional top-level keys:
+The file accepts four optional top-level keys:
 
+- `repo_model_pins`: an operator-owned map from resolved local repo paths or forge `namespace/project`
+  names (case-sensitive globs allowed) to models. These floors beat row pins, ticket labels, one-run
+  picks and all MR review model tiers. See [repository model pins](configuration.md#repository-model-pins)
+  for matching, trust and conflict rules. This key is file-only and preserved by dashboard edits.
 - `rows`: an object keyed by an existing route's row key (`row_id` when set, otherwise its `domain`, such
   as `code`). Each entry accepts string fields `backend`, `adapter`, `model_pin` and `repo_lock_scope`,
   booleans `pin`, `cc_disable_thinking_local` and `cc_fail_fast`, and nullable boolean
@@ -60,7 +64,7 @@ writes a temporary file next to the target and renames it over, so the broker ne
 and its directory. A symlinked file is followed, and the temporary file goes next to the real target. Every other key in the file is kept as it is.
 
 Reloading validates the whole file before publishing it. Malformed JSON, unknown rows or fields, invalid
-adapters, unresolved backends and invalid creator/cap values reject the entire update. The broker keeps
+adapters, unresolved backends, invalid repo model pins and invalid creator/cap values reject the entire update. The broker keeps
 its last good overrides (environment defaults if none loaded), logs the rejection without file contents,
 and sends one operator alert per rejected file version. Successful reload logs identify changed top-level
 keys and row names, not values. Keep credentials out of this file; backend validation reads registry

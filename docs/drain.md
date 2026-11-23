@@ -73,6 +73,30 @@ maintenance and recovery disposition. It introduces no manual SQLite toggle.
 
 ## Intake and ordering
 
+### Scheduled inbox wakes
+
+The existing `POST /drain` boolean is also the scheduled-inbox pause control.
+Configure `BROKER_STATE_PATH` (or `COMPLETED_PATH`) for durable storage, then use
+`{"enabled": true}` before waiting for the maintenance idle window. No separate
+account-specific setting or schedule toggle is needed. This applies to both
+`DISPATCH_PRIORITY=fifo` and `reviews-first`.
+
+Schedules must submit their Gmail wakes through `POST /event`, just like mail
+notifications (`{"source": "gmail", "account": "primary", "event_name": "gmail.new"}`).
+They may keep submitting while drain is on: accepted wakes are journaled, not
+dropped or launched, and do not prevent `live_workers == 0` or `drain.idle == true`.
+Wakes already pending before drain and buffered wakes left by an exiting inbox
+worker also stay held. The hold survives restart. A schedule that launches an
+agent outside the broker is not controlled by broker drain.
+
+After `POST /drain` with `{"enabled": false}`, held wakes resume through normal
+admission and per-account coalescing. Multiple wakes may become one inbox pass;
+they do not imply one worker per timer firing. Normal route, account, approval
+and concurrency guards still apply. Disabling an inbox account is not a pause
+substitute, since ineligible events can be rejected rather than held.
+
+### Admission guards
+
 While enabled, every new launch-producing path waits: Vikunja triggers, GitLab/GitHub
 issues, internally emitted MR reviews, Gmail wakes, authenticated internal Zulip
 wakes, comment respawns, admin reruns, and direct TFA launches. New forwards into

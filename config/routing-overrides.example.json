@@ -7,6 +7,10 @@
     }
   },
   "trusted_creators": [],
+  "repo_model_pins": {
+    "/srv/git/example-project*": "opus",
+    "example/example-project*": "opus"
+  },
   "row_concurrency": {
     "code": 1
   }

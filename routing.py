@@ -992,6 +992,8 @@ class Route:
     # CC inbox cost-proxy ceiling: None = off for local backends, on otherwise.
     # Explicit booleans cover billed local endpoints and free hosted endpoints.
     inbox_input_token_limit: Optional[bool] = None
+    # The operator-owned repo pattern that won model selection, also disables usage-cap fallback.
+    repo_model_pin: str = ""
 
     @property
     def row_key(self):
@@ -1063,7 +1065,8 @@ class Route:
                      self.mcp_config_path, backend, self.backend_from_mode, self.adapter,
                      self.pin or bool(self.model_pin), self.row_id, self.model_pin,
                      self.from_config, self.site_capability, self.browser_mcp_config, self.repo_lock_scope, self.pin,
-                     self.cc_disable_thinking_local, self.cc_fail_fast, self.inbox_input_token_limit)
+                     self.cc_disable_thinking_local, self.cc_fail_fast, self.inbox_input_token_limit,
+                     self.repo_model_pin)
 
 
 # Per-ticket model selection via a `model:<name>` label. The name is either a native
@@ -1147,6 +1150,12 @@ def apply_model_label(route, labels, creator, backend_resolvable):
     with_model() result; `backend_resolvable(name) -> bool` checks the spawn registry (cc.load_backend).
     No label, or a pinned row, returns `route` unchanged. Raises ValueError on an unknown name or a non-Anthropic
     name on a ticket whose creator is not trusted; a bare non-Anthropic label on an untrusted ticket is ignored."""
+    if getattr(route, "repo_model_pin", ""):
+        # A repo floor even beats malformed/conflicting labels, before label validation or trust checks.
+        if labels:
+            log.info("model labels ignored: repo pin %r wins (backend=%r model=%r)",
+                     route.repo_model_pin, route.backend, route.model)
+        return route
     trusted = str(creator or "").strip().lower() in model_label_trusted_creators()
     hits = _model_label_hits(labels, trusted)
     if not hits:
@@ -1181,6 +1190,21 @@ def apply_model_choice(route, name, trusted, backend_resolvable, creator=None):
     _check_site_capability_adapter(route, adapter, "model label")
     return replace(route, env=dict(route.env), publish=dict(route.publish),
                    backend=backend, model=model, adapter=adapter)
+
+
+def apply_repo_model_pin(route, repo=None, project=None):
+    """Apply the operator's repo floor AFTER target resolution, BEFORE ticket or one-run choices.
+    Config is trusted, but registry resolution and capability/harness restrictions still fail closed."""
+    from routing_overrides import OVERRIDES, backend_ok
+    hit = OVERRIDES.repo_pin(repo, project)
+    if not hit:
+        return route
+    pattern, name = hit
+    if name.startswith("claude-") and not backend_ok(name):
+        picked = replace(route, backend="claude", model=name, adapter=_model_adapter("claude"))
+    else:
+        picked = apply_model_choice(route, name, True, backend_ok)
+    return replace(picked, model_pin=name, backend_pinned=True, repo_model_pin=pattern)
 
 
 def _check_site_capability_adapter(route, adapter, source):
@@ -1247,6 +1271,8 @@ def apply_adapter_label(route, labels, creator, capabilities=None):
     pinned row, or a row already on that harness, returns `route` unchanged. Raises ValueError (fail-closed) when
     both labels are present, or when the row's capability is not in `capabilities` (default: the label's own
     ADAPTER_LABELS set). Pure; never mutates `route`."""
+    if getattr(route, "repo_model_pin", ""):
+        return route
     if isinstance(labels, str):
         labels = [labels]
     names = {str(lab).strip().lower() for lab in labels or []}

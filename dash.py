@@ -779,6 +779,7 @@ def _worker_view(key, wk, now):
             "done": bool(getattr(wk, "done", False)), "turn_age": _round(now - ts) if ts else None,
             "model": model, "model_label": model_label(model),
             "backend": backend or None, "harness": harness or None,
+            "model_reason": _scalar(getattr(wk, "model_reason", None)) or None,
             "model_at": at, "model_age": _round(max(0.0, now - at)) if at is not None else None,
             "model_state": "running" if model else "unknown",
             "title": _scalar(getattr(wk, "title", None)) or None, "route": _scalar(getattr(wk, "route", None)) or None}
@@ -1803,6 +1804,7 @@ function runCard(r, inView){
   const now = lastState ? lastState.now : Date.now() / 1000;
   // Technical fields (backend, step count, session id) only with "Everything" on
   const kv = [['Status', r.word + (r.why ? ': ' + r.why : '')], ['Model', w.model_label || w.model || r.model],
+    ['Model reason', w.model_reason],
     ['Harness', HARNESS[w.harness || r.harness] || w.harness || r.harness], ['Kind of work', w.route || r.route], ['Turns', w.turns],
     ['Tokens', w.tokens != null ? kfmt(w.tokens) : r.tokens != null ? kfmt(r.tokens) : null],
     ['Started', r.started != null ? stamp(r.started) + ' (' + agoT(now - r.started) + ')' : null],

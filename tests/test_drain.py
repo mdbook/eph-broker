@@ -111,6 +111,76 @@ class DrainTests:
         self.pump(b)
         assert [k for (k, _) in self.calls] == [key]
 
+    def _pump_inbox_wakes(self, b):
+        # Reviews-first resolves advisory dispatch metadata in background threads.
+        # Let them finish outside the scheduler lock instead of racing a tight tick loop.
+        for _ in range(12):
+            b.tick()
+            deadline = time.monotonic() + 5
+            while True:
+                with b.coalescer.lock:
+                    if not b.coalescer._dispatch_resolving:
+                        break
+                assert time.monotonic() < deadline, 'inbox dispatch metadata did not finish'
+                time.sleep(0.001)
+
+    def test_scheduled_inbox_wakes_stay_idle_across_drained_restart(self):
+        for policy in ('fifo', 'reviews-first'):
+            with patch.dict(os.environ, {'DISPATCH_PRIORITY': policy}):
+                self.path = os.path.join(self.tmp.name, policy + '.sqlite3')
+                self.calls.clear()
+                b = self.broker()
+                wakes = [{'source': 'gmail', 'account': account, 'event_name': 'gmail.new',
+                          'schedule_id': i} for i, account in enumerate(('primary', 'primary', 'secondary'))]
+                # Include a wake armed before drain, plus repeated scheduler arrivals after its ack.
+                b.ingest(wakes[0])
+                assert b.set_drain(True)['idle']
+                for wake in wakes[1:]:
+                    b.ingest(wake)
+                    self._pump_inbox_wakes(b)
+                    assert b.drain_status()['idle'] and self.calls == []
+                b = self.restart(b)
+                self._pump_inbox_wakes(b)
+                assert b.drain_status()['enabled'] and b.drain_status()['idle']
+                assert b.drain_status()['queued'] == 2
+                assert b.coalescer.pending['gmail:primary']['events'] == wakes[:1]
+                assert self.calls == []
+                b.set_drain(False)
+                self._pump_inbox_wakes(b)
+                assert [k for k, _ in self.calls] == ['gmail:primary', 'gmail:secondary']
+                assert b.coalescer.live['gmail:primary']['events'] == wakes[:2]
+                assert b.coalescer.live['gmail:secondary']['events'] == wakes[2:]
+                assert b.drain_status()['queued'] == 0
+                assert not b.coalescer.pending and not b.coalescer.recovery
+
+    def test_scheduled_inbox_wakes_do_not_reopen_idle_window_after_live_exit(self):
+        for policy in ('fifo', 'reviews-first'):
+            with patch.dict(os.environ, {'DISPATCH_PRIORITY': policy}):
+                self.path = os.path.join(self.tmp.name, policy + '.sqlite3')
+                self.calls.clear()
+                b = self.broker()
+                wake = {'source': 'gmail', 'account': 'primary', 'event_name': 'gmail.new'}
+                key = b.ingest(wake)
+                self._pump_inbox_wakes(b)
+                assert len(self.calls) == 1
+                # An already-buffered wake must survive retirement, but not keep launching workers.
+                b.ingest({**wake, 'schedule_id': 1})
+                b.set_drain(True)
+                b.ingest({**wake, 'schedule_id': 2})
+                b.coalescer.settle_self(key)
+                self._pump_inbox_wakes(b)
+                assert b.drain_status()['idle'] and len(self.calls) == 1
+                assert b.drain_status()['queued'] == 1
+                b = self.restart(b)
+                self._pump_inbox_wakes(b)
+                assert b.drain_status()['idle'] and len(self.calls) == 1
+                b.set_drain(False)
+                self._pump_inbox_wakes(b)
+                assert [k for k, _ in self.calls] == [key, key]
+                assert [e['schedule_id'] for e in b.coalescer.live[key]['events']] == [1, 2]
+                assert b.drain_status()['queued'] == 0
+                assert not b.coalescer.pending and not b.coalescer.recovery
+
     def test_all_sources_deferred_private_dm_and_guards_preserved(self):
         b = self.broker()
         b.set_drain(True)

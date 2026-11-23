@@ -430,10 +430,11 @@ stops the worker from starting (logged and escalated). Empty output, an error, a
 A row's `backend` and `adapter` in `routing-overrides.json` (or its `<ROW>_BACKEND` and
 `<ROW>_ADAPTER` environment settings) are defaults, not pins. Precedence is:
 
-1. Explicit row `"pin": true`, or a nonempty `model_pin`.
-2. An operator's one-run model pick on dashboard **Run again**.
-3. A ticket's `model:<name>` or supported bare model label.
-4. The row's backend/harness default, then `FLEET_MODEL_SH` when no backend is set.
+1. A matching repository model pin (see below).
+2. Explicit row `"pin": true`, or a nonempty `model_pin`.
+3. An operator's one-run model pick on dashboard **Run again**.
+4. A ticket's `model:<name>` or supported bare model label.
+5. The row's backend/harness default, then `FLEET_MODEL_SH` when no backend is set.
 
 `opus`, `sonnet` and `haiku` labels select native Claude Code (`cc`), even when the row defaults to
 another harness. Registry backend choices select the entry's `adapter` if present (`cc`, `hermes` or
@@ -455,6 +456,40 @@ Dashboard Settings and `GET /actions/settings` expose the effective `pin`, `pinn
 `model_pin`) and `default_pin` alongside the backend and model pin. Each spawn logs a
 `model selection` line naming the winner (`label`, `operator choice`, `row default` or `pin`),
 backend, model and adapter. Ignored model labels also log that the pin won.
+
+### Repository model pins
+
+Set the file-only `repo_model_pins` map in `routing-overrides.json` to enforce a model across worker
+rows, fix rounds, reruns and all MR review tiers:
+
+```json
+{
+  "repo_model_pins": {
+    "/srv/git/example-project*": "opus",
+    "example/example-project*": "opus"
+  }
+}
+```
+
+Keys are case-sensitive shell globs (`*`, `?`, `[abc]`) or exact names. Workers match their **resolved
+local checkout path**, not the disposable worktree or a ticket's unresolved `repo:` text. MR reviews
+also match the forge `namespace/project`; issue workers and MR fix rounds also match their event's
+project identifier. Include both local and forge forms when you need either form to match independently;
+there is no implicit basename, URL or catalog expansion. Trailing slashes on identities are ignored.
+If multiple patterns match, they must name the same model; conflicting models refuse the spawn rather
+than depending on map order.
+
+Values accept `opus`, `sonnet`, `haiku`, a full `claude-*` model id, or a usable spawn-registry backend.
+Invalid values reject the entire reload, retaining the last good configuration. Config is operator-owned,
+so registry backend pins are trusted without a ticket creator allowlist. The chosen model determines the
+harness through registry metadata, including switching a Codex row to `cc` for `opus`. Capability and
+`CODE_NONCLAUDE_OK` checks still apply. Pins override row pins, ticket model/harness labels, dashboard
+one-run picks and review-tier model defaults. Ignored ticket model labels are logged. Usage-cap fallback
+cannot switch a pinned repository to another provider. A tier that skips review still skips it.
+
+The map reloads on the next spawn or SIGHUP like other routing overrides; running sessions retain their
+launch route. The dashboard run detail's **Model reason** and the `model selection` log name the matching
+repo pin. Edit this map by hand; the dashboard row editor preserves it but does not edit it.
 
 `SPAWN_MODELS_JSON` names the registry file. Each backend is an entry under `backends`:
 

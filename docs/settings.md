@@ -58,6 +58,11 @@ Turn caps and time limits per capability are in `config/constraints.json`, not h
 
 ### Inbox run guardrails (Claude Code)
 
+To pause scheduled inbox launches for maintenance without losing wakes, configure
+durable storage with `BROKER_STATE_PATH` and enable the existing `POST /drain`
+switch. Drain-off resumes held wakes, including after restart. This covers all
+accounts and both dispatch policies; see [scheduled inbox wakes](drain.md#scheduled-inbox-wakes).
+
 The `inbox` triage capability defaults to 15 CLI turns and 1800 seconds per
 invocation, independent of other rows. Override these with
 `max_turns_by_capability.inbox` and `wall_clock_by_capability.inbox`.

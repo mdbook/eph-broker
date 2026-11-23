@@ -12,6 +12,7 @@ import tempfile
 import threading
 from dataclasses import replace
 from unittest.mock import patch
+from types import SimpleNamespace
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -227,6 +228,126 @@ def test_model_choices_preserve_site_capability_rules():
        "the same choices without a site capability still switch")
 
 
+def test_repo_pin_precedence_matching_and_reload():
+    with _Overrides() as (path, loader):
+        route = replace(routing._CODE_ROW.with_model(), backend="sol", adapter="codex", model="gpt-test",
+                        pin=True, backend_pinned=True, model_pin="haiku")
+        save(path, {"repo_model_pins": {"/srv/git/app*": "OPUS", "example/app*": "opus"}})
+        pinned = routing.apply_repo_model_pin(route, repo="/srv/git/app/", project="example/app")
+        assert (pinned.backend, pinned.adapter, pinned.model) == ("claude", "cc", "opus")
+        assert pinned.backend_pinned and pinned.model_pin == "opus"
+        assert routing.apply_repo_model_pin(route, repo="/srv/git/other") is route
+        assert routing.apply_repo_model_pin(route, project="Example/app") is route, "case-sensitive globs"
+        with patch.object(routing.log, "info") as info:
+            assert routing.apply_model_label(pinned, ["model:missing", "sonnet"], "guest", lambda n: False) is pinned
+            assert any("repo pin" in str(call) for call in info.call_args_list)
+        assert routing.apply_adapter_label(pinned, ["hermes", "codex"], "guest") is pinned
+        assert (route.backend, route.model, route.adapter) == ("sol", "gpt-test", "codex"), "no mutation"
+        save(path, {"repo_model_pins": {"/srv/git/app*": "sonnet"}})
+        assert routing.apply_repo_model_pin(route, repo="/srv/git/app-site").model == "sonnet"
+        assert pinned.model == "opus", "running routes retain their launch model"
+        save(path, {"repo_model_pins": {"/srv/git/*": "opus", "/srv/git/app": "sonnet"}})
+        try:
+            loader.repo_pin("/srv/git/app")
+            raise AssertionError("conflicting repo floors must refuse, not depend on key order")
+        except ValueError as e:
+            assert "conflicting" in str(e)
+        path.unlink()
+        assert routing.apply_repo_model_pin(route, repo="/srv/git/app") is route
+    ok("repo pins beat codex/sol and row pins, ignore ticket choices with a log, match globs and hot-reload")
+
+
+def test_repo_pin_backend_trust_capabilities_and_fallback():
+    with _Overrides() as (path, _):
+        route = routing._CODE_ROW.with_model()
+        save(path, {"repo_model_pins": {"/srv/git/app": "test-backend"}, "trusted_creators": []})
+        picked = routing.apply_repo_model_pin(route, repo="/srv/git/app")
+        assert picked.backend == "test-backend" and picked.adapter == "cc", "operator config is trusted"
+        save(path, {"repo_model_pins": {"/srv/git/app": "claude-opus-test"}})
+        picked = routing.apply_repo_model_pin(route, repo="/srv/git/app")
+        assert (picked.backend, picked.model, picked.adapter) == ("claude", "claude-opus-test", "cc")
+        adapter = cc.CCAdapter(router=None, worktree_mgr=None, prompt_loader=None, envelope_parser=None)
+        with patch.object(cc, "_usage_over_threshold", return_value=True), \
+                patch.object(cc, "USAGE_CAP_FALLBACK_CHAIN", "test-backend"):
+            assert adapter._usage_cap_chain(picked) == ["claude"], "repo floor survives proactive/reactive caps"
+        with patch.object(cc, "_backend_entry", lambda n: {
+                "codex": {"model": "gpt-test"}} if n == "sol" else None):
+            save(path, {"repo_model_pins": {"/srv/git/app": "sol"}})
+            assert routing.apply_repo_model_pin(route, repo="/srv/git/app").adapter == "codex"
+            try:
+                routing.apply_repo_model_pin(replace(route, site_capability="writer"), repo="/srv/git/app")
+                raise AssertionError("repo pins must retain the site-capability harness guard")
+            except ValueError as e:
+                assert "cc harness only" in str(e)
+    ok("repo pins trust operator backend choices, preserve capability guards and never change provider on usage caps")
+
+
+def test_repo_pin_worker_uses_resolved_target_on_rerun_and_fix():
+    with _Overrides() as (path, _):
+        save(path, {"repo_model_pins": {"/srv/git/target": "opus"}})
+        route = replace(routing._CODE_ROW.with_model(), repo="/srv/git/default", backend="sol", adapter="codex")
+        ticket = SimpleNamespace(text="repo: /srv/git/target", labels=["model:missing", "sonnet", "codex"],
+                                 creator="guest", title="test")
+        seen = []
+
+        def capture(picked, *args):
+            seen.append(picked)
+            raise RuntimeError("stop before worktree cut")
+
+        adapter = cc.CCAdapter(router=SimpleNamespace(route=lambda *a: route), worktree_mgr=None,
+                               prompt_loader=None, envelope_parser=None, alert_ops=lambda *a, **kw: None)
+        with patch.object(adapter, "_tracker_fetch", return_value=ticket), \
+                patch.object(routing, "code_repo_allowed", return_value=True), \
+                patch.object(routing, "repo_infer_enabled", return_value=False), \
+                patch.object(routing, "repo_infer_shadow", return_value=False), \
+                patch.object(routing, "resolve_issue_repo", return_value="/srv/git/target"), \
+                patch.object(routing, "mr_note_author_allowed", return_value=True), \
+                patch.object(routing, "mr_iteration_max", return_value=3), \
+                patch.object(routing, "apply_adapter_label", side_effect=capture), patch.object(cc.events, "emit"):
+            for brief, choice in (({}, None), ({}, "haiku"), ({"event_names": ["mr.note"], "mr": {
+                    "project": "example/app", "source_branch": "eph/code-change/fix", "target_ref": "main"}}, None)):
+                if choice:
+                    adapter.queue_model_choice("vikunja:task:9991", choice)
+                adapter._run_worker("vikunja:task:9991", {"task_id": 9991, **brief}, "test-run")
+        assert len(seen) == 3, seen
+        assert all((r.backend, r.model, r.adapter) == ("claude", "opus", "cc") for r in seen)
+        assert all(r.repo_model_pin == "/srv/git/target" for r in seen), "not the row's default repo"
+        assert adapter._pop_model_choice("vikunja:task:9991") is None
+    ok("worker repo resolution precedes label validation on initial runs, dashboard reruns and MR fix rounds")
+
+
+def test_repo_pin_all_mr_tiers_dispatch_and_dash_reason():
+    import dash
+    with _Overrides() as (path, _):
+        save(path, {"repo_model_pins": {"example/app*": "opus"}})
+        route = replace(routing._MR_REVIEW_ROW.with_model(), model_pin="haiku", model="haiku",
+                        backend="sol", adapter="codex", backend_pinned=True)
+        wt = SimpleNamespace(make=lambda *a, **kw: str(path.parent), mr_diff=lambda *a, **kw: "a diff",
+                             cut_sha=lambda *a: "a" * 40, remove=lambda *a: None)
+        adapter = cc.CCAdapter(router=SimpleNamespace(route=lambda *a: route), worktree_mgr=wt,
+                               prompt_loader=SimpleNamespace(load=lambda *a: "SYS"),
+                               envelope_parser=None, alert_ops=lambda *a, **kw: None)
+        seen = []
+
+        def turn(worker, dispatched, *args, **kwargs):
+            seen.append((dispatched.backend, dispatched.model, dispatched.adapter, dispatched.prompt_class))
+            view = dash._worker_view(worker.key, worker, 0)
+            assert view["model_reason"] == "repo pin: example/app*"
+            worker.done = True
+            return {"status": "pass", "summary": "test"}
+
+        with patch.object(adapter, "_turn", side_effect=turn), patch.object(adapter, "_post_envelope"), \
+                patch.object(adapter, "_post_mr_verdict"), patch.object(cc.events, "emit"):
+            for tier in ("quick", "standard", "full"):
+                with patch.object(routing, "select_mr_review_tier", return_value=(tier, "test tier")):
+                    adapter._run_worker("mr:example/app!9991", {"mr": {"project": "example/app",
+                        "mr_iid": 9991, "repo_path": str(path.parent), "source_branch": "eph/test",
+                        "target_ref": "main"}}, "test-review")
+        assert seen == [("claude", "opus", "cc", prompt) for prompt in ("quick", "agent", "agent")], seen
+        assert "['Model reason', w.model_reason]" in dash.PAGE
+    ok("repo pin beats reviewer row/tier models for quick, standard and full; dispatch and dashboard name the floor")
+
+
 def test_bad_file_is_atomic_and_alerted_once():
     bad_cases = (
         {"rows": {"code": {"repo_lock_scope": "publish"}}},
@@ -240,6 +361,14 @@ def test_bad_file_is_atomic_and_alerted_once():
         {"trusted_creators": "operator"},
         {"row_concurrency": {"code": True}},
         {"row_concurrency": {"code": -1}},
+        {"repo_model_pins": []},
+        {"repo_model_pins": {"": "opus"}},
+        {"repo_model_pins": {" /srv/git/app": "opus"}},
+        {"repo_model_pins": {"/srv/git/app": "typo"}},
+        {"repo_model_pins": {"/srv/git/app": "claude"}},
+        {"repo_model_pins": {"/srv/git/app": "local"}},
+        {"repo_model_pins": {"/srv/git/app": None}},
+        {"repo_model_pins": {"/srv/git/app": ""}},
         [],
         "invalid json",
     )
@@ -255,6 +384,7 @@ def test_bad_file_is_atomic_and_alerted_once():
             notify.wake_ops = alert
             try:
                 good = {"rows": {routing._CODE_ROW.row_key: {"model_pin": "opus"}},
+                        "repo_model_pins": {"/srv/git/app": "opus"},
                         "trusted_creators": ["operator"], "row_concurrency": {"code": 1}}
                 save(path, good)
                 assert loader.reload() == good

@@ -3692,60 +3692,86 @@ class CCAdapter(Adapter):
                 self._alert_ops(f"UI code worker {key} parked: CODE_BROWSER_MCP_CONFIG is unset "
                                 f"(browser required){self._dash_url(_ref)}", subject=f"reject:{key}")
                 return
-            # A `model:<name>` ticket label picks this worker's model/backend (routing.apply_model_label:
-            # pin wins, unknown name / untrusted creator picking a non-Anthropic backend: fail-closed). Read
-            # off the FETCHED ticket (labels/created_by), so it holds even when the coalesced brief lost them.
-            # Via the Ticket's creator/labels (ticket_meta underneath), which fail closed (creator None) on a
-            # truncated / list-fallback / lookalike blob: then NO label is honored (default model), never a
-            # description-spoofed label/creator.
-            trusted = ticket is not None and ticket.creator is not None
-            selection_source = "pin" if getattr(route, "backend_pinned", False) else "row default"
-            if _task_id is not None and ticket is not None and not trusted:
-                log.info("model label: key=%s run_id=%s -> ticket labels/creator untrusted (truncated/fallback/"
-                         "duplicate fields) -> no model label applied", key, run_id)
-            if choice and route.backend_pinned:
-                log.warning("model choice %r ignored: key=%s row %s is pinned", choice, key, route.row_key)
-            elif choice:
+            selection_source = None
+
+            def select_model(repo):
+                # Code/general targets are known only after inference/allowlist resolution. Delay ALL
+                # ticket validation there so even a bad ticket label cannot defeat the operator's floor.
+                nonlocal route, model_override, adapter_override, selection_source
+                project = ((brief.get("mr") or {}).get("project")
+                           or (brief.get("issue") or {}).get("repo_ident"))
                 try:
-                    from routing_overrides import backend_ok
-                    route = routing.apply_model_choice(route, choice, True, backend_ok)
-                    model_override = (route.backend, route.model)
-                    adapter_override = route.adapter
-                    selection_source = "operator choice"
-                    log.info("model choice: key=%s run_id=%s -> backend=%r model=%r", key, run_id,
-                             route.backend, route.model)
+                    route = routing.apply_repo_model_pin(route, repo=repo, project=project)
                 except ValueError as e:
-                    log.warning("spawn REJECT (model choice): key=%s run_id=%s: %s", key, run_id, e)
-                    self._alert_ops(f"eph worker {key} not spawned: {e}{self._dash_url(_ref)}", subject=f"abort:{key}")
+                    log.warning("spawn REJECT (repo pin): key=%s run_id=%s: %s", key, run_id, e)
+                    self._alert_ops(f"eph worker {key} not spawned: {e}", subject=f"abort:{key}")
+                    return False
+                # A `model:<name>` ticket label picks this worker's model/backend (routing.apply_model_label:
+                # pin wins, unknown name / untrusted creator picking a non-Anthropic backend: fail-closed). Read
+                # off the FETCHED ticket (labels/created_by), so it holds even when the coalesced brief lost them.
+                # Via the Ticket's creator/labels (ticket_meta underneath), which fail closed (creator None) on a
+                # truncated / list-fallback / lookalike blob: then NO label is honored (default model), never a
+                # description-spoofed label/creator.
+                trusted = ticket is not None and ticket.creator is not None
+                repo_pin = getattr(route, "repo_model_pin", "")
+                selection_source = ("repo pin: " + repo_pin if repo_pin else
+                                    "pin" if getattr(route, "backend_pinned", False) else "row default")
+                if _task_id is not None and ticket is not None and not trusted:
+                    log.info("model label: key=%s run_id=%s -> ticket labels/creator untrusted (truncated/fallback/"
+                             "duplicate fields) -> no model label applied", key, run_id)
+                if choice and route.backend_pinned:
+                    log.warning("model choice %r ignored: key=%s row %s is pinned", choice, key, route.row_key)
+                elif choice:
+                    try:
+                        from routing_overrides import backend_ok
+                        route = routing.apply_model_choice(route, choice, True, backend_ok)
+                        model_override = (route.backend, route.model)
+                        adapter_override = route.adapter
+                        selection_source = "operator choice"
+                        log.info("model choice: key=%s run_id=%s -> backend=%r model=%r", key, run_id,
+                                 route.backend, route.model)
+                    except ValueError as e:
+                        log.warning("spawn REJECT (model choice): key=%s run_id=%s: %s", key, run_id, e)
+                        self._alert_ops(f"eph worker {key} not spawned: {e}{self._dash_url(_ref)}", subject=f"abort:{key}")
+                        return
+                if _task_id is not None and trusted:
+                    try:
+                        from routing_overrides import backend_ok
+                        labelled = route if choice else routing.apply_model_label(
+                            route, ticket.labels, ticket.creator, backend_ok)
+                        if labelled is not route:
+                            route, model_override = labelled, (labelled.backend, labelled.model)
+                            adapter_override = labelled.adapter
+                            selection_source = "label"
+                            log.info("model label: key=%s run_id=%s -> backend=%r model=%r", key, run_id,
+                                     labelled.backend, labelled.model)
+                        # A `hermes` / `codex` label flips the harness (after the model label, so its backend rides through)
+                        flipped = routing.apply_adapter_label(route, [] if choice else ticket.labels, ticket.creator)
+                        if flipped is not route:
+                            route, model_override = flipped, (flipped.backend, flipped.model)
+                            adapter_override = flipped.adapter
+                            log.info("%s label: key=%s run_id=%s -> adapter=%s backend=%r", flipped.adapter, key,
+                                     run_id, flipped.adapter, flipped.backend)
+                    except ValueError as e:
+                        _lbl = str(e).split(":", 1)[0]
+                        log.warning("spawn REJECT (%s): key=%s run_id=%s: %s",
+                                    _lbl if _lbl in ("hermes label", "codex label") else "model label",
+                                    key, run_id, e)
+                        self._alert_ops(f"eph worker {key} not spawned: {e}{self._dash_url(_ref)}", subject=f"abort:{key}")
+                        return
+                log.info("model selection: key=%s run_id=%s row=%s winner=%s adapter=%s backend=%r model=%r",
+                         key, run_id, getattr(route, "row_key", route.domain), selection_source,
+                         getattr(route, "adapter", "cc"), getattr(route, "backend", ""), route.model)
+                return True
+
+            from routing_overrides import OVERRIDES
+            defer_model = (getattr(route, "capability", "") in ("code", "general")
+                           and bool(OVERRIDES.reload().get("repo_model_pins")))
+            if not defer_model:
+                selection_repo = ((brief.get("mr") or {}).get("repo_path")
+                                  or pub.get("wiki_repo_path") or getattr(route, "repo", ""))
+                if not select_model(selection_repo):
                     return
-            if _task_id is not None and trusted:
-                try:
-                    from routing_overrides import backend_ok
-                    labelled = route if choice else routing.apply_model_label(
-                        route, ticket.labels, ticket.creator, backend_ok)
-                    if labelled is not route:
-                        route, model_override = labelled, (labelled.backend, labelled.model)
-                        adapter_override = labelled.adapter
-                        selection_source = "label"
-                        log.info("model label: key=%s run_id=%s -> backend=%r model=%r", key, run_id,
-                                 labelled.backend, labelled.model)
-                    # A `hermes` / `codex` label flips the harness (after the model label, so its backend rides through)
-                    flipped = routing.apply_adapter_label(route, [] if choice else ticket.labels, ticket.creator)
-                    if flipped is not route:
-                        route, model_override = flipped, (flipped.backend, flipped.model)
-                        adapter_override = flipped.adapter
-                        log.info("%s label: key=%s run_id=%s -> adapter=%s backend=%r", flipped.adapter, key,
-                                 run_id, flipped.adapter, flipped.backend)
-                except ValueError as e:
-                    _lbl = str(e).split(":", 1)[0]
-                    log.warning("spawn REJECT (%s): key=%s run_id=%s: %s",
-                                _lbl if _lbl in ("hermes label", "codex label") else "model label",
-                                key, run_id, e)
-                    self._alert_ops(f"eph worker {key} not spawned: {e}{self._dash_url(_ref)}", subject=f"abort:{key}")
-                    return
-            log.info("model selection: key=%s run_id=%s row=%s winner=%s adapter=%s backend=%r model=%r",
-                     key, run_id, getattr(route, "row_key", route.domain), selection_source,
-                     getattr(route, "adapter", "cc"), getattr(route, "backend", ""), route.model)
             # dev-spindown GH/GL issue-code: an external issue arrives WITH its title+body in the event (no
             # Vikunja fetch: task_id is None, so the fetcher above no-ops), and collapse() carried them into
             # brief["issue"]. Inject that text into the brief's "ticket" slot (the SAME slot the ticket
@@ -3988,6 +4014,8 @@ class CCAdapter(Adapter):
                 # (test_environment.prepare): an environment gap is verification evidence, not a reason to
                 # discard an otherwise useful change, so it is threaded into the brief, never a hard abort.
                 code_repo = target_repo
+                if defer_model and not select_model(target_repo):
+                    return
                 if routing.code_judged_bash_enabled():
                     code_runner = routing.resolve_declared_test_runner(target_repo)
                 else:
@@ -4171,6 +4199,7 @@ class CCAdapter(Adapter):
                     worktree = self.worktree_mgr.make(key)   # charter-free worktree cwd (ansible default)
                 worker_cwd = worktree
             worker = Worker(key, run_id, worker_cwd)
+            worker.model_reason = selection_source
             steer.clear_inbox(key)                       # a previous run's undelivered message never leaks in
             worker.title = (getattr(ticket, "title", "") or "").strip()[:200] or None
             worker.route = getattr(route, "domain", None)
@@ -4781,6 +4810,9 @@ class CCAdapter(Adapter):
         file says we're over the cap, DROP the doomed Anthropic head so we start on the first fallback (the
         reactive detector still covers a stale/absent file)."""
         head = getattr(route, "backend", "") or ""
+        if getattr(route, "repo_model_pin", ""):
+            # A repo floor must not silently switch providers when the chosen model is capped.
+            return [head]
         tail = [b.strip() for b in (USAGE_CAP_FALLBACK_CHAIN or "").split(",") if b.strip()]
         chain = [head] + tail
         if self._backend_native(head) and _usage_over_threshold():

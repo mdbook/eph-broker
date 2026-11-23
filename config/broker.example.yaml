@@ -83,6 +83,7 @@ constraints:
   wall_clock_by_capability: {code: 3600, inbox: 1800}
   inbox_max_input_tokens: 3000000  # Defaults off for local backends; see inbox_input_token_limit row override.
   inbox_max_cost_usd: 2.0
+  inbox_suppress_progress_caps: true  # Quiet turn/time stops only when distinct new ledger IDs are verified.
   # Inbox CC pricing: exact launch AND observed model ids, USD per million tokens. Review provider rates.
   # Unknown launch/internal models fail loud. Include backend/fallback ids, aliases and internally routed tiers.
   model_prices:

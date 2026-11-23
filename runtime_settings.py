@@ -304,7 +304,8 @@ class RuntimeSettings:
         self.model_denylist_default = copy.deepcopy(site_env.CONFIG.get("model_denylist", []))
         self.constraint_defaults = {name: copy.deepcopy(getattr(broker.adapter, name)) for name in (
             "max_turns", "max_turns_by_capability", "wall_clock_s", "wall_clock_by_capability",
-            "inbox_max_input_tokens", "inbox_max_cost_usd", "model_prices", "max_forwards", "rotate_turns", "rotate_tokens")}
+            "inbox_max_input_tokens", "inbox_max_cost_usd", "inbox_suppress_progress_caps", "model_prices",
+            "max_forwards", "rotate_turns", "rotate_tokens")}
         self.progress_default = broker.liveness.progress_timeout
         self.window_defaults = {name: copy.deepcopy(getattr(importlib.import_module("coalescer"), name))
                                 for name in ("INITIAL_WINDOWS", "RECEIVE_WINDOWS")}
@@ -404,7 +405,11 @@ def constraints(cfg, defaults):
         if name not in cfg:
             continue
         v = cfg[name]
-        if name in ("wall_clock_s", "inbox_max_cost_usd"):
+        if name == "inbox_suppress_progress_caps":
+            if type(v) is not bool:
+                raise ValueError("expected boolean inbox_suppress_progress_caps")
+            values[name] = v
+        elif name in ("wall_clock_s", "inbox_max_cost_usd"):
             values[name] = positive(v)  # durations remain floats, including sub-second budgets
         elif name in ("max_turns_by_capability", "wall_clock_by_capability"):
             parse = positive if name.startswith("wall_clock") else integer

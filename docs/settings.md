@@ -64,6 +64,32 @@ invocation, independent of other rows. Override these with
 `LOCAL_WALL_CLOCK_MULT` does not multiply the inbox time limit. `inbox-chat` and
 all other rows retain their existing limits.
 
+Each account in `inbox-accounts.json` (or `broker.yaml`'s `inbox-accounts`
+section) accepts `batch_size`: an integer from 1 to 6, default `3` unseen
+messages per run. The runtime brief tightens the signed prompt's six-message
+ceiling, using batches of at most three. Stricter account posture still wins.
+After one bounded pass the worker exits; remaining mail waits for the next
+scheduled wake, rather than draining the backlog through warm forwards.
+This is a model work bound, not a guarantee that arbitrary mail fits the turn
+or time limit; those hard limits remain in force. Account changes apply on
+broker restart.
+
+`constraints.inbox_suppress_progress_caps` defaults to `true` (SIGHUP reload).
+A turn or wall-clock cap still produces a truthful `blocked` receipt, but no
+ops alert when the broker verifies distinct new ledger IDs since spawn.
+Set it to `false` to alert on every cap as before. The broker reads the account's
+JSONL ledger before and after the run, accepting string `id`, `gmail_id` or
+`message_id` fields. Duplicate IDs, verdict/timestamp-only edits, removed IDs,
+unreadable files and malformed/unknown records cannot establish progress and
+still alert. Missing files start empty. No message contents or IDs are sent to
+ops for this check. Usage ceilings, upstream errors and ordinary blocked
+results still alert, even when mail was processed.
+
+Terminal inbox runs do not advertise idle or accept another warm turn. During
+cleanup the worker thread is still alive even after its `done` flag is set,
+avoiding a false dead-thread FORCE-CLOSE. Both self-settle and real force-close
+leave `gmail:*` keys eligible for the next wake, never completed-deduped.
+
 `inbox_max_input_tokens` (default `3000000`) and `inbox_max_cost_usd` (default `2.0`)
 are positive per-worker-run ceilings in the constraints section of
 `config/constraints.json` or `broker.yaml`. Send SIGHUP to apply changes. Usage is

@@ -671,7 +671,7 @@ def test_provenance_and_inbox_sections_parity():
                 inbox_accounts.load_accounts(explicit=False)
                 raise AssertionError("bad account accepted")
             except ValueError as e:
-                assert "exactly" in str(e)
+                assert "{email, ledger, posture}" in str(e)
     ok("provenance and inbox-accounts: a broker.yaml section loads like the json file, same checks; an explicit "
        "path env var still wins")
 
@@ -1027,10 +1027,12 @@ def test_live_launch_policy_and_optional_rows_reload_without_restart():
 def test_live_fractional_constraints_reach_turn_budget_without_immediate_exhaustion():
     from adapters import cc
     with _live_broker() as (b, path):
+        assert b.adapter.inbox_suppress_progress_caps is True
         _reload(b, path, constraints={"wall_clock_s": 0.5, "wall_clock_by_capability": {"code": 0.75},
-                                     "max_turns": 9, "max_forwards": 3})
+                                     "max_turns": 9, "max_forwards": 3, "inbox_suppress_progress_caps": False})
         assert b.adapter.wall_clock_s == 0.5 and b.adapter.wall_clock_by_capability["code"] == 0.75
         assert b.adapter.max_turns == 9 and b.coalescer.max_forwards == 3
+        assert b.adapter.inbox_suppress_progress_caps is False
         route = routing.Route(domain="test", repo=str(path.parent), prompt_class="agent", agent="test",
                               model="sonnet", cc_fail_fast=False)
         worker = cc.Worker("test:9992", "synthetic-fractional-run", str(path.parent))
@@ -1052,9 +1054,13 @@ def test_live_fractional_constraints_reach_turn_budget_without_immediate_exhaust
         assert len(budgets) == 1 and 0.4 < budgets[0] <= 0.5
         assert not worker.hard_killed and worker.turn_wall_clock == 0.5
         for cfg in ({"wall_clock_s": 0}, {"wall_clock_s": "nan"}, {"wall_clock_by_capability": {"read": -1}},
-                    {"model_prices": {"test": {"input_tokens": -1}}}):
+                    {"model_prices": {"test": {"input_tokens": -1}}}, {"inbox_suppress_progress_caps": "false"},
+                    {"inbox_suppress_progress_caps": 0}):
             _reload(b, path, constraints=cfg)
             assert b.adapter.wall_clock_s == 0.5 and b.adapter.wall_clock_by_capability["code"] == 0.75
+            assert b.adapter.inbox_suppress_progress_caps is False
+        _reload(b, path, constraints={"inbox_suppress_progress_caps": True})
+        assert b.adapter.inbox_suppress_progress_caps is True
     ok("fractional duration reloads reach the actual CC timeout without truncation; bad constraints retain budgets")
 
 

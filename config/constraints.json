@@ -12,6 +12,7 @@
   },
   "inbox_max_input_tokens": 3000000,
   "inbox_max_cost_usd": 2.0,
+  "inbox_suppress_progress_caps": true,
   "model_prices": {
     "sonnet": {"input_tokens": 3.0, "output_tokens": 15.0, "cache_read_input_tokens": 0.3, "cache_creation_input_tokens": 3.75},
     "example-local-model": {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}

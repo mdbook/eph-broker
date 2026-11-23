@@ -4107,7 +4107,7 @@ def test_bug_b_worker_alive_startup_race():
         release.set()
         t.join(timeout=5)
     assert a.worker_alive(key) is False, "once the spawn thread ends, worker_alive() must go False"
-    # steady-state (Worker registered) path must be unaffected: alive while thread runs, False once done.
+    # Steady-state: alive while the thread runs, including terminal cleanup after done is set.
     w = Worker(key, "run-1", "/tmp")
     release2 = threading.Event()
     live = threading.Thread(target=release2.wait, name="fake-live-thread", daemon=True)
@@ -4117,12 +4117,14 @@ def test_bug_b_worker_alive_startup_race():
     live.start()
     try:
         assert a.worker_alive(key) is True, "steady-state: Worker registered + thread alive -> True"
+        w.done = True
+        assert a.worker_alive(key) is True, "done stops turns, not the still-running cleanup thread"
     finally:
         release2.set()
         live.join(timeout=5)
     assert a.worker_alive(key) is False, "steady-state: thread ended -> False"
     w.done = True
-    assert a.worker_alive(key) is False, "done Worker -> False regardless of thread state"
+    assert a.worker_alive(key) is False, "done Worker with an ended thread -> False"
     ok("bug B: worker_alive() true via _threads fallback during setup race; steady-state unaffected")
 
 
@@ -23966,7 +23968,7 @@ def test_inbox_accounts_overlay_fails_closed():
     for facts in ACCOUNTS.values():   # whatever overlay is installed (none in an OSS export)
         assert facts["email"] not in src and facts["ledger"] not in src, "account facts must not live in code"
     ex = IA.load_accounts(os.path.join(ROOT, "config", "inbox-accounts.example.json"), explicit=True)
-    assert ex and all(set(f) == {"email", "ledger", "posture"} for f in ex.values()), ex
+    assert ex and all(set(f) == {"email", "ledger", "posture", "batch_size"} for f in ex.values()), ex
     with tempfile.TemporaryDirectory() as d:
         missing = os.path.join(d, "nope.json")
         assert IA.load_accounts(missing, explicit=False) == {}
@@ -26339,6 +26341,224 @@ def _inbox_stream_result(tokens=10, cost=0.1, **extra):
                        "usage": {"input_tokens": tokens},
                        "result": json.dumps({"status": "done", "summary": "complete", "wake": []}),
                        **extra}) + "\n"
+
+
+def test_inbox_batch_size_config_tightens_signed_ceiling():
+    import inbox_accounts as IA
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        path = pathlib.Path(d, "accounts.json")
+        facts = {"email": "a@example.test", "ledger": str(pathlib.Path(d, "seen.jsonl")), "posture": "p"}
+        for size in (None, 1, 3, 6, 0, -1, 7, True, "3", 2.5):
+            data = {**facts, **({"batch_size": size} if size is not None else {})}
+            path.write_text(json.dumps({"accounts": {"test": data}}))
+            if size is not None and (type(size) is not int or not 1 <= size <= 6):
+                try:
+                    IA.load_accounts(str(path), explicit=True)
+                    assert False, size
+                except ValueError:
+                    pass
+                continue
+            accounts = IA.load_accounts(str(path), explicit=True)
+            with patch.dict(IA.ACCOUNTS, accounts, clear=True):
+                block = IA.inbox_fact_block("test")
+                assert f"at most {3 if size is None else size} unseen messages TOTAL this run" in block
+                assert "a bounded pass is complete, not blocked" in block
+                assert "TOTAL this run" not in IA.inbox_chat_fact_block()
+        for value in ("false", 0, None):
+            try:
+                _inbox_guardrail_setup(d, inbox_suppress_progress_caps=value)
+                assert False, value
+            except ValueError:
+                pass
+    ok("inbox batch defaults to three, config only tightens six-message ceiling; suppression requires boolean")
+
+
+def test_inbox_bounded_run_exits_and_rearms_buffered_wake():
+    import inbox_accounts as IA
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        a, _, route = _inbox_guardrail_setup(d)
+        ledger = pathlib.Path(d, "seen.jsonl")
+        facts = {"email": "a@example.test", "ledger": str(ledger), "posture": "p", "batch_size": 2}
+        a.router = type("Router", (), {"route": lambda s, key, brief: route})()
+        a.prompt_loader = type("Loader", (), {"load": lambda s, *args: "SYS"})()
+        c = Coalescer(adapter=a)
+        key = "gmail:test"
+        evt = {"source": "gmail", "account": "test", "event_name": "gmail.new"}
+        c.live[key] = {"events": [evt], "forwards": 0, "state": "open_running",
+                       "fwd_buffer": [evt], "expire": time.time() + 100}
+        turns, receipts, alerts = [], [], []
+        backlog = ["mail-" + str(n) for n in range(30)]
+        def turn(worker, route, system, prompt, resume, run_id):
+            turns.append(worker)
+            assert not resume and worker.inbox_ledger_before == set()
+            assert "at most 2 unseen messages TOTAL this run" in json.loads(prompt)["posture"]
+            # A fake triage pass follows the supplied bound, not the whole backlog.
+            ledger.write_text("".join(json.dumps({"id": mid}) + "\n" for mid in backlog[:2]))
+            worker.cmdq.put(("forward", {}))
+            worker.cmdq.put(("close",))  # A regression cannot hang this synchronous test.
+            return {"status": "done", "summary": "bounded pass complete; backlog deferred", "wake": []}
+        a._turn = turn
+        a._post_envelope = lambda brief, run_id, env, worker: receipts.append(env)
+        a._alert_ops = lambda msg, **kw: alerts.append(msg)
+        with patch.dict(IA.ACCOUNTS, {"test": facts}, clear=True):
+            a._run_worker(key, {"n_events": 1}, "run-9655")
+        assert len(turns) == 1 and receipts[0]["status"] == "done" and not alerts
+        assert IA.ledger_ids(str(ledger)) == set(backlog[:2])
+        assert key not in c.live and key not in c.completed and key in c.pending
+        assert not a.worker_alive(key)
+    ok("bounded inbox pass completes once with backlog remaining; buffered Gmail wake re-arms, not warm-drains")
+
+
+def test_inbox_progress_caps_are_silent_but_zero_or_repeated_ids_escalate():
+    import inbox_accounts as IA
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        ledger = pathlib.Path(d, "seen.jsonl")
+        old = json.dumps({"id": "old", "verdict": "retained"}) + "\n"
+        new = json.dumps({"gmail_id": "new", "verdict": "archived"}) + "\n"
+        scenarios = (("new", old + new, True), ("unchanged", old, False),
+                     ("duplicate", old + old, False),
+                     ("verdict-edit", json.dumps({"id": "old", "verdict": "changed"}) + "\n", False),
+                     ("truncated", new, False), ("malformed", old + "{", False),
+                     ("unknown-schema", old + '{"subject":"not an id"}\n', False))
+        for hard_killed in (False, True):
+            for name, after, quiet in scenarios:
+                alerts = []
+                a, w, route = _inbox_guardrail_setup(d, alert_ops=alerts.append)
+                ledger.write_text(old)
+                w.inbox_ledger_path = str(ledger)
+                w.inbox_ledger_before = IA.ledger_ids(str(ledger))
+                w.hard_killed = hard_killed
+                w.turn_capped = not hard_killed
+                ledger.write_text(after)
+                env = a._inbox_failure(w, route, w.run_id)
+                a._post_envelope({}, w.run_id, env, w)
+                assert env["status"] == "blocked" and w.done and not env["needs_operator"]
+                assert bool(w.inbox_cap_progress) == quiet, (name, env)
+                assert bool(alerts) == (not quiet), (name, alerts)
+                assert a._inbox_failure(w, route, w.run_id) is None
+        # An absent baseline file is empty, but an unverified baseline cannot establish progress.
+        for before, suppress, reason, quiet in ((set(), True, "wall-clock limit", True),
+                (None, True, "wall-clock limit", False), (set(), False, "wall-clock limit", False),
+                (set(), True, "cost ceiling (USD)", False), (set(), True, "input-token ceiling", False),
+                (set(), True, "upstream model rejected", False)):
+            alerts = []
+            a, w, route = _inbox_guardrail_setup(d, alert_ops=alerts.append,
+                                                inbox_suppress_progress_caps=suppress)
+            w.inbox_ledger_path, w.inbox_ledger_before = str(ledger), before
+            ledger.write_text(new)
+            w.inbox_limit_reason = reason
+            env = a._inbox_failure(w, route, w.run_id)
+            a._post_envelope({}, w.run_id, env, w)
+            assert bool(alerts) == (not quiet), (before, suppress, reason, alerts)
+        # A worker-controlled field in an ordinary blocked envelope cannot bypass escalation.
+        a, w, route = _inbox_guardrail_setup(d, alert_ops=alerts.append)
+        alerts.clear()
+        a._post_envelope({}, w.run_id, {"status": "blocked", "summary": "decision needed",
+                                      "inbox_cap_progress": 1}, w)
+        assert len(alerts) == 1
+        assert IA.ledger_ids(str(pathlib.Path(d, "missing.jsonl"))) == set()
+        assert IA.ledger_ids(d) is None  # Unreadable is not empty.
+    ok("turn/time caps quiet only on distinct new IDs; no progress, repeats, bad ledgers, budgets/errors still alert")
+
+
+def test_inbox_cap_snapshots_resolve_ledger_against_worker_worktree():
+    import inbox_accounts as IA
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        broker_cwd = pathlib.Path(d, "broker")
+        worker_cwd = pathlib.Path(d, "worker")
+        broker_cwd.mkdir()
+        worker_cwd.mkdir()
+        ledger = worker_cwd / "seen.jsonl"
+        broker_ledger = broker_cwd / "seen.jsonl"
+        old = '{"id":"old"}\n'
+        new = '{"id":"new"}\n'
+        saved_cwd = os.getcwd()
+        try:
+            os.chdir(broker_cwd)
+            for configured_path in ("seen.jsonl", str(ledger)):
+                for hard_killed in (False, True):
+                    for progress in (False, True):
+                        ledger.write_text(old)
+                        broker_ledger.write_text('{"id":"broker-only"}\n')
+                        alerts, workers = [], []
+                        a, _, route = _inbox_guardrail_setup(str(worker_cwd), alert_ops=alerts.append)
+                        facts = {"email": "a@example.test", "ledger": configured_path, "posture": "p"}
+                        a.router = type("Router", (), {"route": lambda s, key, brief: route})()
+                        a.prompt_loader = type("Loader", (), {"load": lambda s, *args: "SYS"})()
+                        def turn(worker, *args, **kwargs):
+                            workers.append(worker)
+                            ledger.write_text(old + (new if progress else old))
+                            # Progress in an unrelated broker-cwd ledger must not count for this worker.
+                            broker_ledger.write_text('{"id":"broker-only"}\n' + new)
+                            worker.hard_killed = hard_killed
+                            worker.turn_capped = not hard_killed
+                            return a._inbox_failure(worker, route, worker.run_id)
+                        a._turn = turn
+                        with patch.dict(IA.ACCOUNTS, {"test": facts}, clear=True), \
+                                patch.object(IA, "ledger_ids", wraps=IA.ledger_ids) as snapshots:
+                            a._run_worker("gmail:test", {"n_events": 1}, "run-9657")
+                        assert len(workers) == 1
+                        worker = workers[0]
+                        assert worker.worktree == str(worker_cwd) and worker.done
+                        assert worker.inbox_ledger_path == str(ledger)
+                        assert worker.inbox_ledger_before == {"old"}
+                        assert [call.args for call in snapshots.call_args_list] == [(str(ledger),)] * 2
+                        assert worker.inbox_cap_progress == int(progress)
+                        assert bool(alerts) == (not progress), alerts
+        finally:
+            os.chdir(saved_cwd)
+    ok("relative/absolute inbox ledgers use worker cwd for both cap snapshots; only worker progress silences alerts")
+
+
+def test_inbox_wall_clock_stop_settles_without_false_force_close():
+    import inbox_accounts as IA
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        alerts = []
+        a, _, route = _inbox_guardrail_setup(d, alert_ops=alerts.append)
+        ledger = pathlib.Path(d, "seen.jsonl")
+        facts = {"email": "a@example.test", "ledger": str(ledger), "posture": "p"}
+        a.router = type("Router", (), {"route": lambda s, key, brief: route})()
+        a.prompt_loader = type("Loader", (), {"load": lambda s, *args: "SYS"})()
+        c = Coalescer(adapter=a)
+        key = "gmail:test"
+        evt = {"source": "gmail", "account": "test"}
+        c.live[key] = {"events": [evt], "forwards": 0, "state": "open_running",
+                       "fwd_buffer": [], "expire": time.time() + 100}
+        drv = LivenessDriver(c, a, alert_ops=alerts.append)
+        def turn(worker, *args, **kwargs):
+            ledger.write_text('{"message_id":"new"}\n')
+            worker.hard_killed = True
+            return a._inbox_failure(worker, route, worker.run_id)
+        def receipt(brief, run_id, env, worker):
+            assert worker.done and a.worker_alive(key)
+            drv.sweep()  # done=True, in_turn=False, but cleanup thread is still running.
+            assert key in c.live and c.live[key]["state"] == "open_running"
+            CCAdapter._post_envelope(a, brief, run_id, env, worker)
+        a._turn = turn
+        a._post_envelope = receipt
+        with patch.dict(IA.ACCOUNTS, {"test": facts}, clear=True):
+            a._run_worker(key, {"n_events": 1}, "run-9656")
+        drv.sweep()
+        assert not alerts and key not in c.live and key not in c.completed
+        c.on_event(evt)
+        assert key in c.pending, "next scheduled Gmail wake can re-arm after wall-clock stop"
+    ok("wall-clock terminal cleanup is alive until self-settle; no false FORCE-CLOSE, next Gmail wake re-arms")
+
+
+def test_inbox_real_force_close_rearms_gmail_subject():
+    fa, alerts = _FakeAdapter(), []
+    c = Coalescer(adapter=fa)
+    key = "gmail:test"
+    evt = {"source": "gmail", "account": "test"}
+    c._would_spawn(key, [evt], time.time())
+    fa._in_turn[key], fa._age[key], fa._alive[key] = False, None, False
+    drv = LivenessDriver(c, fa, alert_ops=alerts.append)
+    drv.sweep()
+    assert key not in c.live and key not in c.completed
+    assert any("FORCE-CLOSE" in msg for msg in alerts)
+    c.on_event(evt)
+    assert key in c.pending
+    ok("genuine dead-thread FORCE-CLOSE stays loud and leaves Gmail subject eligible for the next wake")
 
 
 def test_inbox_stream_usage_counts_requests_not_context_or_content_blocks():

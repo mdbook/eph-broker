@@ -2146,6 +2146,9 @@ class Worker:
         self.inbox_input_tokens = 0  # Run-wide, not reset by session rotation or a warm forward
         self.inbox_cost_usd = 0.0
         self.inbox_limit_reason = None
+        self.inbox_ledger_path = None
+        self.inbox_ledger_before = None
+        self.inbox_cap_progress = 0  # Broker-verified new IDs on a terminal turn/time cap, never worker claims
         self.repo = None             # code worker's resolved BASE repo (venv runner's interpreter lives there)
         self.test_runner = None      # code worker's per-repo runner KEY (routing.resolve_test_runner)
         self.test_tmpdir = None      # private test scratch directory, reused across turns and removed at exit
@@ -2264,6 +2267,7 @@ class CCAdapter(Adapter):
                  run_registry=None, semaphore=None,
                  max_turns=15, wall_clock_s=600, max_forwards=10, max_turns_by_capability=None,
                  wall_clock_by_capability=None, inbox_max_input_tokens=3_000_000, inbox_max_cost_usd=2.0,
+                 inbox_suppress_progress_caps=True,
                  model_prices=None,
                  rotate_turns=20, rotate_tokens=120_000,
                  setting_sources="", claude_bin="claude",
@@ -2294,6 +2298,9 @@ class CCAdapter(Adapter):
         self.wall_clock_by_capability = {"inbox": 1800, **(wall_clock_by_capability or {})}
         self.inbox_max_input_tokens = int(inbox_max_input_tokens)
         self.inbox_max_cost_usd = float(inbox_max_cost_usd)
+        if type(inbox_suppress_progress_caps) is not bool:
+            raise ValueError("inbox_suppress_progress_caps must be a boolean")
+        self.inbox_suppress_progress_caps = inbox_suppress_progress_caps
         if self.inbox_max_input_tokens <= 0 or not 0 < self.inbox_max_cost_usd < float("inf"):
             raise ValueError("inbox run ceilings must be positive and finite")
         # Exact resolved model ids only. No wildcard, alias inference or wrapper-price fallback.
@@ -2722,6 +2729,10 @@ class CCAdapter(Adapter):
             except Exception as e:                         # never let an alert failure wedge the worker
                 log.warning("gate-deny ops DM failed task_id=%s run_id=%s: %s", task_id, run_id, e)
         if env.get("status") != "blocked":
+            return
+        # Only a broker-generated turn/time stop with verified distinct new ledger IDs may be quiet.
+        # Keep the truthful blocked receipt/telemetry; this is not a completed backlog or an operator wait.
+        if getattr(worker, "inbox_cap_progress", 0) and self.inbox_suppress_progress_caps:
             return
         # A blocked result ALWAYS sends an alert DM (ticket link and reason); the reason is worker-derived,
         # so it rides fenced as UNTRUSTED. A turn-cap exit says so up front.
@@ -4173,6 +4184,11 @@ class CCAdapter(Adapter):
                     brief = {**brief, "companions": worker.companions}
             worker.inbox_account = inbox_account          # None on every non-inbox route
             worker.inbox_posture = inbox_posture   # cached for a forward's fresh-session re-attach
+            if getattr(route, "capability", "") == "inbox":
+                # Match the worker's cwd, not the broker's, and pin both progress snapshots to this path.
+                worker.inbox_ledger_path = os.path.abspath(os.path.join(
+                    worker.worktree, inbox_accounts.ACCOUNTS[inbox_account]["ledger"]))
+                worker.inbox_ledger_before = inbox_accounts.ledger_ids(worker.inbox_ledger_path)
             worker.chat_zc = chat_zc               # cached for a forward's fresh-session DM-history re-attach
             if infra_grant is not None:                   # Write the grant file the mcp-rw.sh wrapper checks
                 try:
@@ -4253,10 +4269,14 @@ class CCAdapter(Adapter):
             # coalescer already advertised state=open_running for the seed turn at _would_spawn().
             env = self._turn(worker, route, system_prompt, first_prompt, resume=False, run_id=run_id)
             self._post_envelope(brief, run_id, env, worker)   # post the seed turn's summary
+            if env is not None and getattr(route, "capability", "") == "inbox":
+                # One bounded pass per run. Buffered wakes retire to a fresh run, not another backlog pass
+                # in the same session/budget. Gmail subjects remain re-armable via settle_self.
+                worker.done = True
             if mr_review is not None:                     # MR-reviewer: broker posts the verdict as an
                 self._post_mr_verdict(mr_review, run_id, env,   # MR note (reviewer is cred-free; seed only)
                                       harness=getattr(route, "adapter", "cc"))   # From the route
-            if not worker.api_overloaded:                # Never idle (it would force a stamping close) on give-up
+            if not worker.api_overloaded and not worker.done:  # Retiring runs settle without accepting forwards
                 self._advertise_idle(key)                # seed turn-boundary: mark open_idle
             # Warm-worker command loop (one turn at a time; a single CC session can't run two turns).
             # An API-overload give-up exits straight away (un-stamped) instead of idling to a stamping close.
@@ -4695,11 +4715,20 @@ class CCAdapter(Adapter):
         if not reason:
             return None
         worker.inbox_limit_reason = reason
+        if reason in ("--max-turns limit", "wall-clock limit"):
+            before = getattr(worker, "inbox_ledger_before", None)
+            path = getattr(worker, "inbox_ledger_path", None)
+            after = inbox_accounts.ledger_ids(path) if path else None
+            if before is not None and after is not None and before <= after:
+                worker.inbox_cap_progress = len(after - before)
+        progress = getattr(worker, "inbox_cap_progress", 0)
+        note = (f" Verified {progress} new ledger ID(s); remaining work is deferred to the next scheduled wake."
+                if progress else " No new ledger IDs could be verified. Review existing state before retrying.")
         worker.done = True
         return {"status": "blocked", "summary": (
             "<p>Inbox run stopped by the broker: " + html.escape(reason) +
-            ". Work is incomplete; mail or ledger changes may already have occurred. "
-            "Review existing state before retrying.</p>"), "wake": [], "needs_operator": False,
+            ". Work is incomplete; mail or ledger changes may already have occurred."
+            + note + "</p>"), "wake": [], "needs_operator": False,
             "session_id": worker.session_id, "tokens": worker.inbox_input_tokens,
             "run_id": run_id, "harness": getattr(route, "adapter", "cc")}
 
@@ -5311,7 +5340,9 @@ class CCAdapter(Adapter):
         with self._lock:
             worker = self._workers.get(key)
             if worker is not None:
-                return bool(not worker.done and worker.thread and worker.thread.is_alive())
+                # done prevents new turns, not cleanup. A capped worker sets it BEFORE settling the
+                # coalescer entry; calling that live thread dead races into a spurious FORCE-CLOSE.
+                return bool(worker.thread and worker.thread.is_alive())
             t = self._threads.get(key)                   # setup window: spawned, not yet registered
             return bool(t and t.is_alive())
 

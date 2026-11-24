@@ -4653,7 +4653,7 @@ def _assert_prompt_hash_gate(prompt_class, domain):
 
 
 def test_worker_prompt_file_access():
-    """Workers describe harness tools and optional repo standards, in site and public renders."""
+    """Workers describe harness tools, repo standards and MR review rules in site and public renders."""
     rp = _load_render_module()
     root = pathlib.Path(ROOT)
     signed_workers = {"code/change-proposer", "mr-review/agent", "mr-review/quick"}
@@ -4670,7 +4670,10 @@ def test_worker_prompt_file_access():
             assert rendered == out.read_text(encoding="utf-8"), out
             key = mf.relative_to(root / "workers").with_suffix("").as_posix()
             if key in signed_workers:
-                assert loader.load(mf.stem, mf.parent.name) == rendered, key
+                if mf.parent.name == "mr-review":
+                    assert _assert_prompt_hash_gate(mf.stem, mf.parent.name) == rendered, key
+                else:
+                    assert loader.load(mf.stem, mf.parent.name) == rendered, key
             renders.append((mf, rendered))
             # Copy only generic modules: site overrides must not be needed for the fix.
             for sec in json.loads(mf.read_text(encoding="utf-8"))["sections"]:
@@ -4695,6 +4698,21 @@ def test_worker_prompt_file_access():
             rule += " and check the diff against them." if mf.parent.name == "mr-review" else \
                 " before changing code or UI, and follow them."
             assert rendered.count(rule) == 1, mf
+        if mf.parent.name == "mr-review":
+            for rule in ("List EVERY blocker you can find in ONE pass, numbered",
+                         "each with `file:line` and the fix you expect",
+                         "Do not stop at the first blocker",
+                         "when the brief shows a prior BLOCK on this MR",
+                         "re-check the prior blockers and any code the fix round changed",
+                         "Do not raise a NEW blocker on code unchanged since the prior review",
+                         "unless it is a security/secret/data-loss issue",
+                         "List other new findings on unchanged code as non-blocking nits",
+                         "State which prior blockers are resolved or remain open",
+                         "Non-blocking nits never produce a BLOCK verdict",
+                         "Return `\"pass\"` when no blockers remain, even if there are nits",
+                         "list ALL blockers in a numbered `<ol>`",
+                         "prerequisites that qualify as blockers under the review contract above"):
+                assert rule in rendered, (mf, rule)
     ok("worker file access: site prompts match render and approvals, site/public workers read optional repo standards")
 
 

@@ -143,6 +143,24 @@ manifest and modules, and `SOURCE CHANGED:` when an inlined file's hash differs 
 The renderer always writes into this repo's `prompts/`. The broker reads from `PROMPTS_DIR` and
 `APPROVED_PROMPTS`, which default to `prompts/` and `approved-prompts.json` next to `app.py`.
 
+## MR reviewer contract
+
+Both `mr-review/agent` and `mr-review/quick` report every blocker they can find in one pass at
+their assigned review depth. Blockers are numbered, each with `file:line`, the concrete risk,
+and the expected fix. Reviewers do not stop at the first blocker. Non-blocking nits are listed
+separately and never produce a BLOCK verdict; a review with only nits returns `pass`.
+
+When the brief shows a prior BLOCK on the same MR, the reviewer re-checks the prior blockers
+and code changed by the fix round, reporting which blockers are resolved or still open.
+A new finding on code unchanged since the prior review is non-blocking unless it is a
+security, secret, or data-loss issue. Such an exception needs concrete evidence.
+This contract does not change `cd.py`'s `_on_block_verdict` policy: one automatic fix retry,
+then escalation on a second BLOCK.
+
+These behavior changes require operator approval before re-signing `mr-review/agent` and
+`mr-review/quick` in `approved-prompts.json`. Do not activate the changed
+prompts without that approval.
+
 ## Signing
 
 The code worker contract uses baseline differences: run tests before editing and again afterwards;

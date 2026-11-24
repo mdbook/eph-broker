@@ -555,6 +555,9 @@ prompt ([configuration.md](configuration.md#built-in-rows)). Each one has `*_REP
 | `INFRA_GENERAL_BACKEND` | `INFRA_BACKEND` | Generalist backend. |
 | `INFRA_ZBUS_ENV` | unset | Infrastructure workers' chat identity file. |
 | `EPH_WRITE_GRANTS_ENABLED`, `EPH_WRITE_GRANT_DIR`, `EPH_WRITE_GRANT_TTL_S` | off, `~/.local/state/eph-broker/write-grants`, `3600` | Time-limited live-write grant files for the infrastructure rows. |
+| `EPH_WRITE_BUNDLES` | `grafana-edit,n8n-workflow-edit` | Comma-separated bundle names in new live-write grants. Replaces defaults; Proxmox is not a default bundle. |
+| `EPH_WRITE_WRAPPERS` | `mcp-rw.sh` | Comma-separated bare script names. Allow-listed only for granted code routes; path forms always denied. Independent deny-floor command collisions reject the override, log an error and use the default list. Restart required. |
+| `EPH_WRITE_AUDIT_TAGS` | `mcp-rw` | Comma-separated journal tags read for closing-comment audits; one shared 50-line cap. |
 | `INBOX_ROW_SOURCE` | unset | Event source enabling mail triage. |
 | `INBOX_REPO` | unset | Persistent mail ledger checkout. |
 | `INBOX_MCP_CONFIG_DIR` | `~/.config/eph-broker/inbox-mcp` | One MCP config per mail account. |

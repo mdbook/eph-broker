@@ -917,15 +917,6 @@ _BASH_N_DENIED = [
 _ANSIBLE_SYNTAX_PREFIX = "ansible-playbook --syntax-check -i /dev/null"
 _ANSIBLE_SYNTAX_DENIED = [f"Bash({_ANSIBLE_SYNTAX_PREFIX}* -*)"]
 
-# The live-WRITE bridge wrapper. `Bash(mcp-rw.sh:*)` is allow-listed ONLY for an infra
-# worker whose spawn wrote a write-grant file (write_grant.py: trusted provenance, no `write:none`, rollback flag
-# on); the wrapper itself checks that grant file's bundles + expiry. With no grant the bare token sits on every
-# deny-floor (deny wins), so a classifier-judged general worker can't reach it either. The ABSOLUTE-path forms
-# of mcp-rw.sh and the raw mcp.sh are ALWAYS denied: the Bash matcher is a literal prefix, so the bare-name
-# `Bash(mcp.sh:*)` deny never matched `<mcp dir>/mcp.sh …` (the dir comes from site.env, see _mcp_abs).
-_MCP_RW = ["Bash(mcp-rw.sh:*)"]
-_MCP_ABS_DENIED = _mcp_abs("mcp.sh", "mcp-rw.sh")
-
 # Tools a READ worker must never get; they're explicitly DISABLED (verified: disallow disables the tool outright).
 # Bus-enabled read rows get only the shared DM Bash grant below; no-bus rows (including mr-review)
 # keep Bash disabled. Secret-file denies still protect Read/Grep/Glob on both kinds of row.
@@ -1011,7 +1002,7 @@ _WRITE_DENIED = ["Bash(git push:*)", "Bash(git remote:*)", "Bash(git config:*)",
                  # plumbing are denied outright, as is `git cherry-pick` reading a commit list from stdin/file.
                  "Bash(git merge*F*)", "Bash(git merge* --fi*)", "Bash(git merge-*)",
                  "Bash(git cherry-pick* --stdin*)",
-                 ] + _GITDIR_EDIT_DENIED + _MCP_RW + _MCP_ABS_DENIED + _SECRET_READ_DENIED + _BASH_N_DENIED + _ANSIBLE_SYNTAX_DENIED   # See above. See the _SECRET_READ_DENIED note above; covers write/code/inbox (_CODE_DENIED/_INBOX_DENIED reuse this list). _BASH_N_DENIED: see comment above its definition; only the code lane's bash-n runner ever grants `Bash(bash -n:*)`, so these are a no-op everywhere else.
+                 ] + _GITDIR_EDIT_DENIED + _mcp_abs("mcp.sh") + _SECRET_READ_DENIED + _BASH_N_DENIED + _ANSIBLE_SYNTAX_DENIED   # See above. See the _SECRET_READ_DENIED note above; covers write/code/inbox (_CODE_DENIED/_INBOX_DENIED reuse this list). _BASH_N_DENIED: see comment above its definition; only the code lane's bash-n runner ever grants `Bash(bash -n:*)`, so these are a no-op everywhere else.
 
 # ============================================================================================
 # The "code" capability: a code change-proposer worker (SECURITY-CRITICAL).
@@ -1299,12 +1290,11 @@ _CODE_TEST_SHAPED_GUARD = os.path.join(os.path.dirname(os.path.dirname(os.path.a
 
 def _code_floor(portcullis=None, write_grant=False):
     """The deny-floor in force for a code turn: the adjudicated floor when Portcullis is armed, else the legacy
-    one; the mcp-rw.sh entries (_MCP_RW) are lifted from it iff the route has a write grant, exactly as the
+    one; only wrapper-added entries are lifted iff the route has a write grant, exactly as the
     --disallowedTools filter in capability_tool_grant does, so the floor hooks and the grant never diverge."""
-    if portcullis is None:
-        return _CODE_DENIED   # legacy: unchanged
-    rw = _MCP_RW if write_grant is True else []
-    return [d for d in _CODE_ADJUDICATED_DENIED if d not in rw]
+    liftable = _WRITE_WRAPPER_LIFTABLE if write_grant is True else ()
+    floor = _CODE_DENIED if portcullis is None else _CODE_ADJUDICATED_DENIED
+    return [d for d in floor if d not in liftable]
 
 
 def _code_judged_hook_settings(worktree_root=None, portcullis=None, write_grant=False):
@@ -1409,7 +1399,7 @@ _GENERAL_DENIED = ["Bash(git push:*)", "Bash(git remote:*)", "Bash(git config:*)
                    "Bash(rm:*)", "Bash(sudo:*)",
                    "Bash(dd:*)", "Bash(shred:*)", "Bash(truncate:*)",   # rm-substitutes (destructive)
                    "Bash(mcp.sh:*)",   # Raw broad gateway denied; only mcp-ro.sh is explicitly allowed
-                   ] + _GITDIR_EDIT_DENIED + _MCP_RW + _MCP_ABS_DENIED + [   # live-write wrapper + absolute-path gateway forms
+                   ] + _GITDIR_EDIT_DENIED + _mcp_abs("mcp.sh") + [   # raw gateway absolute-path forms
                    # secret-read floor (belt under the user-level rules' refusal + classifier credential rules,
                    # both verified live to block a secret read): deny the Read tool on env/secret files.
                    # Reuse the ONE shared list (_SECRET_READ_DENIED, defined near _READ_DENIED
@@ -1428,6 +1418,25 @@ _GENERAL_DENIED = ["Bash(git push:*)", "Bash(git remote:*)", "Bash(git config:*)
 _CODE_NETWORK_UNFLOORED = ("Bash(curl:*)", "Bash(wget:*)", "Bash(ssh:*)")
 _CODE_ADJUDICATED_DENIED = ([d for d in _WRITE_DENIED if d not in _CODE_NETWORK_UNFLOORED]
                             + [d for d in _GENERAL_DENIED if d not in _WRITE_DENIED])
+
+# Snapshot wrappers ONLY AFTER constructing the independent floors (ticket 3096). Derive protected
+# command names from all code/hook floor rules, including subcommand-specific rules such as git/bash.
+# Never let configuration turn a pre-existing deny into a write-wrapper exception.
+_INDEPENDENT_CODE_DENIED = frozenset(_CODE_DENIED + _CODE_ADJUDICATED_DENIED)
+_WRITE_PROTECTED_COMMANDS = frozenset(
+    os.path.basename(match.group(1)) for rule in _INDEPENDENT_CODE_DENIED
+    for match in [re.match(r"Bash\(([^ :*)]+)", rule)] if match)
+_WRITE_WRAPPERS = write_grant.wrappers(_WRITE_PROTECTED_COMMANDS)
+_MCP_RW = [f"Bash({name}:*)" for name in _WRITE_WRAPPERS]
+# Keep the original wrapper denied even when replaced. Only the bare token can be lifted, only for a
+# granted code route, and only if the wrapper added that deny. Absolute/path forms are ALWAYS denied.
+_WRITE_WRAPPER_NAMES = tuple(dict.fromkeys(("mcp-rw.sh",) + _WRITE_WRAPPERS))
+_WRITE_WRAPPER_DENIED = [f"Bash({name}:*)" for name in _WRITE_WRAPPER_NAMES]
+_WRITE_WRAPPER_LIFTABLE = frozenset(_MCP_RW) - _INDEPENDENT_CODE_DENIED
+_MCP_ABS_DENIED = _mcp_abs(*dict.fromkeys(("mcp.sh",) + _WRITE_WRAPPER_NAMES))
+for _floor in (_WRITE_DENIED, _GENERAL_DENIED, _CODE_ADJUDICATED_DENIED):
+    # _CODE_DENIED aliases _WRITE_DENIED; extend in place so it keeps the same floor.
+    _floor.extend(d for d in _WRITE_WRAPPER_DENIED + _MCP_ABS_DENIED if d not in _floor)
 
 # ============================================================================================
 # The "inbox" capability: a Gmail-MUTATION-capable triage worker (SECURITY-CRITICAL).
@@ -1744,7 +1753,7 @@ def _base_capability_tool_grant(capability, test_runner=None, bypass_classifier=
     lives in; ignored by every other key.
 
     `write_grant` applies ONLY to capability=="code": True iff the broker wrote a write-grant file for
-    this worker (write_grant.py). It adds `Bash(mcp-rw.sh:*)` and lifts that ONE bare token off the deny-floor
+    this worker (write_grant.py). It adds configured wrappers and lifts ONLY their bare tokens off the deny-floor
     (deny wins, so it must leave the floor); the absolute-path forms stay denied. Any other capability ignores it.
 
     `judged` applies ONLY to capability=="code": default False keeps this function's output byte-identical to
@@ -1809,12 +1818,12 @@ def _base_capability_tool_grant(capability, test_runner=None, bypass_classifier=
         adjudicated = adjudicated and not bypass_classifier   # non-native backend: legacy posture (F3), never skip-permissions
         if adjudicated:
             allowed = _READ_ALLOWED + rw
-            denied = [d for d in _CODE_ADJUDICATED_DENIED if d not in rw]
+            denied = _code_floor(True, write_grant)
         else:
             # The legacy allow-list grant, byte-identical to before. Consumed by the codex/hermes mechanical
             # gates (no classifier, no hook adjudicator there: an empty Bash grant would deny ALL Bash).
             allowed = _WRITE_ALLOWED + _CODE_GIT + _CODE_MEMORY + _code_test_bash(test_runner, test_repo) + rw
-            denied = [d for d in _CODE_DENIED if d not in rw]
+            denied = _code_floor(None, write_grant)
         if browser is True:
             allowed = allowed + _PLAYWRIGHT_TOOLS
             denied = denied + _PLAYWRIGHT_DENIED_TOOLS
@@ -2756,7 +2765,7 @@ class CCAdapter(Adapter):
                 log.warning("label_poster failed task_id=%s run_id=%s: %s", task_id, run_id, e)
 
     def _write_audit_html(self, worker, task_id):
-        """The HTML block of this ticket's `mcp-rw` journal audit lines since the last comment (broker-read,
+        """The HTML block of this ticket's configured write audit tags since the last comment (broker-read,
         HTML-escaped). Advances worker.audit_since so a forward's comment only carries new lines. Never raises."""
         try:
             since = worker.audit_since or time.time()
@@ -2764,11 +2773,12 @@ class CCAdapter(Adapter):
                                             reader=self._audit_reader)
             worker.audit_since = time.time()
             bundles = ", ".join((worker.write_grant or {}).get("bundles") or [])
-            head = f"<p><b>mcp-rw audit</b> (write grant: {html.escape(bundles)}):</p>"
+            audit_name = html.escape(", ".join(write_grant.audit_tags()) or "write")
+            head = f"<p><b>{audit_name} audit</b> (write grant: {html.escape(bundles)}):</p>"
             if lines is None:
                 return head + "<p>audit lines unavailable (journal read failed).</p>"
             if not lines:
-                return head + "<p>no mcp-rw calls logged.</p>"
+                return head + f"<p>no {audit_name} calls logged.</p>"
             return head + "<pre>" + html.escape("\n".join(lines)) + "</pre>"
         except Exception as e:                             # an audit failure must never block the comment
             log.warning("mcp-rw audit block failed task_id=%s: %s", task_id, e)

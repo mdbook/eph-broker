@@ -55,6 +55,41 @@ companions. An explicitly named missing file, invalid configuration, checkout fa
 detached at its resolved SHA, stripped of git metadata and made read-only. There is no submodule fetch.
 See [worker-runtime.md](worker-runtime.md#companion-sources) for worker access and provenance.
 
+## Infrastructure live-write grants
+
+`EPH_WRITE_GRANTS_ENABLED` stays **off by default**. When enabled, the infrastructure rows still require
+trusted ticket creator/assigner provenance, honor `write:none`, and use the existing grant expiry
+(`EPH_WRITE_GRANT_TTL_S`, default `3600`). The following comma lists configure the write surface without
+changing those checks:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `EPH_WRITE_BUNDLES` | `grafana-edit,n8n-workflow-edit` | Bundles written into new grant files. Proxmox is no longer included. |
+| `EPH_WRITE_WRAPPERS` | `mcp-rw.sh` | Bare script names allowed only when the code route has a write grant. Absolute/path forms remain denied, including the original `mcp-rw.sh` and raw `mcp.sh` gateways. |
+| `EPH_WRITE_AUDIT_TAGS` | `mcp-rw` | Journal tags queried together for the closing comment. Only this ticket's nonce/id matches are included, with one shared 50-line cap. |
+
+Unset means use the default. Set lists replace defaults, trim whitespace, ignore empty entries and remove
+duplicates. An explicitly empty value selects no bundles, wrappers or audit tags respectively. Empty audit
+tags never cause an unfiltered journal read. Wrapper names may contain only ASCII letters, digits, `_`, `.`,
+and `-`, and must start with a letter, digit or `_`; paths, shell syntax and wildcards are rejected. An invalid
+wrapper list logs an error and grants no write wrappers. Removing `mcp-rw.sh` from the list does not remove
+its deny-floor protection. Names that collide with independent deny-floor commands (for example `mcp.sh`,
+`sudo`, `git` or `bash`) reject the whole override, log the reason and use the default `mcp-rw.sh` list.
+A write grant never lifts an independent deny. Wrappers themselves must enforce the grant's bundles and expiry; configuring a
+name does not install a script or credentials.
+
+For example, in your broker environment or `config/site.env`:
+
+```ini
+EPH_WRITE_BUNDLES=grafana-edit,docker-cycle
+EPH_WRITE_WRAPPERS=mcp-rw.sh,docker-rw.sh
+EPH_WRITE_AUDIT_TAGS=mcp-rw,docker-rw
+```
+
+Restart after changing these settings. Wrapper permission floors are snapshotted at startup; bundles and
+audit tags are read when used. These knobs are not hot-reload settings. This example does not turn on the
+master flag or authorize any new creator/assigner.
+
 ## The config file
 
 Paths below use the source checkout layout. The RPM service instead uses `BROKER_CONFIG_DIR=/etc/eph-broker`:

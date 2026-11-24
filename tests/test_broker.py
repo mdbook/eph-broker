@@ -22577,7 +22577,7 @@ def test_infra_general_worker_cuts_default_and_dms_infra_bot():
 
 
 # =====================================================================================
-# Default-on live-write grants for infra-eph (mcp-rw.sh), deterministic, flag default OFF.
+# Opt-in live-write grants for infra-eph, deterministic, flag default OFF.
 # =====================================================================================
 def _ticket(creator="owner", labels=()):
     lab = ("**labels:** [" + ",".join('{"title": "%s"}' % l for l in labels) + "]\n") if labels else ""
@@ -22610,10 +22610,11 @@ def test_make_grant_provenance_optout_and_flag():
     import write_grant as WG
     with _Env(EPH_WRITE_GRANTS_ENABLED=None, MODEL_LABEL_TRUSTED_CREATORS="owner,ops"):
         assert WG.make_grant(9361, [], "owner", "ops") is None, "rollback flag defaults OFF"
-    with _Env(EPH_WRITE_GRANTS_ENABLED="1", MODEL_LABEL_TRUSTED_CREATORS="owner,ops", EPH_WRITE_GRANT_TTL_S="600"):
+    with _Env(EPH_WRITE_GRANTS_ENABLED="1", MODEL_LABEL_TRUSTED_CREATORS="owner,ops",
+              EPH_WRITE_GRANT_TTL_S="600", EPH_WRITE_BUNDLES=None):
         g = WG.make_grant(9361, ["infra:general"], "Owner", "ops", now=1000)
         assert g["ticket"] == 9361 and g["expires"] == 1600 and len(g["nonce"]) == 32, g
-        assert g["bundles"] == list(WG.DEFAULT_BUNDLES) and "pve-guest-ops" in g["bundles"], g
+        assert g["bundles"] == list(WG.DEFAULT_BUNDLES) and "pve-guest-ops" not in g["bundles"], g
         assert WG.make_grant(9361, [], "ops", None) is not None, "ops-created, assigner unknown"
         assert WG.make_grant(9361, [], "infra", "dev") is not None, "standing fleet agents are trusted"
         assert WG.make_grant(9361, ["Write:None"], "owner", "ops") is None, "write:none opts out"
@@ -22624,6 +22625,145 @@ def test_make_grant_provenance_optout_and_flag():
         assert WG.make_grant(9361, [], "pool-3", "ops") is None
         assert WG.make_grant(None, [], "owner", "ops") is None
     ok("grant only with flag on + trusted creator/assigner + no write:none; svc-account/untrusted -> none")
+
+
+def test_write_grant_configured_bundles():
+    import write_grant as WG
+    with _Env(EPH_WRITE_GRANTS_ENABLED="1", MODEL_LABEL_TRUSTED_CREATORS="owner,ops"):
+        for value, expected in ((None, list(WG.DEFAULT_BUNDLES)),
+                                (" grafana-edit, docker-cycle, ,grafana-edit ", ["grafana-edit", "docker-cycle"]),
+                                ("", [])):
+            with _Env(EPH_WRITE_BUNDLES=value):
+                assert WG.make_grant(9361, [], "owner", "ops")["bundles"] == expected
+                assert WG.make_grant(9361, ["write:none"], "owner", "ops") is None
+                assert WG.make_grant(9361, [], "guest", "ops") is None
+    ok("EPH_WRITE_BUNDLES replaces defaults, trims/deduplicates, supports an empty list; trust gates unchanged")
+
+
+def test_write_grant_configured_wrappers():
+    # Fresh imports snapshot both the allow rules and all deny-floors, as a broker restart does.
+    probe = '''import json, adapters.cc as C
+rows = []
+for capability in ("code", "general", "write", "inbox", "read"):
+    for granted in (False, True):
+        for adjudicated in (False, True):
+            argv = C.capability_tool_grant(capability, write_grant=granted, adjudicated=adjudicated)
+            allowed = argv[argv.index("--allowedTools") + 1] if "--allowedTools" in argv else ""
+            denied = argv[argv.index("--disallowedTools") + 1]
+            floor = C._code_floor(("hook", "dir") if adjudicated else None, granted)
+            rows.append([capability, granted, adjudicated, allowed, denied, floor])
+print(json.dumps([C._MCP_RW, rows]))
+'''
+    keep = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "LANG", "TMPDIR")}
+    for value, names in ((None, ["mcp-rw.sh"]), ("", []),
+                         (" grafana-rw.sh, docker-rw.sh,,grafana-rw.sh ", ["grafana-rw.sh", "docker-rw.sh"]),
+                         ("/opt/wrappers/write.sh", []), ("./write.sh", []), ("write*.sh", []),
+                         ("good.sh,bad.sh;id", []), ("mcp.sh", ["mcp-rw.sh"]),
+                         ("sudo", ["mcp-rw.sh"]), ("good.sh,git", ["mcp-rw.sh"]),
+                         ("dd", ["mcp-rw.sh"]), ("bash", ["mcp-rw.sh"])):
+        env = {**keep, "BROKER_SITE_ENV": os.devnull, "BROKER_MCP_SH": "/opt/wrappers/mcp.sh",
+               "PYTHONPATH": ROOT, **_FIXTURE_ROSTERS}
+        if value is not None:
+            env["EPH_WRITE_WRAPPERS"] = value
+        out = subprocess.run([sys.executable, "-c", probe], cwd=ROOT, env=env,
+                             capture_output=True, text=True, timeout=60)
+        assert out.returncode == 0, out.stderr
+        rules, rows = json.loads(out.stdout.strip().splitlines()[-1])
+        assert rules == [f"Bash({n}:*)" for n in names], (value, rules)
+        if value in ("mcp.sh", "sudo", "good.sh,git", "dd", "bash"):
+            assert "EPH_WRITE_WRAPPERS collides with deny-floor commands" in out.stderr, out.stderr
+        for capability, granted, adjudicated, allowed, denied, floor in rows:
+            for protected in ("mcp.sh", "sudo"):
+                rule = f"Bash({protected}:*)"
+                assert rule not in allowed, (value, capability, allowed)
+                if capability != "read":
+                    assert rule in denied, (value, capability, denied)
+                assert rule in floor, (value, adjudicated, granted, floor)
+            for name in names:
+                rule = f"Bash({name}:*)"
+                permit = capability == "code" and granted
+                assert (rule in allowed) == permit, (value, capability, granted, allowed)
+                # Read disables Bash entirely; other capabilities carry explicit wrapper denies.
+                if capability != "read":
+                    assert (rule in denied.split(" ")) == (not permit), (value, capability, granted, denied)
+                if capability == "code":
+                    assert (rule in floor) == (not permit), (value, floor)
+            for name in set(names + ["mcp.sh", "mcp-rw.sh"]):
+                if capability != "read":
+                    for rule in (f"Bash(/opt/wrappers/{name}:*)", f"Bash(*/{name} *)"):
+                        assert rule in denied, (value, capability, rule)
+                        if capability == "code":
+                            assert rule in floor, (value, rule, floor)
+                assert f"Bash(/opt/wrappers/{name}:*)" not in allowed
+            assert "Bash(unlisted-rw.sh:*)" not in allowed
+            if "mcp-rw.sh" not in names:
+                assert "Bash(mcp-rw.sh:*)" not in allowed
+    ok("EPH_WRITE_WRAPPERS: defaults/custom/empty/invalid; grant-only bare allows, absolute denies, matching hook floors")
+
+
+def test_write_grant_protected_commands_derived_from_floors():
+    import write_grant as WG
+    from adapters import cc as C
+    # A newly protected command must automatically become an invalid wrapper too, even if its floor
+    # entry only blocks a subcommand or flag. No second hand-maintained reserved-name list.
+    assert {"mcp.sh", "sudo", "git", "bash", "dd", "ansible-playbook"} <= C._WRITE_PROTECTED_COMMANDS
+    for name in C._WRITE_PROTECTED_COMMANDS:
+        with _Env(EPH_WRITE_WRAPPERS="custom-rw.sh," + name):
+            assert WG.wrappers(C._WRITE_PROTECTED_COMMANDS) == ("mcp-rw.sh",), name
+    ok("every independent code/adjudicated/hook floor command rejects the whole wrapper override")
+
+
+def test_write_grant_lifts_only_wrapper_added_denies():
+    # Bypass config validation to test the second, independent defense: floor construction must track
+    # which denies predated wrappers, not remove anything matching an allow rule by value.
+    probe = '''import write_grant as WG
+WG.wrappers = lambda protected: ("mcp.sh", "sudo", "custom-rw.sh")
+import adapters.cc as C
+for adjudicated in (False, True):
+    for granted in (False, True):
+        argv = C.capability_tool_grant("code", write_grant=granted, adjudicated=adjudicated)
+        denied = argv[argv.index("--disallowedTools") + 1]
+        floor = C._code_floor(("hook", "dir") if adjudicated else None, granted)
+        for rule in ("Bash(mcp.sh:*)", "Bash(sudo:*)"):
+            assert rule in denied, (adjudicated, granted, denied)
+            assert rule in floor, (adjudicated, granted, floor)
+        rule = "Bash(custom-rw.sh:*)"
+        assert (rule in denied) == (not granted), denied
+        assert (rule in floor) == (not granted), floor
+'''
+    env = {**os.environ, "BROKER_SITE_ENV": os.devnull, "PYTHONPATH": ROOT, **_FIXTURE_ROSTERS}
+    out = subprocess.run([sys.executable, "-c", probe], cwd=ROOT, env=env,
+                         capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    ok("granted legacy/adjudicated routes and hook floors preserve independent denies even if validation is bypassed")
+
+
+def test_write_grant_configured_audit_tags():
+    import write_grant as WG
+    from types import SimpleNamespace
+    adapter = CCAdapter(router=None, worktree_mgr=None, prompt_loader=None, envelope_parser=EnvelopeParser())
+    for value, tags in ((None, ["mcp-rw"]), (" grafana-rw, docker-rw, ,grafana-rw ", ["grafana-rw", "docker-rw"]),
+                        ("", [])):
+        raw = "\n".join(f"x {tags[i % len(tags)]}[1]: ticket=9361 call=<{i}>" for i in range(70)) if tags else ""
+        with _Env(EPH_WRITE_AUDIT_TAGS=value), patch.object(WG.subprocess, "run") as run:
+            run.return_value = SimpleNamespace(returncode=0, stdout=raw)
+            assert WG.audit_tags() == tuple(tags)
+            lines = WG.audit_lines(9361, "nonce", 1000)
+            assert lines == raw.splitlines()[-WG.AUDIT_MAX_LINES:]
+            if tags:
+                argv = run.call_args[0][0]
+                assert argv == (["journalctl"] + [arg for tag in tags for arg in ("-t", tag)] +
+                                ["--since", "@1000", "-o", "short-iso", "--no-pager", "-q"]), argv
+            else:
+                run.assert_not_called()
+            worker = SimpleNamespace(audit_since=1000, write_grant={"nonce": "nonce", "bundles": ["grafana-edit"]})
+            block = adapter._write_audit_html(worker, 9361)
+            assert (", ".join(tags) or "write") + " audit" in block, block
+            if tags:
+                assert "call=&lt;69&gt;" in block and "call=&lt;0&gt;" not in block, block
+                run.return_value.returncode = 1
+                assert WG.audit_lines(9361, "nonce", 1000) is None
+    ok("EPH_WRITE_AUDIT_TAGS: default/custom/empty journal filters, shared 50-line cap and escaped closing block")
 
 
 def test_grant_file_and_audit_lines():

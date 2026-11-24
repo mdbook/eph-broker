@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""write_grant.py: default-on live-write grants for the infra-eph rows.
+"""write_grant.py: opt-in live-write grants for the infra-eph rows.
 
 At spawn of an infra row (routing._INFRA_ROW / _INFRA_GENERAL_ROW, domain "infra") the broker decides,
 DETERMINISTICALLY and with ZERO LLM in the path, whether the worker gets a write grant. If so it writes a
-grant file {ticket, bundles, nonce, expires} that the infra repo's `mcp-rw.sh` wrapper
-checks before it passes a write tool through. cc.capability_tool_grant allow-lists `Bash(mcp-rw.sh:*)` ONLY
+grant file {ticket, bundles, nonce, expires} that the configured write wrappers
+check before passing a write tool through. cc.capability_tool_grant allow-lists these wrappers ONLY
 when a grant file was written for this worker; with no grant the wrapper token stays on the deny-floor.
 
 Decision (make_grant), every input broker-side (never worker-derived):
@@ -19,7 +19,7 @@ Decision (make_grant), every input broker-side (never worker-derived):
     is not a trustworthy author for a live-write grant). An unknown or absent
     creator means NO grant (fail-closed);
   * the ticket does not carry the opt-out label `write:none`.
-Then bundles = DEFAULT_BUNDLES. Anything else gives None (no grant; the worker keeps its read-only bridges).
+Then bundles = EPH_WRITE_BUNDLES (unset = DEFAULT_BUNDLES). Anything else gives None (no grant).
 
 Value-free: identity NAMES only, no secrets. The grant file holds no credential; the wrapper owns auth.
 """
@@ -30,11 +30,39 @@ import routing
 
 log = logging.getLogger("eph-broker.write-grant")
 
-DEFAULT_BUNDLES = ("pve-guest-ops", "grafana-edit", "n8n-workflow-edit")
+DEFAULT_BUNDLES = ("grafana-edit", "n8n-workflow-edit")
 OPT_OUT_LABEL = "write:none"
-AUDIT_TAG = "mcp-rw"                     # journal SYSLOG_IDENTIFIER the mcp-rw.sh wrapper logs under
+AUDIT_TAG = "mcp-rw"                     # default journal SYSLOG_IDENTIFIER
 AUDIT_MAX_LINES = 50                     # cap on audit lines carried into the closing comment
 _UNTRUSTED_AUTHORS = provenance._UNTRUSTED_AUTHORS   # roster "untrusted_authors"
+
+
+def _env_list(name, default):
+    """Comma lists replace defaults; an explicitly empty list disables the surface."""
+    raw = os.getenv(name)
+    return tuple(dict.fromkeys(s.strip() for s in raw.split(",") if s.strip())) if raw is not None else default
+
+
+def bundles():
+    return _env_list("EPH_WRITE_BUNDLES", DEFAULT_BUNDLES)
+
+
+def wrappers(protected_commands):
+    """Bare script names only: never interpolate paths, shell syntax or permission wildcards into rules."""
+    names = _env_list("EPH_WRITE_WRAPPERS", ("mcp-rw.sh",))
+    if any(not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", n) for n in names):
+        log.error("write grants: invalid EPH_WRITE_WRAPPERS; no write wrappers granted")
+        return ()
+    collisions = set(names) & set(protected_commands)
+    if collisions:
+        log.error("write grants: EPH_WRITE_WRAPPERS collides with deny-floor commands %s; using default wrappers",
+                  ", ".join(sorted(collisions)))
+        return ("mcp-rw.sh",)
+    return names
+
+
+def audit_tags():
+    return _env_list("EPH_WRITE_AUDIT_TAGS", (AUDIT_TAG,))
 
 
 def enabled():
@@ -76,7 +104,7 @@ def make_grant(task_id, labels, creator, assigner=None, now=None):
     if not trusted_provenance(creator, assigner):
         return None
     now = time.time() if now is None else now
-    return {"ticket": int(task_id), "bundles": list(DEFAULT_BUNDLES),
+    return {"ticket": int(task_id), "bundles": list(bundles()),
             "nonce": secrets.token_hex(16), "expires": int(now + grant_ttl_s())}
 
 
@@ -103,14 +131,18 @@ def remove_grant_file(path):
 
 
 def _journal_reader(since_epoch):
-    out = subprocess.run(["journalctl", "-t", AUDIT_TAG, "--since", f"@{int(since_epoch)}",
+    tags = audit_tags()
+    if not tags:
+        return ""                       # no -t would accidentally query the entire journal
+    out = subprocess.run(["journalctl"] + [arg for tag in tags for arg in ("-t", tag)] +
+                         ["--since", f"@{int(since_epoch)}",
                           "-o", "short-iso", "--no-pager", "-q"],
                          capture_output=True, text=True, timeout=15)
     return out.stdout if out.returncode == 0 else None
 
 
 def audit_lines(task_id, nonce, since_epoch, reader=None):
-    """This ticket's mcp-rw audit lines since `since_epoch` (journal tag mcp-rw), capped. A line belongs to
+    """This ticket's write audit lines since `since_epoch` (EPH_WRITE_AUDIT_TAGS), capped. A line belongs to
     the ticket if it carries the grant nonce or a `ticket=<id>` / `ticket: <id>` field. -> list[str], or None
     when the journal could not be read."""
     try:

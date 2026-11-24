@@ -18329,6 +18329,7 @@ def _cd_env(on=True):
     os.environ["CD_REPO_ALLOWLIST"] = "Owner/Eph-Broker"          # case-insensitive opt-in
     os.environ["CD_MR_AUTHOR"] = "eph-bot"
     cd._BY_MR.clear(); cd._BY_SHA.clear(); cd._HANDED_OFF.clear(); cd._IN_FLIGHT.clear(); cd._DM_SENT.clear()
+    cd._LAST_HANDOFF.clear(); cd._SKIPPED.clear()
     cd._NO_AUTHOR_WARNED.clear()
     cd._RETRY_RECORDS.clear()   # the in-memory retry-marker mirror must not leak across tests (F1 guard)
 
@@ -18339,6 +18340,7 @@ def _cd_env(on=True):
             else:
                 os.environ[k] = v
         cd._BY_MR.clear(); cd._BY_SHA.clear(); cd._HANDED_OFF.clear(); cd._IN_FLIGHT.clear(); cd._DM_SENT.clear()
+        cd._LAST_HANDOFF.clear(); cd._SKIPPED.clear()
         cd._NO_AUTHOR_WARNED.clear()
         cd._RETRY_RECORDS.clear()
     return restore
@@ -19936,6 +19938,181 @@ def test_pipeline_success_handoff_exact_dm():
     ok("default-branch pipeline success -> exact 'DEPLOY-HANDOFF repo= sha= ver=<VERSION>-<iid> "
        "ticket=' DM to deploy-bot + ticket comment; redelivery deduped; own-merge record traced; "
        "unreadable VERSION -> ver=sha; DM failure -> ops DM + comment")
+
+
+def _cd_no_deploy_gl(sha, comparison=None):
+    return _FakeGL({**_cd_verify_routes(sha=sha),
+                    ("GET", "/repository/compare"): comparison,
+                    ("GET", "/merge_requests"): [{"source_branch": "eph/code-change/vikunja_task_9341-ab"}]})
+
+
+def test_pipeline_no_deploy_paths_skip_and_accumulate():
+    import cd, urllib.parse
+    restore = _cd_env()
+    try:
+        repo, first, skipped, next_sha = "owner/eph-broker", "a" * 40, "b" * 40, "c" * 40
+        entry = {"kind": "ansible-rpm-pin", "no_deploy_paths": ["docs/*", "tests/*", "README*"]}
+        comments, dms, ops, c, d, o = _cd_sinks()
+
+        def run(sha, comparison):
+            gl = _cd_no_deploy_gl(sha, comparison)
+            out = cd.handle_pipeline(_cd_pipeline(sha=sha), {repo: entry}, comment=c, dm=d, dm_ops=o, api=gl)
+            return out, gl
+
+        # An unknown baseline deploys and becomes the baseline, without attempting a compare.
+        out, gl = run(first, None)
+        assert out == "handoff-sent" and cd._LAST_HANDOFF == {repo: first}
+        assert not any("/compare?" in path for _, path, _ in gl.calls)
+        comments.clear(); dms.clear()
+        comparison = {"compare_timeout": False, "diffs": _cd_diffs("docs/nested/guide.md", "tests/test_x.py",
+                                                                   "README.md")}
+        with patch.object(cd.log, "info") as logged:
+            out, gl = run(skipped, comparison)
+            assert out == "ignored:no-deploy-paths", out
+            logged.assert_called_once_with(
+                "cd: skipped hand-off repo=%s sha=%s (all paths match no_deploy_paths)", repo, skipped)
+        assert comments == dms == ops == []
+        assert (repo, skipped) in cd._SKIPPED and (repo, skipped) not in cd._HANDED_OFF
+        assert cd._LAST_HANDOFF == {repo: first}
+        assert len(gl.calls) == 4, gl.calls  # verification + compare only; no ticket/version lookups
+        assert cd.handle_pipeline(_cd_pipeline(sha=skipped), {repo: entry}, comment=c, dm=d, dm_ops=o,
+                                  api=gl) == "ignored:duplicate"
+        assert len(gl.calls) == 4
+        # A later mixed diff still compares from FIRST, not the skipped SHA.
+        out, gl = run(next_sha, {"compare_timeout": False, "diffs": _cd_diffs("docs/guide.md", "cd.py")})
+        assert out == "handoff-sent" and len(dms) == len(comments) == 1 and ops == []
+        path = next(path for _, path, _ in gl.calls if "/compare?" in path)
+        assert urllib.parse.parse_qs(urllib.parse.urlsplit(path).query) == {
+            "from": [first], "to": [next_sha], "straight": ["true"]}
+        assert cd._LAST_HANDOFF == {repo: next_sha}
+    finally:
+        restore()
+    ok("no_deploy_paths: unknown baseline deploys; docs/tests skip quietly; next mixed diff includes skipped commits")
+
+
+def test_pipeline_no_deploy_paths_compare_uncertainty_deploys():
+    import cd
+    cases = [
+        _http_error(500), None, [], {},
+        {"compare_timeout": True, "diffs": _cd_diffs("docs/x.md")},
+        {"compare_timeout": False, "overflow": True, "diffs": _cd_diffs("docs/x.md")},
+        {"compare_timeout": False, "compare_same_ref": True, "diffs": []},
+        {"compare_timeout": False, "diffs": []},
+        {"compare_timeout": False, "diffs": "invalid"},
+        {"compare_timeout": False, "diffs": _cd_diffs(*(["docs/x.md"] * 1000))},
+        {"compare_timeout": False, "diffs": [None]},
+        {"compare_timeout": False, "diffs": [{"new_path": "docs/x.md"}]},
+        {"compare_timeout": False, "diffs": [{"old_path": "docs/x.md", "new_path": ""}]},
+        {"compare_timeout": False, "diffs": [{**_cd_diffs("docs/x.md")[0], "too_large": True}]},
+        {"compare_timeout": False, "diffs": [{**_cd_diffs("docs/x.md")[0], "collapsed": True}]},
+    ]
+    for comparison in cases:
+        restore = _cd_env()
+        try:
+            repo = "owner/eph-broker"
+            cd._LAST_HANDOFF[repo] = "a" * 40
+            comments, dms, ops, c, d, o = _cd_sinks()
+            out = cd.handle_pipeline(_cd_pipeline(), {repo: {"kind": "ansible-rpm-pin",
+                                                           "no_deploy_paths": ["docs/*"]}},
+                                     comment=c, dm=d, dm_ops=o, api=_cd_no_deploy_gl(_CD_SHA, comparison))
+            assert out == "handoff-sent", (comparison, out)
+            assert len(dms) == len(comments) == 1 and ops == []
+            assert cd._LAST_HANDOFF[repo] == _CD_SHA and cd._SKIPPED == set()
+        finally:
+            restore()
+    ok("no_deploy_paths: compare error, timeout, malformed/empty/truncated diffs all keep the hand-off")
+
+
+def test_pipeline_no_deploy_paths_missing_or_invalid_config_deploys():
+    import cd
+    for patterns in (None, [], "docs/*", ["docs/*", None], [""]):
+        restore = _cd_env()
+        try:
+            repo = "owner/eph-broker"
+            cd._LAST_HANDOFF[repo] = "a" * 40
+            entry = {"kind": "ansible-rpm-pin"}
+            if patterns is not None:
+                entry["no_deploy_paths"] = patterns
+            comments, dms, ops, c, d, o = _cd_sinks()
+            gl = _cd_no_deploy_gl(_CD_SHA, {"compare_timeout": False, "diffs": _cd_diffs("docs/x.md")})
+            assert cd.handle_pipeline(_cd_pipeline(), {repo: entry}, comment=c, dm=d, dm_ops=o,
+                                      api=gl) == "handoff-sent"
+            assert len(dms) == len(comments) == 1 and ops == []
+            assert not any("/compare?" in path for _, path, _ in gl.calls)
+        finally:
+            restore()
+    ok("no_deploy_paths: absent, empty or invalid config preserves hand-off behavior")
+
+
+def test_pipeline_no_deploy_paths_match_both_rename_sides_and_full_path():
+    import cd
+    for old, new in (("app.py", "docs/app.py"), ("docs/app.py", "app.py"),
+                     ("src/README.md", "src/README.md"), ("Docs/x.md", "Docs/x.md")):
+        restore = _cd_env()
+        try:
+            repo = "owner/eph-broker"
+            cd._LAST_HANDOFF[repo] = "a" * 40
+            comments, dms, ops, c, d, o = _cd_sinks()
+            gl = _cd_no_deploy_gl(_CD_SHA, {"compare_timeout": False,
+                                          "diffs": [{"old_path": old, "new_path": new}]})
+            assert cd.handle_pipeline(_cd_pipeline(), {repo: {"kind": "ansible-rpm-pin",
+                                                           "no_deploy_paths": ["docs/*", "README*"]}},
+                                      comment=c, dm=d, dm_ops=o, api=gl) == "handoff-sent"
+            assert len(dms) == len(comments) == 1 and ops == []
+        finally:
+            restore()
+    ok("no_deploy_paths: rename from/to runtime files deploys; globs match case-sensitive full paths only")
+
+
+def test_pipeline_no_deploy_paths_does_not_bypass_verification_or_advance_on_failure():
+    import cd
+    restore = _cd_env()
+    try:
+        repo, previous = "owner/eph-broker", "a" * 40
+        cd._LAST_HANDOFF[repo] = previous
+        entry = {"kind": "ansible-rpm-pin", "no_deploy_paths": ["docs/*"]}
+        comments, dms, ops, c, d, o = _cd_sinks()
+        gl = _cd_no_deploy_gl(_CD_SHA, {"compare_timeout": False, "diffs": _cd_diffs("docs/x.md")})
+        gl.routes.update(_cd_verify_routes(head="c" * 40))
+        assert cd.handle_pipeline(_cd_pipeline(), {repo: entry}, comment=c, dm=d, dm_ops=o,
+                                  api=gl) == "verify-failed"
+        assert not any("/compare?" in path for _, path, _ in gl.calls)
+        gl = _cd_no_deploy_gl(_CD_SHA, {"compare_timeout": False, "diffs": _cd_diffs("cd.py")})
+        assert cd.handle_pipeline(_cd_pipeline(), {repo: entry}, comment=c, dm=lambda *a: False, dm_ops=o,
+                                  api=gl) == "handoff-failed"
+        assert cd._LAST_HANDOFF == {repo: previous}
+        assert cd.handle_pipeline(_cd_pipeline(), {repo: entry}, comment=lambda *a: False, dm=d, dm_ops=o,
+                                  api=gl) == "comment-failed"
+        assert cd._LAST_HANDOFF == {repo: previous}
+        assert cd.handle_pipeline(_cd_pipeline(), {repo: entry}, comment=c, dm=d, dm_ops=o,
+                                  api=gl) == "handoff-sent"
+        assert cd._LAST_HANDOFF == {repo: _CD_SHA} and len(dms) == 1
+    finally:
+        restore()
+    ok("no_deploy_paths: verify first; failed/partial hand-offs never advance the baseline; retries still work")
+
+
+def test_pipeline_no_deploy_paths_comment_only_and_repo_isolation():
+    import cd
+    restore = _cd_env()
+    try:
+        repo, previous = "owner/docs-repo", "a" * 40
+        entry = {"kind": "nightly", "no_deploy_paths": ["docs/*"]}
+        comments, dms, ops, c, d, o = _cd_sinks()
+        cd._LAST_HANDOFF["owner/eph-broker"] = previous  # not a baseline for this repo
+        gl = _FakeGL({**_cd_verify_routes(repo=repo), ("GET", "/merge_requests"): []})
+        assert cd.handle_pipeline(_cd_pipeline(repo=repo), {repo: entry}, comment=c, dm=d, dm_ops=o,
+                                  api=gl) == "commented"
+        assert cd._LAST_HANDOFF[repo] == _CD_SHA
+        sha = "b" * 40
+        gl = _FakeGL({**_cd_verify_routes(repo=repo, sha=sha),
+                      ("GET", "/repository/compare"): {"compare_timeout": False, "diffs": _cd_diffs("docs/x")}})
+        assert cd.handle_pipeline(_cd_pipeline(repo=repo, sha=sha), {repo: entry}, comment=c, dm=d, dm_ops=o,
+                                  api=gl) == "ignored:no-deploy-paths"
+        assert comments == dms == ops == [] and cd._LAST_HANDOFF[repo] == _CD_SHA
+    finally:
+        restore()
+    ok("no_deploy_paths: baselines are repo-scoped; comment-only kinds can skip too")
 
 
 def test_pipeline_ignored_and_comment_only_kinds():

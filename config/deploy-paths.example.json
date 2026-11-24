@@ -6,7 +6,8 @@
     "pin_var": "my_app_version",
     "target": "app-host",
     "verify": "the play's health checks",
-    "ver_template": "{VERSION}-{pipeline_iid}"
+    "ver_template": "{VERSION}-{pipeline_iid}",
+    "no_deploy_paths": ["docs/*", "tests/*", "README*"]
   },
   "group/my-site": {
     "repo": "group/my-site",

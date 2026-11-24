@@ -28,9 +28,10 @@ read at CALL time), so an unset flag is byte-identical to a broker without this 
                                        and a ticket comment;
      kind nightly / registry-image* -> ticket comment only, with the expected live time;
      kind none / unlisted repo      -> nothing.
-   The broker NEVER closes the ticket (the deploy side closes it on live-verify). POLICY: this hands off EVERY
-   green default-branch pipeline of a listed repo, hand-pushed and operator-merged Full ones included. Merging
-   to the default branch IS the deploy sign-off once CD_ENABLED (it replaces a separate manual sign-off step).
+   The broker NEVER closes the ticket (the deploy side closes it on live-verify). POLICY: this hands off every
+   green default-branch pipeline of a listed repo, hand-pushed and operator-merged Full ones included, unless
+   every changed path since the last hand-off matches that repo's optional no_deploy_paths. Any uncertainty
+   in that comparison keeps the hand-off. Merging to the default branch IS the deploy sign-off once CD_ENABLED.
 
 Secrets: the merge token is read at runtime from the env var NAMED by GITLAB_MERGE_TOKEN_ENV (default
 GITLAB_MERGE_TOKEN), falling back to the MR-open token (gitlab_mr.GITLAB_MR_TOKEN_ENV). Its value is never
@@ -110,6 +111,8 @@ _BY_MR = {}        # (project, mr_iid) -> task_id  (MRs the broker merged / arme
 _BY_SHA = {}       # merge_commit_sha -> task_id
 _DM_SENT = set()     # (project, sha) whose ansible hand-off DM went out (a retry re-posts only the comment)
 _HANDED_OFF = set()  # (project, sha) whose hand-off DM + comment SUCCEEDED (a redelivery is then a no-op)
+_LAST_HANDOFF = {}   # project -> last successfully handed-off sha; unknown after restart means deploy
+_SKIPPED = set()     # (project, sha) skipped by no_deploy_paths; never advances _LAST_HANDOFF
 _IN_FLIGHT = set()   # (project, sha) being handed off right now (guards concurrent redeliveries)
 _NO_AUTHOR_WARNED = []  # non-empty once the operator was DMed that CD_MR_AUTHOR is unset (DM once per process)
 
@@ -875,17 +878,20 @@ def _handle_pipeline(payload, deploy_paths, comment, dm, dm_ops, api):
         return "ignored:no-deploy-path"
     key = (repo, sha)
     with _lock:
-        if key in _HANDED_OFF or key in _IN_FLIGHT:
+        if key in _HANDED_OFF or key in _SKIPPED or key in _IN_FLIGHT:
             return "ignored:duplicate"
         _IN_FLIGHT.add(key)
     try:
         out = _hand_off(payload, repo, sha, entry, kind, attrs, comment, dm, dm_ops, api)
+        with _lock:
+            if out in ("handoff-sent", "commented"):   # only fully successful hand-offs advance the baseline
+                _HANDED_OFF.add(key)
+                _LAST_HANDOFF[repo] = sha
+            elif out == "ignored:no-deploy-paths":
+                _SKIPPED.add(key)
     finally:
         with _lock:
             _IN_FLIGHT.discard(key)
-    if out in ("handoff-sent", "commented"):   # dedup ONLY after DM and comment succeeded, so a redelivery
-        with _lock:                             # of a failed hand-off retries it
-            _HANDED_OFF.add(key)
     return out
 
 
@@ -909,6 +915,44 @@ def _verify_pipeline(api, token, repo, sha, attrs):
     return None
 
 
+def _no_deploy_change(api, token, repo, sha, entry):
+    """Only a complete, nonempty comparison of BOTH sides of every path can suppress a hand-off.
+    Unlike pipeline verification, comparison errors fail open to deploying (ticket 3104)."""
+    patterns = entry.get("no_deploy_paths")
+    if not patterns:
+        return False
+    with _lock:
+        previous = _LAST_HANDOFF.get(repo)
+    if not previous:
+        return False
+    try:
+        if not isinstance(patterns, list) or any(not isinstance(p, str) or not p for p in patterns):
+            raise ValueError("no_deploy_paths must be a list of nonempty globs")
+        query = urllib.parse.urlencode({"from": previous, "to": sha, "straight": "true"})
+        comparison = api("GET", f"/projects/{_pid(repo)}/repository/compare?{query}", token)
+        # GitLab compare is not paginated. Refuse timeouts, explicit truncation and a response at the
+        # default GitLab 1000-file limit rather than treating a potentially partial list as complete.
+        if not isinstance(comparison, dict) or comparison.get("compare_timeout") is not False \
+                or comparison.get("overflow") or comparison.get("compare_same_ref"):
+            raise ValueError("incomplete compare response")
+        diffs = comparison.get("diffs")
+        if not isinstance(diffs, list) or not diffs or len(diffs) >= 1000:
+            raise ValueError("empty, invalid or possibly truncated compare diff")
+        paths = []
+        for diff in diffs:
+            if not isinstance(diff, dict) or diff.get("too_large") or diff.get("collapsed"):
+                raise ValueError("incomplete compare diff entry")
+            for side in ("old_path", "new_path"):
+                path = diff.get(side)
+                if not isinstance(path, str) or not path:
+                    raise ValueError("missing compare path")
+                paths.append(path)
+        return all(any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns) for path in paths)
+    except Exception as e:
+        log.warning("cd: no_deploy_paths compare unavailable %s@%s: %s - keeping hand-off", repo, sha, _err(e))
+        return False
+
+
 def _hand_off(payload, repo, sha, entry, kind, attrs, comment, dm, dm_ops, api):
     token = _token()
     try:
@@ -922,6 +966,9 @@ def _hand_off(payload, repo, sha, entry, kind, attrs, comment, dm, dm_ops, api):
         except Exception as e:
             log.warning("cd: ops DM failed: %s", e)
         return "verify-failed"
+    if _no_deploy_change(api, token, repo, sha, entry):
+        log.info("cd: skipped hand-off repo=%s sha=%s (all paths match no_deploy_paths)", repo, sha)
+        return "ignored:no-deploy-paths"
     tid = find_ticket(api, token, repo, sha, (payload.get("commit") or {}).get("message", ""))
     ver = resolve_ver(api, token, repo, sha, entry, attrs.get("iid"))
     pipe_url = f"{gitlab_web_url()}/{repo}/-/pipelines/{attrs.get('id')}" if gitlab_web_url() else f"pipeline {attrs.get('id')}"

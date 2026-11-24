@@ -472,6 +472,14 @@ do.
 | `CD_RETRY_MAX` | `2000` | FIFO cap on remembered per-MR BLOCK retry/escalation records, not the number of retries per MR. |
 | `CD_RETRY_PENDING_TTL_S` | `1800` | Seconds before an undelivered queued re-review expires and escalates. |
 
+`config/deploy-paths.json` also accepts a per-repo `no_deploy_paths` list (default absent, no skipping),
+for example `["docs/*", "tests/*", "README*"]`. These are case-sensitive full-path `fnmatch` globs,
+including both old and new rename paths. A verified green default-branch pipeline skips its hand-off
+only if every path changed since that repo's last successful hand-off matches. Skips are logged with
+the full SHA, without DMs or ticket comments, and do not advance the baseline. Unknown baseline (also
+after restart), invalid config or an inconclusive compare keeps deploying as before. Hot-reloaded on
+SIGHUP; see [CD deploy paths](cd-deploy-paths.md#configdeploy-pathsjson) for comparison safety checks.
+
 ## Live transcripts and the dashboard
 
 | Variable | Default | Meaning |

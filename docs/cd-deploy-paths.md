@@ -35,7 +35,8 @@ Default **off**. Set `CD_ENABLED=1` in the broker env to enable.
    or an older pipeline finishing after a newer merge) is refused so it can't roll prod back.
 
    With `CD_ENABLED=1`, every green default-branch pipeline of a listed repo is handed off, including
-   hand-pushed commits and Full-tier MRs a human merged. Merging to the default branch is the deploy sign-off.
+   hand-pushed commits and Full-tier MRs a human merged, unless its optional `no_deploy_paths` rule applies
+   (see below). Merging to the default branch is the deploy sign-off.
    What the hand-off does depends on the repo's `kind` (see the table below):
    - `ansible-*` kinds: a message to `CD_ANSIBLE_HANDLE`, through the `NOTIFY_BACKEND` channel, with exactly
      `DEPLOY-HANDOFF repo=<ns/name> sha=<sha> ver=<ver> ticket=<id|none>`, plus a ticket comment. Whatever
@@ -67,9 +68,28 @@ The file maps each repo (`ns/name`) to an entry. The broker hot-reloads it on SI
 | `verify` | no | how the deploy is live-verified (free text or `{probe, url}`) |
 | `ver_template` | no | `ver=` value in the hand-off line. Placeholders: `{VERSION}` (the VERSION file at the sha), `{pipeline_iid}`, `{sha}`, `{short_sha}`. If unset or unresolvable, the sha is used |
 | `expected_live` | no | text for the "expected live" comment on non-ansible kinds |
+| `no_deploy_paths` | no | List of case-sensitive globs matching full repo-relative paths. Skip the hand-off only when every old and new path since the last successful hand-off matches one of these globs. Missing or empty means always hand off as before |
 
-The broker itself only reads `kind`, `ver_template` and `expected_live`. The other keys are notes for whoever
+The broker itself reads `kind`, `ver_template`, `expected_live` and `no_deploy_paths`. The other keys are notes for whoever
 reads the hand-off.
+
+For example, add `"no_deploy_paths": ["docs/*", "tests/*", "README*"]` to a repo entry to avoid
+deploying docs/tests-only changes. These are Python `fnmatch` globs: `*` also matches `/`, so `docs/*`
+includes nested docs. Patterns match the full path, not its basename, and both sides of a rename must
+match. Only list paths that do not affect that repo at runtime; prompts and config are not implicitly exempt.
+
+After verifying the pipeline and current default-branch head, the broker calls GitLab's compare API from
+the last successfully handed-off SHA to the pipeline SHA, with `straight=true` (a direct comparison, not
+the merge base). An all-matching diff skips the hand-off, records the repo and full skipped SHA in one log
+line, and sends no DM or ticket comment. Redeliveries of that SHA are deduplicated. A skip never advances
+the comparison baseline, so the next hand-off includes skipped commits naturally.
+
+Unknown baseline (including after a broker restart), invalid configuration, lookup/compare errors, timeout,
+empty/malformed diffs, explicit truncation, or a diff at the default GitLab 1000-file limit all keep the
+normal hand-off. These checks fail open to **deploying**, never to silently dropping a runtime change.
+Pipeline verification still refuses an unverified or stale pipeline as before. The baseline advances only
+after a successful hand-off and comment (or successful comment-only path); like the existing hand-off
+dedup records, it is in memory and resets on restart.
 
 ## Auto-merge without a reviewer (`AUTO_MERGE_REPOS`)
 

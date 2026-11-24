@@ -14,6 +14,7 @@ from typing import Optional
 import provenance
 import site_env  # noqa: F401  load the site overlay before the env reads below
 import config_paths
+import inbox_accounts
 import cd   # reused by the tiered MR review below for cd._patterns(tier_cfg, repo) - its Full-path glob
             # CATEGORIES, keyed fresh per call to the MR's own repo/site-config (never its
             # classify_paths()/DEFAULT_FULL_REPOS logic, a stricter deploy-MERGE-gate axis); no circular
@@ -994,6 +995,8 @@ class Route:
     inbox_input_token_limit: Optional[bool] = None
     # The operator-owned repo pattern that won model selection, also disables usage-cap fallback.
     repo_model_pin: str = ""
+    # Generic mail triage shares inbox limits/output, but has NO mailbox connector or Gmail grants.
+    mail_event_only: bool = False
 
     @property
     def row_key(self):
@@ -1002,7 +1005,7 @@ class Route:
     def __post_init__(self):
         if type(self.pin) is not bool:
             raise ValueError(f"Route {self.row_key!r}: pin must be a boolean")
-        for name in ("cc_disable_thinking_local", "cc_fail_fast"):
+        for name in ("cc_disable_thinking_local", "cc_fail_fast", "mail_event_only"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"Route {self.row_key!r}: {name} must be a boolean")
         if self.inbox_input_token_limit is not None and type(self.inbox_input_token_limit) is not bool:
@@ -1066,7 +1069,7 @@ class Route:
                      self.pin or bool(self.model_pin), self.row_id, self.model_pin,
                      self.from_config, self.site_capability, self.browser_mcp_config, self.repo_lock_scope, self.pin,
                      self.cc_disable_thinking_local, self.cc_fail_fast, self.inbox_input_token_limit,
-                     self.repo_model_pin)
+                     self.repo_model_pin, self.mail_event_only)
 
 
 # Per-ticket model selection via a `model:<name>` label. The name is either a native
@@ -1541,6 +1544,9 @@ _INBOX_ROW = Route(
     backend_from_mode=True,             # every row follows FLEET_MODE; a pin wins
     adapter=_row_adapter("INBOX_TRIAGE_ADAPTER"),   # hermes and codex both refuse inbox today (fail-closed)
 )
+
+# Account configuration is the opt-in. No connector config is needed or loaded for this source.
+_MAIL_ROW = replace(_INBOX_ROW, mcp_config_dir="", mail_event_only=True)
 
 # Zulip-wake: a 1:1 DM from an allowlisted human to a wake-mapped bot (config/zulip-wake.json, first:
 # mail-bot) gives an ephemeral inbox CHAT worker. Source-signalled like the gmail row (zulip_wake.py
@@ -2338,6 +2344,8 @@ _BASE_PROFILES = [
     ("vikunja:task", ANSIBLE_ROW_LABEL, _ANSIBLE_ROW),
     ("vikunja:task", WIKI_ROW_LABEL, _WIKI_DOCS_ROW),
     ("gmail", INBOX_ROW_SOURCE, _INBOX_ROW, _source_signal_predicates),
+    ("mail:", "mail" if any(f.get("kind") == "mail" for f in inbox_accounts.ACCOUNTS.values()) else "",
+     _MAIL_ROW, _source_signal_predicates),
     ("vikunja:task", CODE_UI_ROW_LABEL, _CODE_UI_ROW, _exact_label_signal_predicates),
     ("vikunja:task", CODE_ROW_LABEL, _CODE_ROW),
     # @dev ASSIGNEE (no label) routes to the SAME code change-proposer row. Assignee-ONLY, exact
@@ -2781,6 +2789,14 @@ class Router:
         # the comment-forward branch below and before the source-signalled issue rows can match, so a
         # forge-shaped comment can't forward into a live worker and the broker does not depend on the external
         # tap alone. vikunja/gmail/mr events are NOT in _FORGE_SOURCES and are unaffected.
+        if key.startswith("mail:") or evt.get("source") == "mail":
+            try:
+                if evt.get("source") != "mail" or inbox_accounts.account_kind(evt.get("account")) != "mail":
+                    return None
+            except inbox_accounts.UnknownInboxAccount:
+                return None
+            if key != f"mail:{evt['account']}":
+                return None
         if key.startswith("mr:note:") or (evt.get("source") == "mr" and evt.get("event_name") == "mr.note"):
             if not mr_note_allowed(evt):
                 return None

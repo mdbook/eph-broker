@@ -1586,7 +1586,7 @@ def _inbox_chat_gmail_allowed():
     read/reversible-write tool, never send (the server-agnostic `mcp__*__send_gmail_message` deny in
     _GMAIL_DENIED, kept verbatim below, already covers every one of these account-suffixed names)."""
     tools = _GMAIL_READ_TOOLS + _GMAIL_WRITE_SAFE_TOOLS
-    return [f"mcp__google-workspace-{a}__{t}" for a in sorted(inbox_accounts.ACCOUNTS) for t in tools]
+    return [f"mcp__google-workspace-{a}__{t}" for a in sorted(inbox_accounts.gmail_accounts()) for t in tools]
 
 
 def _inbox_chat_gmail_denied():
@@ -1597,7 +1597,7 @@ def _inbox_chat_gmail_denied():
     wildcard form exists for it). Explicit per-account denies close both, for every account, alongside
     (never instead of) the kept wildcard send-deny (belt-and-suspenders if a server is ever misnamed)."""
     return [f"mcp__google-workspace-{a}__{tool}"
-            for a in sorted(inbox_accounts.ACCOUNTS)
+            for a in sorted(inbox_accounts.gmail_accounts())
             for tool in ("send_gmail_message", "manage_gmail_filter")]
 
 
@@ -1609,7 +1609,7 @@ def _inbox_chat_trash_matcher():
     is built from the SAME live table so the two can never drift apart again, by construction, regardless).
     No accounts configured -> `(?!)` (a negative lookahead that always fails): the pattern then matches
     NOTHING, never an accidentally-open gate."""
-    names = "|".join(re.escape(a) for a in sorted(inbox_accounts.ACCOUNTS)) or "(?!)"
+    names = "|".join(re.escape(a) for a in sorted(inbox_accounts.gmail_accounts())) or "(?!)"
     return (rf"mcp__google-workspace-({names})__(modify_gmail_message_labels|"
             r"batch_modify_gmail_message_labels)")
 
@@ -1641,10 +1641,10 @@ _INBOX_CHAT_DENIED = (_INBOX_DENIED + _inbox_chat_gmail_denied()
 
 
 def _merge_inbox_chat_mcp_config(mcp_config_dir):
-    """combine every account's own `<mcp_config_dir>/<account>.json` (opencode-authored secret
+    """Combine every Gmail account's own `<mcp_config_dir>/<account>.json` (opencode-authored secret
     per-account Gmail OAuth, unchanged schema, `{"mcpServers": {"google-workspace": {...}}}`, same file
     triage's single-account path already reads) into ONE combined --strict-mcp-config file, so the inbox-chat
-    worker can act on EVERY account in inbox_accounts.ACCOUNTS within its one session instead of only the bot
+    worker can act on every connector-backed account within its one session instead of only the bot
     map's named one. Each account's lone `google-workspace` server is renamed `google-workspace-<account>`
     (capability_tool_grant's inbox-chat allow-list + the TRASH-guard hook matcher both key off that SAME
     name), so the harness can tell the accounts apart under one --strict-mcp-config. cc still never AUTHORS a
@@ -1661,10 +1661,11 @@ def _merge_inbox_chat_mcp_config(mcp_config_dir):
     it at worker teardown (mirrors write_grant.py's own file lifecycle)."""
     if not mcp_config_dir:
         raise ValueError("inbox-chat: no mcp_config_dir configured (fail-closed)")
-    if not inbox_accounts.ACCOUNTS:
+    accounts = inbox_accounts.gmail_accounts()
+    if not accounts:
         raise ValueError("inbox-chat: no inbox accounts configured (fail-closed)")
     servers = {}
-    for account in sorted(inbox_accounts.ACCOUNTS):
+    for account in sorted(accounts):
         path = os.path.join(mcp_config_dir, f"{account}.json")
         try:
             with open(path, encoding="utf-8") as f:
@@ -1901,10 +1902,18 @@ def agent_dm_recipients(capability):
 
 
 def capability_tool_grant(capability, test_runner=None, bypass_classifier=False, test_repo=None,
-                          write_grant=False, judged=False, browser=False, adjudicated=False, bus_enabled=None):
+                          write_grant=False, judged=False, browser=False, adjudicated=False, bus_enabled=None,
+                          mail_event_only=False):
     """Add one shared DM grant to bus-enabled workers, never a new bus identity."""
     grant = _base_capability_tool_grant(capability, test_runner, bypass_classifier, test_repo,
                                        write_grant, judged, browser, adjudicated)
+    if mail_event_only:
+        if capability != "inbox":
+            raise ValueError("mail_event_only requires the inbox capability")
+        i = grant.index("--allowedTools") + 1
+        grant[i] = " ".join(_READ_ALLOWED + _INBOX_GIT + ["Bash(mcp-ro.sh hindsight:*)"])
+        # Empty strict MCP config below is the containment; deny direct MCP tools too.
+        grant[grant.index("--disallowedTools") + 1] += " mcp__*"
     # Legacy callers build these historically bus-capable grants without a route.
     # Actual spawns pass the route's ZBUS_ENV presence explicitly.
     if bus_enabled is None:
@@ -3160,7 +3169,7 @@ class CCAdapter(Adapter):
                    mcp_config_path=None, test_runner=None, setting_sources=None, effort=None,
                    bypass_classifier=False, session_uuid=None, test_repo=None, write_grant=False,
                    site_capability="", thread_dir=None, judged_bash=False, worktree_root=None,
-                   browser_config=None, steer_hook=None, companions=False, bus_enabled=None):
+                   browser_config=None, steer_hook=None, companions=False, bus_enabled=None, mail_event_only=False):
         if not system_prompt:
             raise ValueError("refusing to spawn without a system prompt (constraint #1: never --bare)")
         # Constraint 4, charter-strip: setting-sources defaults to self.setting_sources ("") so every existing worker
@@ -3199,7 +3208,8 @@ class CCAdapter(Adapter):
                                       # code only: with Portcullis configured the allow-list is dropped and the
                                       # hook adjudicates; unconfigured (the default) keeps the legacy grant, so
                                       # the allow-list is never removed without an adjudicator in its place.
-                                      adjudicated=portcullis is not None, bus_enabled=bus_enabled)
+                                      adjudicated=portcullis is not None, bus_enabled=bus_enabled,
+                                      mail_event_only=mail_event_only)
         if site_capability:   # a broker.yaml capability: its base grant (above) plus its own extra rules
             grant = _with_site_rules(grant, capability, site_capability)
         # Wiki skills (EPH_WIKI_SKILLS_ENABLED, default OFF). An allow-listed capability does NOT include
@@ -3235,13 +3245,16 @@ class CCAdapter(Adapter):
         # tools (the write-capable connectors) out of its callable surface, hence fail-closed here, no ambient fallback.
         # The general config file is non-secret (unauthenticated Hindsight) and is authored/placed by
         # hand at deploy (same as the inbox config, which is hand-authored); the repo only points and gates.
-        if capability in ("inbox", "inbox-chat", "general"):   # inbox-chat = per-account
+        if not mail_event_only and capability in ("inbox", "inbox-chat", "general"):
             if not mcp_config_path or not os.path.exists(mcp_config_path):
                 raise ValueError(
                     f"refusing to spawn {capability} worker without its MCP config (fail-closed): "
                     f"{mcp_config_path!r} is missing; the operator places these config files "
                     f"(inbox = secret per-account; general = non-secret Hindsight-only)")
             argv += ["--mcp-config", mcp_config_path, "--strict-mcp-config"]
+        if mail_event_only:
+            # CC accepts inline JSON as well as a path. Never inherit ambient mailbox connectors.
+            argv += ["--mcp-config", '{"mcpServers":{}}', "--strict-mcp-config"]
         # The code lane's OPT-IN browser (playwright MCP): when the route names a config, load ONLY that
         # server via --strict-mcp-config (so the code worker's directly-loaded MCP surface is EXACTLY the
         # playwright server, never the broker host's ambient .mcp.json) and FAIL CLOSED if the named config
@@ -3839,7 +3852,10 @@ class CCAdapter(Adapter):
                         log.warning("zulip_account lookup failed key=%s: %s", key, e)
                         account = ""
                 try:
-                    inbox_posture = inbox_accounts.inbox_fact_block(account)
+                    kind = "mail" if getattr(route, "mail_event_only", False) else "gmail"
+                    if (key.startswith("mail:") != (kind == "mail")):
+                        raise inbox_accounts.UnknownInboxAccount(account)
+                    inbox_posture = inbox_accounts.inbox_fact_block(account, kind=kind)
                 except inbox_accounts.UnknownInboxAccount:
                     log.warning("inbox spawn REJECTED key=%s: unknown account %r (fail-closed, no worker cut)",
                                 key, account)
@@ -4244,7 +4260,7 @@ class CCAdapter(Adapter):
                     brief = {**brief, "companions": worker.companions}
             worker.inbox_account = inbox_account          # None on every non-inbox route
             worker.inbox_posture = inbox_posture   # cached for a forward's fresh-session re-attach
-            if getattr(route, "capability", "") == "inbox":
+            if getattr(route, "capability", "") == "inbox" and not getattr(route, "mail_event_only", False):
                 # Match the worker's cwd, not the broker's, and pin both progress snapshots to this path.
                 worker.inbox_ledger_path = os.path.abspath(os.path.join(
                     worker.worktree, inbox_accounts.ACCOUNTS[inbox_account]["ledger"]))
@@ -5030,7 +5046,7 @@ class CCAdapter(Adapter):
         # ALL-ACCOUNTS file (_merge_inbox_chat_mcp_config). build_argv fails closed if the result is absent
         # (never a hard-coded path). Every other capability either reuses a fixed config (below) or passes None.
         mcp_config_path = None
-        if capability == "inbox":
+        if capability == "inbox" and not getattr(route, "mail_event_only", False):
             # gmail:<account> keys keep the key-derived single-account path.
             account = getattr(worker, "inbox_account", None) or (
                 worker.key.split(":")[1] if ":" in worker.key else worker.key)
@@ -5116,6 +5132,8 @@ class CCAdapter(Adapter):
             stream_kw["test_repo"] = getattr(worker, "repo", None)
         if getattr(route, "site_capability", ""):        # only when set, so a built-in row's call is unchanged
             stream_kw["site_capability"] = route.site_capability
+        if getattr(route, "mail_event_only", False):
+            stream_kw["mail_event_only"] = True
         grant_path = getattr(worker, "write_grant_path", None)   # Set at spawn only for a granted infra worker
         if grant_path and capability == "code":
             stream_kw["write_grant"] = True

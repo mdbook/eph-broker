@@ -385,6 +385,30 @@ An existing tap can still send a signed normalized `POST /event` like this one:
 - The worker works from `title` and `body`. The change comes back as a GitLab merge request, so the local
   checkout needs a GitLab https origin. With `GITHUB_TOKEN` configured, summaries are posted on the GitHub issue.
 
+## non-Gmail mail sources
+
+A poller for Outlook, IMAP, or another mailbox can send `source: "mail"` to the existing signed `/event`.
+Add its account key with `"kind": "mail"` and a posture in `config/inbox-accounts.json` (see the
+[example](../config/inbox-accounts.example.json)); omitted `kind` still means Gmail. Use the existing inbox
+repo, notification identity and model settings. No mailbox credentials or MCP config are needed for a mail
+account, and it is excluded from Gmail chat access. Unknown accounts, wrong kinds and non-string fields are
+dropped, fail closed (`dropped: true` in the response).
+
+The inbox/triage worker classifies only the supplied sender, subject, receipt time and snippet, all fenced as
+UNTRUSTED data. It cannot read back or change this mailbox. It recommends actions and notifies according to the
+account posture using the usual triage outputs. Events coalesce per `mail:<account>`, single-flight with the
+existing spawn-rate accounting; after completion the next event starts a fresh pass. The producer should send
+only newly observed mail, not replay its backlog on every poll.
+
+With `BROKER_HMAC_SECRET` already provisioned in the sender's environment, sign the exact bytes sent by curl:
+
+```sh
+body='{"source":"mail","account":"external","from":"sender@example.test","subject":"Review requested","received_at":"2026-11-24T16:00:00Z","snippet":"Please review the attached proposal."}'
+signature=$(printf '%s' "$body" | python3 -c 'import hashlib,hmac,os,sys; print(hmac.new(os.environ["BROKER_HMAC_SECRET"].encode(),sys.stdin.buffer.read(),hashlib.sha256).hexdigest())')
+curl --fail-with-body http://127.0.0.1:8787/event \
+  -H 'Content-Type: application/json' -H "X-Broker-HMAC: sha256=$signature" --data-binary "$body"
+```
+
 ## Notifications
 
 Worker escalations go to `OPS_HANDLE`; hand-offs (the CD deploy line, infra MR links) go to their own handle. All

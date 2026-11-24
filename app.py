@@ -20,6 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import site_env         # load config/site.env BEFORE any module reads env at import time
 import config_paths
+import inbox_accounts
 import sandbox
 import coalescer as C
 from coalescer import Coalescer
@@ -571,6 +572,18 @@ class Broker:
         self.zulip_wake.start()  # enabling either flag after startup must also start reconciliation
 
     def ingest(self, evt, internal=False):
+        if evt.get("source") == "mail":
+            # Validate before durable admission, including while draining. Producer fields such as
+            # task_id/doer/event_name must never become trusted routing or worker-brief metadata.
+            try:
+                valid_account = inbox_accounts.account_kind(evt.get("account")) == "mail"
+            except inbox_accounts.UnknownInboxAccount:
+                valid_account = False
+            if not valid_account or any(not isinstance(evt.get(k), str) for k in C.MAIL_FIELDS):
+                self.rejected += 1
+                return None
+            evt = {k: evt[k] for k in ("source", "account") + C.MAIL_FIELDS}
+            evt["event_name"] = "mail.received"
         if self.state is None:
             return self._ingest(evt, internal=internal)
         with self.coalescer.lock:

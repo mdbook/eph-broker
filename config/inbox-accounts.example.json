@@ -1,11 +1,17 @@
 {
-  "_comment": "Copy to config/inbox-accounts.json (or point BROKER_INBOX_ACCOUNTS at your file). accounts: account key -> {email, ledger, posture}, all three non-empty strings, plus optional batch_size (integer 1..6, default 3 unseen messages per run). ledger = the seen-ledger JSONL path the worker appends to; records identify mail with id, gmail_id or message_id. posture = per-account triage rules appended verbatim to the worker's runtime brief. A missing default file = no accounts (every inbox spawn refuses, logged); an explicit BROKER_INBOX_ACCOUNTS that does not exist, or a malformed file, stops the broker. Each account also needs <INBOX_MCP_CONFIG_DIR>/<account>.json.",
+  "_comment": "Copy to config/inbox-accounts.json (or point BROKER_INBOX_ACCOUNTS at your file). accounts: account key -> {email, ledger, posture}, all three non-empty strings, plus optional kind (gmail, the default, or mail) and batch_size (integer 1..6, default 3 unseen Gmail messages per run). ledger = the seen-ledger JSONL path for connector-backed triage; records identify mail with id, gmail_id or message_id. posture = per-account triage rules appended verbatim to the worker's runtime brief. A missing default file = no accounts (every inbox spawn refuses, logged); an explicit BROKER_INBOX_ACCOUNTS that does not exist, or a malformed file, stops the broker. Only Gmail accounts need <INBOX_MCP_CONFIG_DIR>/<account>.json. kind=mail classifies supplied event snippets only, with no mailbox access or ledger writes; the ledger path is reserved and unused.",
   "accounts": {
     "personal": {
       "email": "user@example.test",
       "ledger": "/var/lib/eph-broker/inbox/seen-ledger-personal.jsonl",
       "batch_size": 3,
       "posture": "#### `personal`: user@example.test\n\n**Primary inbox. Conservative posture (would-archive-only):** log intended archives as `would-archive-*` ledger verdicts and leave the mail in the inbox. On ANY doubt, leave + surface."
+    },
+    "external": {
+      "kind": "mail",
+      "email": "external@example.test",
+      "ledger": "/var/lib/eph-broker/inbox/seen-ledger-external.jsonl",
+      "posture": "Classify supplied mail snippets and notify the operator of actionable or uncertain items. Digest routine items. Recommend actions only; this mailbox cannot be read or changed by the worker."
     }
   }
 }

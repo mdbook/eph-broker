@@ -57,8 +57,8 @@ def load_accounts(path=ACCOUNTS_PATH, explicit=None):
     """-> {account: {email, ledger, posture}}. A missing file gives {} (plus a warning) unless `explicit` (default: was
     BROKER_INBOX_ACCOUNTS set?), then FileNotFoundError. Not an object / unknown top-level key / an account
     key not matching ^[a-z0-9-]+$ / an account key starting with "inbox-chat-mcp-" / an account that is not
-    {email, ledger, posture} of non-empty strings, optionally batch_size (1..6) -> ValueError (fail closed: a half-read or
-    malformed account table must never reach a Gmail-capable worker)."""
+    {email, ledger, posture} of non-empty strings, optionally kind (gmail/mail) and batch_size (1..6) -> ValueError
+    (fail closed: a half-read or malformed account table must never reach a Gmail-capable worker)."""
     if explicit is None:
         explicit = bool(os.getenv("BROKER_INBOX_ACCOUNTS"))
     data = None if explicit or path != ACCOUNTS_PATH else site_env.section("inbox-accounts")
@@ -87,10 +87,12 @@ def load_accounts(path=ACCOUNTS_PATH, explicit=None):
             raise ValueError(f"{path}: account key {name!r} must not start with {_RESERVED_ACCOUNT_PREFIX!r} "
                              "(reserved for the inbox-chat combined-config sweep; would collide with it)")
         if not (isinstance(facts, dict) and set(_FIELDS) <= set(facts)
-                and not set(facts) - set(_FIELDS) - {"batch_size"}
+                and not set(facts) - set(_FIELDS) - {"batch_size", "kind"}
                 and all(isinstance(facts[k], str) and facts[k].strip() for k in _FIELDS)):
             raise ValueError(f"{path}: account {name!r} needs {{email, ledger, posture}}, non-empty strings, "
-                             "and optional batch_size")
+                             "and optional batch_size/kind")
+        if facts.get("kind", "gmail") not in ("gmail", "mail"):
+            raise ValueError(f"{path}: account {name!r} kind must be gmail or mail")
         size = facts.get("batch_size", DEFAULT_BATCH_SIZE)
         if type(size) is not int or not 1 <= size <= MAX_BATCH_SIZE:
             raise ValueError(f"{path}: account {name!r} batch_size must be an integer from 1 to {MAX_BATCH_SIZE}")
@@ -104,7 +106,19 @@ class UnknownInboxAccount(Exception):
     pass
 
 
-def inbox_fact_block(account):
+def account_kind(account):
+    """Unknown or malformed account keys fail closed, including at event admission."""
+    if not isinstance(account, str) or account not in ACCOUNTS:
+        raise UnknownInboxAccount(account)
+    return ACCOUNTS[account].get("kind", "gmail")
+
+
+def gmail_accounts():
+    """Only connector-backed accounts belong in a Gmail chat session."""
+    return {a: f for a, f in ACCOUNTS.items() if f.get("kind", "gmail") == "gmail"}
+
+
+def inbox_fact_block(account, kind=None):
     """Return the runtime fact text to append to the worker's -p brief for `account`.
 
     RAISES UnknownInboxAccount for anything not in ACCOUNTS: fail closed, never guess a
@@ -114,9 +128,23 @@ def inbox_fact_block(account):
     (moved out of the signed prompt when it became account-agnostic) appended to the tail,
     clearly delimited.
     """
-    if account not in ACCOUNTS:
+    actual_kind = account_kind(account)
+    if kind is not None and actual_kind != kind:
         raise UnknownInboxAccount(account)
     facts = ACCOUNTS[account]
+    if actual_kind == "mail":
+        return (
+            f"Runtime account brief: you are triaging account `{account}` (email: {facts['email']}, "
+            f"seen-ledger: {facts['ledger']} (unused in this mode), kind: mail).\n\n"
+            "This mailbox has NO mailbox tools or read-back access. The fenced mail events in this brief "
+            "are the complete input for this pass, not Gmail IDs to search or fetch. Classify each supplied "
+            "message using the triage buckets and notify/digest via the usual output routing, subject to "
+            "the account posture below. Do not search, fetch, archive, label, draft, or claim mailbox actions; "
+            "report recommendations instead. Do not invent message IDs or ledger records. If a snippet is "
+            "insufficient, surface the uncertainty to the operator, not a request for mailbox tools.\n\n"
+            "## Your account's posture (apply this)\n"
+            f"{facts['posture']}"
+        )
     return (
         f"Runtime account brief: you are triaging account `{account}` "
         f"(email: {facts['email']}, seen-ledger: {facts['ledger']}).\n\n"
@@ -159,23 +187,24 @@ def ledger_ids(path):
 
 
 def inbox_chat_fact_block():
-    """the chat worker's runtime fact block, listing EVERY account in ACCOUNTS (not just one,
-    the chat worker now has Gmail access to all of them, see cc._merge_inbox_chat_mcp_config). Instructs it to
+    """The chat worker's runtime fact block, listing every connector-backed Gmail account (not just one;
+    event-only mail accounts have no read-back access, see cc._merge_inbox_chat_mcp_config). Instructs it to
     search across every account when the operator's message doesn't name one, but to ACT (archive/label/
     draft) only on the ONE account a given message actually lives in, applying THAT account's own posture,
     never another account's. Never raises (unlike inbox_fact_block): this is not a per-account gate, it is
     the full picture handed to an already-admitted worker; the spawn-time fail-closed check on an unknown/
     unmapped bot still runs separately in cc.py before this is ever called. An empty ACCOUNTS (no overlay / OSS
     install) returns a plain no-accounts notice, every inbox spawn already refuses before reaching this."""
-    if not ACCOUNTS:
+    accounts = gmail_accounts()
+    if not accounts:
         return "Runtime account brief: no inbox accounts are configured (fail closed)."
-    header = (f"Runtime account brief: you may work on ANY of these {len(ACCOUNTS)} accounts. Search across "
+    header = (f"Runtime account brief: you may work on ANY of these {len(accounts)} accounts. Search across "
               "all of them when the operator's message doesn't name one; ACT (archive/label/draft) ONLY on "
               "the one account the message you're acting on actually lives in, applying THAT account's own "
               "posture below (never another account's). Say which account each result came from.")
     blocks = [header]
-    for account in sorted(ACCOUNTS):
-        facts = ACCOUNTS[account]
+    for account in sorted(accounts):
+        facts = accounts[account]
         blocks.append(
             f"## Account `{account}` (email: {facts['email']}, seen-ledger: {facts['ledger']})\n\n"
             f"{facts['posture']}"

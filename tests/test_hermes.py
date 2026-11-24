@@ -297,6 +297,33 @@ def test_hermes_model_denylist_at_launch():
     ok("hermes: denylist checks final backend model immediately before worker launch")
 
 
+def test_hermes_threads_worker_write_grant_to_policy():
+    from unittest.mock import patch
+
+    class StopTurn(Exception):
+        pass
+
+    with tempfile.TemporaryDirectory() as d, _Registry(d), patch.dict(os.environ, {"CODE_NONCLAUDE_OK": "1"}):
+        a = _adapter(d, envelope_parser=EnvelopeParser())
+        w = Worker("vikunja:task:9312", "grant-test", d)
+        for cap in ("code", "write", "mr-review"):
+            for path in (None, "", os.path.join(d, "write-grant.json")):
+                w.write_grant_path = path
+                expected = cap == "code" and bool(path)
+                with patch.object(H, "gate_policy", wraps=H.gate_policy) as make_policy, \
+                        patch.object(a.hermes, "_install_gate", side_effect=StopTurn) as install:
+                    try:
+                        a._one_turn(w, _route(capability=cap), "SYS", "P", resume=False)
+                        raise AssertionError("must reach the gate installer")
+                    except StopTurn:
+                        pass
+                    assert make_policy.call_args.kwargs["write_grant"] is expected
+                    policy = install.call_args.args[1]
+                    if cap == "code":
+                        assert bool(CC._WRITE_WRAPPER_LIFTABLE.intersection(policy["deny"])) is not expected
+    ok("hermes: only code workers with write_grant_path thread a live-write grant into the installed policy")
+
+
 def test_hermes_big_prompt_rides_stdin_no_e2big():
     """A >200 KiB brief (an mr-review diff) goes through the REAL hermes argv builder and a REAL exec on
     stdin; no argv string nears MAX_ARG_STRLEN (128 KiB), so the spawn cannot die with E2BIG."""

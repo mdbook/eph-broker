@@ -1126,6 +1126,34 @@ def test_codex_happy_path_and_resume():
        "scrubbed env (no OPENAI_*/CODEX_* leak), gate trusted and live, denials reported, resume + token delta")
 
 
+def test_codex_threads_worker_write_grant_to_policy():
+    from unittest.mock import patch
+
+    class StopTurn(Exception):
+        pass
+
+    with tempfile.TemporaryDirectory() as d, _Codex(d):
+        wt = _git_repo(os.path.join(d, "wt"))
+        a = _adapter(d)
+        w = Worker("vikunja:task:9312", "grant-test", wt)
+        for cap in ("code", "write", "mr-review"):
+            for path in (None, "", os.path.join(d, "write-grant.json")):
+                w.write_grant_path = path
+                expected = cap == "code" and bool(path)
+                with patch.object(X, "gate_policy", wraps=X.gate_policy) as make_policy, \
+                        patch.object(a.codex, "_install_gate", side_effect=StopTurn) as install:
+                    try:
+                        a._one_turn(w, _route(capability=cap), "SYS", "P", resume=False)
+                        raise AssertionError("must reach the gate installer")
+                    except StopTurn:
+                        pass
+                    assert make_policy.call_args.kwargs["write_grant"] is expected
+                    policy = install.call_args.args[1]
+                    if cap == "code":
+                        assert bool(CC._WRITE_WRAPPER_LIFTABLE.intersection(policy["deny"])) is not expected
+    ok("codex: only code workers with write_grant_path thread a live-write grant into the installed policy")
+
+
 def test_codex_sandbox_network_requires_opt_in():
     auto = ["--permission-mode", "auto"]
     cases = [(auto, None, False),

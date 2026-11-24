@@ -404,11 +404,14 @@ def _nonsecret_paths(root):
     return []
 
 
-def gate_policy(capability, cwd, test_runner=None, test_repo=None, nonce=None, bus_enabled=None, companions=()):
+def gate_policy(capability, cwd, test_runner=None, test_repo=None, nonce=None, bus_enabled=None, companions=(),
+                write_grant=False):
     """The CC grant for the SAME capability, plus read extensions requiring eph-gate's parsed path checks."""
     if bus_enabled is None:
         bus_enabled = capability in _cc._LEGACY_BUS_CAPABILITIES
-    grant = _cc.capability_tool_grant(capability, test_runner=test_runner, test_repo=test_repo, bus_enabled=bus_enabled)
+    # Reuse CC's code-only wrapper grant and floor filtering; independent/absolute denies stay intact.
+    grant = _cc.capability_tool_grant(capability, test_runner=test_runner, test_repo=test_repo,
+                                      bus_enabled=bus_enabled, write_grant=write_grant)
     if capability in _gate.READ_ONLY_CAPABILITIES and ("--permission-mode" in grant or any(
             r.split("(", 1)[0] in _READ_ONLY_FORBIDDEN_RULES for r in _gate.split_rules(
                 grant[grant.index("--allowedTools") + 1] if "--allowedTools" in grant else ""))):
@@ -898,7 +901,9 @@ class HermesHarness:
             env["TERMINAL_CWD"] = cwd                      # hermes' terminal/file base dir == the gate's cwd
             nonce = self._install_gate(home, gate_policy(capability, cwd, test_runner, test_repo,
                                        bus_enabled=bool(getattr(route, "env", {}).get("ZBUS_ENV")),
-                                       companions=getattr(worker, "companions", [])), env, cwd, argv)
+                                       companions=getattr(worker, "companions", []),
+                                       write_grant=capability == "code" and bool(
+                                           getattr(worker, "write_grant_path", None))), env, cwd, argv)
             # The probe checks startup + hook dispatch, never starts a terminal or sources shell_init_files.
             # Let its security refusal win over a stale init file if the home sweep regresses (B2). Still create
             # exclusively BEFORE the real run: any re-plant after the sweep, even during the probe, refuses.

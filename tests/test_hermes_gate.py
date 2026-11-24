@@ -122,6 +122,46 @@ def T(cmd, **kw):
     return dict(command=cmd, **kw)
 
 
+def test_write_grant_lifts_only_cc_wrapper_floor():
+    args = ("code", fx().wt)
+    base = H.gate_policy(*args, nonce="grant-test")
+    granted = H.gate_policy(*args, nonce="grant-test", write_grant=True)
+    assert CC._WRITE_WRAPPER_LIFTABLE <= set(base["deny"])
+    assert granted["deny"] == [r for r in base["deny"] if r not in CC._WRITE_WRAPPER_LIFTABLE]
+    assert not CC._WRITE_WRAPPER_LIFTABLE.intersection(granted["deny"])
+    assert set(base["deny"]).intersection(CC._INDEPENDENT_CODE_DENIED) <= set(granted["deny"])
+    assert set(CC._MCP_ABS_DENIED) <= set(granted["deny"])
+    assert set(CC._MCP_RW) <= set(granted["allow"])
+    assert [r for r in granted["allow"] if r not in CC._MCP_RW] == base["allow"]
+    assert {k: v for k, v in granted.items() if k not in ("deny", "allow")} == {
+        k: v for k, v in base.items() if k not in ("deny", "allow")}
+    for name in CC._WRITE_WRAPPERS:
+        cmd = name + " grafana tools/call '{}'"
+        assert not G.decide("terminal", T(cmd), G.Policy(base)).allowed
+        v = G.decide("terminal", T(cmd), G.Policy(granted))
+        assert v.allowed, v.reason
+    ok("write grant: CC's bare wrappers allowed; exactly its liftable denies removed, all other floors unchanged")
+
+
+def test_write_grant_default_policy_byte_identical():
+    # The pre-grant policy used this exact CC call, without a write_grant argument.
+    legacy_grant = CC.capability_tool_grant("code", test_runner="pytest", bus_enabled=True)
+    with patch.object(CC, "capability_tool_grant", return_value=legacy_grant):
+        legacy = H.gate_policy("code", fx().wt, test_runner="pytest", nonce="grant-test", bus_enabled=True)
+    for kw in ({}, {"write_grant": False}):
+        policy = H.gate_policy("code", fx().wt, test_runner="pytest", nonce="grant-test", bus_enabled=True, **kw)
+        assert json.dumps(policy) == json.dumps(legacy)
+    ok("write grant: omitted/False preserves the pre-grant policy byte for byte")
+
+
+def test_write_grant_ignored_for_non_code_capabilities():
+    for cap in ("write", "general", "mr-review", "read"):
+        base = H.gate_policy(cap, fx().wt, nonce="grant-test")
+        granted = H.gate_policy(cap, fx().wt, nonce="grant-test", write_grant=True)
+        assert json.dumps(granted) == json.dumps(base), cap
+    ok("write grant: non-code capabilities lift nothing and keep identical policies")
+
+
 def test_npm_lockfile_and_script_free_install_grants():
     from adapters import codex as X
     from adapters import codex_gate as CG

@@ -110,6 +110,18 @@ def gitdir(worktree):
     return _path(os.path.join(directory, common))
 
 
+def hidden_paths():
+    """Shared secret masks for launch and broker-side executable validation, including symlink targets."""
+    import site_env
+
+    hidden = [os.path.expanduser("~/.git-credentials"), os.path.expanduser("~/.config/eph-broker"),
+              "/etc/eph-broker",
+              os.path.dirname(site_env.SITE_ENV), os.path.dirname(site_env.BROKER_CONFIG),
+              site_env.SITE_ENV, site_env.BROKER_CONFIG,
+              *_paths("WORKER_SANDBOX_HIDE")]
+    return sorted(set(_path(p) for p in hidden), key=lambda p: (p.count("/"), p))
+
+
 def wrap(argv, worktree, base_repo_gitdir, *, writable_paths=(), readonly_paths=(),
          ssh_config=None, ssh_control_dir=None):
     """Return a launch argv (off: an unchanged copy), without mutating the host.
@@ -125,8 +137,6 @@ def wrap(argv, worktree, base_repo_gitdir, *, writable_paths=(), readonly_paths=
     binary = check()
     if binary is None:
         return list(argv)
-    import site_env                     # already loaded by app, after the site overlay
-
     out = [binary, "--die-with-parent", "--new-session", "--unshare-user", "--unshare-pid",
            "--cap-drop", "ALL", "--ro-bind", "/", "/", "--tmpfs", "/tmp"]
     for path in dict.fromkeys(_path(p) for p in (worktree, base_repo_gitdir, *writable_paths,
@@ -141,16 +151,10 @@ def wrap(argv, worktree, base_repo_gitdir, *, writable_paths=(), readonly_paths=
             out += ["--ro-bind", source, target]
     # Mount these AFTER any configured bind so EXTRA_RO cannot restore host /proc.
     out += ["--dev", "/dev", "--proc", "/proc"]
-    hidden = [os.path.expanduser("~/.git-credentials"), os.path.expanduser("~/.config/eph-broker"),
-              "/etc/eph-broker",          # conventional EnvironmentFile directory (docs/install.md)
-              os.path.dirname(site_env.SITE_ENV), os.path.dirname(site_env.BROKER_CONFIG),
-              site_env.SITE_ENV, site_env.BROKER_CONFIG,
-              *_paths("WORKER_SANDBOX_HIDE")]
     # Resolve the files too: a file symlink can escape its hidden parent directory.
     # The parents mask the original locations; realpath masks targets exposed by the readable root.
-    paths = sorted(set(_path(p) for p in hidden), key=lambda p: (p.count("/"), p))
     covered = []
-    for path in paths:
+    for path in hidden_paths():
         if any(path.startswith(parent + "/") for parent in covered):
             continue
         if not os.path.exists(path):    # absent secrets need no mount; no host placeholders are created

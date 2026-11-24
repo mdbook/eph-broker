@@ -802,6 +802,17 @@ def _worker_ssh(env, base, worker, mcp_granted=False):
 def worker_env(base, route, backend_env=None, worker=None):
     """Shared launch env for every row/harness; install managed SSH when preparing a worker turn."""
     env = scrub_worker_env(base, route_env=route.env, backend_env=backend_env)
+    # Never forward config selectors or accept inherited/route/backend mail authority. Only the broker
+    # can resolve this run's account and posture, outside the sandbox where config remains hidden.
+    for name in ("BROKER_CONFIG_DIR", "CONFIG_DIR", "BROKER_CONFIG", "BROKER_SITE_ENV", "BROKER_INBOX_ACCOUNTS",
+                 "BROKER_MAIL_ACCOUNT", "BROKER_MAIL_TOOL", "BROKER_MAIL_ARCHIVE"):
+        env.pop(name, None)
+    if getattr(route, "mail_event_only", False) and worker is not None:
+        account = getattr(worker, "inbox_account", None) or worker.key.split(":", 1)[1]
+        tool, archive = inbox_accounts.mail_tool_config(account)
+        if tool:
+            env.update(BROKER_MAIL_ACCOUNT=account, BROKER_MAIL_TOOL=tool,
+                       BROKER_MAIL_ARCHIVE="1" if archive else "0")
     env.update(routing.worker_git_identity(route))
     if worker is not None:
         _worker_ssh(env, base, worker, mcp_granted=_worker_mcp_granted(route))
@@ -1903,7 +1914,7 @@ def agent_dm_recipients(capability):
 
 def capability_tool_grant(capability, test_runner=None, bypass_classifier=False, test_repo=None,
                           write_grant=False, judged=False, browser=False, adjudicated=False, bus_enabled=None,
-                          mail_event_only=False):
+                          mail_event_only=False, mail_account=None):
     """Add one shared DM grant to bus-enabled workers, never a new bus identity."""
     grant = _base_capability_tool_grant(capability, test_runner, bypass_classifier, test_repo,
                                        write_grant, judged, browser, adjudicated)
@@ -1911,9 +1922,19 @@ def capability_tool_grant(capability, test_runner=None, bypass_classifier=False,
         if capability != "inbox":
             raise ValueError("mail_event_only requires the inbox capability")
         i = grant.index("--allowedTools") + 1
-        grant[i] = " ".join(_READ_ALLOWED + _INBOX_GIT + ["Bash(mcp-ro.sh hindsight:*)"])
+        mail_allowed = []
+        if mail_account is not None:
+            tool, archive = inbox_accounts.mail_tool_config(mail_account)
+            if tool:
+                command = inbox_accounts.mail_tool_command(mail_account)
+                mail_allowed = [f"Bash({command} list)", f"Bash({command} read *)"]
+                if archive:
+                    mail_allowed += [f"Bash({command} archive *)"]
+        grant[i] = " ".join(_READ_ALLOWED + _INBOX_GIT + ["Bash(mcp-ro.sh hindsight:*)"] + mail_allowed)
         # Empty strict MCP config below is the containment; deny direct MCP tools too.
         grant[grant.index("--disallowedTools") + 1] += " mcp__*"
+    elif mail_account is not None:
+        raise ValueError("mail_account requires mail_event_only")
     # Legacy callers build these historically bus-capable grants without a route.
     # Actual spawns pass the route's ZBUS_ENV presence explicitly.
     if bus_enabled is None:
@@ -3169,7 +3190,8 @@ class CCAdapter(Adapter):
                    mcp_config_path=None, test_runner=None, setting_sources=None, effort=None,
                    bypass_classifier=False, session_uuid=None, test_repo=None, write_grant=False,
                    site_capability="", thread_dir=None, judged_bash=False, worktree_root=None,
-                   browser_config=None, steer_hook=None, companions=False, bus_enabled=None, mail_event_only=False):
+                   browser_config=None, steer_hook=None, companions=False, bus_enabled=None, mail_event_only=False,
+                   mail_account=None):
         if not system_prompt:
             raise ValueError("refusing to spawn without a system prompt (constraint #1: never --bare)")
         # Constraint 4, charter-strip: setting-sources defaults to self.setting_sources ("") so every existing worker
@@ -3209,7 +3231,7 @@ class CCAdapter(Adapter):
                                       # hook adjudicates; unconfigured (the default) keeps the legacy grant, so
                                       # the allow-list is never removed without an adjudicator in its place.
                                       adjudicated=portcullis is not None, bus_enabled=bus_enabled,
-                                      mail_event_only=mail_event_only)
+                                      mail_event_only=mail_event_only, mail_account=mail_account)
         if site_capability:   # a broker.yaml capability: its base grant (above) plus its own extra rules
             grant = _with_site_rules(grant, capability, site_capability)
         # Wiki skills (EPH_WIKI_SKILLS_ENABLED, default OFF). An allow-listed capability does NOT include
@@ -3293,6 +3315,18 @@ class CCAdapter(Adapter):
                     **(_code_hook_settings(worktree_root, judged_bash, bypass_classifier, portcullis, write_grant)
                        if capability == "code" else {})}
         # Append, never overwrite any capability-specific hooks.
+        if mail_event_only and mail_account is not None:
+            tool, archive = inbox_accounts.mail_tool_config(mail_account)
+            if tool:
+                guard = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                     "hooks", "mail_tool_guard.py")
+                command = " ".join(shlex.quote(a) for a in
+                                   (sys.executable, "-I", guard, inbox_accounts.mail_tool_command(mail_account),
+                                    str(archive).lower()))
+                hooks = {**settings.get("hooks", {})}
+                settings["hooks"] = hooks
+                hooks["PreToolUse"] = hooks.get("PreToolUse", []) + [{
+                    "matcher": "Bash", "hooks": [{"type": "command", "command": command}]}]
         dm_enabled = bus_enabled if bus_enabled is not None else capability in _LEGACY_BUS_CAPABILITIES
         dm_patterns = agent_dm_recipients(capability) if dm_enabled and capability != "mr-review" else []
         guard = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks", "zbus_guard.py")
@@ -3325,7 +3359,8 @@ class CCAdapter(Adapter):
         # "hooks" dict, so the module-level capability settings above are never mutated.
         if steer_hook:
             settings["hooks"] = {**settings.get("hooks", {}),
-                                 "PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": steer_hook,
+                                 "PostToolUse": settings.get("hooks", {}).get("PostToolUse", []) +
+                                 [{"matcher": "*", "hooks": [{"type": "command", "command": steer_hook,
                                                                            "timeout": 5}]}]}
         argv += ["--settings", json.dumps(settings)]
         if resume_session:
@@ -5134,6 +5169,8 @@ class CCAdapter(Adapter):
             stream_kw["site_capability"] = route.site_capability
         if getattr(route, "mail_event_only", False):
             stream_kw["mail_event_only"] = True
+            stream_kw["mail_account"] = (getattr(worker, "inbox_account", None)
+                                          or worker.key.split(":", 1)[1])
         grant_path = getattr(worker, "write_grant_path", None)   # Set at spawn only for a granted infra worker
         if grant_path and capability == "code":
             stream_kw["write_grant"] = True

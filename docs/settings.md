@@ -574,6 +574,7 @@ prompt ([configuration.md](configuration.md#built-in-rows)). Each one has `*_REP
 | `INBOX_CHAT_BACKEND` | unset | Default mail chat backend. |
 | `INBOX_ZBUS_ENV` | unset | Mail workers' chat identity file. |
 | `BROKER_INBOX_ACCOUNTS` | `CONFIG_DIR/inbox-accounts.json` | Mail account configuration. |
+| `BROKER_MAIL_ACCOUNT`, `BROKER_MAIL_TOOL`, `BROKER_MAIL_ARCHIVE` | unset | Broker-generated worker-only facts for a configured `kind: mail` run: account, command path, and archive opt-in (`0` or `1`). Not operator settings or config-file selectors; other rows receive none. |
 | `FLEET_ASSIGNEE_ALT`, `SPAWN_SH`, `TFA_BACKEND`, `TFA_CWD_BASE`, `TFA_DEDUP_S` | unset, unset, unset, `~/.cache/eph-tfa`, `300` | The external launcher row: hands a ticket to your own script instead of starting a worker. |
 | `EPH_WIKI_SKILLS_ENABLED`, `EPH_WIKI_SKILLS_DIR` | off, `~/.eph-broker/wiki-skills` | Passes a Claude Code plugin directory of skills to workers. |
 

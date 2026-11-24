@@ -394,11 +394,36 @@ repo, notification identity and model settings. No mailbox credentials or MCP co
 account, and it is excluded from Gmail chat access. Unknown accounts, wrong kinds and non-string fields are
 dropped, fail closed (`dropped: true` in the response).
 
-The inbox/triage worker classifies only the supplied sender, subject, receipt time and snippet, all fenced as
-UNTRUSTED data. It cannot read back or change this mailbox. It recommends actions and notifies according to the
+By default the inbox/triage worker classifies only the supplied sender, subject, receipt time and snippet,
+all fenced as UNTRUSTED data. It cannot read back or change this mailbox. It recommends actions and notifies according to the
 account posture using the usual triage outputs. Events coalesce per `mail:<account>`, single-flight with the
 existing spawn-rate accounting; after completion the next event starts a fresh pass. The producer should send
 only newly observed mail, not replay its backlog on every poll.
+
+A `kind: mail` account may optionally set `mail_tool` to a normalized absolute path such as
+`/usr/local/bin/mail-tool` (letters, digits, `_`, `.`, `-`, `/` only). The operator installs and trusts this
+command; no device-specific adapter or credentials belong in the broker. Its contract is exactly `list`,
+`read <id>`, `archive <id>`, JSON on stdout, exit 2 for unknown verbs and exit 3 when busy. List results must
+provide opaque IDs and enough metadata to match an event unambiguously. The worker lists to match supplied
+messages for authorized reads/archives, reads bodies only when fields cannot classify, and leaves ambiguous
+matches untouched. Grants name only the broker-owned `hooks/mail_tool_fence.py` wrapper, run with the
+broker's Python interpreter in isolated mode and a fixed account, never the raw configured command.
+The broker resolves the account, command and posture before sandbox launch and passes only those facts
+in the run's environment. The wrapper never loads operator config; broker config and secret paths stay
+masked. Config loading rejects a command located under a sandbox-hidden path, including symlink targets
+and the private `/tmp`, `/proc` and `/dev` mounts. Install the command outside those paths.
+The wrapper exposes only list/read; the optional boolean posture flag
+`allow_archive` (default false) adds
+archive, still subject to account archive-mode, bucket rules and prerequisites. Without a tool the flag
+cannot be true. A hook enforces one standalone command with exactly one non-option ID, canonically
+shell-quoted if necessary, no extra arguments or shell operators. Tool responses are untrusted like mail
+fields; the wrapper captures stdout and stderr and emits only one delimiter-safe, sanitized fence on
+success or failure, preserving exit codes. It checks the argv account against the run's account and enforces
+the broker-resolved archive posture before execution. The hook
+only enforces argv; it does not add a duplicate result copy. No compose/reply/send/delete verbs or other
+device access are granted. Unset `mail_tool` preserves
+classify-only behavior. This changes the signed inbox/triage prompt: merging requires operator approval
+and ops re-signing `approved-prompts.json`.
 
 With `BROKER_HMAC_SECRET` already provisioned in the sender's environment, sign the exact bytes sent by curl:
 

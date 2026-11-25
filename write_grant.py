@@ -130,6 +130,25 @@ def remove_grant_file(path):
         pass
 
 
+def apply_worker_env(env, path):
+    """Install the wrapper's env pair from the broker-written file, never inherited env or ticket text.
+
+    A missing/invalid granted file refuses launch rather than sending a partial grant to the wrapper.
+    No grant clears both names, including any route/backend overrides.
+    """
+    env.pop("EPH_WRITE_GRANT_FILE", None)
+    env.pop("EPH_WRITE_GRANT_NONCE", None)
+    if not path:
+        return
+    path = os.path.abspath(path)
+    with open(path, encoding="utf-8") as f:
+        grant = json.load(f)
+    nonce = grant.get("nonce") if isinstance(grant, dict) else None
+    if not isinstance(nonce, str) or not nonce:
+        raise ValueError("write grant file must contain a nonempty nonce")
+    env.update(EPH_WRITE_GRANT_FILE=path, EPH_WRITE_GRANT_NONCE=nonce)
+
+
 def _journal_reader(since_epoch):
     tags = audit_tags()
     if not tags:

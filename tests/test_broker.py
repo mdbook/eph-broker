@@ -22983,6 +22983,66 @@ def test_grant_file_and_audit_lines():
     ok("grant file is 0600 <ticket>.json (atomic, revocable); audit lines filtered to this ticket/nonce")
 
 
+def test_write_grant_worker_env_rejects_inherited_and_invalid_grants():
+    import write_grant as WG
+    injected = {"EPH_WRITE_GRANT_FILE": "/untrusted/grant.json", "EPH_WRITE_GRANT_NONCE": "untrusted"}
+    route = Route(domain="infra", repo="/srv/infra", prompt_class="general", agent="infra-worker",
+                  capability="code", env=injected)
+    env = cc.worker_env({"PATH": os.defpath, **injected}, route, backend_env=injected)
+    assert "EPH_WRITE_GRANT_FILE" not in env and "EPH_WRITE_GRANT_NONCE" not in env
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "grant.json")
+        for grant in ({}, {"nonce": ""}, {"nonce": 123}, []):
+            with open(path, "w") as f:
+                json.dump(grant, f)
+            env = dict(injected)
+            try:
+                WG.apply_worker_env(env, path)
+                raise AssertionError("invalid grant must refuse launch")
+            except ValueError:
+                pass
+            assert "EPH_WRITE_GRANT_FILE" not in env and "EPH_WRITE_GRANT_NONCE" not in env
+        WG.remove_grant_file(path)
+        try:
+            WG.apply_worker_env(dict(injected), path)
+            raise AssertionError("revoked grant must refuse launch")
+        except FileNotFoundError:
+            pass
+    ok("write-grant env rejects inherited authority, invalid nonce and revoked files without a partial pair")
+
+
+def test_cc_threads_worker_write_grant_to_env():
+    import write_grant as WG
+
+    class StopTurn(Exception):
+        pass
+
+    with tempfile.TemporaryDirectory() as d:
+        a = CCAdapter(router=None, worktree_mgr=None, prompt_loader=None,
+                      envelope_parser=EnvelopeParser(), claude_bin=_write_fake_claude(d))
+        route = Route(domain="infra", repo=d, prompt_class="general", agent="infra-worker",
+                      capability="code", model="claude-opus-4-8")
+        w = Worker("vikunja:task:9361", "grant-test", d)
+        grant = {"ticket": 9361, "bundles": ["grafana-edit"], "nonce": "cc-test-nonce", "expires": 5}
+        grant_path = WG.write_grant_file(grant, os.path.join(d, "grants"))
+        w.write_grant = {"nonce": "not-the-file-nonce"}
+        for path in (None, "", grant_path):
+            w.write_grant_path = path
+            with patch.object(cc.subprocess, "Popen", side_effect=StopTurn) as launch:
+                try:
+                    a._one_turn(w, route, "SYS", "P", resume=False)
+                    raise AssertionError("must reach worker launch")
+                except StopTurn:
+                    pass
+                env = launch.call_args.kwargs["env"]
+                if path:
+                    assert env["EPH_WRITE_GRANT_FILE"] == grant_path
+                    assert env["EPH_WRITE_GRANT_NONCE"] == grant["nonce"]
+                else:
+                    assert "EPH_WRITE_GRANT_FILE" not in env and "EPH_WRITE_GRANT_NONCE" not in env
+    ok("cc: granted launch carries file plus matching on-disk nonce; ungranted launch carries neither")
+
+
 def _flag_run(ticket, flag="1", doer="ops"):
     import adapters.cc as CCM
     import write_grant as WG

@@ -297,8 +297,9 @@ def test_hermes_model_denylist_at_launch():
     ok("hermes: denylist checks final backend model immediately before worker launch")
 
 
-def test_hermes_threads_worker_write_grant_to_policy():
+def test_hermes_threads_worker_write_grant_to_policy_and_env():
     from unittest.mock import patch
+    import write_grant as WG
 
     class StopTurn(Exception):
         pass
@@ -306,8 +307,11 @@ def test_hermes_threads_worker_write_grant_to_policy():
     with tempfile.TemporaryDirectory() as d, _Registry(d), patch.dict(os.environ, {"CODE_NONCLAUDE_OK": "1"}):
         a = _adapter(d, envelope_parser=EnvelopeParser())
         w = Worker("vikunja:task:9312", "grant-test", d)
+        grant = {"ticket": 9312, "bundles": ["grafana-edit"], "nonce": "hermes-test-nonce", "expires": 5}
+        grant_path = WG.write_grant_file(grant, os.path.join(d, "grants"))
+        w.write_grant = {"nonce": "not-the-file-nonce"}
         for cap in ("code", "write", "mr-review"):
-            for path in (None, "", os.path.join(d, "write-grant.json")):
+            for path in (None, "", grant_path):
                 w.write_grant_path = path
                 expected = cap == "code" and bool(path)
                 with patch.object(H, "gate_policy", wraps=H.gate_policy) as make_policy, \
@@ -318,10 +322,16 @@ def test_hermes_threads_worker_write_grant_to_policy():
                     except StopTurn:
                         pass
                     assert make_policy.call_args.kwargs["write_grant"] is expected
+                    env = install.call_args.args[2]
+                    if path:
+                        assert env["EPH_WRITE_GRANT_FILE"] == grant_path
+                        assert env["EPH_WRITE_GRANT_NONCE"] == grant["nonce"]
+                    else:
+                        assert "EPH_WRITE_GRANT_FILE" not in env and "EPH_WRITE_GRANT_NONCE" not in env
                     policy = install.call_args.args[1]
                     if cap == "code":
                         assert bool(CC._WRITE_WRAPPER_LIFTABLE.intersection(policy["deny"])) is not expected
-    ok("hermes: only code workers with write_grant_path thread a live-write grant into the installed policy")
+    ok("hermes: grant file supplies the env pair; only granted code workers lift the policy floor")
 
 
 def test_hermes_big_prompt_rides_stdin_no_e2big():

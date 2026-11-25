@@ -800,8 +800,9 @@ def _worker_ssh(env, base, worker, mcp_granted=False):
 
 
 def worker_env(base, route, backend_env=None, worker=None):
-    """Shared launch env for every row/harness; install managed SSH when preparing a worker turn."""
+    """Shared launch env for every row/harness; install the grant pair and managed SSH for worker turns."""
     env = scrub_worker_env(base, route_env=route.env, backend_env=backend_env)
+    write_grant.apply_worker_env(env, getattr(worker, "write_grant_path", None))
     # Never forward config selectors or accept inherited/route/backend mail authority. Only the broker
     # can resolve this run's account and posture, outside the sandbox where config remains hidden.
     for name in ("BROKER_CONFIG_DIR", "CONFIG_DIR", "BROKER_CONFIG", "BROKER_SITE_ENV", "BROKER_INBOX_ACCOUNTS",
@@ -5212,8 +5213,6 @@ class CCAdapter(Adapter):
         # A login profile can replace PATH and silently undo the shared SSH launcher (ticket 2104).
         env["CLAUDE_BASH_NO_LOGIN"] = "1"
         test_environment.apply_tmpdir(env, worker, capability, test_runner)
-        if stream_kw.get("write_grant"):                 # The mcp-rw.sh wrapper finds this worker's grant here
-            env["EPH_WRITE_GRANT_FILE"] = grant_path
         # A src-layout repo (e.g. game-sync) would otherwise import the package the venv has INSTALLED
         # (the base repo's copy), not the worktree's edits, giving a false green. Put the worktree's src/ first.
         _wt_src = os.path.join(worker.worktree or "", "src")

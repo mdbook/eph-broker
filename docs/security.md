@@ -69,7 +69,12 @@ MR receives a marked summary and a fresh review of the new SHA, not a new MR or 
 
 Every worker gets these, whichever harness runs it ([adapters.md](adapters.md)).
 
-- A fresh git worktree, with `CLAUDE.md` and `AGENTS.md` removed so repo instructions can't steer it.
+- A fresh git worktree, with root `CLAUDE.md`, `AGENTS.md` and `*-AGENT.md` removed so repo instructions
+  can't steer it. Hidden tracked paths are marked skip-worktree in that worktree's index, so `git commit -a`
+  and `git add -A` do not record their removal. Code MR publication also refuses committed root-charter
+  deletions before pushing or opening the MR, including earlier fix-round changes when the target ref is
+  available locally. This conservative guard does not infer permission from ticket prose: intentional charter
+  deletions need a human-controlled publication path.
 - The signed prompt, checked against `approved-prompts.json` before every start. See [prompts.md](prompts.md).
 - An environment with the broker's secrets removed (`scrub_worker_env` in `adapters/cc.py`).
 - A tool grant built from its row's `capability`. The allow and deny lists live in `adapters/cc.py`, and both

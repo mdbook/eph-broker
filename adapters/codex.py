@@ -1107,7 +1107,7 @@ class CodexHarness:
         worker.kill_group = True
         _cc.site_env.require_model_allowed(model)
         _cc.record_launch(worker, model, backend, "codex")   # dash Worker view: the model this process gets
-        argv = _cc.sandbox.wrap(argv, worker.worktree, worker.sandbox_gitdir,
+        argv = _cc.sandbox.wrap(argv, getattr(worker, "sandbox_cwd", worker.worktree), worker.sandbox_gitdir,
                                 writable_paths=(home, worker.test_tmpdir, *steer.sandbox_paths(worker.key)),
                                 readonly_paths=(worker.ssh_tmpdir,),
                                 ssh_config=worker.ssh_config, ssh_control_dir=worker.ssh_control_dir)

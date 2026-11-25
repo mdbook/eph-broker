@@ -29,6 +29,7 @@ Removing an entry restores its startup value. Bootstrap paths, ports and identit
 | `BROKER_PROVENANCE_PATH` | `CONFIG_DIR/provenance.json` | Which accounts are agents ([configuration.md](configuration.md#who-counts-as-an-agent)). |
 | `BROKER_PROVENANCE_NEUTRAL` | unset | `1` lets the broker start without a provenance file, with only built-in agent names. |
 | `ROUTES_PATH` | `CONFIG_DIR/routes.json` | Your own agent types ([routes.md](routes.md)). |
+| `ROUTE_WORKDIR_ALLOWLIST` | unset | Colon list of directories a `read` row in routes.json may run in as its `workdir`, loading that directory's own project settings ([routes.md](routes.md#running-in-an-agents-home-directory)). Unset: none. |
 | `ROUTING_OVERRIDES_FILE` | `CONFIG_DIR/routing-overrides.json` | Atomic, last-good dashboard routing overrides. |
 | `REPO_COMPANIONS_FILE` | `CONFIG_DIR/repo-companions.json` | Optional per-code-repo read-only source checkouts. Re-read on each cut; an explicit missing file refuses the run. See [configuration.md](configuration.md#companion-source-repositories). |
 | `EVENTS_LOG` | `$TMPDIR/eph-broker/events.jsonl` | Every accepted event, one JSON line each. Its directory also holds the state files below. |

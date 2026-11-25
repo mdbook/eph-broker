@@ -924,7 +924,7 @@ class HermesHarness:
         worker.kill_group = True                           # teardown kills the process group, not just the pid
         _cc.site_env.require_model_allowed(model)
         _cc.record_launch(worker, model, backend, "hermes")   # dash Worker view: the model this process gets
-        argv = _cc.sandbox.wrap(argv, worker.worktree, worker.sandbox_gitdir,
+        argv = _cc.sandbox.wrap(argv, getattr(worker, "sandbox_cwd", worker.worktree), worker.sandbox_gitdir,
                                 writable_paths=(home, worker.test_tmpdir),
                                 readonly_paths=(worker.ssh_tmpdir,),
                                 ssh_config=worker.ssh_config, ssh_control_dir=worker.ssh_control_dir)

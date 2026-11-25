@@ -27,7 +27,8 @@ which of the built-in capabilities it gets. Start from `config/routes.example.js
 | `match` | yes | `{"label": "..."}`, `{"assignee": "..."}` or both. Matching is exact and case-insensitive. With both, the ticket needs the assignee and the label. |
 | `prompt` | yes | `<domain>/<class>`, which means `prompts/<domain>/<class>.md`. It has to be signed in `approved-prompts.json` already. |
 | `capability` | yes | `read`, `code` or `general` (below), or one of your own [site capabilities](#site-capabilities). |
-| `repo` | yes | Absolute path to the repo the worker gets a throwaway worktree of. It has to be in `CODE_REPO_ALLOWLIST` or `GENERAL_REPO_ALLOWLIST` (see below). |
+| `repo` | yes, unless `workdir` is set | Absolute path to the repo the worker gets a throwaway worktree of. It has to be in `CODE_REPO_ALLOWLIST` or `GENERAL_REPO_ALLOWLIST` (see below). |
+| `workdir` | no | Run a `read` row in this fixed directory instead of a worktree, loading its own `CLAUDE.md` and `.claude/` ([below](#running-in-an-agents-home-directory)). Replaces `repo`; set one or the other. |
 | `agent` | no | Name passed to `FLEET_MODEL_SH` to pick a model. Defaults to the built-in worker of the same capability (`CODE_AGENT`, `GENERAL_AGENT`, or the ansible row's agent for `read`). |
 | `model` | no | Pin a model for this row (for example `opus`), skipping `FLEET_MODEL_SH`. |
 | `repo_lock_scope` | no | `phases` (default): same-repo workers edit/test in parallel, while cut, publish and removal are mutually exclusive. `run`: serialize the whole worker run for that repo. Applies to publishing routes. |
@@ -96,12 +97,62 @@ no allow and deny lists to add the rules to. The section is read once at startup
 
 ## Where a row works
 
-A config row always works in its own `repo`. A `repo:` line in the ticket that names a different repo makes
+A config row always works in its own `repo` (or its `workdir`, see the previous section). A `repo:` line in the ticket that names a different repo makes
 the broker refuse the ticket, and the repo inference used by the built-in code worker is skipped. The
 allowlist is checked again at every spawn.
 
 A row also inherits the built-in worker's backend pin (`CODE_CHANGE_BACKEND`, `GENERAL_BACKEND`, or
 `ANSIBLE_BACKEND` for `read`), so a site-wide pin applies to your rows too.
+
+## Running in an agent's home directory
+
+Some lanes need an agent's own context rather than a repo: a design reviewer that should follow the design
+agent's charter, conventions and skills, for example. A `read` row can name that directory as its `workdir`:
+
+```json
+{
+  "id": "design-eph",
+  "match": {"assignee": "design-eph"},
+  "prompt": "design/review",
+  "capability": "read",
+  "workdir": "/srv/agents/design",
+  "model": "opus"
+}
+```
+
+Such a worker:
+
+- runs with the directory itself as its cwd. No worktree is cut, so the directory doesn't have to be a git repo,
+  and nothing is removed when the worker exits. Under the bwrap sandbox the directory stays read-only, `.git`
+  included.
+- runs Claude Code with `--setting-sources project`, so it loads the directory's `CLAUDE.md`,
+  `.claude/settings.json`, `.claude/skills/` and the rest of its project settings. Every other row stays
+  charter-blind.
+- keeps the read-only grant. Edit, Write, Bash and web tools stay denied, and a deny on the command line wins
+  over any allow in the directory's settings.
+- can't pick up the directory's MCP servers or subagents. The broker always passes an empty
+  `--mcp-config '{"mcpServers":{}}' --strict-mcp-config`, so a `.mcp.json` or `enableAllProjectMcpServers` there
+  loads nothing, and it adds `mcp__*`, `Task` and `Agent` to the deny list. `Skill` stays available.
+- runs with an explicit `--permission-mode default`. The command-line mode outranks a `permissions.defaultMode`
+  in the directory's settings, so the directory can't switch the worker to `bypassPermissions` or `acceptEdits`.
+- keeps its broker scratch (the SSH launcher dir) under `$TMPDIR/eph-broker`, never next to the directory. That
+  parent must be a plain directory owned by the broker user with no group or other write bit; if it can't be
+  created, or fails that check, the spawn is refused.
+
+Rules:
+
+- Only `capability: "read"` rows may set `workdir`; a site capability is refused. A row that could edit would be
+  editing the agent's live home.
+- The path must be absolute and normalized (no trailing `/`, no `..`), and it must be listed in
+  `ROUTE_WORKDIR_ALLOWLIST` ([settings.md](settings.md#process-and-files)). Unset, no row may use a workdir.
+- The allowlist and the directory's existence are checked again at every spawn. A miss rejects the ticket and
+  alerts ops.
+- A ticket `repo:` line is ignored on these rows.
+
+The directory's project settings are trusted the way `broker.yaml` is. Its hooks run as the broker's user, and
+its permission allow rules apply on top of the read grant (they can't lift the deny list, the mode or the MCP
+pin above). Only allowlist a directory whose owner you trust, and
+review its `.claude/` the same way you review a site capability's `allow` rules.
 
 ## Ordering
 

@@ -2697,6 +2697,87 @@ def test_worktree_charter_strip():
        "live checkout denied and charter/copy changes excluded from saved diffs (#5)")
 
 
+def test_hidden_charters_survive_broad_worker_commits():
+    """Real git: both common broad staging paths must leave every hidden charter in HEAD."""
+    with tempfile.TemporaryDirectory() as d:
+        repo = pathlib.Path(d, "repo"); repo.mkdir()
+        def git(path, *args):
+            return subprocess.run(["git", "-C", str(path), *args], check=True,
+                                  capture_output=True, text=True).stdout
+        git(repo, "init", "-q")
+        git(repo, "config", "user.email", "t@t")
+        git(repo, "config", "user.name", "t")
+        charters = ("AGENTS.md", "CLAUDE.md", "CODER-AGENT.md", " spaced-AGENT.md")
+        for name in (*charters, "ordinary.txt"):
+            (repo / name).write_text("original\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "init")
+        wm = WorktreeManager(str(repo), os.path.join(d, "wt"))
+        key = "vikunja:task:9335"
+        path = pathlib.Path(wm.make(key))
+        try:
+            assert git(path, "status", "--porcelain") == "", "hiding must not dirty the worktree"
+            for mode in ("commit-a", "add-A"):
+                (path / "ordinary.txt").write_text(mode + "\n")
+                if mode == "add-A":
+                    git(path, "add", "-A")
+                    git(path, "commit", "-qm", "unrelated edit")
+                else:
+                    git(path, "commit", "-qam", "unrelated edit")
+                changed = git(path, "diff", "--name-only", wm.cut_sha(key), "HEAD").splitlines()
+                assert changed == ["ordinary.txt"], changed
+                for name in charters:
+                    assert not (path / name).exists()
+                    assert git(path, "show", "HEAD:" + name) == "original\n"
+            assert git(repo, "status", "--porcelain") == "", "base index must stay untouched"
+            flags = git(repo, "ls-files", "-v")
+            assert not any(line.startswith("S ") for line in flags.splitlines()), flags
+        finally:
+            wm.remove(key)
+    ok("hidden root charters survive real commit -a and add -A; base index stays unchanged")
+
+
+def test_publish_mr_refuses_committed_charter_deletions():
+    """Defense in depth: reject worker-staged deletions AND deletions inherited from a fix-round cut."""
+    import worktree as W
+    for charter in ("AGENTS.md", "CLAUDE.md", "CODER-AGENT.md", " spaced-AGENT.md"):
+        for inherited in (False, True):
+            with tempfile.TemporaryDirectory() as d:
+                repo = pathlib.Path(d, "repo"); repo.mkdir()
+                def git(path, *args):
+                    return subprocess.run(["git", "-C", str(path), *args], check=True,
+                                          capture_output=True, text=True).stdout
+                git(repo, "init", "-q")
+                git(repo, "config", "user.email", "t@t")
+                git(repo, "config", "user.name", "t")
+                (repo / charter).write_text("rules\n")
+                (repo / "ordinary.txt").write_text("original\n")
+                git(repo, "add", "-A")
+                git(repo, "commit", "-qm", "init")
+                if inherited:
+                    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+                    (repo / charter).unlink()
+                    git(repo, "commit", "-qam", "previous accidental deletion")
+                wm = WorktreeManager(str(repo), os.path.join(d, "wt"))
+                key = "vikunja:task:9336"
+                path = pathlib.Path(wm.make(key))
+                try:
+                    if not inherited:
+                        # Simulate an older worktree or explicit index tampering by the worker.
+                        git(path, "update-index", "--no-skip-worktree", "--", charter)
+                    (path / "ordinary.txt").write_text("unrelated edit\n")
+                    git(path, "commit", "-qam", "worker edit")
+                    with patch.object(W, "_gitlab_push_url", side_effect=AssertionError("must not publish")):
+                        try:
+                            wm.publish_mr(key, continue_branch="eph/code-change/previous" if inherited else None)
+                            raise AssertionError("charter deletion reached MR publication")
+                        except ValueError as e:
+                            assert "refusing root charter deletions" in str(e) and charter.strip() in str(e), e
+                finally:
+                    wm.remove(key)
+    ok("MR publication refuses committed root-charter deletions before any push/MR-open, including fix rounds")
+
+
 def test_repo_rules_copy_refuses_symlink_or_tracked_directory():
     from worktree import _copy_repo_rules
     with tempfile.TemporaryDirectory() as d:

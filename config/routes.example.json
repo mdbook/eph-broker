@@ -15,6 +15,14 @@
       "capability": "read",
       "repo": "/srv/git/app",
       "model": "sonnet"
+    },
+    {
+      "id": "design-review",
+      "match": {"assignee": "design-eph"},
+      "prompt": "design/review",
+      "capability": "read",
+      "workdir": "/srv/agents/design",
+      "model": "opus"
     }
   ]
 }

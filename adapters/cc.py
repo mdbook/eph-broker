@@ -20,7 +20,7 @@ The 7 constraints:
                                           max-forwards/resumes 10 (counter).
   7. session rotation                  -> after 20 turns OR ~120k tokens: drop --resume, start fresh session.
 """
-import html, inspect, json, os, queue, re, shlex, shutil, subprocess, sys, tempfile, threading, time, uuid, logging, weakref
+import html, inspect, json, os, queue, re, shlex, shutil, stat, subprocess, sys, tempfile, threading, time, uuid, logging, weakref
 from contextlib import contextmanager
 from datetime import datetime
 from urllib.parse import urlsplit
@@ -752,6 +752,22 @@ def _worker_ssh_control_dir():
         return None
 
 
+def _broker_scratch_dir():
+    """$TMPDIR/eph-broker: a scratch parent the broker user alone owns, for workers whose cwd is not a broker
+    worktree (routes.json `workdir` rows). Raises ValueError (the spawn is refused) if it cannot be created or
+    is not a plain directory owned by us and closed to group/other writes, e.g. a planted symlink in /tmp."""
+    parent = os.path.join(tempfile.gettempdir(), "eph-broker")
+    try:
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+        st = os.lstat(parent)
+    except OSError as e:
+        raise ValueError(f"refusing to spawn: broker scratch dir {parent!r} unavailable ({e.strerror})") from None
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o022:
+        raise ValueError(f"refusing to spawn: broker scratch dir {parent!r} is not a private directory owned by "
+                         "the broker user (fail-closed)")
+    return parent
+
+
 def _worker_ssh(env, base, worker, mcp_granted=False):
     """Own the SSH configuration choice, not just the broker's accidental PATH (ticket 2268).
 
@@ -762,7 +778,12 @@ def _worker_ssh(env, base, worker, mcp_granted=False):
     No credential contents are read/copied, and no tool, network or host-key restriction is relaxed.
     """
     if not getattr(worker, "ssh_tmpdir", None):
-        parent = os.path.dirname(os.path.abspath(worker.worktree)) if worker.worktree else None
+        # A workdir row's cwd is a live agent home, so its dirname is the SHARED homes root (not a broker-owned
+        # worktree root): never make scratch there, use the broker's own private scratch parent instead.
+        if getattr(worker, "readonly_cwd", False):
+            parent = _broker_scratch_dir()
+        else:
+            parent = os.path.dirname(os.path.abspath(worker.worktree)) if worker.worktree else None
         worker.ssh_tmpdir = tempfile.mkdtemp(prefix="s-", dir=parent)
         weakref.finalize(worker, shutil.rmtree, worker.ssh_tmpdir, ignore_errors=True)
         os.chmod(worker.ssh_tmpdir, 0o700)
@@ -933,6 +954,9 @@ _ANSIBLE_SYNTAX_DENIED = [f"Bash({_ANSIBLE_SYNTAX_PREFIX}* -*)"]
 # Bus-enabled read rows get only the shared DM Bash grant below; no-bus rows (including mr-review)
 # keep Bash disabled. Secret-file denies still protect Read/Grep/Glob on both kinds of row.
 _READ_DENIED = ["Edit", "Write", "MultiEdit", "NotebookEdit", "Bash", "WebFetch", "WebSearch"] + _SECRET_READ_DENIED
+# Added to a routes.json `workdir` row's read deny list (build_argv workdir_row): its project settings load, so
+# an mcp__* allow there must not reach a tool, and it may not spawn subagents (Task, or Agent on newer CLIs).
+_WORKDIR_EXTRA_DENIED = ["mcp__*", "Task", "Agent"]
 
 # The git verbs a WRITE worker may run as Bash: STAGE + COMMIT only (the broker does the ONLY
 # push, cred-side; the worker is cred-free and NEVER pushes). status/diff/log are read-only orientation.
@@ -2168,13 +2192,18 @@ class _InboxUsage:
 
 class Worker:
     """State for one live ephemeral worker."""
-    def __init__(self, key, run_id, worktree):
+    def __init__(self, key, run_id, worktree, readonly_cwd=False):
         self.key = key
         self.run_id = run_id
         self.worktree = worktree
+        # The cwd the sandbox binds WRITABLE. A routes.json `workdir` row (readonly_cwd) runs in a live agent home
+        # that it must never change, so its cwd and any .git there stay under the read-only root bind.
+        self.sandbox_cwd = None if readonly_cwd else worktree
+        self.readonly_cwd = readonly_cwd   # also keeps broker scratch (ssh launcher) out of that dir's parent
         # Snapshot the trusted cut once; off must preserve the old launch behavior.
         self.sandbox_gitdir = (sandbox.gitdir(worktree)
-                               if os.getenv("WORKER_SANDBOX", "bwrap").strip().lower() != "off" else None)
+                               if not readonly_cwd and os.getenv("WORKER_SANDBOX", "bwrap").strip().lower() != "off"
+                               else None)
         self.session_id = None      # claude session id, once known (for --resume)
         self.stream_session = None  # Pinned/resumed session -> transcript file for steer replies and the viewer
         self.last_output = None      # Most recent raw worker output (wrapped UNTRUSTED on escalate)
@@ -3223,7 +3252,7 @@ class CCAdapter(Adapter):
                    bypass_classifier=False, session_uuid=None, test_repo=None, write_grant=False,
                    site_capability="", thread_dir=None, judged_bash=False, worktree_root=None,
                    browser_config=None, steer_hook=None, companions=False, bus_enabled=None, mail_event_only=False,
-                   mail_account=None):
+                   mail_account=None, workdir_row=False):
         if not system_prompt:
             raise ValueError("refusing to spawn without a system prompt (constraint #1: never --bare)")
         # Constraint 4, charter-strip: setting-sources defaults to self.setting_sources ("") so every existing worker
@@ -3266,6 +3295,17 @@ class CCAdapter(Adapter):
                                       mail_event_only=mail_event_only, mail_account=mail_account)
         if site_capability:   # a broker.yaml capability: its base grant (above) plus its own extra rules
             grant = _with_site_rules(grant, capability, site_capability)
+        if workdir_row:
+            # A routes.json `workdir` row runs with --setting-sources project in a live agent home, so that home's
+            # .claude/settings.json and .mcp.json load too. Pin everything they could widen: deny every direct MCP
+            # tool and subagent spawning (Skill stays), an explicit non-bypass mode (the CLI flag outranks a
+            # project permissions.defaultMode), and an empty strict MCP config (appended below).
+            if capability != "read" or site_capability:
+                raise ValueError("refusing to spawn: a workdir row must be a plain capability read row (fail-closed)")
+            if "--permission-mode" in grant:
+                raise ValueError("refusing to spawn: a workdir row's grant already sets a permission mode")
+            grant[grant.index("--disallowedTools") + 1] += " " + " ".join(_WORKDIR_EXTRA_DENIED)
+            grant += ["--permission-mode", "default"]
         # Wiki skills (EPH_WIKI_SKILLS_ENABLED, default OFF). An allow-listed capability does NOT include
         # the Skill tool, so a headless -p worker would be refused it -> append `Skill` to THAT capability's
         # --allowedTools only when the plugin dir is actually passed. The deny-floor is untouched (deny wins);
@@ -3308,6 +3348,9 @@ class CCAdapter(Adapter):
             argv += ["--mcp-config", mcp_config_path, "--strict-mcp-config"]
         if mail_event_only:
             # CC accepts inline JSON as well as a path. Never inherit ambient mailbox connectors.
+            argv += ["--mcp-config", '{"mcpServers":{}}', "--strict-mcp-config"]
+        if workdir_row:
+            # Only this empty config loads: the workdir's .mcp.json / enableAllProjectMcpServers add nothing.
             argv += ["--mcp-config", '{"mcpServers":{}}', "--strict-mcp-config"]
         # The code lane's OPT-IN browser (playwright MCP): when the route names a config, load ONLY that
         # server via --strict-mcp-config (so the code worker's directly-loaded MCP surface is EXACTLY the
@@ -4307,6 +4350,20 @@ class CCAdapter(Adapter):
                     # MR settles as completed (NOT re-armable) - unlike the diff-unavailable skip above.
                     self._skip_mr_review_by_tier(mr_review, run_id, _tier_reason, harness=_harness)
                     return
+            elif getattr(route, "workdir", ""):
+                # routes.json "read" row with a `workdir`: run IN that persistent dir (an agent home), no worktree,
+                # so its own CLAUDE.md / .claude/ load (route.setting_sources="project"). Re-check at spawn what
+                # load_config_routes checked (read-only, allowlisted) plus that the dir exists; fail closed.
+                wd = route.workdir
+                reason = ("workdir rows must be capability read" if route.capability != "read" else
+                          f"workdir {wd!r} not in ROUTE_WORKDIR_ALLOWLIST" if not routing.route_workdir_allowed(wd)
+                          else f"workdir {wd!r} is not a directory" if not os.path.isdir(wd) else None)
+                if reason:
+                    log.warning("workdir spawn REJECTED key=%s: %s (fail-closed)", key, reason)
+                    self._alert_ops(f"worker {key} rejected: {reason} (fail-closed)", subject=f"reject:{key}")
+                    return
+                attempted = True
+                worker_cwd = wd                           # worktree stays None: nothing to remove
             else:
                 attempted = True                          # ansible-default row has no spawn-time reject gate
                 if getattr(route, "from_config", False):   # routes.json "read" row: its own repo
@@ -4314,7 +4371,7 @@ class CCAdapter(Adapter):
                 else:
                     worktree = self.worktree_mgr.make(key)   # charter-free worktree cwd (ansible default)
                 worker_cwd = worktree
-            worker = Worker(key, run_id, worker_cwd)
+            worker = Worker(key, run_id, worker_cwd, readonly_cwd=bool(getattr(route, "workdir", "")))
             worker.model_reason = selection_source
             steer.clear_inbox(key)                       # a previous run's undelivered message never leaks in
             worker.title = (getattr(ticket, "title", "") or "").strip()[:200] or None
@@ -5212,6 +5269,8 @@ class CCAdapter(Adapter):
             stream_kw["test_repo"] = getattr(worker, "repo", None)
         if getattr(route, "site_capability", ""):        # only when set, so a built-in row's call is unchanged
             stream_kw["site_capability"] = route.site_capability
+        if getattr(route, "workdir", "") or getattr(worker, "readonly_cwd", False):
+            stream_kw["workdir_row"] = True              # contain the agent home's project settings (build_argv)
         if getattr(route, "mail_event_only", False):
             stream_kw["mail_event_only"] = True
             stream_kw["mail_account"] = (getattr(worker, "inbox_account", None)
@@ -5293,7 +5352,7 @@ class CCAdapter(Adapter):
         record_launch(worker, eff_model, _backend, "cc")  # dash Worker view: the model this process gets
         claude_state = [os.path.expanduser(p) for p in ("~/.claude", "~/.claude.json")
                         if os.path.exists(os.path.expanduser(p))]
-        launch_argv = sandbox.wrap(argv, worker.worktree, worker.sandbox_gitdir,
+        launch_argv = sandbox.wrap(argv, getattr(worker, "sandbox_cwd", worker.worktree), worker.sandbox_gitdir,
                                    writable_paths=(*claude_state, worker.test_tmpdir, *steer.sandbox_paths(worker.key)),
                                    readonly_paths=(worker.ssh_tmpdir,),
                                    ssh_config=worker.ssh_config, ssh_control_dir=worker.ssh_control_dir)

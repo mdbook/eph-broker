@@ -109,6 +109,14 @@ def general_repo_allowed(repo_path):
     return repo_path in GENERAL_REPO_ALLOWLIST
 
 
+# Directories a routes.json "read" row may name as its `workdir` (a persistent cwd that loads its own charter and
+# .claude/ settings, see Route.workdir). Colon list; unset = none, so no row can run outside a worktree.
+# Read at call time so a test or a unit restart sees the current env.
+def route_workdir_allowed(path):
+    """True iff path is in ROUTE_WORKDIR_ALLOWLIST (fail-closed: unset or unknown gives False)."""
+    return bool(path) and path in set(filter(None, os.getenv("ROUTE_WORKDIR_ALLOWLIST", "").split(":")))
+
+
 # The worktree-target repos the CODE worker may cut from. Sibling of GENERAL_REPO_ALLOWLIST. The code
 # path previously had NO override at all: every Vikunja ticket cut the hardcoded
 # `CODE_REPO_PATH` default (one fixed repo), so a ticket about any other repo produced a worker that
@@ -997,6 +1005,13 @@ class Route:
     repo_model_pin: str = ""
     # Generic mail triage shares inbox limits/output, but has NO mailbox connector or Gmail grants.
     mail_event_only: bool = False
+    # routes.json `workdir`: a FIXED, persistent directory (an agent's home, not necessarily a git repo) the worker
+    # runs in INSTEAD of a throwaway worktree, with `setting_sources="project"` so it loads that directory's own
+    # CLAUDE.md and .claude/ (charter, conventions, skills). It deliberately waives constraint #5 (charter-free
+    # cwd) for that one row, so load_config_routes admits it only on a "read" row (no edits to the live dir) whose
+    # path is in ROUTE_WORKDIR_ALLOWLIST, and cc._run_worker re-checks both at spawn. Empty (every built-in row and
+    # every repo row) = the worktree cut, unchanged.
+    workdir: str = ""
 
     @property
     def row_key(self):
@@ -1069,7 +1084,7 @@ class Route:
                      self.pin or bool(self.model_pin), self.row_id, self.model_pin,
                      self.from_config, self.site_capability, self.browser_mcp_config, self.repo_lock_scope, self.pin,
                      self.cc_disable_thinking_local, self.cc_fail_fast, self.inbox_input_token_limit,
-                     self.repo_model_pin, self.mail_event_only)
+                     self.repo_model_pin, self.mail_event_only, self.workdir)
 
 
 # Per-ticket model selection via a `model:<name>` label. The name is either a native
@@ -2398,7 +2413,7 @@ CONFIG_ROUTE_CAPABILITIES = {"read": _ANSIBLE_ROW, "code": _CODE_ROW, "general":
 # prompt domains cc.py/app.py branch on by name (tfa launch, inbox account gate, infra grants): a config row
 # reusing one would inherit that special handling, so they are refused.
 CONFIG_ROUTE_RESERVED_DOMAINS = frozenset({"tfa", "inbox", "infra"})
-_CONFIG_ROUTE_KEYS = {"id", "match", "prompt", "capability", "repo", "agent", "model", "repo_lock_scope"}
+_CONFIG_ROUTE_KEYS = {"id", "match", "prompt", "capability", "repo", "workdir", "agent", "model", "repo_lock_scope"}
 
 # Every capability name cc.capability_tool_grant knows. A site capability may not reuse one.
 BUILTIN_CAPABILITIES = frozenset({"read", "write", "code", "general", "inbox", "inbox-chat", "mr-review",
@@ -2562,7 +2577,9 @@ def load_config_routes(path=None, prompts_dir=None, approved_path=None, site_cap
         extra = {k for k in row if not k.startswith("_")} - _CONFIG_ROUTE_KEYS
         if extra:
             raise RoutesConfigError(f"{where}: unknown key(s) {sorted(extra)}")
-        missing = [k for k in ("id", "match", "prompt", "capability", "repo") if k not in row]
+        missing = [k for k in ("id", "match", "prompt", "capability") if k not in row]
+        if "repo" not in row and "workdir" not in row:
+            missing.append("repo")
         if missing:
             raise RoutesConfigError(f"{where}: missing {missing}")
         if not isinstance(rid, str) or not _CONFIG_ROUTE_ID_RE.fullmatch(rid):
@@ -2594,16 +2611,29 @@ def load_config_routes(path=None, prompts_dir=None, approved_path=None, site_cap
             raise RoutesConfigError(f"{where}: prompt not signed: {e}")
         except (OSError, UnicodeDecodeError) as e:
             raise RoutesConfigError(f"{where}: prompt file missing or unreadable ({e})")
-        repo = row["repo"]
-        if not isinstance(repo, str) or not os.path.isabs(repo):
-            raise RoutesConfigError(f"{where}: repo must be an absolute path")
-        if cap == "code" and not code_repo_allowed(repo):
-            raise RoutesConfigError(f"{where}: repo {repo!r} is not in CODE_REPO_ALLOWLIST")
-        if cap == "general" and not general_repo_allowed(repo):
-            raise RoutesConfigError(f"{where}: repo {repo!r} is not in GENERAL_REPO_ALLOWLIST")
-        if cap == "read" and not (code_repo_allowed(repo) or general_repo_allowed(repo)):
-            raise RoutesConfigError(f"{where}: repo {repo!r} is in neither CODE_REPO_ALLOWLIST nor "
-                                    "GENERAL_REPO_ALLOWLIST")
+        workdir = row.get("workdir")
+        if workdir is not None:
+            # A persistent cwd that loads its own charter (Route.workdir): read-only rows only, allowlisted.
+            if "repo" in row:
+                raise RoutesConfigError(f"{where}: set repo or workdir, not both")
+            if not isinstance(workdir, str) or not os.path.isabs(workdir) or os.path.normpath(workdir) != workdir:
+                raise RoutesConfigError(f"{where}: workdir must be a normalized absolute path")
+            if cap != "read" or site_cap:
+                raise RoutesConfigError(f"{where}: workdir is only allowed on a capability read row")
+            if not route_workdir_allowed(workdir):
+                raise RoutesConfigError(f"{where}: workdir {workdir!r} is not in ROUTE_WORKDIR_ALLOWLIST")
+            repo = workdir                 # shown as the row's location; no worktree is cut from it
+        else:
+            repo = row["repo"]
+            if not isinstance(repo, str) or not os.path.isabs(repo):
+                raise RoutesConfigError(f"{where}: repo must be an absolute path")
+            if cap == "code" and not code_repo_allowed(repo):
+                raise RoutesConfigError(f"{where}: repo {repo!r} is not in CODE_REPO_ALLOWLIST")
+            if cap == "general" and not general_repo_allowed(repo):
+                raise RoutesConfigError(f"{where}: repo {repo!r} is not in GENERAL_REPO_ALLOWLIST")
+            if cap == "read" and not (code_repo_allowed(repo) or general_repo_allowed(repo)):
+                raise RoutesConfigError(f"{where}: repo {repo!r} is in neither CODE_REPO_ALLOWLIST nor "
+                                        "GENERAL_REPO_ALLOWLIST")
         for k in ("agent", "model"):
             if k in row and not (isinstance(row[k], str) and _CONFIG_ROUTE_NAME_RE.fullmatch(row[k])):
                 raise RoutesConfigError(f"{where}: {k} must be a plain name")
@@ -2630,6 +2660,8 @@ def load_config_routes(path=None, prompts_dir=None, approved_path=None, site_cap
             fields.update(read_only=False, env=dict(tmpl.env), test_runner=tmpl.test_runner,
                           setting_sources=tmpl.setting_sources, mcp_config_path=tmpl.mcp_config_path,
                           publish={**tmpl.publish, "code_repo_path": repo, "branch_prefix": f"eph/{rid}"})
+        if workdir is not None:
+            fields.update(workdir=workdir, setting_sources="project")   # load the dir's own CLAUDE.md + .claude/
         route = Route(**fields)
         if label and assignee:
             entries.append(("vikunja:task", (assignee, label), route, _assignee_label_signal_predicates))

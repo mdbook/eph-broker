@@ -5,6 +5,8 @@ The worker's cwd must carry no charter (CLAUDE.md / AGENTS.md / *-AGENT.md),
 so a stripped-charter worker (`--system-prompt` REPLACE + `--setting-sources ''`) doesn't
 silently re-inherit one from the working directory. This is belt and suspenders with the flags.
 Root charters remain readable as git-excluded, read-only .txt copies under .eph/repo-rules/.
+Their tracked paths are skip-worktree so broad worker staging cannot commit the hiding.
+Code publication also refuses committed root-charter deletions before opening an MR.
 
 Value-free: git plumbing only, no secrets.
 """
@@ -386,7 +388,7 @@ def _copy_repo_rules(path):
 
 
 def strip_charter(path):
-    """Remove any charter files from the worktree root so cwd is charter-free."""
+    """Remove root charters without making their hiding a stageable tracked deletion."""
     removed = []
     try:
         for name in os.listdir(path):
@@ -400,6 +402,13 @@ def strip_charter(path):
     except OSError as e:
         log.warning("charter strip listdir failed for %s: %s", path, e)
     if removed:
+        # Worktree-local index flags, not the shared base index. Fail the cut if protection fails:
+        # exclusions on broker staging alone do not protect a worker's `commit -a` or `add -A`.
+        tracked = subprocess.run(_wt_argv(path, "ls-files", "-z"), check=True, capture_output=True,
+                                 text=True, env=_wt_env(path)).stdout.split("\0")
+        hidden = sorted(set(removed) & set(tracked))
+        if hidden:
+            _git(path, "update-index", "--skip-worktree", "--", *hidden, env=_wt_env(path))
         log.info("stripped charter files from %s: %s", path, removed)
     return removed
 
@@ -685,6 +694,25 @@ class WorktreeManager:
             log.info("publish_mr key=%s: worker made no commit -> no-op", key)
             return None
         head = _git(path, "rev-parse", "HEAD", env=env)
+        # Last gate before branch publication / MR-open. Never infer permission from ticket prose:
+        # intentional charter removals need a separate, human-controlled publication path.
+        # Check the full MR when its target is available (including earlier fix-round commits),
+        # and always check changes since the cut, even when the target ref is unavailable locally.
+        refs = [cut_sha]
+        target = f"refs/remotes/{remote}/{mr_target_ref}"
+        target_exists = subprocess.run(_wt_argv(path, "show-ref", "--verify", "--quiet", target),
+                                       capture_output=True, text=True, env=env)
+        if target_exists.returncode == 0:
+            refs.append(target)
+        elif target_exists.returncode != 1:
+            raise RuntimeError("code publish_mr: cannot verify MR target for charter deletion guard")
+        for ref in refs:
+            deleted = _git(path, "diff", *_NO_EXT_DIFF, "--no-renames", "--diff-filter=D",
+                           "--name-only", "-z", f"{ref}...{head}", "--", env=env).split("\0")
+            charters = [name for name in deleted if "/" not in name and
+                        (name in _CHARTER_NAMES or name.endswith(_CHARTER_SUFFIX))]
+            if charters:
+                raise ValueError(f"code publish_mr key={key}: refusing root charter deletions: {charters!r}")
         if continue_branch:
             import routing
             refusal = routing.continue_mr_refusal(continue_branch, mr_target_ref)

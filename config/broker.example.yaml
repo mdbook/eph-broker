@@ -65,6 +65,13 @@ settings:
 #     capability: read
 #     repo: /srv/git/app
 #     model: sonnet
+#   # read-only reviewer in an agent's home dir (loads its CLAUDE.md and .claude/); needs ROUTE_WORKDIR_ALLOWLIST
+#   - id: design-review
+#     match: {assignee: design-eph}
+#     prompt: design/review
+#     capability: read
+#     workdir: /srv/agents/design
+#     model: opus
 
 # Your own capabilities (docs/routes.md#site-capabilities): a built-in base (read, code or general) plus extra
 # rules appended to its allow and deny lists. The base's deny list always wins. Read at startup.

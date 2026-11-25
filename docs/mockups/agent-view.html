@@ -1,21 +1,39 @@
 <!DOCTYPE html>
 <!--
-  Mockup for ticket 3193: the Agents tab's hermes view and the Fleet quick view, drawn in the broker's own DOM
-  and dash styles (docs/DESIGN.md) instead of the sidecar's embedded page. Static and self-contained: the
-  tokens and components below are copied from dash.PAGE / transcript_assets.CSS, the data is made up.
-  Phase 1 only. Nothing here is wired to the broker; phase 2 builds it in viewer/ui.js.
+  Mockup for ticket 3193, phase 1c: the Agents tab's hermes view and the Fleet quick view, drawn as the sidecar view's
+  transcript (the renderer viewer/ui.js mounts today) living natively inside a broker card. Static and
+  self-contained. The data is made up and nothing here talks to the broker. Phase 2 builds it.
 
-  What changes against today's view:
-    - ONE header: back, name, status, harness, model and context, one actions menu. No second logo, no
-      session pill row, no per-view theme toggle, no search or folder icons in a second bar.
-    - Broker type scale and system fonts. No serif or italics, no gradient, no vignette.
-    - Replies are the loudest thing in the body. Thinking and tool steps collapse into one quiet line per turn.
-    - Composer: one Send. While the agent works, Send queues for the next turn; "Interrupt and send" is the
-      secondary option behind the Send menu. Stop moves to the actions menu.
-    - The theme follows the dash header button (try it).
+  Kept from the sidecar view, on purpose (feature parity):
+    - A transcript, not a chat app. A left gutter carries speaker and time, with a thin tinted rule down it.
+      There are no bubbles.
+    - Replies set in the sidecar view's reading serif, full width, with code, tables and lists. Tool calls are dark
+      terminal wells holding the command, its output, the exit code and the duration. Thinking is quiet italic
+      under a hairline.
+    - Every turn has a tally: one tick per tool call (height = how long it ran, red = failed), the summary
+      ("5 tool calls, 38s") and a Show/Hide steps toggle. Earlier turns start folded.
+    - Date dividers, Load earlier, the live tail line ("thinking for 0:31"), copy buttons, turn actions.
+    - Header controls: session picker, live state ("thinking for 0:31" / "idle, last step 10:46"), model and
+      token count (opens the context panel), files, search, Hide steps.
+    - Composer: attach, "Message atlas, or / for commands" with the slash menu, Send, and while the agent is
+      busy Stop, Interrupt and Queue (Send becomes Queue), plus the queued-message list.
 
-  Visual QA (phase 1b): controls take their height from --ctl (36px, 44px on phones) and view edges from --gut,
-  so a text box and the buttons beside it cannot drift apart. Spacing sticks to the DESIGN.md scale.
+  Changed for the broker (integration only):
+    - ONE header row. the sidecar view's header takes the broker's name, status chip and harness. No second card
+      header, no fox logo, no per-view theme toggle: colors follow the dash theme button (try it).
+    - No vignette and no gradient. The composer is a solid strip pinned to the bottom of the card, and nothing
+      paints outside the card.
+    - the sidecar view's palette maps onto the dash tokens (docs/DESIGN.md); type, spacing and layout stay the sidecar view's.
+      The tool wells stay dark in both themes.
+    - The view is a size container. Under 720px of view width (a phone, the Fleet quick view, a narrow window)
+      the gutter folds inline like the sidecar view's phone layout, the header wraps to a second line and the header
+      tools move behind "···".
+
+  QA bar (from phase 1b): every control in a row takes its height from --ctl (36px, 44px on phones), so a text
+  box and the buttons beside it line up by construction; no horizontal overflow at 390px.
+  Phone pass (fix round 2): every tap target at least 44px. The per-turn actions fold into one "···" menu,
+  copy buttons get a line of their own, the harness drops under the name so the session picker shows in full,
+  and the composer placeholder shortens to "Message atlas".
 -->
 
 <html lang="en">
@@ -25,22 +43,22 @@
 <meta name="robots" content="noindex">
 <title>eph-broker · Agents mockup</title>
 <style>
+  /* ---- dash tokens (dash.PAGE), unchanged */
   :root{
     color-scheme:light;
     --bg:#f4f5f7; --s1:#ffffff; --s2:#f0f2f5; --s3:#e6e9ee; --line:#dce0e6;
     --t1:#141920; --t2:#475160; --t3:#626c7b; --brand:#2b57c9; --onbrand:#ffffff;
     --run:#17734a; --wait:#8a5600; --block:#bb3328; --shadow:0 1px 2px rgba(20,25,32,.05);
-    --r:12px; --btn:120px; --pop:0 8px 24px rgba(20,25,32,.12);
-    /* Shared control metrics. Every button, input and textarea that can sit in a row takes its height from
-       --ctl, so a row lines up by construction. Phones raise it to the 44px tap target (see the 720px block).
-       --gut is the one left/right edge for header, body and composer inside a view. */
-    --ctl:36px; --gut:20px;
+    --r:12px; --pop:0 8px 24px rgba(20,25,32,.12);
+    --well:#1c2027;
+    --ctl:36px;
   }
   :root[data-theme=dark]{
     color-scheme:dark;
     --bg:#0f1216; --s1:#161a20; --s2:#1d222a; --s3:#262c35; --line:#2b323c;
     --t1:#e8ecf1; --t2:#aab3bf; --t3:#8a94a2; --brand:#8eabff; --onbrand:#0c1120;
     --run:#4cc38a; --wait:#e3a63d; --block:#f27c71; --shadow:none; --pop:0 8px 24px rgba(0,0,0,.45);
+    --well:#0a0c10;
   }
   @media (prefers-color-scheme:dark){
     :root:not([data-theme=light]){
@@ -48,18 +66,20 @@
       --bg:#0f1216; --s1:#161a20; --s2:#1d222a; --s3:#262c35; --line:#2b323c;
       --t1:#e8ecf1; --t2:#aab3bf; --t3:#8a94a2; --brand:#8eabff; --onbrand:#0c1120;
       --run:#4cc38a; --wait:#e3a63d; --block:#f27c71; --shadow:none; --pop:0 8px 24px rgba(0,0,0,.45);
+      --well:#0a0c10;
     }
   }
+  /* Phones: every control grows to the 44px tap target. */
+  @media (max-width:720px){ :root{--ctl:44px} }
+
   *{box-sizing:border-box}
   [hidden]{display:none !important}
   body{margin:0;font:14px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI Variable Text","Segoe UI",system-ui,sans-serif;
        background:var(--bg);color:var(--t1);-webkit-font-smoothing:antialiased}
-  code,pre{font-family:ui-monospace,SFMono-Regular,"JetBrains Mono",Menlo,monospace}
-  button{font:inherit;color:var(--t1)}
-  a{color:inherit}
+  button{font:inherit;color:inherit}
   :focus-visible{outline:2px solid var(--brand);outline-offset:2px}
 
-  /* ---- dash header (unchanged, here for context) */
+  /* ---- dash chrome (unchanged, here for context) */
   .top{position:sticky;top:0;z-index:5;background:var(--s1);border-bottom:1px solid var(--line)}
   .top-in{max-width:1440px;margin:0 auto;padding:0 40px;height:64px;display:flex;align-items:center;gap:28px}
   .brand{display:flex;align-items:center;gap:10px;font-weight:650;font-size:16px;letter-spacing:-.01em;white-space:nowrap}
@@ -73,192 +93,335 @@
   .nav a:hover{color:var(--t1)}
   .nav a[aria-current=page]{color:var(--t1);font-weight:600;border-bottom-color:var(--brand)}
   .top-r{margin-left:auto;display:flex;align-items:center;gap:12px}
-
-  .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-width:var(--btn);height:var(--ctl);padding:0 16px;
-       border-radius:8px;border:1px solid var(--line);background:var(--s1);color:var(--t1);font-weight:600;font-size:14px;
-       line-height:20px;text-decoration:none;cursor:pointer;white-space:nowrap;flex:none}
-  .btn:hover{border-color:color-mix(in srgb,var(--t1) 28%,var(--line))}
-  .btn:active{background:var(--s3);transform:translateY(1px)}
-  .btn.pri{background:var(--brand);border-color:var(--brand);color:var(--onbrand)}
-  .btn.pri:hover{background:color-mix(in srgb,var(--brand) 85%,var(--t1));border-color:color-mix(in srgb,var(--brand) 85%,var(--t1))}
-  .btn.pri:active{background:color-mix(in srgb,var(--brand) 75%,var(--t1))}
-  .btn.ghost{background:transparent;border-color:transparent}
-  .btn.ghost:hover{background:var(--s2);border-color:var(--line)}
-  .btn.sq{min-width:var(--ctl);width:var(--ctl);padding:0}
-  .btn.bad{color:var(--block)}
-  .btn:disabled,.btn:disabled:hover{opacity:.5;cursor:default;transform:none;border-color:var(--line)}
-  .btn.pri:disabled,.btn.pri:disabled:hover{background:var(--brand);border-color:var(--brand)}
-  .lnk{display:inline-flex;align-items:center;color:var(--brand);font-weight:600;text-decoration:none;background:none;border:0;
-       padding:0;cursor:pointer;font-size:14px;line-height:20px;white-space:nowrap;border-radius:4px}
+  .btn{display:inline-flex;align-items:center;justify-content:center;height:var(--ctl);min-width:var(--ctl);padding:0 16px;border-radius:8px;
+       border:1px solid var(--line);background:var(--s1);color:var(--t1);font-weight:600;font-size:14px;cursor:pointer;white-space:nowrap}
+  .btn.ghost{background:transparent;border-color:transparent}.btn.ghost:hover{background:var(--s2);border-color:var(--line)}
+  .btn.sq{width:var(--ctl);padding:0}
+  .lnk{display:inline-flex;align-items:center;color:var(--brand);font-weight:600;text-decoration:none;background:none;border:0;padding:0;
+       cursor:pointer;font-size:14px;line-height:20px;min-height:var(--ctl);white-space:nowrap;border-radius:4px}
   .lnk:hover{text-decoration:underline}
-  .card{background:var(--s1);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow);min-width:0}
-  .page{max-width:1440px;margin:0 auto;padding:32px 40px 64px}
-  .ph{display:flex;align-items:baseline;gap:12px;margin:0 0 20px}
-  .ph h1{margin:0;font-size:28px;line-height:1.2;font-weight:650;letter-spacing:-.02em}
-  .sub{font-size:13px;color:var(--t2)}
-  /* The track is one control tall, so it lines up with any button beside it. */
+  .page{max-width:1440px;margin:0 auto;padding:32px 40px 32px}
+  .ph h1{margin:0 0 20px;font-size:28px;line-height:1.2;font-weight:650;letter-spacing:-.02em}
   .seg{display:inline-flex;height:var(--ctl);background:var(--s3);border-radius:9px;padding:3px;gap:2px}
-  .seg button{border:0;background:none;border-radius:7px;padding:0 12px;font-size:13px;line-height:20px;font-weight:600;color:var(--t2);cursor:pointer;white-space:nowrap}
-  .seg button:hover{color:var(--t1)}
+  .seg button{border:0;background:none;border-radius:7px;padding:0 12px;font-size:13px;font-weight:600;color:var(--t2);cursor:pointer;white-space:nowrap}
   .seg button[aria-pressed=true]{background:var(--s1);color:var(--t1);box-shadow:var(--shadow)}
+  .card{background:var(--s1);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow);min-width:0}
 
-  /* ---- mockup-only control strip (not part of the design) */
+  /* mockup-only control strip (not part of the design) */
   .mock{display:flex;align-items:center;gap:8px 12px;flex-wrap:wrap;margin:0 0 16px;padding:8px 16px;border:1px dashed var(--line);
         border-radius:10px;font-size:13px;color:var(--t2)}
-  .mock .lnk{height:var(--ctl)}
   .mock b{font-weight:600;color:var(--t1)}
 
-  /* ---- status chip (viewer .ad-st) */
-  .ad-st{flex:none;display:inline-flex;align-items:center;gap:8px;height:24px;font-size:13px;line-height:20px;font-weight:600;padding:0 12px;border-radius:999px;
-    white-space:nowrap;color:var(--t2);background:color-mix(in srgb,currentColor 13%,var(--s1))}
-  .ad-st::before{content:'';flex:none;box-sizing:border-box;width:8px;height:8px;border-radius:50%;border:1.5px solid var(--t3)}
-  .ad-st.run{color:var(--run)}.ad-st.run::before{border:0;background:currentColor}
-  .ad-st.wait{color:var(--wait)}.ad-st.wait::before{border:2px solid currentColor}
-  .ad-st.off{color:var(--t3)}.ad-st.off::before{border:0;height:2px;border-radius:1px;background:currentColor}
-  .ad-meter{display:inline-block;flex:none;width:56px;height:6px;border-radius:3px;background:var(--s3);overflow:hidden}
-  .ad-meter i{display:block;height:100%;background:var(--brand)}.ad-meter.warm i{background:var(--wait)}
-
-  /* ---- Agents tab: directory + detail (viewer .adir) */
-  .adir{display:grid;grid-template-columns:260px 1fr;gap:16px;align-items:start}
+  /* Agents directory (viewer .adir, unchanged) */
+  .adir{display:grid;grid-template-columns:260px minmax(0,1fr);gap:16px;align-items:start}
   .adir-list{padding:4px 0}
-  .adir-it{display:flex;align-items:center;gap:12px;padding:16px 20px 16px 17px;border-left:3px solid transparent;color:inherit;text-decoration:none}
-  .adir-it:focus-visible{outline-offset:-2px}
+  .adir-it{display:flex;align-items:center;gap:12px;padding:14px 20px 14px 17px;border-left:3px solid transparent;color:inherit;text-decoration:none}
   .adir-it:hover{background:var(--s2)}
   .adir-it[aria-current=true]{background:color-mix(in srgb,var(--brand) 7%,var(--s1));border-left-color:var(--brand)}
   .adir-it.grey{color:var(--t2)}.adir-grow{flex:1;min-width:0}.adir-nm{font-weight:600}
   .adir-meta{font-size:13px;color:var(--t2)}
   .adir-dot{width:8px;height:8px;border-radius:50%;background:var(--brand)}
-  .adir-detail{position:sticky;top:80px;display:flex;flex-direction:column;height:calc(100dvh - 96px - 56px);overflow:hidden}
+  /* The card clips: nothing the view paints (popovers included) can leak past its border. */
+  .adir-detail{position:sticky;top:80px;height:calc(100dvh - 96px);overflow:hidden;display:flex}
 
-  /* ONE header. Line 1: name, status, actions. Line 2: harness, model, context, session, last activity. */
-  /* Header, body and composer share --gut, so the name, the first reply and the text box start on one edge. */
-  .vh{flex:none;display:grid;gap:8px;padding:12px var(--gut) 16px;border-bottom:1px solid var(--line)}
-  .vh-top{display:flex;align-items:center;gap:12px;min-width:0;min-height:var(--ctl)}
-  .vh-top h2{margin:0;font-size:18px;line-height:24px;font-weight:650;letter-spacing:-.01em;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .vh-top .sp{flex:1}
-  .vh-top .lnk{height:var(--ctl)}
-  .vh-now{margin:0;font-size:14px;overflow-wrap:anywhere}.vh-now b{color:var(--t2);font-weight:600;margin-right:8px}
-  .vh-meta{display:flex;align-items:center;flex-wrap:wrap;gap:4px 12px;font-size:13px;line-height:20px;color:var(--t2);font-variant-numeric:tabular-nums}
-  .vh-meta > span{display:inline-flex;align-items:center;gap:8px;white-space:nowrap}
-  .vh-meta .sess{color:var(--t1);font-weight:600}
-  .back{display:none;flex:none;color:var(--brand);font-size:14px;font-weight:600;text-decoration:none;white-space:nowrap;border-radius:4px}
-  .back:hover{text-decoration:underline}
+  /* status chip (viewer .ad-st) */
+  .ad-st{flex:none;display:inline-flex;align-items:center;gap:8px;height:24px;font:600 13px/20px -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",system-ui,sans-serif;
+    padding:0 10px;border-radius:999px;white-space:nowrap;color:var(--t2);background:color-mix(in srgb,currentColor 13%,var(--s1))}
+  .ad-st::before{content:'';flex:none;box-sizing:border-box;width:8px;height:8px;border-radius:50%;border:1.5px solid var(--t3)}
+  .ad-st.run{color:var(--run)}.ad-st.run::before{border:0;background:currentColor}
 
-  /* Single actions menu: a native popover anchored under the button. */
-  .menu-w{position:relative;flex:none}
-  .menu{position:absolute;right:0;top:calc(100% + 8px);z-index:10;min-width:220px;padding:4px;margin:0;list-style:none;
-        background:var(--s1);border:1px solid var(--line);border-radius:10px;box-shadow:var(--pop)}
-  .menu button{display:flex;width:100%;align-items:center;justify-content:space-between;gap:12px;min-height:var(--ctl);padding:0 12px;
-        border:0;background:none;border-radius:6px;font-size:14px;line-height:20px;text-align:left;cursor:pointer;white-space:nowrap}
-  .menu button:hover,.menu button:focus-visible{background:var(--s2)}
-  .menu button:focus-visible{outline-offset:-2px}
-  .menu button:disabled{opacity:.5;cursor:default;background:none}
-  .menu button.bad{color:var(--block)}
-  .menu button span{font-size:13px;color:var(--t2)}
-  .menu hr{border:0;border-top:1px solid var(--line);margin:4px}
-  .menu .lbl{font-size:12px;line-height:16px;font-weight:500;color:var(--t2);padding:8px 12px 4px}
+  /* ======================================================================================================
+     The agent view: the sidecar view, native. the sidecar view's tokens are re-pointed at the dash tokens here, so its rules
+     read as they do upstream and the dash theme button recolors an open view without remounting it.
+     ====================================================================================================== */
+  .ov{
+    --ground:var(--s1); --panel:var(--s2); --rule:var(--line); --rule2:color-mix(in srgb,var(--t1) 16%,var(--line));
+    --ink:var(--t1); --dim:var(--t2); --faint:var(--t3);
+    --iris:var(--brand); --amber:var(--wait); --bad:var(--block);
+    --you:var(--brand); --agent:var(--run);
+    /* the terminal wells stay dark in both themes */
+    --w-ink:#eef1f5; --w-term:#c6ccd5; --w-dim:#9aa3af; --w-amber:#e3a63d; --w-bad:#f27c71; --w-add:#5fd19a; --w-del:#f58f85; --w-hunk:#9db6ff;
+    --serif:"Iowan Old Style","Charter","Bitstream Charter","Source Serif 4","Sitka Text",Cambria,Georgia,serif;
+    --sans:"Avenir Next","Seravek","Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,sans-serif;
+    --mono:ui-monospace,"SF Mono","Cascadia Mono","JetBrains Mono",Menlo,Consolas,monospace;
+    --gut:5.4rem; --w:64rem; --edge:20px;
+    --ease:cubic-bezier(.2,0,0,1); --q:120ms; --s:220ms;
+    container:ov/inline-size;
+    position:relative;flex:1;min-width:0;height:100%;display:flex;flex-direction:column;
+    background:var(--ground);color:var(--ink);font:15px/1.5 var(--sans);-webkit-text-size-adjust:100%;
+  }
+  .ov ::selection{background:color-mix(in srgb,var(--iris) 22%,transparent)}
+  .ov svg.i{width:1rem;height:1rem;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;flex:none}
 
-  /* ---- transcript body: plain surface, broker transcript components */
-  .tl{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:12px;padding:16px var(--gut) 24px;background:var(--s1)}
-  .tl > *{flex-shrink:0}
-  .day{align-self:center;font-size:12px;color:var(--t2);padding:4px 0}
-  .ev{max-width:760px;border-radius:14px;padding:8px 16px;border:1px solid var(--line);background:var(--s1);min-width:0;overflow-wrap:anywhere}
-  .ev.user{background:color-mix(in srgb,var(--brand) 7%,var(--s1));border-color:color-mix(in srgb,var(--brand) 22%,var(--line));align-self:flex-end;max-width:620px}
-  .ev.agent{border:0;padding-left:0;padding-right:0;max-width:760px}
-  .ev-meta{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--t2);margin-bottom:4px}
-  .who{font-weight:600;color:var(--t1)}
-  .ev.user .who{color:var(--brand)}
-  .ts{font-size:12px;color:var(--t3);font-variant-numeric:tabular-nums}
-  .md p{margin:.35em 0} .md ul{margin:.35em 0;padding-left:1.4em}
-  .md code{background:var(--s2);border:1px solid var(--line);border-radius:5px;padding:0 4px;font-size:12px}
+  /* ---- the one header row */
+  .bar{flex:none;position:relative;z-index:3;display:flex;align-items:center;gap:8px 14px;min-width:0;
+       padding:10px var(--edge);border-bottom:1px solid var(--rule);background:var(--ground)}
+  .back{display:none;align-items:center;min-height:var(--ctl);margin-left:-8px;padding:0 8px;border-radius:8px;
+        color:var(--iris);font:600 14px var(--sans);text-decoration:none;white-space:nowrap}
+  .back:hover{background:var(--panel)}
+  .idn{display:flex;align-items:center;gap:10px;min-width:0;flex:0 1 auto}
+  .nm{margin:0;font:600 1.3rem/1.2 var(--serif);letter-spacing:.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+  .hz{color:var(--dim);font-size:.84rem;white-space:nowrap}
+  .sesswrap{flex:0 1 auto;min-width:0}
+  .sess{display:block;max-width:16rem;width:100%;height:var(--ctl);background-color:transparent;color:var(--ink);border:1px solid transparent;border-radius:8px;
+    padding:0 1.5rem 0 .5rem;font:500 .9rem var(--sans);cursor:pointer;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+    background-image:linear-gradient(45deg,transparent 50%,var(--dim) 50%),linear-gradient(-45deg,transparent 50%,var(--dim) 50%);
+    background-size:4px 4px;background-position:calc(100% - .75rem) 55%,calc(100% - .5rem) 55%;background-repeat:no-repeat;
+    transition:background-color var(--q) var(--ease)}
+  .sess:hover,.sess[aria-expanded=true]{background-color:var(--panel)}
+  .state{color:var(--dim);font-size:.84rem;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+  .ov.busy .state{color:var(--amber)}
+  .grow{flex:1 1 0}
+  .brk{display:none}
+  .tools{display:flex;align-items:center;gap:4px;flex:none}
+  /* header buttons: quiet until hovered, one control tall */
+  .hb{display:inline-flex;align-items:center;justify-content:center;gap:8px;height:var(--ctl);min-width:var(--ctl);padding:0 10px;flex:none;
+      background:none;border:1px solid transparent;border-radius:8px;color:var(--dim);font:.8rem var(--sans);cursor:pointer;white-space:nowrap;
+      transition:color var(--q) var(--ease),background var(--q) var(--ease),border-color var(--q) var(--ease)}
+  .hb:hover,.hb[aria-expanded=true]{color:var(--ink);background:var(--panel)}
+  .hb.ic{padding:0}
+  .hb .lb{display:none}
+  .stats{color:var(--faint);font-variant-numeric:tabular-nums}.stats b{font-weight:500;color:var(--dim)}
+  .hb.steps[aria-pressed=true]{color:var(--ink);border-color:var(--rule2)}
+  .more,.close{display:none}
 
-  /* Steps: one quiet line per turn, collapsed by default. Quieter than any reply: 13px, --t2, no card fill. */
-  details.steps{max-width:760px;font-size:13px;color:var(--t2)}
-  /* The -8px margin puts the summary text on the --gut edge; the hover fill hangs into the gutter. */
-  details.steps > summary{list-style:none;display:inline-flex;align-items:center;gap:8px;min-height:32px;padding:0 8px;margin-left:-8px;
-        max-width:calc(100% + 8px);border-radius:8px;cursor:pointer;font-variant-numeric:tabular-nums;line-height:20px}
-  details.steps > summary::-webkit-details-marker{display:none}
-  details.steps > summary:hover{background:var(--s2);color:var(--t1)}
-  details.steps > summary::after{content:"›";color:var(--t3);transition:transform .15s}
-  details.steps[open] > summary::after{transform:rotate(90deg)}
-  .steps-body{display:grid;gap:8px;margin:4px 0 4px 4px;padding-left:12px;border-left:2px solid var(--line)}
-  .step{display:flex;align-items:baseline;gap:8px;min-width:0}
-  .step .k{flex:none;font-weight:600;color:var(--t2);min-width:64px}
-  .step .v{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .step code{font-size:12px;color:var(--t2)}
-  .step.think .v{white-space:normal;color:var(--t2)}
-  .step .ts{margin-left:auto;flex:none}
+  /* popovers (session list, context, files) hang from the header and stay inside the card */
+  .pop{position:absolute;z-index:8;top:calc(100% - 4px);right:var(--edge);width:min(24rem,calc(100% - 2 * var(--edge)));max-height:60vh;overflow:auto;
+       background:var(--ground);border:1px solid var(--rule2);border-radius:10px;box-shadow:var(--pop);padding:6px}
+  .pop.left{left:var(--edge);right:auto}
+  .pop h3{margin:6px 8px 8px;font:600 1.05rem var(--serif)}
+  .pop .k{margin:10px 8px 4px;font:600 .7rem var(--sans);letter-spacing:.06em;text-transform:uppercase;color:var(--faint)}
+  .pop p{margin:4px 8px;font-size:.86rem;color:var(--dim)}
+  .so{display:block;width:100%;text-align:left;background:none;border:0;padding:8px 10px;min-height:var(--ctl);border-radius:6px;color:var(--ink);cursor:pointer}
+  .so:hover,.so[aria-selected=true]{background:var(--panel)}
+  .so .sn{display:block;font-size:.88rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .so .sm{display:block;font-size:.74rem;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .so.on .sn::before{content:"";display:inline-block;width:.4rem;height:.4rem;border-radius:50%;background:var(--agent);margin-right:.45rem;vertical-align:.1em}
+  .cbar{display:flex;height:.6rem;margin:6px 8px;border-radius:99px;background:var(--panel);box-shadow:inset 0 0 0 1px var(--rule);overflow:hidden}
+  .cbar i{display:block;background:var(--c)}
+  .legend{display:grid;gap:2px;list-style:none;margin:6px 8px;padding:0;font-size:.8rem;color:var(--dim)}
+  .legend li{display:flex;align-items:center;gap:8px}.legend li::before{content:"";width:.55rem;height:.55rem;border-radius:2px;background:var(--c)}
+  .legend .n{margin-left:auto;color:var(--ink);font-variant-numeric:tabular-nums}
+  .chips{display:flex;flex-wrap:wrap;gap:6px;margin:4px 8px 8px}
+  .chips button{font:.8rem var(--sans);min-height:32px;background:var(--panel);border:1px solid var(--rule2);border-radius:99px;padding:0 12px;color:var(--ink);cursor:pointer}
+  .chips button[aria-pressed=true]{border-color:var(--iris);color:var(--iris)}
+  .ent{border-top:1px solid var(--rule);padding:8px;font-size:.86rem;overflow-wrap:anywhere}
 
-  /* Working line: the only live element in the body. A pulsing dot, the current step, elapsed time. */
-  .working{display:flex;align-items:center;gap:8px;font-size:13px;line-height:20px;color:var(--t2);font-variant-numeric:tabular-nums;min-width:0}
-  .working::before{content:"";flex:none;width:8px;height:8px;border-radius:50%;background:var(--run);animation:pulse 1.4s ease-in-out infinite}
+  /* search row, under the header (the sidecar view #search) */
+  /* lines up with the transcript column, which is centered once the view is wider than --w */
+  .search{flex:none;display:flex;align-items:center;gap:8px;border-bottom:1px solid var(--rule);
+    padding:8px max(var(--edge),calc((100% - var(--w)) / 2 + var(--edge))) 10px max(calc(var(--edge) + var(--gut) + 1rem),calc((100% - var(--w)) / 2 + var(--edge) + var(--gut) + 1rem))}
+  .search input{flex:1;min-width:0;height:var(--ctl);background:var(--panel);color:var(--ink);border:1px solid var(--rule2);border-radius:8px;padding:0 10px;font:.92rem var(--sans)}
+  .search input:focus{outline:none;border-color:var(--iris)}
+  .qn{color:var(--dim);font-size:.8rem;font-variant-numeric:tabular-nums;white-space:nowrap}
+
+  /* ---- the transcript */
+  .log{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;padding:4px 0 24px}
+  .lw{max-width:var(--w);margin:0 auto;padding:0 var(--edge)}
+  .earlier{display:grid;grid-template-columns:var(--gut) minmax(0,1fr);column-gap:1rem;margin:4px 0 0}
+  .tgl{background:none;border:0;padding:0;color:var(--dim);font:.76rem var(--sans);cursor:pointer;text-decoration:underline dotted;text-underline-offset:3px;
+       min-height:28px;white-space:nowrap}
+  .tgl:hover{color:var(--ink)}
+  .earlier .tgl{grid-column:2;justify-self:start;color:var(--faint);font-size:.8rem}
+  .row{display:grid;grid-template-columns:var(--gut) minmax(0,1fr);column-gap:1rem}
+  .gut{padding:.6rem .8rem .5rem 0;border-right:2px solid var(--rail,var(--rule2));text-align:right;
+       font-size:.72rem;line-height:1.35;color:var(--faint);font-variant-numeric:tabular-nums}
+  .who{display:block;font-size:.8rem;font-weight:600;color:var(--dim);margin-bottom:.05rem}
+  .ch{display:block;font-size:.68rem;font-weight:500;letter-spacing:.02em;color:var(--faint);margin-bottom:.1rem}
+  .bd{padding:.5rem 0;min-width:0;position:relative}
+  .ag{--rail:color-mix(in srgb,var(--agent) 45%,var(--rule))}
+  .ag .who{color:var(--agent)}
+  .in{margin-top:1.4rem;--rail:var(--you)}
+  .in .who{color:var(--you)}
+  .in .bd{font-size:1rem;line-height:1.55;max-width:72ch;overflow-wrap:anywhere}
+  .day{margin-top:2.2rem}
+  .day .gut{border-right-color:transparent}
+  .day .bd{display:flex;align-items:center;gap:.8rem;padding:.1rem 0;color:var(--dim);font:600 .82rem var(--sans)}
+  .day .bd::after{content:"";flex:1;border-top:1px solid var(--rule)}
+
+  /* the agent's prose */
+  .think{color:var(--dim);font-size:.85rem;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;max-width:76ch;margin:.05rem 0 .4rem;
+         padding-left:.7rem;border-left:1px solid var(--rule2);font-style:italic}
+  .reply{font:1.06rem/1.62 var(--serif);max-width:68ch;overflow-wrap:anywhere;margin:.1rem 0;color:var(--ink)}
+  .md>:first-child{margin-top:0}.md>:last-child{margin-bottom:0}
+  .md p{margin:.5em 0}.md ul,.md ol{margin:.45em 0;padding-left:1.4em}.md li{margin:.2em 0}
+  .md strong{font-weight:650}
+  .md code{font:.8em var(--mono);background:var(--panel);border:1px solid var(--rule);padding:.05em .32em;border-radius:3px}
+  .md pre{position:relative;font:12.5px/1.55 var(--mono);background:var(--well);color:var(--w-term);padding:.6rem .8rem;border-radius:4px;
+          white-space:pre-wrap;overflow-wrap:anywhere;margin:.6em 0}
+  .md pre[data-lang]::before{content:attr(data-lang);float:right;margin:0 0 .2rem .8rem;font:10.5px/1.9 var(--sans);letter-spacing:.06em;text-transform:uppercase;color:var(--w-dim)}
+  .md .tbl{overflow-x:auto}
+  .md table{border-collapse:collapse;font:.88em/1.45 var(--sans);margin:.6em 0}
+  .md th,.md td{border:1px solid var(--rule2);padding:.25em .6em;text-align:left;vertical-align:top}
+  .md th{font-weight:650;background:var(--panel)}
+  .add{color:var(--w-add)}.del{color:var(--w-del)}.hunk{color:var(--w-hunk)}
+
+  /* tool wells: dark terminal blocks with the command, its output, exit code and duration */
+  .term{position:relative;background:var(--well);border-radius:4px;padding:.55rem .8rem;margin:.35rem 0 .5rem;max-width:52rem;
+        font:12.5px/1.55 var(--mono);color:var(--w-term);overflow-wrap:anywhere;border-left:2px solid transparent}
+  .term.failed{border-left-color:var(--w-bad)}
+  .term pre{margin:0;font:inherit;white-space:pre-wrap;overflow-wrap:anywhere}
+  .cmd{color:var(--w-ink)}
+  .ps{color:var(--w-amber);user-select:none}
+  .tool{color:var(--w-amber);font-weight:600}
+  .dpath{color:var(--w-dim);margin:.1rem 0 .3rem}
+  .out{margin-top:.45rem;padding-top:.45rem;border-top:1px dashed color-mix(in srgb,var(--w-dim) 35%,transparent)}
+  .term dl{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:.05rem 1rem;margin:.2rem 0 0}
+  .term dt{color:var(--w-dim)}.term dd{margin:0;color:var(--w-ink);min-width:0}
+  .meta{display:flex;flex-wrap:wrap;gap:.2rem 1.2rem;margin-top:.45rem;color:var(--w-dim);font:11.5px var(--sans);font-variant-numeric:tabular-nums}
+  .meta .bad{color:var(--w-bad);font-weight:600}
+  .running{display:flex;align-items:center;gap:.5em;margin-top:.35rem;color:var(--w-amber);font:.78rem var(--sans)}
+  .running::before,.tail .bd::before{content:"";flex:none;width:8px;height:8px;border-radius:50%;background:currentColor;animation:pulse 1.4s ease-in-out infinite}
   @keyframes pulse{50%{opacity:.3}}
 
-  /* ---- composer: one Send, Interrupt behind the Send menu */
-  /* Text box and Send share one height (--ctl) and one row. The box grows upward as you type; the buttons stay
-     on its bottom edge (flex-end), so at one line their tops, centers and bottoms all match. */
-  .comp{flex:none;display:grid;gap:8px;padding:12px var(--gut) calc(12px + env(safe-area-inset-bottom));border-top:1px solid var(--line);background:var(--s1)}
-  .comp-row{display:flex;align-items:flex-end;gap:8px;min-width:0}
-  .comp textarea{display:block;flex:1;min-width:0;resize:none;margin:0;font:inherit;font-size:14px;line-height:20px;
-        height:var(--ctl);min-height:var(--ctl);max-height:140px;overflow-y:auto;padding:calc((var(--ctl) - 22px) / 2) 12px;
-        border:1px solid var(--line);border-radius:8px;background:var(--s1);color:var(--t1)}
-  .comp textarea::placeholder{color:var(--t3);opacity:1}
-  .comp textarea:hover{border-color:color-mix(in srgb,var(--t1) 28%,var(--line))}
-  .comp textarea:focus{border-color:var(--brand)}
-  .comp textarea:focus-visible{outline-offset:0}
-  .split{display:inline-flex;flex:none}
-  .split .btn{min-width:0}
-  .split .btn.main{border-radius:8px 0 0 8px}
-  .split.solo .btn.main{border-radius:8px}
-  .split .btn.more{border-radius:0 8px 8px 0;border-left-color:color-mix(in srgb,var(--onbrand) 35%,var(--brand));width:var(--ctl);min-width:var(--ctl);padding:0}
-  .split .menu{bottom:calc(100% + 8px);top:auto;min-width:260px}
-  .comp-hint{margin:0;font-size:12px;line-height:16px;color:var(--t2)}
+  /* copy: there on hover, a little on touch */
+  .cp{position:absolute;top:.3rem;right:.35rem;z-index:1;background:var(--ground);border:1px solid var(--rule2);border-radius:5px;color:var(--dim);
+      font:.7rem var(--sans);padding:.2rem .4rem;cursor:pointer;opacity:0;transition:opacity var(--q) var(--ease)}
+  .term .cp{background:color-mix(in srgb,var(--well) 80%,#fff 8%);color:var(--w-dim);border-color:color-mix(in srgb,var(--w-dim) 40%,transparent)}
+  .term:hover>.cp,.bd:hover>.cp,.cp:focus-visible{opacity:1}
+  .bd>.cp{top:.45rem;right:0}
+  @media (hover:none){.cp{opacity:.55}}
 
-  /* ---- Fleet quick view: the dash detail sheet with the same header and composer */
-  .detail-sheet{--gut:24px;padding:0;color:var(--t1);width:min(640px,calc(100% - 32px));max-height:calc(100dvh - 32px);
-                background:var(--s1);border:1px solid var(--line);border-radius:12px;overflow:hidden;display:none}
-  .detail-sheet[open]{display:flex;flex-direction:column}
+  /* turn tally: one tick per tool call, height = how long it ran, red = failed. The quiet "N tool calls" line. */
+  .tally .gut{padding-top:0;padding-bottom:0}
+  .tally .bd{display:flex;align-items:center;flex-wrap:wrap;gap:.35rem .9rem;padding:.05rem 0 .35rem}
+  .tape{display:flex;align-items:flex-end;gap:2px;height:1rem;flex-wrap:wrap;max-width:min(100%,38rem)}
+  .tick{width:5px;height:calc(.25rem + var(--d,.3) * .75rem);border-radius:1px;background:color-mix(in srgb,var(--amber) 70%,var(--ground))}
+  .tick.fail{background:var(--bad)}
+  .tick.go{background:var(--amber);animation:pulse 1.2s ease-in-out infinite}
+  .sum{color:var(--faint);font-size:.76rem;font-variant-numeric:tabular-nums}
+  .sum .bad{color:var(--bad)}
+  .tsep{color:var(--faint);font-size:.76rem;margin:0 -.45rem}
+  .tacts{display:inline-flex;opacity:0;transition:opacity var(--q) var(--ease)}
+  .tlist{display:inline-flex;gap:.8rem}
+  .tmore{display:none}
+  .tally:hover .tacts,.tacts:focus-within{opacity:1}
+  @media (hover:none){.tacts{opacity:.6}}
+  .row.f{display:none}
+  .row.hit>.bd{background:linear-gradient(90deg,color-mix(in srgb,var(--amber) 16%,transparent),transparent 70%)}
+
+  /* the live tail: the one moving line in the body */
+  .tail .bd{display:flex;align-items:center;gap:.55rem;color:var(--amber);font-size:.85rem;font-variant-numeric:tabular-nums;padding:.45rem 0}
+
+  /* ---- composer: a solid strip pinned to the bottom of the card. No gradient, no shadow spilling upward. */
+  .compose{flex:none;position:relative;z-index:2;border-top:1px solid var(--rule);background:var(--ground);
+           padding:10px 0 calc(10px + env(safe-area-inset-bottom))}
+  /* the compose column sits under the transcript column, as in the sidecar view: same width and edges as .lw */
+  .cin{max-width:var(--w);margin:0 auto;padding:0 var(--edge) 0 calc(var(--edge) + var(--gut) + 1rem);display:grid;gap:8px}
+  .queue{display:grid;gap:4px;margin:0;padding:0;list-style:none}
+  .queue li{display:flex;align-items:center;gap:10px;min-width:0;padding:4px 4px 4px 10px;border:1px dashed var(--rule2);border-radius:8px;font-size:.86rem}
+  .queue .qt{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .queue .qs{flex:none;color:var(--amber);font-size:.76rem}
+  .slash{background:var(--ground);border:1px solid var(--rule2);border-radius:8px;box-shadow:var(--pop);max-height:min(18rem,40vh);overflow:auto;padding:4px}
+  .opt{display:grid;grid-template-columns:auto minmax(0,1fr);gap:.8rem;align-items:baseline;padding:0 .55rem;min-height:var(--ctl);align-content:center;border-radius:5px;cursor:pointer}
+  .opt[aria-selected=true],.opt:hover{background:var(--panel)}
+  .opt .n{font:600 .86rem var(--mono);white-space:nowrap}
+  .opt .d{color:var(--dim);font-size:.82rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .box{display:flex;align-items:flex-end;gap:6px;min-width:0;background:var(--ground);border:1px solid var(--rule2);border-radius:10px;padding:4px;
+       transition:border-color var(--q) var(--ease)}
+  .box:focus-within{border-color:color-mix(in srgb,var(--iris) 60%,var(--rule2))}
+  .attach{flex:none;width:var(--ctl);height:var(--ctl);display:grid;place-items:center;background:none;border:0;border-radius:6px;color:var(--faint);cursor:pointer}
+  .attach:hover{color:var(--ink);background:var(--panel)}
+  .msg{flex:1;min-width:0;resize:none;display:block;margin:0;height:var(--ctl);min-height:var(--ctl);max-height:40vh;overflow-y:auto;
+       background:transparent;color:var(--ink);border:0;outline:0;padding:calc((var(--ctl) - 1.45rem) / 2) 4px;font:1rem/1.45 var(--sans)}
+  .msg::placeholder{color:var(--faint);opacity:1}
+  .acts{display:flex;gap:6px;flex:none}
+  .cb{height:var(--ctl);border-radius:7px;padding:0 .95rem;font:600 .84rem var(--sans);cursor:pointer;border:1px solid transparent;white-space:nowrap}
+  .cb:active{transform:scale(.97)}
+  .send{background:var(--iris);color:var(--onbrand)}
+  .send:hover{background:color-mix(in srgb,var(--iris) 85%,var(--ink))}
+  .stop{background:transparent;color:var(--bad);border-color:color-mix(in srgb,var(--bad) 50%,transparent)}
+  .stop:hover{background:color-mix(in srgb,var(--bad) 10%,transparent)}
+  .force{background:color-mix(in srgb,var(--bad) 14%,transparent);color:var(--bad);border-color:color-mix(in srgb,var(--bad) 60%,transparent)}
+  .force:hover{background:color-mix(in srgb,var(--bad) 22%,transparent)}
+  .cnotes{margin:0;min-height:1.1em;padding:0 .2rem;color:var(--dim);font-size:.78rem}
+
+  /* broker's "what it is doing" line, quick view only */
+  .qnow{flex:none;margin:0;padding:8px var(--edge);border-bottom:1px solid var(--rule);font-size:.86rem;color:var(--dim);overflow-wrap:anywhere}
+  .qnow b{color:var(--ink);font-weight:600;margin-right:6px}.qnow .w{color:var(--amber);font-weight:600}
+
+  /* ---- compact view: under 720px of VIEW width (phone, quick view, narrow window). the sidecar view's phone layout. */
+  @container ov (max-width:720px){
+    .bar{flex-wrap:wrap;--edge:16px;padding:6px 16px 8px;row-gap:2px}
+    .back{display:inline-flex;order:0}
+    .idn{order:1;flex:1 1 0}
+    .nm{font-size:1.15rem}
+    .more,.close{display:inline-flex;order:2}
+    .brk{display:block;order:3;flex-basis:100%;height:0}
+    .hz{order:4}.sesswrap{order:5}.state{order:6;flex:0 1 auto;font-size:.8rem}
+    .grow{display:none}
+    .sess{max-width:11rem;padding-left:.35rem;margin-left:-.35rem}
+    /* header tools fold behind ··· as a menu of labelled rows */
+    .tools{display:none;order:7;position:absolute;z-index:8;top:calc(100% - 4px);right:16px;flex-direction:column;align-items:stretch;gap:0;
+           min-width:15rem;padding:4px;background:var(--ground);border:1px solid var(--rule2);border-radius:10px;box-shadow:var(--pop)}
+    .bar.open .tools{display:flex}
+    .tools .hb{justify-content:flex-start;padding:0 10px;font-size:.88rem;color:var(--ink)}
+    .tools .hb .lb{display:inline}
+    .tools .stats{color:var(--dim)}
+    .pop{right:16px;width:calc(100% - 32px)}.pop.left{left:16px}
+    .search{padding:8px 16px 10px}
+    .log{padding-bottom:16px}
+    .lw{padding:0 16px}
+    .row{display:block;border-left:2px solid var(--rail,var(--rule2));padding-left:.7rem}
+    .gut{border:0;text-align:left;padding:.55rem 0 0;display:flex;gap:.6rem;align-items:baseline}
+    .who,.ch{display:inline;margin:0}.ch::before{content:'· '}
+    .bd{padding-top:.15rem}
+    .day{border-left-color:transparent;padding-left:0}.day .gut{display:none}
+    .tally{border-left-color:transparent}.tally .gut{display:none}
+    .earlier{display:block}
+    .term{margin-left:-.35rem;margin-right:-.35rem}
+    .compose{padding:8px 0 calc(8px + env(safe-area-inset-bottom))}
+    .cin{padding:0 12px}
+    /* busy: Stop, Interrupt and Queue do not fit beside the text at 390px, so the text box takes its own line */
+    .ov.busy .box{flex-wrap:wrap}
+    .ov.busy .msg{order:-1;flex-basis:100%}
+    .ov.busy .acts{margin-left:auto}
+    .qnow{padding:8px 16px}
+  }
+  /* Phones: iOS does not zoom a 16px field on focus; the small text toggles and chips grow to 44px targets. */
+  @media (max-width:720px){
+    .msg{font-size:16px}
+    .tgl,.chips button{min-height:var(--ctl)}
+    .seg{height:calc(var(--ctl) + 6px)}
+    /* header: the harness drops under the name, so the session picker and the live state share a line in full */
+    .hz{flex-basis:100%;font-size:.8rem}
+    .sesswrap{flex:none}
+    .sess{width:auto;max-width:14rem}
+    /* turn actions: one 44px "···" at the end of the tally, opening a menu of full-height rows */
+    .tacts{position:relative;margin-left:auto;opacity:1}
+    .tmore{display:inline-flex;align-items:center;justify-content:center;min-width:var(--ctl);border-radius:8px;text-decoration:none;
+           font-size:1rem;letter-spacing:.08em;color:var(--faint)}
+    .tmore[aria-expanded=true]{background:var(--panel);color:var(--ink)}
+    .tlist{display:none;position:absolute;z-index:4;top:100%;right:0;flex-direction:column;gap:0;min-width:10rem;padding:4px;
+           background:var(--ground);border:1px solid var(--rule2);border-radius:10px;box-shadow:var(--pop)}
+    .tacts.open .tlist{display:flex}
+    .tlist .tgl{display:flex;align-items:center;padding:0 10px;border-radius:6px;text-decoration:none;font-size:.9rem;color:var(--ink)}
+    .tlist .tgl:hover{background:var(--panel)}
+    /* copy sits on its own line under the reply or tool output, never over the text, at full tap size */
+    .cp{position:static;display:inline-flex;align-items:center;justify-content:center;min-height:var(--ctl);min-width:var(--ctl);
+        margin:.15rem 0 0 -.5rem;padding:0 .5rem;background:none;border-color:transparent;opacity:1;font-size:.8rem;color:var(--faint)}
+    .term .cp{background:none;border-color:transparent;color:var(--w-dim)}
+  }
+
+  /* ---- Fleet quick view: the dash detail sheet holding the same view */
+  .detail-sheet{padding:0;color:var(--t1);width:min(640px,calc(100% - 32px));height:min(720px,calc(100dvh - 32px));
+                background:var(--s1);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+  .detail-sheet[open]{display:flex}
   .detail-sheet::backdrop{background:color-mix(in srgb,var(--t1) 35%,transparent)}
-  .detail-sheet .vh{padding-top:16px}
-  .qv{flex:1;min-height:0;overflow:auto;display:grid;align-content:start;gap:16px;padding:16px var(--gut)}
-  .qv-now{display:grid;gap:8px;padding:12px 16px;border-radius:10px;background:var(--s2)}
-  .qv-now .lbl{font-size:12px;line-height:16px;font-weight:600;color:var(--t2)}
-  .qv-now p{margin:0}
-  .qv-wait{display:flex;align-items:center;gap:8px;font-weight:600;color:var(--wait)}
-  .qv-wait::before{content:'';flex:none;width:10px;height:10px;box-sizing:border-box;border-radius:50%;border:2px solid currentColor}
-  .qv-latest{display:grid;gap:8px}
-  .qv .lbl2{font-size:12px;line-height:16px;font-weight:600;color:var(--t2)}
-  .qv .tl{padding:0;overflow:visible;background:none}
-  .menu [data-full-item]{display:none}
 
   @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 
-  /* ---- phone */
+  /* ---- page at phone width */
   @media (max-width:820px){
-    .adir{grid-template-columns:1fr}.adir-listcard{display:none}
-    .adir-detail{position:static;height:calc(100dvh - 64px - 32px - 48px)}
-    .back{display:inline-flex;min-height:44px;align-items:center}
+    .adir{grid-template-columns:minmax(0,1fr)}.adir-listcard{display:none}
+    .adir-detail{position:static;height:calc(100dvh - 64px - 32px)}
   }
-  /* Phones: every control grows to the 44px tap target through --ctl, and every edge moves to 16px through --gut.
-     The text box is 16px so iOS does not zoom on focus. */
   @media (max-width:720px){
-    :root,.detail-sheet{--ctl:44px;--gut:16px}
     .top-in{padding:0 16px;gap:12px}.nav,.inst{display:none}
-    .page{padding:16px 16px 24px}.ph{display:none}
+    .page{padding:16px}.ph{display:none}
     .mock{margin-bottom:12px}
-    .vh{padding:8px var(--gut) 12px;gap:4px}.vh-top{gap:8px}.vh-top h2{font-size:16px}
-    .vh-meta{font-size:12px;gap:0 12px}.vh-meta .opt{display:none}
-    .vh-now{font-size:13px}
-    .tl{padding:12px var(--gut)}
-    .ev.user{max-width:88%}
-    .comp textarea{font-size:16px}
-    details.steps > summary{min-height:var(--ctl)}
-    .back{min-height:var(--ctl);align-items:center;margin-left:-8px;padding:0 8px}
-    .detail-sheet{width:100%;max-width:100%;margin:auto 0 0;border-radius:16px 16px 0 0;border-bottom:0;max-height:calc(100dvh - 48px)}
-    .detail-sheet .vh{padding-top:12px}.qv{padding:12px var(--gut)}
-    /* The quick view header has no room for a text link next to two icon buttons at 390px. */
-    .vh-top [data-full]{display:none}
-    .detail-sheet .menu [data-full-item]{display:flex}
+    .adir-detail{height:calc(100dvh - 64px - 24px);border-radius:10px}
+    .detail-sheet{width:100%;max-width:100%;margin:auto 0 0;height:calc(100dvh - 48px);border-radius:16px 16px 0 0;border-bottom:0}
   }
 </style>
 </head>
@@ -285,7 +448,7 @@
       <button type="button" aria-pressed="false" data-v="idle">Idle</button>
     </div>
     <button class="lnk" type="button" id="m-quick">Open the Fleet quick view</button>
-    <span>Theme follows the header button.</span>
+    <span>Theme follows the header button. Type / in the composer for commands.</span>
   </div>
 
   <div class="adir">
@@ -301,111 +464,204 @@
           <div class="adir-meta">Offline · Hermes · 6h ago</div></span></a>
       </nav>
     </div>
-
-    <section class="card adir-detail" aria-label="atlas">
-      <div id="view-slot"></div>
-    </section>
+    <section class="card adir-detail" aria-label="atlas" id="view-slot"></section>
   </div>
 </main>
 
-<dialog class="detail-sheet" id="quick" aria-label="atlas quick view">
-  <div id="quick-slot"></div>
-</dialog>
+<dialog class="detail-sheet" id="quick" aria-label="atlas quick view"></dialog>
 
-<!-- Shared pieces, cloned into the Agents detail and the quick view so both read the same. -->
-<template id="t-head">
-  <div class="vh">
-    <div class="vh-top">
-      <a class="back" href="#">‹ Agents</a>
-      <h2>atlas</h2>
-      <span class="ad-st run" data-status>Working</span>
-      <span class="sp"></span>
-      <a class="lnk" href="#" data-full hidden>Open full view</a>
-      <div class="menu-w">
-        <button class="btn ghost sq" type="button" aria-label="Actions" title="Actions" aria-haspopup="menu" aria-expanded="false" data-menu>⋯</button>
-        <div class="menu" role="menu" hidden>
-          <button type="button" role="menuitem" data-full-item>Open full view</button>
-          <div class="lbl">Session</div>
-          <button type="button" role="menuitem">main <span>current</span></button>
-          <button type="button" role="menuitem">fix-composer <span>2h ago</span></button>
-          <button type="button" role="menuitem">New session</button>
-          <hr>
-          <button type="button" role="menuitem" data-toggle-steps>Show all steps</button>
-          <button type="button" role="menuitem">Copy link</button>
-          <hr>
-          <button type="button" role="menuitem" class="bad" data-stop>Stop current turn</button>
-        </div>
-      </div>
-      <button class="btn ghost sq" type="button" aria-label="Close" title="Close" data-close hidden>✕</button>
+<!-- One view, used by the Agents detail and the Fleet quick view. -->
+<template id="t-view">
+<div class="ov busy">
+  <header class="bar">
+    <a class="back" href="#">‹ Agents</a>
+    <div class="idn"><h2 class="nm">atlas</h2><span class="ad-st run" data-status>Working</span></div>
+    <span class="hz">Hermes · local</span>
+    <div class="sesswrap">
+      <button class="sess" type="button" aria-haspopup="listbox" aria-expanded="false" data-pop="sess" title="Switch session">main</button>
     </div>
-    <p class="vh-now" data-now><b>Now</b>Running the viewer tests for the composer change.</p>
-    <div class="vh-meta">
-      <span>Hermes</span>
-      <span>sonnet-4.5</span>
-      <span><span class="ad-meter" title="61k of 200k context"><i style="width:31%"></i></span>61k</span>
-      <span class="opt">Session <span class="sess">main</span></span>
-      <span class="opt" data-last>Last activity 12s ago</span>
+    <span class="state" data-state aria-live="off">thinking for 0:31</span>
+    <span class="grow"></span>
+    <button class="hb ic more" type="button" aria-label="More actions" title="More actions" aria-expanded="false" data-overflow>···</button>
+    <button class="hb ic close" type="button" aria-label="Close" title="Close" data-close hidden>✕</button>
+    <span class="brk"></span>
+    <div class="tools">
+      <button class="hb" type="button" data-qv-only hidden data-full>Open full view</button>
+      <button class="hb stats" type="button" aria-haspopup="dialog" data-pop="ctx" title="Where the context goes (t)">sonnet-4.5, <b>61k</b> tokens</button>
+      <button class="hb ic" type="button" aria-label="What atlas keeps" title="Memory, skills, cron, and writes waiting on you (b)" data-pop="keeps">
+        <svg class="i" viewBox="0 0 16 16"><path d="M2.5 3.5h4l1.5 1.5h5.5v7.5h-11ZM2.5 7h11"/></svg><span class="lb">Files and memory</span></button>
+      <button class="hb ic" type="button" aria-label="Search" title="Search this session (/)" data-find>
+        <svg class="i" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.6"/><path d="M10.4 10.4 14 14"/></svg><span class="lb">Search</span></button>
+      <button class="hb steps" type="button" aria-pressed="false" title="Show or hide tool steps in every turn (s)" data-steps>Hide steps</button>
     </div>
-  </div>
-</template>
 
-<template id="t-body">
-  <div class="tl" aria-live="polite">
-    <div class="day">Today</div>
-    <div class="ev user"><div class="ev-meta"><span class="who">you</span><span class="ts">10:41 AM</span></div>
-      <div class="md"><p>Can you check why the composer loses focus after sending on a phone?</p></div></div>
-    <details class="steps"><summary>Thought, read 3 files, ran 1 command · 38s</summary>
-      <div class="steps-body">
-        <div class="step think"><span class="k">Thought</span><span class="v">The form resets the textarea height after submit, which re-renders the row; focus likely drops there.</span></div>
-        <div class="step"><span class="k">Read</span><span class="v"><code>viewer/ui.js</code></span><span class="ts">10:41</span></div>
-        <div class="step"><span class="k">Read</span><span class="v"><code>dash.py</code></span><span class="ts">10:41</span></div>
-        <div class="step"><span class="k">Read</span><span class="v"><code>tests/test_viewer.py</code></span><span class="ts">10:42</span></div>
-        <div class="step"><span class="k">Ran</span><span class="v"><code>python3 tests/test_viewer.py</code></span><span class="ts">10:42</span></div>
-      </div>
-    </details>
-    <div class="ev agent"><div class="ev-meta"><span class="who">atlas</span><span class="ts">10:42 AM</span></div>
-      <div class="md"><p>Found it. <code>grow()</code> runs after the submit handler replaces the quick-reply buttons, and on iOS that blurs the textarea. Keeping focus is a two-line change:</p>
-        <ul><li>call <code>input.focus()</code> after a successful send</li><li>skip the quick-reply rebuild when the list did not change</li></ul>
-        <p>Want me to make it?</p></div></div>
-    <div class="ev user"><div class="ev-meta"><span class="who">you</span><span class="ts">10:44 AM</span></div>
-      <div class="md"><p>Yes, and add a test.</p></div></div>
-    <details class="steps"><summary>Edited 1 file, ran 2 commands · 1m 12s</summary>
-      <div class="steps-body">
-        <div class="step"><span class="k">Edited</span><span class="v"><code>viewer/ui.js</code></span><span class="ts">10:44</span></div>
-        <div class="step"><span class="k">Ran</span><span class="v"><code>python3 tests/test_viewer.py</code></span><span class="ts">10:45</span></div>
-        <div class="step"><span class="k">Ran</span><span class="v"><code>sh tools/check.sh</code></span><span class="ts">10:45</span></div>
-      </div>
-    </details>
-    <div class="working" data-working>Working · running <code>sh tools/check.sh</code> · 24s</div>
-  </div>
-</template>
-
-<template id="t-comp">
-  <form class="comp" onsubmit="return false">
-    <div class="comp-row">
-      <textarea rows="1" placeholder="Message atlas" aria-label="Message atlas"></textarea>
-      <div class="split menu-w">
-        <button class="btn pri main" type="submit">Send</button>
-        <button class="btn pri more" type="button" aria-label="More send options" title="More send options" aria-haspopup="menu" aria-expanded="false" data-menu data-busy-only>▾</button>
-        <div class="menu" role="menu" hidden>
-          <button type="button" role="menuitem">Interrupt and send <span>stops the current turn</span></button>
-        </div>
-      </div>
+    <div class="pop left" role="listbox" aria-label="Sessions" data-popbox="sess" hidden>
+      <button class="so on" type="button" role="option" aria-selected="true"><span class="sn">main</span><span class="sm">live now · 214 messages</span></button>
+      <button class="so" type="button" role="option" aria-selected="false"><span class="sn">fix-composer</span><span class="sm">2h ago · 38 messages</span></button>
+      <button class="so" type="button" role="option" aria-selected="false"><span class="sn">nightly-backup</span><span class="sm">yesterday · 12 messages</span></button>
     </div>
-    <p class="comp-hint" data-hint>atlas is working. Send queues your message for its next turn.</p>
+    <div class="pop" role="dialog" aria-label="Context" data-popbox="ctx" hidden>
+      <h3>61k of 200k context</h3>
+      <div class="cbar"><i style="--c:var(--iris);width:14%"></i><i style="--c:var(--amber);width:9%"></i><i style="--c:var(--agent);width:8%"></i></div>
+      <ul class="legend">
+        <li style="--c:var(--iris)">Conversation <span class="n">28k</span></li>
+        <li style="--c:var(--amber)">Tool output <span class="n">18k</span></li>
+        <li style="--c:var(--agent)">System and skills <span class="n">15k</span></li>
+      </ul>
+      <p>sonnet-4.5 · 41k in, 20k out, $0.38</p>
+    </div>
+    <div class="pop" role="dialog" aria-label="What atlas keeps" data-popbox="keeps" hidden>
+      <h3>What atlas keeps</h3>
+      <div class="chips"><button type="button" aria-pressed="true">Memory</button><button type="button" aria-pressed="false">Skills</button>
+        <button type="button" aria-pressed="false">Cron</button><button type="button" aria-pressed="false">Waiting on you</button></div>
+      <div class="ent"><b>viewer conventions</b><br>Composer controls share one height. Phones get 44px targets.</div>
+      <div class="ent"><b>repo layout</b><br>viewer/ui.js mounts the Agents tab. Tests in tests/test_viewer_ui.py.</div>
+    </div>
+  </header>
+
+  <form class="search" role="search" onsubmit="return false" hidden>
+    <input type="search" placeholder="Search everything atlas has said or run in this session" aria-label="Search this session" autocomplete="off">
+    <span class="qn"></span>
+    <button class="hb" type="button">all sessions</button>
+    <button class="hb" type="button" data-find-close aria-label="Close search">Esc</button>
   </form>
-</template>
 
-<template id="t-quick">
-  <div class="qv">
-    <div class="qv-now"><span class="lbl">Doing now</span><p>Running the viewer tests for the composer change.</p>
-      <div class="qv-wait">Waiting on review from kestrel</div></div>
-    <div class="qv-latest"><div class="lbl2">Latest</div></div>
+  <p class="qnow" data-qv-only hidden><b>Now</b>Running the viewer checks for the composer fix. <span class="w">Waiting on review from kestrel.</span></p>
+
+  <div class="log" aria-live="polite">
+    <div class="lw">
+      <div class="earlier"><button class="tgl" type="button">Load earlier</button></div>
+
+      <div class="row day"><div class="gut"></div><div class="bd">Yesterday</div></div>
+
+      <div class="row in"><div class="gut"><span class="who">sam</span><span class="ch">zulip</span>9:12 PM</div>
+        <div class="bd">Is the nightly backup green?</div></div>
+      <div class="row tally" style="--rail:var(--you)" data-turn="y1"><div class="gut"></div><div class="bd">
+        <div class="tape"><i class="tick" style="--d:.2"></i><i class="tick" style="--d:.5"></i></div>
+        <span class="sum">2 tool calls, 4s</span><span class="tsep" aria-hidden="true">·</span><button class="tgl" type="button" data-fold>Show 2 steps</button>
+        <span class="tacts"><button class="tgl tmore" type="button" aria-label="Turn actions" aria-haspopup="menu" aria-expanded="false" data-tmenu>···</button><span class="tlist"><button class="tgl" type="button">link</button><button class="tgl" type="button">copy md</button><button class="tgl" type="button">save .md</button></span></span>
+      </div></div>
+      <div class="row ag f" data-step="y1"><div class="gut"></div><div class="bd">
+        <div class="term"><pre class="cmd"><span class="ps">$ </span>systemctl --user status restic-nightly --no-pager</pre>
+          <div class="out"><pre>Active: inactive (dead) since Tue 03:14
+Main PID: 81822 (code=exited, status=0/SUCCESS)</pre></div>
+          <div class="meta"><span>exit 0</span><span>0.3s</span></div></div>
+        <div class="term"><pre class="cmd"><span class="ps">$ </span>restic snapshots --latest 1 --compact</pre>
+          <div class="out"><pre>ID        Time                 Host   Size
+4e1c09a2  2026-11-24 03:14:07  forest 412.8 GiB</pre></div>
+          <div class="meta"><span>exit 0</span><span>3.6s</span></div></div>
+      </div></div>
+      <div class="row ag"><div class="gut"><span class="who">atlas</span>9:12 PM</div>
+        <div class="bd"><div class="reply md"><p>Green. Last night's run finished at 3:14 AM with exit 0 and the newest snapshot is <code>4e1c09a2</code>, 412.8 GiB.</p></div>
+          <button class="cp" type="button" title="Copy the reply">copy</button></div></div>
+
+      <div class="row day"><div class="gut"></div><div class="bd">Today</div></div>
+
+      <div class="row in"><div class="gut"><span class="who">sam</span><span class="ch">web</span>10:41 AM</div>
+        <div class="bd">Can you check why the composer loses focus after sending on a phone?</div></div>
+      <div class="row tally" style="--rail:var(--you)" data-turn="t1"><div class="gut"></div><div class="bd">
+        <div class="tape"><i class="tick" style="--d:.1"></i><i class="tick" style="--d:.1"></i><i class="tick" style="--d:.2"></i><i class="tick" style="--d:.7"></i><i class="tick fail" style="--d:.4"></i></div>
+        <span class="sum">5 tool calls, 38s, <span class="bad">1 failed</span></span><span class="tsep" aria-hidden="true">·</span><button class="tgl" type="button" data-fold>Show 5 steps</button>
+        <span class="tacts"><button class="tgl tmore" type="button" aria-label="Turn actions" aria-haspopup="menu" aria-expanded="false" data-tmenu>···</button><span class="tlist"><button class="tgl" type="button">link</button><button class="tgl" type="button">copy md</button><button class="tgl" type="button">save .md</button></span></span>
+      </div></div>
+      <div class="row ag f" data-step="t1"><div class="gut"><span class="who">atlas</span>10:41 AM</div><div class="bd">
+        <div class="think">The form resets the textarea height after submit, which re-renders the row. Focus probably drops there. Check where grow() runs.</div>
+        <div class="term"><pre class="cmd"><span class="ps">$ </span>rg -n "grow\(" viewer/ui.js</pre>
+          <div class="out"><pre>296:  function grow() { input.style.height = 'auto'; ... }
+329:    if (await submit(input.value)) { input.value = ''; grow(); }
+331:  input.addEventListener('input', grow);</pre></div>
+          <div class="meta"><span>exit 0</span><span>0.1s</span></div><button class="cp" type="button">copy</button></div>
+        <div class="term"><div class="tool">read_file</div>
+          <dl><dt>path</dt><dd>viewer/ui.js</dd><dt>lines</dt><dd>276-363</dd></dl>
+          <div class="out"><pre>88 lines</pre></div>
+          <div class="meta"><span>0.1s</span></div></div>
+        <div class="term failed"><pre class="cmd"><span class="ps">$ </span>python3 tests/test_viewer_phone.py</pre>
+          <div class="out"><pre>python3: can't open file 'tests/test_viewer_phone.py': [Errno 2] No such file or directory</pre></div>
+          <div class="meta"><span class="bad">exit 2</span><span>0.2s</span></div></div>
+        <div class="term"><pre class="cmd"><span class="ps">$ </span>python3 tests/test_viewer_ui.py</pre>
+          <div class="out"><pre>48 checks passed</pre></div>
+          <div class="meta"><span>exit 0</span><span>27.4s</span></div></div>
+      </div></div>
+      <div class="row ag"><div class="gut"><span class="who">atlas</span>10:42 AM</div>
+        <div class="bd"><div class="reply md">
+          <p>Found it. <code>grow()</code> runs after the submit handler rebuilds the quick-reply buttons, and on iOS that rebuild blurs the text box. Two small changes keep focus:</p>
+          <ol><li>call <code>input.focus()</code> after a successful send</li><li>skip the quick-reply rebuild when the list did not change</li></ol>
+          <div class="tbl"><table><thead><tr><th>Case</th><th>Before</th><th>After</th></tr></thead>
+            <tbody><tr><td>Send on iPhone</td><td>keyboard closes</td><td>keyboard stays</td></tr>
+            <tr><td>Quick reply tap</td><td>keyboard closes</td><td>unchanged, by design</td></tr></tbody></table></div>
+          <pre data-lang="js">  if (await submit(input.value)) {
+    input.value = ''; grow();
+<span class="add">+   input.focus();</span>
+  }</pre>
+          <p>Want me to make it?</p></div>
+          <button class="cp" type="button" title="Copy the reply">copy</button></div></div>
+
+      <div class="row in"><div class="gut"><span class="who">sam</span><span class="ch">web</span>10:44 AM</div>
+        <div class="bd">Yes, and add a test.</div></div>
+      <div class="row tally" style="--rail:var(--you)" data-turn="t2"><div class="gut"></div><div class="bd">
+        <div class="tape"><i class="tick" style="--d:.1"></i><i class="tick" style="--d:.3"></i><i class="tick go" style="--d:.9" data-busy></i><i class="tick" style="--d:.9" data-idle hidden></i></div>
+        <span class="sum" data-busy>3 tool calls, 1m 12s</span><span class="sum" data-idle hidden>3 tool calls, 1m 53s</span>
+        <span class="tsep" aria-hidden="true">·</span><button class="tgl" type="button" data-fold>Hide steps</button>
+        <span class="tacts"><button class="tgl tmore" type="button" aria-label="Turn actions" aria-haspopup="menu" aria-expanded="false" data-tmenu>···</button><span class="tlist"><button class="tgl" type="button">link</button><button class="tgl" type="button">copy md</button><button class="tgl" type="button">save .md</button></span></span>
+      </div></div>
+      <div class="row ag" data-step="t2"><div class="gut"><span class="who">atlas</span>10:44 AM</div><div class="bd">
+        <div class="term"><div class="tool">patch</div><div class="dpath">viewer/ui.js <span>+2 −0</span></div>
+          <pre><span class="hunk">@@ -327,6 +327,7 @@ function composer(opts)</span>
+   form.onsubmit = async (e) =&gt; {
+     e.preventDefault();
+<span class="add">+    if (await submit(input.value)) { input.value = ''; grow(); input.focus(); }</span>
+<span class="del">-    if (await submit(input.value)) { input.value = ''; grow(); }</span></pre>
+          <div class="meta"><span>0.1s</span></div><button class="cp" type="button">copy</button></div>
+        <div class="term"><div class="tool">patch</div><div class="dpath">tests/test_viewer_ui.py <span>+14 −0</span></div>
+          <div class="meta"><span>0.1s</span></div></div>
+        <div class="term"><pre class="cmd"><span class="ps">$ </span>sh tools/check.sh</pre>
+          <div class="out"><pre>coalescer selftest ok
+tests/test_viewer_ui.py: 49 checks passed<span data-idle hidden>
+render-prompts --check: ok
+all suites passed</span></pre></div>
+          <div class="running" data-busy>running for 0:31</div>
+          <div class="meta" data-idle hidden><span>exit 0</span><span>41.2s</span></div></div>
+      </div></div>
+      <div class="row ag" data-idle hidden><div class="gut"><span class="who">atlas</span>10:46 AM</div>
+        <div class="bd"><div class="reply md"><p>Done. The composer keeps focus after a send, and <code>tests/test_viewer_ui.py</code> has a check for it. <code>sh tools/check.sh</code> passes.</p></div>
+          <button class="cp" type="button" title="Copy the reply">copy</button></div></div>
+
+      <div class="row tail" data-busy><div class="gut"></div><div class="bd" data-tail>running sh tools/check.sh for 0:31</div></div>
+    </div>
   </div>
+
+  <form class="compose" onsubmit="return false">
+    <div class="cin">
+      <ul class="queue" aria-label="Queued messages" aria-live="polite" data-busy>
+        <li><span class="qt">Also check the Fleet quick view at 390 px.</span><span class="qs">Queued</span>
+          <button class="hb" type="button" data-unqueue aria-label="Remove from the queue">Remove</button></li>
+      </ul>
+      <div class="slash" role="listbox" aria-label="Commands" hidden>
+        <div class="opt" role="option" aria-selected="true"><span class="n">/retry</span><span class="d">Run the last message again</span></div>
+        <div class="opt" role="option" aria-selected="false"><span class="n">/model</span><span class="d">Switch the model for this session</span></div>
+        <div class="opt" role="option" aria-selected="false"><span class="n">/compact</span><span class="d">Summarise earlier turns to free context</span></div>
+        <div class="opt" role="option" aria-selected="false"><span class="n">/new</span><span class="d">Start a new session</span></div>
+        <div class="opt" role="option" aria-selected="false"><span class="n">/skills</span><span class="d">List the skills atlas can load</span></div>
+      </div>
+      <div class="box">
+        <button class="attach" type="button" aria-label="Attach images" title="Attach images (or paste / drop them)">
+          <svg class="i" viewBox="0 0 16 16"><path d="M10.5 4.5 5.4 9.6a1.4 1.4 0 0 0 2 2l5.3-5.3a2.8 2.8 0 0 0-4-4L3.4 7.6a4.2 4.2 0 0 0 6 6l4.1-4.1"/></svg></button>
+        <textarea class="msg" rows="1" placeholder="Message atlas, or / for commands" aria-label="Message atlas" enterkeyhint="send"></textarea>
+        <div class="acts">
+          <button class="cb stop" type="button" data-busy data-stop title="Stop atlas's current turn (Esc Esc)">Stop</button>
+          <button class="cb force" type="button" data-busy data-stop title="Interrupt atlas's current turn now, whichever way it can be reached (Ctrl+Esc Esc)">Interrupt</button>
+          <button class="cb send" type="submit" data-send title="atlas is busy: this waits in the queue and goes when it's free (Enter)">Queue</button>
+        </div>
+      </div>
+      <p class="cnotes" data-busy>atlas is busy. Queue waits for this turn to end; Stop or Interrupt ends it now.</p>
+      <p class="cnotes" data-idle hidden>Enter sends. Shift+Enter for a new line.</p>
+    </div>
+  </form>
+</div>
 </template>
 
 <script>
-// Mockup behavior only: theme cycle, menus, state toggle, quick view. Nothing talks to the broker.
+// Mockup behavior only. Nothing talks to the broker.
 const root = document.documentElement, themes = ['auto', 'light', 'dark'], glyph = {auto: '◐', light: '☀', dark: '☾'};
 let theme = 'auto';
 document.getElementById('theme').onclick = (e) => {
@@ -415,76 +671,149 @@ document.getElementById('theme').onclick = (e) => {
   e.currentTarget.title = e.currentTarget.ariaLabel = 'Theme: ' + theme;
 };
 
-const clone = (id) => document.getElementById(id).content.cloneNode(true);
+const tpl = document.getElementById('t-view');
 function build(slot, quick) {
-  const s = document.getElementById(slot);
-  s.style.display = 'contents';
-  s.append(clone('t-head'));
+  const v = tpl.content.firstElementChild.cloneNode(true);
   if (quick) {
-    const qv = clone('t-quick'), body = clone('t-body'), tl = body.querySelector('.tl');
-    // The quick view shows the last few lines only.
-    [...tl.children].slice(0, 4).forEach((n) => n.remove());
-    qv.querySelector('.qv-latest').append(tl);
-    s.append(qv);
-    s.querySelector('[data-close]').hidden = false;
-    s.querySelector('[data-full]').hidden = false;
-    s.querySelector('[data-now]').remove();
-    s.querySelector('.back').remove();
-  } else s.append(clone('t-body'));
-  s.append(clone('t-comp'));
+    // The quick view is the same view: the newest turns, the broker's "Now" line, Close, and Open full view.
+    v.querySelectorAll('[data-qv-only]').forEach((n) => { n.hidden = false; });
+    v.querySelector('[data-close]').hidden = false;
+    v.querySelector('.back').remove();
+    const lw = v.querySelector('.lw'), keep = lw.querySelector('[data-turn="t2"]').previousElementSibling;
+    while (lw.firstElementChild !== keep) lw.firstElementChild.remove();
+    lw.prepend(Object.assign(document.createElement('div'), {className: 'earlier',
+      innerHTML: '<button class="tgl" type="button">Load earlier</button>'}));
+  }
+  document.getElementById(slot).append(v);
 }
 build('view-slot', false);
-build('quick-slot', true);
+build('quick', true);
+
+const all = (sel) => document.querySelectorAll(sel);
+function closePops() {
+  all('[data-popbox]').forEach((p) => { p.hidden = true; });
+  all('[data-pop],[data-overflow]').forEach((b) => b.setAttribute('aria-expanded', 'false'));
+  all('.bar.open').forEach((b) => b.classList.remove('open'));
+  all('.tacts.open').forEach((t) => { t.classList.remove('open'); t.querySelector('[data-tmenu]').setAttribute('aria-expanded', 'false'); });
+}
+function foldTurn(ov, id, fold) {
+  const steps = ov.querySelectorAll('[data-step="' + id + '"]');
+  steps.forEach((r) => r.classList.toggle('f', fold));
+  const n = ov.querySelectorAll('[data-step="' + id + '"] .term, [data-step="' + id + '"] .think').length;
+  const b = ov.querySelector('[data-turn="' + id + '"] [data-fold]');
+  if (b) b.textContent = fold ? 'Show ' + n + (n > 1 ? ' steps' : ' step') : 'Hide steps';
+}
 
 document.addEventListener('click', (e) => {
-  const opener = e.target.closest('[data-menu]');
-  document.querySelectorAll('.menu').forEach((m) => {
-    if (!opener || m !== opener.parentNode.querySelector('.menu')) {
-      m.hidden = true; const b = m.parentNode.querySelector('[data-menu]'); if (b) b.setAttribute('aria-expanded', 'false');
-    }
-  });
-  if (opener) {
-    const m = opener.parentNode.querySelector('.menu');
-    m.hidden = !m.hidden; opener.setAttribute('aria-expanded', String(!m.hidden));
+  const ov = e.target.closest('.ov');
+  const pop = e.target.closest('[data-pop]'), over = e.target.closest('[data-overflow]');
+  if (pop) {
+    const box = pop.closest('.bar').querySelector('[data-popbox="' + pop.dataset.pop + '"]'), show = box.hidden;
+    closePops(); box.hidden = !show; pop.setAttribute('aria-expanded', String(show)); return;
   }
-  const t = e.target.closest('[data-toggle-steps]');
-  if (t) {
-    const box = t.closest('.adir-detail, .detail-sheet'), all = box.querySelectorAll('details.steps');
-    const open = ![...all].every((d) => d.open);
-    all.forEach((d) => { d.open = open; });
-    t.textContent = open ? 'Hide steps' : 'Show all steps';
-    t.closest('.menu').hidden = true;
+  if (over) {
+    const bar = over.closest('.bar'), open = !bar.classList.contains('open');
+    closePops(); bar.classList.toggle('open', open); over.setAttribute('aria-expanded', String(open)); return;
   }
+  const tmenu = e.target.closest('[data-tmenu]');
+  if (tmenu) {
+    const t = tmenu.closest('.tacts'), open = !t.classList.contains('open');
+    closePops(); t.classList.toggle('open', open); tmenu.setAttribute('aria-expanded', String(open)); return;
+  }
+  if (!e.target.closest('[data-popbox]')) closePops();
+  if (!ov) return;
+  const so = e.target.closest('.so');
+  if (so) { ov.querySelector('.sess').textContent = so.querySelector('.sn').textContent; closePops(); }
+  const fold = e.target.closest('[data-fold]');
+  if (fold) { const id = fold.closest('[data-turn]').dataset.turn; foldTurn(ov, id, !ov.querySelector('[data-step="' + id + '"]').classList.contains('f')); }
+  const steps = e.target.closest('[data-steps]');
+  if (steps) {
+    const hide = steps.getAttribute('aria-pressed') !== 'true';
+    steps.setAttribute('aria-pressed', String(hide)); steps.textContent = hide ? 'Show steps' : 'Hide steps';
+    ov.querySelectorAll('[data-turn]').forEach((t) => foldTurn(ov, t.dataset.turn, hide));
+  }
+  if (e.target.closest('[data-find]')) { const s = ov.querySelector('.search'); s.hidden = false; s.querySelector('input').focus(); closePops(); }
+  if (e.target.closest('[data-find-close]')) closeSearch(ov);
   if (e.target.closest('[data-stop]')) setState('idle');
+  if (e.target.closest('[data-unqueue]')) e.target.closest('li').remove();
   if (e.target.closest('[data-close]')) document.getElementById('quick').close();
-});
-// The text box starts one control tall (CSS --ctl) and grows with its content up to its max-height.
-document.addEventListener('input', (e) => {
-  const ta = e.target.closest('.comp textarea');
-  if (!ta) return;
-  ta.style.height = '';
-  if (ta.scrollHeight > ta.clientHeight) ta.style.height = (ta.scrollHeight + ta.offsetHeight - ta.clientHeight) + 'px';
-});
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') document.querySelectorAll('.menu').forEach((m) => { m.hidden = true; });
+  const opt = e.target.closest('.opt');
+  if (opt) { const ta = ov.querySelector('.msg'); ta.value = opt.querySelector('.n').textContent + ' '; ta.focus(); ov.querySelector('.slash').hidden = true; }
+  if (e.target.closest('.cp')) { const b = e.target.closest('.cp'); b.textContent = 'copied'; setTimeout(() => { b.textContent = 'copy'; }, 1200); }
+  if (e.target.closest('[data-send]')) send(ov);
 });
 
+function closeSearch(ov) {
+  const s = ov.querySelector('.search'); s.hidden = true; s.querySelector('input').value = '';
+  ov.querySelectorAll('.row.hit').forEach((r) => r.classList.remove('hit')); s.querySelector('.qn').textContent = '';
+}
+function send(ov) {
+  const ta = ov.querySelector('.msg'), text = ta.value.trim();
+  if (!text) return;
+  if (ov.classList.contains('busy')) {
+    const li = document.createElement('li');
+    li.innerHTML = '<span class="qt"></span><span class="qs">Queued</span><button class="hb" type="button" data-unqueue aria-label="Remove from the queue">Remove</button>';
+    li.firstChild.textContent = text; ov.querySelector('.queue').append(li);
+  } else {
+    const row = document.createElement('div'); row.className = 'row in';
+    row.innerHTML = '<div class="gut"><span class="who">sam</span><span class="ch">web</span>10:47 AM</div><div class="bd"></div>';
+    row.lastChild.textContent = text; ov.querySelector('.lw').append(row);
+    ov.querySelector('.log').scrollTop = 1e9;
+  }
+  ta.value = ''; grow(ta); ov.querySelector('.slash').hidden = true; ta.focus();
+}
+function grow(ta) {
+  ta.style.height = '';
+  if (ta.scrollHeight > ta.clientHeight) ta.style.height = (ta.scrollHeight + ta.offsetHeight - ta.clientHeight) + 'px';
+}
+document.addEventListener('input', (e) => {
+  const ov = e.target.closest('.ov');
+  if (e.target.matches('.msg')) { grow(e.target); ov.querySelector('.slash').hidden = !e.target.value.startsWith('/') || e.target.value.includes(' '); }
+  if (e.target.matches('.search input')) {
+    const q = e.target.value.trim().toLowerCase(); let n = 0;
+    ov.querySelectorAll('.lw > .row.in, .lw > .row.ag').forEach((r) => {
+      const hit = !!q && r.textContent.toLowerCase().includes(q); r.classList.toggle('hit', hit); n += hit;
+    });
+    ov.querySelector('.qn').textContent = q ? n + (n === 1 ? ' match' : ' matches') : '';
+  }
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') { closePops(); all('.ov').forEach((ov) => { if (!ov.querySelector('.search').hidden) closeSearch(ov); }); }
+  if (e.key === 'Enter' && !e.shiftKey && e.target.matches('.msg') && !matchMedia('(pointer:coarse)').matches) { e.preventDefault(); send(e.target.closest('.ov')); }
+});
+
+// Busy and idle, as the live state would drive them.
+let secs = 31, timer = null;
+const mmss = (s) => Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+function paintClock() {
+  all('[data-state]').forEach((n) => { n.textContent = 'thinking for ' + mmss(secs); });
+  all('[data-tail]').forEach((n) => { n.textContent = 'running sh tools/check.sh for ' + mmss(secs); });
+  all('.running').forEach((n) => { n.textContent = 'running for ' + mmss(secs); });
+}
 function setState(v) {
   const busy = v === 'busy';
-  document.querySelectorAll('#m-state button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.v === v)));
-  document.querySelectorAll('[data-status]').forEach((c) => { c.className = 'ad-st ' + (busy ? 'run' : 'idle'); c.textContent = busy ? 'Working' : 'Idle'; });
-  document.querySelectorAll('[data-working]').forEach((w) => { w.hidden = !busy; });
-  document.querySelectorAll('[data-now]').forEach((n) => { n.hidden = !busy; });
-  document.querySelectorAll('[data-stop]').forEach((n) => { n.disabled = !busy; n.hidden = !busy; });
-  document.querySelectorAll('[data-hint]').forEach((h) => { h.hidden = !busy; });
-  // Idle: Send is the only option. Working: the split arrow offers Interrupt and send.
-  document.querySelectorAll('[data-busy-only]').forEach((b) => { b.hidden = !busy; });
-  document.querySelectorAll('.split').forEach((s) => { s.classList.toggle('solo', !busy); });
+  all('#m-state button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.v === v)));
+  all('.ov').forEach((ov) => ov.classList.toggle('busy', busy));
+  all('[data-busy]').forEach((n) => { n.hidden = !busy; });
+  all('[data-idle]').forEach((n) => { n.hidden = busy; });
+  all('[data-status]').forEach((c) => { c.className = 'ad-st ' + (busy ? 'run' : 'idle'); c.textContent = busy ? 'Working' : 'Idle'; });
+  all('[data-send]').forEach((b) => {
+    b.textContent = busy ? 'Queue' : 'Send';
+    b.title = busy ? "atlas is busy: this waits in the queue and goes when it's free (Enter)" : 'Send (Enter). Shift+Enter for a new line';
+  });
   document.getElementById('list-meta').textContent = (busy ? 'Working' : 'Idle') + ' · Hermes · 12s ago';
+  clearInterval(timer);
+  if (busy) { secs = 31; paintClock(); timer = setInterval(() => { secs++; paintClock(); }, 1000); }
+  else all('[data-state]').forEach((n) => { n.textContent = 'idle, last step 10:46'; });
 }
 document.getElementById('m-state').onclick = (e) => { const b = e.target.closest('button'); if (b) setState(b.dataset.v); };
-document.getElementById('m-quick').onclick = () => document.getElementById('quick').showModal();
-document.getElementById('nav-fleet').onclick = (e) => { e.preventDefault(); document.getElementById('quick').showModal(); };
+const openQuick = (e) => { if (e) e.preventDefault(); document.getElementById('quick').showModal(); };
+document.getElementById('m-quick').onclick = () => openQuick();
+document.getElementById('nav-fleet').onclick = openQuick;
+// Phones get a placeholder short enough for one line beside Send; the slash hint stays in the full one.
+const phone = matchMedia('(max-width:720px)');
+const placeholders = () => all('.msg').forEach((t) => { t.placeholder = phone.matches ? 'Message atlas' : 'Message atlas, or / for commands'; });
+phone.addEventListener('change', placeholders); placeholders();
 setState('busy');
 </script>
 </body>

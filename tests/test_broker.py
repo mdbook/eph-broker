@@ -7705,6 +7705,28 @@ def test_mr_review_capability_grant_is_read_posture():
        "Edit/Write/Bash/git/network); byte-identical to read")
 
 
+def test_mr_review_grant_reads_worktree_images_deny_floor_holds():
+    """A UI review must open the committed screenshots. The CC mr-review grant allows bare Read
+    (which shows images), and no Read() deny on its floor matches a PNG/JPG/WebP in the checkout, while the
+    same floor still matches env/secret files. Matched with the gate's own CC-glob translation."""
+    from adapters.hermes_gate.gate import glob_to_regex
+    g = capability_tool_grant("mr-review")
+    allowed = g[g.index("--allowedTools") + 1].split()
+    disallowed = g[g.index("--disallowedTools") + 1].split()
+    assert "Read" in allowed, allowed
+    read_denies = [glob_to_regex(t[len("Read("):-1]) for t in disallowed if t.startswith("Read(")]
+    assert read_denies, disallowed
+    wt = "/srv/review/worktree-9325"
+    for img in ("docs/screenshots/shots-9325/mockup-desktop.png",
+                "docs/screenshots/shots-9325/build-mobile.png", "shots/build.jpg", "shots/build.webp"):
+        path = wt + "/" + img
+        assert not any(rx.match(path) for rx in read_denies), path
+    for secret in (".db-env", "config/site.env", ".pii-store/x", ".git-credentials"):
+        path = wt + "/" + secret
+        assert any(rx.match(path) for rx in read_denies), path
+    ok("MR-reviewer: CC grant reads worktree images (png/jpg/webp); the secret/env Read floor still holds")
+
+
 def test_mr_review_capability_fails_closed_near_miss():
     """FAIL-CLOSED: a typo'd/near-miss capability ('mr-revieww', 'MR-REVIEW', 'review', ...) yields the
     READ grant, NEVER a write/permission-mode grant. Reaches build_argv read-posture through the builder."""
@@ -9217,6 +9239,7 @@ def test_mr_review_manifest_renders_and_matches_committed_prompt():
         "role/ephemeral-oneshot",       # REUSED
         "capabilities/file-access",     # REUSED: harness-specific file tools
         "scopes/mr-review",             # NEW: read-only adversarial scope
+        "scopes/mr-review-ui",          # UI MRs: view the screenshots, BLOCK on mismatch
         "constraints/mr-review",        # NEW: review-only / no-merge hard bounds
         "outputs/mr-review",            # NEW: {status:pass|block, summary, wake} envelope
     ], mf["sections"]
@@ -25934,6 +25957,49 @@ def test_code_prompt_approval_matches_edited_tree_first_contract():
     assert "after pass/fail counts" in text and "Only when there were failures" in text
     assert "baseline-diff" not in text and "Run and save the baseline" not in text
     ok("code prompt is approved and follows edited-tree-first verification")
+
+
+def test_ui_mockup_sections_in_code_and_review_prompts():
+    """UI work is built from the mockup and checked by eye: the code worker ports the mockup,
+    renders mockup + build, opens the PNGs and stops without a mockup; both review tiers open the screenshots,
+    BLOCK on a structural mismatch or missing images, and a UI PASS must list the images it viewed. The
+    sections are generic modules (no site override), so site and public renders both carry them, and the
+    approved behavior ships signed."""
+    rp = _load_render_module()
+    approved = json.load(open(os.path.join(ROOT, "approved-prompts.json")))
+    worker_rules = ("No mockup, no build.", "`needs_operator: true`", "Port, do not paraphrase.",
+                    "Render the mockup AND your build", "1440x900 (desktop) and 390x844 (mobile)",
+                    "Open every PNG with your file-read tool", "Commit the screenshots",
+                    "`mockup-<width>x<height>.png` and `build-<width>x<height>.png`",
+                    "never claim you viewed an image you did not open",
+                    # explained minor deviations may stay (ticket 3325 FR1)
+                    "A **minor deviation** may stay when it has a valid reason",
+                    "tap-target size, spacing forced by real data, a platform constraint, accessibility",
+                    "with its reason. An unlisted deviation reads as a mismatch.")
+    review_rules = ("Open every image.", "PNG/JPG/WebP", "a structural mismatch between mockup and build",
+                    "screenshots are missing", "the change has no mockup to compare against",
+                    "you could not open an image", "A PASS on a UI MR must say you viewed the images",
+                    # an explained minor deviation is a nit; only unexplained or structural blocks
+                    "**Explained minor deviations are not blockers.**",
+                    "that the MR description names with a valid reason; list it as a nit.",
+                    "an unexplained deviation", "Never block on a pixel nit.")
+    for key, module, rules in (("code/change-proposer", "scopes/ui-mockup", worker_rules),
+                               ("mr-review/agent", "scopes/mr-review-ui", review_rules),
+                               ("mr-review/quick", "scopes/mr-review-ui", review_rules)):
+        mf = pathlib.Path(ROOT, "workers", key + ".json")
+        assert module in json.loads(mf.read_text(encoding="utf-8"))["sections"], key
+        assert not pathlib.Path(ROOT, "modules", "site", module + ".md").exists(), module
+        out, rendered = rp.render(mf)
+        assert out.read_text(encoding="utf-8") == rendered, key
+        body = pathlib.Path(ROOT, "modules", module + ".md").read_text(encoding="utf-8").rstrip("\n")
+        assert rendered.count(body) == 1, key
+        for rule in rules:
+            assert rule in rendered, (key, rule)
+        assert chr(0x2014) not in body, module   # no em dashes (docs voice)
+        digest = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+        assert approved.get(key) == digest, (key, digest)
+    ok("code worker ports + renders + views the mockup (stops without one); both review tiers view the "
+       "screenshots and BLOCK on mismatch or missing images; prompts signed")
 
 
 def test_test_environment_gap_reaches_worker_and_does_not_prevent_mr():

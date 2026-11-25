@@ -651,6 +651,26 @@ def test_nonsecret_preserves_other_denies_and_read_only():
     ok("nonsecret: unrelated explicit denies and read-only capabilities remain authoritative")
 
 
+def test_mr_review_reads_worktree_screenshots_secret_floor_holds():
+    """A UI review opens the committed mockup/build screenshots: read_file on an image in the
+    checkout is allowed for mr-review, while env/secret files and paths outside the checkout stay denied."""
+    f = fx()
+    shots = os.path.join(f.wt, "docs", "screenshots", "shots-9325")
+    os.makedirs(shots, exist_ok=True)
+    names = ("mockup-desktop.png", "build-mobile.png", "build.jpg", "build.webp")
+    for n in names:
+        open(os.path.join(shots, n), "wb").write(b"\x89PNG\r\n\x1a\n")
+    for n in names:
+        assert G.decide("read_file", {"path": "docs/screenshots/shots-9325/" + n}, f.mr).allowed, n
+        assert G.decide("read_file", {"path": os.path.join(shots, n)}, f.mr).allowed, n
+    assert G.decide("search_files", {"pattern": "*.png", "target": "files", "path": "docs/screenshots"}, f.mr).allowed
+    for denied in ("sec/.db-env", "../../x.env", "lnk_secret", os.path.join(f.d, "outside/secret.txt")):
+        assert not G.decide("read_file", {"path": denied}, f.mr).allowed, denied
+    assert not G.decide("write_file", {"path": "docs/screenshots/shots-9325/build.png", "content": "x"},
+                        f.mr).allowed
+    ok("mr-review reads worktree screenshots (png/jpg/webp); secret floor, confinement and read-only still hold")
+
+
 def test_nonsecret_unavailable_catalog_keeps_floor():
     import repo_catalog
     with _nonsecret_workspace() as (f, wt):

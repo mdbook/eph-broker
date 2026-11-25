@@ -36,6 +36,8 @@ modules/
   scopes/code-change.md              what the job is
   scopes/general.md
   scopes/mr-review.md
+  scopes/ui-mockup.md                UI tickets: port the mockup, render and view it (code worker)
+  scopes/mr-review-ui.md             UI MRs: view the screenshots, BLOCK on mismatch (both review tiers)
   capabilities/code-change.md        what tools it has and how to use them
   capabilities/general.md
   constraints/code-change.md         hard rules it must not break
@@ -50,9 +52,9 @@ The three manifests combine them as follows.
 
 | Class | Sections, in order |
 |---|---|
-| `code/change-proposer` | `role/ephemeral-oneshot`, `scopes/code-change`, `capabilities/code-change`, `constraints/code-change`, `outputs/tickets/code` |
+| `code/change-proposer` | `role/ephemeral-oneshot`, `scopes/code-change`, `scopes/ui-mockup`, `capabilities/code-change`, `constraints/code-change`, `outputs/tickets/code` |
 | `general/agent` | `role/ephemeral-oneshot`, `scopes/general`, `capabilities/general`, `constraints/general`, `outputs/tickets/general` |
-| `mr-review/agent` | `role/ephemeral-oneshot`, `scopes/mr-review`, `constraints/mr-review`, `outputs/mr-review` |
+| `mr-review/agent` | `role/ephemeral-oneshot`, `scopes/mr-review`, `scopes/mr-review-ui`, `constraints/mr-review`, `outputs/mr-review` |
 
 The role module is shared. Its one slot, `{{worker_kind}}`, is filled differently by each manifest.
 
@@ -160,6 +162,39 @@ then escalation on a second BLOCK.
 These behavior changes require operator approval before re-signing `mr-review/agent` and
 `mr-review/quick` in `approved-prompts.json`. Do not activate the changed
 prompts without that approval.
+
+## UI changes: mockup in, screenshots out
+
+A UI change is anything a person sees: an HTML/CSS/JS view, a template, a page, a component, or markup and
+styles held in code. The code worker (`scopes/ui-mockup`) and both review tiers (`scopes/mr-review-ui`) treat
+it the same way, whatever the ticket says:
+
+- The mockup is the design. The worker finds the mockup the ticket names (or the one in the repo for that
+  screen) and ports its markup and CSS rather than re-interpreting it.
+- No mockup, no build. A UI ticket without a mockup ends `blocked` with `needs_operator`, no commit and no MR;
+  the ticket comment asks for one.
+- The worker renders the mockup and its build in a browser at the ticket's viewports (1440x900 and 390x844 when
+  the ticket names none), opens every PNG, fixes structural differences, and commits the pairs as
+  `mockup-<width>x<height>.png` and `build-<width>x<height>.png` in the ticket's screenshot directory (else
+  the repo's, else `docs/screenshots/ticket-<id>/`). The MR description lists them.
+- The reviewer opens every image and compares each pair. It blocks on a structural mismatch (layout pattern,
+  alignment, element order, a missing header, navigation or composer), on missing screenshots or mockup, and
+  when it cannot open an image. A UI `pass` must list the images it viewed.
+- Minor deviations are allowed when explained. A deviation with a valid reason (contrast, tap-target size,
+  spacing forced by real data, a platform constraint, accessibility) may stay if the MR description names it
+  and its reason; the reviewer lists it as a nit. Only a structural or unexplained mismatch blocks, never a
+  pixel nit.
+
+Rendering needs a browser: the `code/ui` row's Playwright MCP (label the ticket `eph:code-ui` and set
+`CODE_BROWSER_MCP_CONFIG`, see [configuration.md](configuration.md#the-code-workers-browser)) or a
+screenshot script the repo's test runner already runs. Without one the
+worker commits the code, says which screenshots are missing, and the reviewer blocks the MR.
+
+Viewing needs a harness that shows images to the model. On Claude Code the reviewer's `Read` grant opens
+PNG, JPG and WebP files in the checkout; the secret and env-file deny floor is unchanged. The hermes gate
+allows `read_file` on them too. Codex keeps `view_image` switched off (it would bypass the gate), and a
+backend model without vision cannot see an image either, so on those a UI MR is blocked rather than passed
+unseen.
 
 ## Signing
 

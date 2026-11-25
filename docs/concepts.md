@@ -149,6 +149,11 @@ Opening an MR starts the reviewer. It runs in a checkout of the MR branch with r
 diff in its first message. Its `pass` or `block` verdict is posted as an MR note. The reviewer can't merge
 anything, and it isn't the agent that wrote the change.
 
+UI changes carry their own evidence. The code worker builds from the ticket's mockup (and stops to ask when
+there is none), renders the mockup and its build, looks at the screenshots and commits them. The reviewer
+opens those images and blocks on a structural mismatch or missing screenshots. See
+[prompts.md](prompts.md#ui-changes-mockup-in-screenshots-out).
+
 To pick the reviewer's model, see [configuration.md](configuration.md#choosing-the-reviewers-model).
 
 Merging is up to you. The optional CD module can merge a reviewed MR in an allowlisted repo after more checks;

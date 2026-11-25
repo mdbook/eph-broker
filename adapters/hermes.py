@@ -37,12 +37,12 @@ a `pre_tool_call` hook that applies the SAME allow/deny rules a CC worker of tha
 per turn from cc.capability_tool_grant() + cc._SECRET_FILE_GLOBS (never copied), so a tightening in cc.py reaches
 hermes unchanged, plus hard denies of its own (worktree confinement, git file-reading options, secret floor,
 .git/ writes). Mapping + command-parsing ceiling: see gate.py.
-    mr-review  -> `-t file` under eph-gate, READ-ONLY (live 2026-09-28: a tool-less `-t todo` reviewer could not
+    mr-review  -> `-t file,terminal` under eph-gate, READ-ONLY (a tool-less `-t todo` reviewer could not
                   read the checkout and blocked every MR). Policy = cc's mr-review grant (Read/Grep/Glob; Edit/
                   Write/Bash denied; no acceptEdits) + the secret floor, read_root = the MR source-branch checkout.
-                  read_file / search_files only; write_file / patch / terminal are HARD-denied by the gate for this
+                  read_file / search_files plus configured parsed Git history; writers are HARD-denied for this
                   capability whatever the imported rules say (gate.READ_ONLY_CAPABILITIES, fail-closed). The
-                  terminal toolset is never granted. Same sweep / probe / sentinel / env pops as every gated turn.
+                  terminal toolset only permits that history grammar. Same sweep / probe / sentinel / env pops.
     write      -> `-t file,terminal` under eph-gate: reads/searches confined to the repo, edits confined to the
                   worker cwd (CC's acceptEdits cwd), terminal = the CC write allow-list (git add/commit/status/
                   diff/log) minus the deny-floor.
@@ -158,7 +158,7 @@ HERMES_SPILL_CHARS = 20000
 # eph-gate plugin. Every honoured capability is gated now (mr-review too: `file` = read_file + write_file + patch
 # + search_files, so the READ-only posture is the gate's; the writers are hard-denied for mr-review). A
 # tool-less row (never an empty -t, which enables ALL toolsets) would name `todo`.
-HERMES_GRANTS = {"mr-review": ("file",), "write": ("file", "terminal"), "code": ("file", "terminal"),
+HERMES_GRANTS = {"mr-review": ("file", "terminal"), "write": ("file", "terminal"), "code": ("file", "terminal"),
                  "general": ("file", "terminal")}
 GATED_CAPABILITIES = frozenset({"mr-review", "write", "code", "general"})
 # general = file + terminal under eph-gate + an exec-gate judge (gate.judge). NO web: the broker
@@ -445,7 +445,7 @@ def gate_policy(capability, cwd, test_runner=None, test_repo=None, nonce=None, b
         # CC's string patterns cannot confine no-index operands or validate sed programs. Only the
         # parsed eph-gate path (shared by hermes and codex) can safely grant these read-only forms.
         pol["allow"] += ["Bash(git diff --check)", "Bash(git diff --no-index:*)", "Bash(sed:*)"]
-        # Extend inspection with existing regular files only (enforced by the parsed gate). Do not restore
+        # Legacy inspection forms, with parsed path floors. Do not restore
         # broad `git diff:*`: two operands can implicitly enable no-index outside the repo.
         diff_forms = ("git diff", "git diff --cached", "git diff --stat", "git diff --cached --stat",
                       "git diff HEAD", "git diff --check")
@@ -456,6 +456,8 @@ def gate_policy(capability, cwd, test_runner=None, test_repo=None, nonce=None, b
         # Separate from arbitrary Bash grants: an env prefix may only wrap this turn's reviewed runner.
         pol["test_allow"] = _cc._code_test_bash(test_runner, test_repo)
     try:
+        pol["git_history_forms"] = _gate.git_history_forms(json.loads(os.getenv(
+            "EPH_GATE_GIT_HISTORY_FORMS", json.dumps(_gate.GIT_HISTORY_FORMS))))
         pol["nonsecret_globs"] = _nonsecret_paths(read_root)
         if capability == "code":
             extra = [n.strip() for n in os.getenv("EPH_GATE_TEST_ENV_ALLOW", "").split(",") if n.strip()]
@@ -845,8 +847,8 @@ class HermesHarness:
             raise HermesRefused(f"hermes adapter: binary {HERMES_BIN!r} not found - refusing")
         capability = getattr(route, "capability", "read")
         toolsets = hermes_toolsets(capability)                                    # refuse BEFORE any launch
-        if capability in _gate.READ_ONLY_CAPABILITIES and set(toolsets) - {"file"}:
-            raise HermesRefused(f"hermes adapter: read-only {capability} may only get the file toolset "
+        if capability in _gate.READ_ONLY_CAPABILITIES and set(toolsets) - {"file", "terminal"}:
+            raise HermesRefused(f"hermes adapter: read-only {capability} may only get the file toolset and gated history terminal "
                                 f"(got {toolsets!r}) - refusing (fail-closed)")
         backend = getattr(route, "backend", "") if backend_override is _NO_OVERRIDE else backend_override
         provider, model, token, overrides = hermes_provider(backend)
@@ -871,6 +873,7 @@ class HermesHarness:
         # Build the shared env before the terminal init file: login snapshots must use this PATH too.
         env = _cc.worker_env(os.environ, route, backend_env={KEY_ENV: token}, worker=worker)
         env.update(_cc.repo_companions.environment(worker))
+        env.update(_gate.git_history_env())
         test_runner = getattr(worker, "test_runner", None) or getattr(route, "test_runner", "") or None
         _cc.test_environment.apply_tmpdir(env, worker, capability, test_runner)
         init_files = []
@@ -884,6 +887,7 @@ class HermesHarness:
                 shell_init += f'export {name}={shlex.quote(value)}\n'
             shell_init += "".join(f"export {k}={shlex.quote(v)}\n"
                                   for k, v in _cc.repo_companions.environment(worker).items())
+            shell_init += "".join(f"export {k}={shlex.quote(v)}\n" for k, v in _gate.git_history_env().items())
             if test_runner == "venv" and os.path.isdir(_wt_src):
                 # N-N3: on the terminal shell only (its login snapshot), NOT the hermes process env
                 shell_init += f'export PYTHONPATH={shlex.quote(_wt_src)}"${{PYTHONPATH:+:$PYTHONPATH}}"\n'

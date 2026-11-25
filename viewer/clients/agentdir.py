@@ -86,7 +86,13 @@ class Client:
 
     def _call(self, action, data=None, recover=True):
         data = dict(data or {})
+        if action == 'beat' and data.get('status') in ('busy', 'idle'):
+            # Saved with the signing timestamp before I/O, so hooks and tail processes share
+            # the latest explicit intent even after a lost reply or directory restart.
+            self.state['status'] = data['status']
         if action == 'register':
+            if self.state.get('status') in ('busy', 'idle'):
+                data['status'] = self.state['status']
             # Only this beat consumer with a local inbox can promise pull delivery.
             data['caps'] = [cap for cap in data.get('caps', []) if cap != 'steer-pull']
             if self.state.get('steer_dir'):
@@ -97,7 +103,8 @@ class Client:
             inbox.sync(self.state['steer_dir'], messages)
             self.save()
             data['steer_queued'] = [mid for mid, m in messages.items() if m['state'] == 'queued']
-            delivered = data['steer_delivered'] = [mid for mid, m in messages.items() if m['state'] == 'delivered']
+            delivered = [mid for mid, m in messages.items() if m['state'] == 'delivered']
+            data['steer_delivered'] = list(dict.fromkeys(data.get('steer_delivered', []) + delivered))
         path = '/v1/' + action
         body = json.dumps(data or {}, separators=(',', ':')).encode()
         headers = {'Content-Type': 'application/json'}
@@ -182,6 +189,8 @@ def main(argv=None):
     lifetime.add_argument('--while-tmux')
     status = commands.add_parser('status')
     status.add_argument('status', choices=('busy', 'idle'))
+    ack = commands.add_parser('ack-wake', help='acknowledge a dashboard wake after the agent consumes it')
+    ack.add_argument('id')
     tail = commands.add_parser('tail', help='follow and push a Claude Code or Codex transcript')
     tail.add_argument('--transcript', required=True)
     tail.add_argument('--lines', type=int, default=2000, help='local replay ring (1..10000)')
@@ -212,6 +221,8 @@ def main(argv=None):
                 client.state['steer_dir'] = os.path.abspath(args.steer_dir)
                 client.save()
             client.call('register', data)
+        elif args.command == 'ack-wake':
+            client.call('beat', {'steer_delivered': [args.id]})
         elif args.command == 'beat':
             interval = args.every if args.every is not None else client.state.get('ttl', 60) / 3
             if not 0 < interval <= client.state.get('ttl', 60) / 3:

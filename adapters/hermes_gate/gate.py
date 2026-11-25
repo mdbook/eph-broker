@@ -23,9 +23,8 @@ TOOL MAPPING (anything else -> DENY, incl. the tool_search bridge):
     terminal               -> Bash(...)       every segment of the command must match an allow rule and no deny
                                               rule; foreground only; workdir confined; argument checks below
     tool_call/tool_search/tool_describe -> DENY always (bridge off in config; the underlying name is reported)
-READ-ONLY CAPABILITIES (READ_ONLY_CAPABILITIES, mr-review): write_file / patch / terminal are HARD-denied before
-any rule is consulted, whatever the imported lists say (the CC mr-review grant has no acceptEdits and no Bash, so
-the rule layer denies them too; this is the fail-closed belt under it). Only read_file / search_files remain.
+READ-ONLY CAPABILITIES (READ_ONLY_CAPABILITIES, mr-review): writers are HARD-denied. Terminal permits only
+configured, parsed read-only Git history forms, never arbitrary Bash, even with a widened imported grant.
 
 COMMAND-PARSING CEILING (terminal). `split_command` is a small POSIX-shell lexer, not bash. It understands
 words, '…' and "…" quoting, backslash escapes, line continuations, and the list/pipe operators ; && || | and
@@ -41,7 +40,7 @@ inside read_root and off the secret floor. The exact /dev/null candidate is beni
 after `--`, which must stay in-tree. No other device path is exempt. Denied outright: a word starting with `:`
 (git pathspec magic such as `:(icase)`), any candidate starting with `@` (pytest/argparse response files). git: global options before the
 subcommand, GIT_DENY_LONG prefixes, `--paths*`, short F/t/O/S, `git add -f/--force`; after `--` every word is a
-plain existing regular file for inspection commands (no directories or wildcard pathspecs). Forms without
+confined file/directory for inspection commands, with validated exclusions. Forms without
 `--` retain the imported grants, but content-producing whole-tree diffs deny tracked secret-floor files.
 Exact `diff --no-index <a> <b>` is an exception, with directory tree checks too. `log -L` ranges have
 their file extracted before path checking (colon-bearing addresses/filenames remain denied as ambiguous).
@@ -63,7 +62,7 @@ same exposure CC has), and functions/aliases the shell snapshot sources from the
 import os, re, subprocess, sys
 
 PROBE_TOOL = "__eph_gate_probe__"
-# capabilities that may only READ: write_file / patch / terminal are denied outright for these (fail-closed)
+# These capabilities deny writers and limit terminal access to configured, parsed read-only history.
 READ_ONLY_CAPABILITIES = frozenset({"mr-review"})
 READ_ONLY_DENIED_TOOLS = ("write_file", "patch", "terminal")
 BRIDGE_TOOLS = ("tool_call", "tool_search", "tool_describe")
@@ -75,7 +74,7 @@ BRIDGE_TOOLS = ("tool_call", "tool_search", "tool_describe")
 GIT_DENY_LONG = ("file", "pathspec-from-file", "pathspec-file-nul", "no-index", "output", "output-directory",
                  "template", "gpg-sign", "ext-diff", "exec", "exec-path", "upload-pack", "receive-pack",
                  "git-dir", "work-tree", "namespace", "config-env", "contents", "orderfile", "ignore-revs-file",
-                 "reference", "separate-git-dir", "include-untracked-files-from")
+                 "reference", "separate-git-dir", "include-untracked-files-from", "textconv", "show-signature")
 # short options with the same effect: commit -F <file> / -t <template> / -S (gpg), diff -O <orderfile>.
 # A short cluster is scanned char by char (`-aF x` == `-a -F x`). The ONE value char that stops the scan is
 # commit's `-m` (the rest of the cluster is message text); every other attached value is scanned too, so a
@@ -334,6 +333,31 @@ def glob_to_regex(g):
 # normally a superset): even a policy that arrives without secret_globs keeps the env-file / pii-store floor.
 HARD_SECRET_GLOBS = ("//**/*-env", "//**/.env", "//**/.env.*", "//**/*.env", "//**/.pii-store", "//**/.pii-store/**")
 
+# Config selects families, never arbitrary Bash prefixes. The parser is the safety boundary.
+GIT_HISTORY_FORMS = ["git diff", "git log", "git show"]
+# Like codex._head_text: even a read of history can execute a planted signature verifier.
+# Pin config in gate subprocesses AND tool shells (Codex cannot apply modified tool input).
+# Backend-specific programs override gpg.program, so disable those too.
+_GIT_HISTORY_CONFIG = [("log.showSignature", "false"), ("gpg.program", "/bin/false"),
+                       ("gpg.openpgp.program", "/bin/false"), ("gpg.x509.program", "/bin/false"),
+                       ("gpg.ssh.program", "/bin/false")]
+GIT_HISTORY_ARGS = [arg for key, value in _GIT_HISTORY_CONFIG for arg in ("-c", key + "=" + value)]
+
+
+def git_history_env():
+    # Replace, rather than append to, inherited command-scope config. PARAMETERS otherwise wins over COUNT.
+    env = {"GIT_CONFIG_PARAMETERS": "", "GIT_CONFIG_COUNT": str(len(_GIT_HISTORY_CONFIG))}
+    for i, (key, value) in enumerate(_GIT_HISTORY_CONFIG):
+        env["GIT_CONFIG_KEY_%d" % i] = key
+        env["GIT_CONFIG_VALUE_%d" % i] = value
+    return env
+
+
+def git_history_forms(value):
+    if not isinstance(value, list) or any(not isinstance(v, str) or v not in GIT_HISTORY_FORMS for v in value):
+        raise ValueError("git_history_forms must be a list drawn from git diff, git log, git show")
+    return value
+
 
 def nonsecret_globs(value):
     """Only repo-relative globs, using the same *, ** and ? syntax as the secret floor."""
@@ -358,6 +382,7 @@ class Policy(object):
         self.allow = [parse_rule(r) for r in d.get("allow") or []]
         self.deny = [parse_rule(r) for r in d.get("deny") or []]
         self.test_allow = [parse_rule(r) for r in d.get("test_allow") or []]
+        self.git_history_forms = git_history_forms(d.get("git_history_forms", []))
         self.test_env_allow = test_env_names(d.get("test_env_allow", []))
         self.test_env_bindings = d.get("test_env_bindings", {})
         if (not isinstance(self.test_env_bindings, dict) or any(
@@ -679,15 +704,183 @@ def _no_index_paths(argv):
     return paths if len(paths) == 2 and all(p and not p.startswith("-") for p in paths) else None
 
 
+def _git_history(policy, argv):
+    """Parse only reviewed read-only syntax. None means it still needs an ordinary capability grant."""
+    if len(argv) < 2 or " ".join(argv[:2]) not in policy.git_history_forms:
+        return None
+    verb = argv[1]
+    args = argv[2:]
+    paths = args[args.index("--") + 1:] if "--" in args else []
+    opts = args[:args.index("--")] if "--" in args else args
+    if "--" in args and not paths:
+        return None
+    refs, flags = [], []
+    i = 0
+    while i < len(opts):
+        a = opts[i]
+        if a in ("--stat", "--name-only", "--numstat", "--no-ext-diff", "--no-textconv"):
+            flags.append(a)
+        elif verb == "log" and a in ("--oneline",):
+            flags.append(a)
+        elif verb == "log" and (a.startswith("--since=") or a.startswith("--format=")):
+            pass                         # data, never paths or further Git options
+        elif verb == "log" and a in ("--since", "--format"):
+            i += 1
+            if i == len(opts) or not opts[i] or opts[i].startswith("-"):
+                return None
+        elif not a.startswith("-"):
+            refs.append(a)
+        else:
+            return None
+        i += 1
+    if (verb == "diff" and not 1 <= len(refs) <= 2) or (verb == "show" and len(refs) != 1):
+        return None
+    if verb == "log" and len(refs) > 1:
+        return None
+    blob = None
+    if verb == "show" and ":" in refs[0]:
+        rev, blob = refs[0].split(":", 1)
+        refs = [rev]
+        if paths or not blob:
+            return None
+    # No reflog searches, object expressions, option injection, or filesystem operands. Resolve to commits
+    # before granting the extension: two file operands must never trigger implicit --no-index.
+    for ref in refs:
+        if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_./~^+-]*(?:\.{2,3}[A-Za-z0-9_./~^+-]*)?", ref):
+            return None
+        if ":" in ref or ".." in ref.replace("...", "", 1).replace("..", "", 1):
+            return None
+        if verb == "show" and ".." in ref:
+            return None
+    metadata = any(f in flags for f in ("--stat", "--name-only", "--numstat")) or verb == "log"
+    return refs, paths, blob, metadata
+
+
+def _git_names(policy, cwd, command):
+    """Git does the pathspec matching; only NUL-delimited names enter the floor, never file contents."""
+    names = subprocess.check_output(
+        ["git"] + GIT_HISTORY_ARGS + ["-c", "core.fsmonitor=false"] + command,
+        cwd=cwd, stderr=subprocess.DEVNULL, timeout=10)
+    top = os.fsdecode(subprocess.check_output(
+        ["git"] + GIT_HISTORY_ARGS + ["rev-parse", "--show-toplevel"],
+        cwd=cwd, stderr=subprocess.DEVNULL, timeout=10)).rstrip("\n")
+    if not _inside(top, policy.read_root):
+        return "git inspection reaches outside the worktree"
+    for name in names.split(b"\0"):
+        if name:
+            _, why = _check_read_path(policy, os.fsdecode(name), top)
+            if why:
+                return "git inspection may print a tracked secret-floor file or unsafe path: " + why
+    return None
+
+
+def _git_helpers(argv, cwd):
+    if argv[1] not in ("diff", "log", "show"):
+        return None
+    opts = argv[2:argv.index("--")] if "--" in argv else argv[2:]
+    if "--no-ext-diff" in opts and "--no-textconv" in opts:
+        return None
+    # Codex cannot apply updated tool input. Do not silently add safety flags in only one harness.
+    # Inspect config NAMES only; configured helpers require explicit disabling, even if unused by this diff.
+    result = subprocess.run(["git"] + GIT_HISTORY_ARGS + ["config", "--name-only", "--get-regexp",
+                             r"^diff\.(external|.*\.(textconv|command))$"],
+                            cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10)
+    if result.returncode not in (0, 1):
+        return "git inspection: cannot verify diff helper configuration"
+    if result.stdout or os.environ.get("GIT_EXTERNAL_DIFF"):
+        return "git inspection: configured helpers require --no-ext-diff --no-textconv"
+    return None
+
+
+def _git_pathspecs(policy, paths, cwd):
+    for path in paths:
+        exclude = path.startswith(":(exclude)")
+        raw = path[len(":(exclude)"):] if exclude else path
+        if (not raw or raw.startswith((":", "@", "-", "~")) or "\\" in raw
+                or ".." in raw.split("/") or "\x00" in raw):
+            return "git inspection: unsupported or escaping pathspec"
+        if not exclude and any(c in raw for c in "*?["):
+            return "git inspection: positive pathspecs must be literal files or directories"
+        # Exclusions may name secrets, but never escape the root or hide a symlink escape.
+        norm, real = _resolve(raw, cwd)
+        if not (_inside(norm, policy.read_root) and _inside(real, policy.read_root)):
+            return "git inspection pathspec reaches outside the worktree"
+        if not exclude:
+            _, why = _check_read_path(policy, raw, cwd)
+            if why:
+                return why
+    return None
+
+
+def _git_history_floor(policy, argv, cwd, parsed):
+    refs, paths, blob, metadata = parsed
+    base = cwd
+    if blob is not None:
+        base = os.fsdecode(subprocess.check_output(
+            ["git"] + GIT_HISTORY_ARGS + ["rev-parse", "--show-toplevel"], cwd=cwd,
+            stderr=subprocess.DEVNULL, timeout=10)).rstrip("\n")
+    why = _git_pathspecs(policy, [blob] if blob is not None else paths, base)
+    if why:
+        return why
+    commits = []
+    for ref in refs:
+        parts = re.split(r"\.{2,3}", ref)
+        if len(parts) > 2:
+            return "git inspection: invalid revision range"
+        for part in parts:
+            commit = subprocess.check_output(
+                ["git"] + GIT_HISTORY_ARGS +
+                ["rev-parse", "--verify", "--end-of-options", (part or "HEAD") + "^{commit}"],
+                cwd=cwd, stderr=subprocess.DEVNULL, timeout=10).decode("ascii").strip()
+            commits.append(commit)
+    if blob is not None:
+        # `rev:./path` is cwd-relative in Git, unlike `rev:path`. Keep this seam unambiguous and
+        # require an actual historical file, not a missing name or a recursive tree object.
+        if os.path.isabs(blob) or any(p in ("", ".", "..") for p in blob.split("/")):
+            return "git show: expected a repository-relative file path"
+        kind = subprocess.check_output(["git"] + GIT_HISTORY_ARGS + ["cat-file", "-t", commits[0] + ":" + blob], cwd=cwd,
+                                       stderr=subprocess.DEVNULL, timeout=10).strip()
+        return None if kind == b"blob" else "git show: expected a historical file, not a tree"
+    if metadata:
+        return None                      # these forms cannot print file contents
+    # The history walk also catches deleted/renamed secrets absent from the current index and HEAD.
+    # For diff, checking the history of both endpoints is conservative, including a triple-dot merge base.
+    for commit in commits:
+        why = _git_names(policy, cwd, ["log", "--format=", "--name-only", "-z", "--no-renames",
+                                     "--no-ext-diff", "--no-textconv", commit, "--"] + paths)
+        if why:
+            return why
+    if argv[1] == "diff":
+        for command in (["ls-files", "--cached", "--full-name", "-z", "--"] + paths,
+                        ["diff", "--cached", "--name-only", "-z", "--no-renames",
+                         "--no-ext-diff", "--no-textconv", "--"] + paths):
+            why = _git_names(policy, cwd, command)
+            if why:
+                return why
+    return None
+
+
 def _git_inspection_paths(policy, argv, cwd):
-    """Vet literal files, not just the directory/glob spelling Git would expand recursively."""
+    """Legacy grants keep their option rules; directories/exclusions also vet selected tracked names."""
     if argv[1] not in ("diff", "log", "show", "status") or _no_index_paths(argv) is not None:
         return None
     if "--" not in argv[2:]:
+        if argv[1] == "show" or (argv[1] == "log" and any(
+                a in ("-p", "--patch", "--raw", "--cc", "-c") for a in argv[2:])):
+            return _git_names(policy, cwd, ["log", "--all", "--format=", "--name-only", "-z",
+                                           "--no-renames", "--no-ext-diff", "--no-textconv"])
         return _git_unfiltered_diff(policy, argv, cwd)
     paths = argv[argv.index("--", 2) + 1:]
     if not paths:
-        return "git inspection requires a nonempty -- <file> list"
+        return "git inspection requires a nonempty file list after the double-dash separator"
+    why = _git_pathspecs(policy, paths, cwd)
+    if why:
+        return why
+    if any(p.startswith(":(exclude)") or os.path.isdir(_resolve(p, cwd)[1]) for p in paths):
+        # Legacy grants (e.g. log -p) need the same directory/exclusion floor as the new forms.
+        return _git_names(policy, cwd, ["log", "--all", "--format=", "--name-only", "-z",
+                                       "--no-renames", "--no-ext-diff", "--no-textconv", "--"] + paths) or \
+            _git_names(policy, cwd, ["ls-files", "--cached", "--full-name", "-z", "--"] + paths)
     for path in paths:
         if not path or path.startswith((":", "@")) or any(ch in path for ch in "*?["):
             return "git inspection requires plain file paths (no magic, @-args or wildcards)"
@@ -712,13 +905,15 @@ def _git_unfiltered_diff(policy, argv, cwd):
             ("--stat",), ("--cached", "--stat"), ("--name-only",), ("--cached", "--name-only")):
         return None
     top = os.fsdecode(subprocess.check_output(
-        ["git", "rev-parse", "--show-toplevel"], cwd=cwd, stderr=subprocess.DEVNULL, timeout=10)).rstrip("\n")
+        ["git"] + GIT_HISTORY_ARGS + ["rev-parse", "--show-toplevel"],
+        cwd=cwd, stderr=subprocess.DEVNULL, timeout=10)).rstrip("\n")
     if not _inside(top, policy.read_root):
         return "unfiltered git diff reaches outside the worktree"
     for command in (["git", "ls-files", "--cached", "--full-name", "-z"],
                     ["git", "diff", "--cached", "--name-only", "-z", "--no-renames",
                      "--no-ext-diff", "--no-textconv"]):
-        names = subprocess.check_output(command, cwd=top, stderr=subprocess.DEVNULL, timeout=10)
+        names = subprocess.check_output(command[:1] + GIT_HISTORY_ARGS + command[1:],
+                                        cwd=top, stderr=subprocess.DEVNULL, timeout=10)
         for name in names.split(b"\0"):
             if name and _secret(policy, *_resolve(os.fsdecode(name), top)):
                 return "unfiltered git diff may print a tracked secret-floor file; use explicit safe files"
@@ -756,6 +951,10 @@ def _git_hard(argv):
             name = a[2:].split("=", 1)[0]
             if not name or name.startswith("paths") or any(d.startswith(name) for d in GIT_DENY_LONG):
                 return "git option %r (reads/writes a file, runs a program or reaches another repo)" % a, msg_idx
+            if argv[1] in ("diff", "log", "show") and any(n.startswith(name) for n in ("format", "pretty")):
+                value = a.split("=", 1)[1] if "=" in a else (argv[idx + 1] if idx + 1 < len(argv) else "")
+                if re.search(r"%[-+ ]?G", value):
+                    return "git signature format placeholders (%G) are not allowed", msg_idx
             if add and "force".startswith(name):
                 return "git add %r (stages ignored files, e.g. secrets)" % a, msg_idx
             if commit and len(name) >= 3 and "message".startswith(name):
@@ -914,11 +1113,15 @@ def check_segment(policy, argv, cwd):
         why = _check_args_paths(policy, ["env"] + checked_assignments, cwd, set())
         if why:
             return why
+    history = _git_history(policy, argv)
     for t, s in policy.deny:
+        if history is not None and policy.read_only and t == "Bash" and s is None:
+            continue                     # only the parsed read-only extension, never arbitrary Bash
         if t == "Bash" and (bash_rule_matches(s, argv, for_allow=False) or
                             bash_rule_matches(s, original, for_allow=False)):
             return "matches deny rule Bash(%s)" % s if s is not None else "Bash is denied for this capability"
-    if not parser_test and not any(t == "Bash" and bash_rule_matches(s, argv, for_allow=True) for t, s in policy.allow):
+    if history is None and not parser_test and not any(
+            t == "Bash" and bash_rule_matches(s, argv, for_allow=True) for t, s in policy.allow):
         return "%r is not on the allow-list" % " ".join(argv)[:200]
     if parser_test:
         why = _portcullis_parser_hard(policy, argv, cwd)
@@ -928,11 +1131,15 @@ def check_segment(policy, argv, cwd):
     prog = os.path.basename(argv[0])
     if prog == "git":
         why, skip = _git_hard(argv)
+        why = why or _git_helpers(argv, cwd)
         if why:
             return why
-        why = _git_inspection_paths(policy, argv, cwd)
+        why = _git_history_floor(policy, argv, cwd, history) if history is not None else \
+            _git_inspection_paths(policy, argv, cwd)
         if why:
             return why
+        if history is not None:
+            skip.update(range(1, len(argv)))  # revisions/options/pathspecs were checked by the Git parser
     elif prog in SHELLS:
         why = _shell_hard(argv)
         if why:
@@ -1002,6 +1209,8 @@ def _decide_terminal(policy, args):
     except Deny as e:
         return _deny("terminal: " + str(e))
     for argv in segs:
+        if policy.read_only and _git_history(policy, argv) is None:
+            return _deny("terminal: READ-ONLY capabilities only permit configured git history forms")
         why = check_segment(policy, argv, cwd)
         if why:
             return _deny("terminal: segment %r: %s" % (" ".join(argv)[:200], why))
@@ -1047,7 +1256,8 @@ def _decide(tool_name, args, policy):
             under = ",".join(str((c or {}).get("name")) for c in calls if isinstance(c, dict))
         return _deny("the tool_search bridge (%s) is disabled%s" % (tool_name,
                      " (underlying: %s)" % under if under else ""))
-    if policy.read_only and tool_name in READ_ONLY_DENIED_TOOLS:
+    if policy.read_only and tool_name in READ_ONLY_DENIED_TOOLS and not (
+            tool_name == "terminal" and policy.git_history_forms):
         return _deny("%s: capability %s is READ-ONLY (hard deny)" % (tool_name, policy.capability))
     if tool_name == "read_file":
         if set(args) - _READ_KEYS:
@@ -1098,7 +1308,7 @@ def _decide(tool_name, args, policy):
     if tool_name == "terminal":
         if policy.judge is not None:
             return _decide_terminal_general(policy, args)
-        if not any(t == "Bash" for t, _ in policy.allow):
+        if not policy.git_history_forms and not any(t == "Bash" for t, _ in policy.allow):
             return _deny("terminal: Bash is not granted for this capability")
         return _decide_terminal(policy, args)
     # A table miss is its own kind, so a replay can tell "the table is too narrow" from a judged deny
@@ -1156,6 +1366,18 @@ def _decide_terminal_general(policy, args):
         for t, s in policy.deny:
             if t == "Bash" and bash_rule_matches(s, argv, for_allow=False):
                 return _deny("terminal: segment %r matches deny rule Bash(%s)" % (" ".join(argv)[:200], s))
+        if argv[0] == "git":
+            why, _ = _git_hard(argv)
+            why = why or _git_helpers(argv, cwd)
+            parsed = _git_history(policy, argv)
+            why = why or (_git_history_floor(policy, argv, cwd, parsed) if parsed is not None else
+                          _git_inspection_paths(policy, argv, cwd))
+            if why:
+                return _deny("terminal: " + why)
+            if parsed is None:
+                why = _check_args_paths(policy, argv, cwd, set())
+                if why:
+                    return _deny("terminal: " + why)
     v = judge(policy, "Bash", {"command": cmd}, cwd)
     if v.allowed:
         v.modified_args = {"workdir": cwd}

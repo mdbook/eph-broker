@@ -8,6 +8,8 @@ import os
 import uuid
 from collections import deque
 
+from . import wake
+
 BATCH_BYTES = 65536
 LINE_BYTES = 24576
 BATCH_LINES = 100
@@ -140,7 +142,12 @@ def normalize(line, kind, calls=None):
         if not isinstance(record, dict):
             return None
         if kind == 'codex':
+            # Canonical text parts are deliberately not displayed. Preserve only receipt IDs
+            # before projection, including on the second pass at the directory.
+            receipts = wake.consumed_ids([line])
             record = _codex(record, calls if calls is not None else deque(maxlen=500))
+            if record is not None and record.get('type') == 'user' and receipts:
+                record['wake_receipts'] = sorted(receipts)
         if record is None:
             return None
         result = _redact_secretish(json.dumps(record))

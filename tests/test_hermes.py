@@ -418,7 +418,7 @@ def test_hermes_happy_path_parses_envelope():
         (r1,) = _records(rec)
         argv = r1["argv"]
         assert argv[:6] == ["chat", "--query-file", "-", "--format", "stream-json", "-Q"], argv
-        for flag, val in (("-t", "file"), ("--max-turns", "7"), ("-m", "fake-model"), ("--provider", "eph"),
+        for flag, val in (("-t", "file,terminal"), ("--max-turns", "7"), ("-m", "fake-model"), ("--provider", "eph"),
                           ("--run-budget", "60"), ("--source", "tool")):
             assert argv[argv.index(flag) + 1] == val, (flag, argv)
         assert "--ignore-rules" in argv and not [x for x in argv if x.startswith("--resume")], argv
@@ -434,9 +434,9 @@ def test_hermes_happy_path_parses_envelope():
                                            "transport": "chat_completions", "default_model": "fake-model",
                                            "context_length": 1000}, cfg["providers"]
         assert cfg["auth"]["adopt_external_logins"] is False and cfg["mcp_servers"] == {}, cfg
-        # mr-review read tools: `file` only (no terminal), under eph-gate with cc's pure-read grant; the gate
-        # the run loaded hard-denies write_file / patch / terminal
-        assert "terminal" in cfg["agent"]["disabled_toolsets"] and "file" not in cfg["agent"]["disabled_toolsets"]
+        # mr-review: file reads and parsed history only. The imported CC grant remains pure-read;
+        # eph-gate supplies the history extension without granting arbitrary Bash or writers.
+        assert not {"file", "terminal"}.intersection(cfg["agent"]["disabled_toolsets"])
         assert cfg["plugins"]["enabled"] == ["eph-gate"], cfg["plugins"]
         # hermes' large-output spill thresholds lowered from its 50_000-char defaults
         assert cfg["tool_output"]["max_bytes"] == H.HERMES_SPILL_CHARS == 20000, cfg.get("tool_output")
@@ -515,7 +515,7 @@ def test_hermes_refuses_ungrantable():
             except H.HermesRefused:
                 pass
         assert not os.path.exists(rec), "a refused route must never launch hermes"
-        assert H.hermes_toolsets("mr-review") == ["file"] and sorted(H.HERMES_GRANTS) == ["code", "general", "mr-review", "write"]
+        assert H.hermes_toolsets("mr-review") == ["file", "terminal"] and sorted(H.HERMES_GRANTS) == ["code", "general", "mr-review", "write"]
         # --ignore-rules is the ONE flag keeping worktree AGENTS.md/.hermes.md/SOUL.md (worker-writable) out of the
         # prompt: on every argv shape, fresh and resumed, read-only and read-write
         for ts, res in ((["file"], None), (["file", "terminal"], None), (["file", "terminal"], "sess-1")):

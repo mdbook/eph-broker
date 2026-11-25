@@ -7,11 +7,12 @@ import time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from . import adapters, auth, transcripts
+from . import adapters, auth, transcripts, wake
 from .allowlist import Allowlist
 from .steer import TEXT_MAX_CHARS
 
 MESSAGE_LIMIT = 32
+TERMINAL = ('delivered', 'not_delivered')
 
 
 class Refused(ValueError):
@@ -21,10 +22,12 @@ class Refused(ValueError):
 
 
 class Directory:
-    def __init__(self, key, state_dir, allowlist=None, clock=time.time):
+    def __init__(self, key, state_dir, allowlist=None, clock=time.time, wake_sender=None):
         if len(key) < 32:
             raise ValueError('enrollment key must contain at least 32 bytes')
         self.key, self.clock = key, clock
+        self.wake_channels = wake.channels()
+        self.wake_sender = wake_sender or wake.send
         self.allowlist = allowlist if allowlist is not None else Allowlist()
         self.lock = threading.RLock()
         self.entries, self.seen, self.timestamps = {}, {}, {}
@@ -157,6 +160,8 @@ class Directory:
     def _register(self, kid, name, data, stamp):
         ttl = data.get('ttl', 60)
         caps = data.get('caps', [])
+        if 'status' in data and data['status'] not in ('busy', 'idle'):
+            raise Refused('status must be busy or idle')
         if (data.get('name') != name or data.get('kind') not in adapters.KINDS or
                 type(ttl) is not int or not 3 <= ttl <= 86400 or
                 not isinstance(caps, list) or
@@ -186,7 +191,9 @@ class Directory:
             if previous and (previous['kind'] != data['kind'] or 'tail' not in caps):
                 self.tails.pop(name, None)
             self.entries[name] = dict(name=name, kid=kid, kind=data['kind'], caps=caps,
-                                      view_url=url, ttl=ttl, status='live', last_beat=self.clock(), messages=messages)
+                                      view_url=url, ttl=ttl,
+                                      status=data.get('status', previous['status'] if previous else 'live'),
+                                      last_beat=self.clock(), messages=messages, wake=self.wake_channels.get(name))
         return {'ok': True}
 
     def queue_message(self, name, text, doer):
@@ -202,17 +209,42 @@ class Directory:
             if not isinstance(text, str) or not text.strip() or len(text) > TEXT_MAX_CHARS:
                 raise Refused('message must contain 1..4000 characters')
             messages = list(entry['messages'])
-            if sum(m['state'] != 'delivered' for m in messages) >= MESSAGE_LIMIT:
+            if sum(m['state'] not in TERMINAL for m in messages) >= MESSAGE_LIMIT:
                 raise Refused('agent message queue is full', 409)
             message = dict(id=steer.new_id(), ns=str(time.time_ns()), text=text,
                            doer=str(doer)[:64], state='pending')
+            channel = entry['wake'] if entry['status'] == 'idle' else None
+            if entry['status'] == 'idle':
+                message['via'] = 'wake'
+                if channel:
+                    # Persist before sending; a fast consumption receipt can race the transport reply.
+                    message['state'] = 'waking'
+                else:
+                    message.update(state='not_delivered', reason='agent idle, no wake channel')
             messages.append(message)
             # Keep a bounded recent history without evicting undelivered messages.
             while len(messages) > MESSAGE_LIMIT:
-                messages.remove(next(m for m in messages if m['state'] == 'delivered'))
+                messages.remove(next(m for m in messages if m['state'] in TERMINAL))
             self._save_messages(entry['kid'], messages)
             entry['messages'] = messages
-            return {'ok': True, 'id': message['id']}
+            kid = entry['kid']
+        # Never hold the directory lock across external I/O: beats and consumption receipts must progress.
+        if channel:
+            sent = self.wake_sender(channel, message)
+            with self.lock:
+                messages = [dict(m) for m in self.steering.get(kid, [])]
+                for current in messages:
+                    if current['id'] == message['id']:
+                        if current['state'] == 'waking':
+                            current['state'] = 'sent' if sent else 'not_delivered'
+                            if not sent:
+                                current['reason'] = 'wake channel failed'
+                        message = current
+                self._save_messages(kid, messages)
+                current_entry = self.entries.get(name)
+                if current_entry and current_entry['kid'] == kid:
+                    current_entry['messages'] = messages
+        return dict(ok=True, **{k: message[k] for k in ('id', 'state', 'via', 'reason') if k in message})
 
     def _save_messages(self, kid, messages):
         updated = dict(self.steering)
@@ -235,8 +267,10 @@ class Directory:
             reports[field] = set(ids)
         messages = [dict(m) for m in entry['messages']]
         for message in messages:
-            if message['id'] in reports['steer_delivered']:
+            if (message['id'] in reports['steer_delivered'] and
+                    (message['state'] != 'not_delivered' or message.get('reason') == 'wake channel failed')):
                 message['state'] = 'delivered'
+                message.pop('reason', None)
             elif message['id'] in reports['steer_queued'] and message['state'] == 'pending':
                 message['state'] = 'queued'
         if messages != entry['messages']:
@@ -266,6 +300,18 @@ class Directory:
         normalized = [transcripts.normalize(line, entry['kind']) for line in lines]
         if not tail.append(source, start, normalized):
             return dict(ok=True, epoch=tail.epoch, replay=True)
+        # Clients carry receipt IDs across projection. Native rollout messages also need
+        # their normalized user-role form; raw canonical records remain supported.
+        consumed = wake.consumed_ids(lines) | wake.consumed_ids(normalized)
+        messages = [dict(m) for m in entry['messages']]
+        for message in messages:
+            if (message['id'] in consumed and (message['state'] in ('waking', 'sent') or
+                    message.get('reason') == 'wake channel failed')):
+                message['state'] = 'delivered'
+                message.pop('reason', None)
+        if messages != entry['messages']:
+            self._save_messages(kid, messages)
+            entry['messages'] = messages
         entry['last_beat'] = self.clock()
         return dict(ok=True, epoch=tail.epoch, replay=False)
 
@@ -276,7 +322,8 @@ class Directory:
             result = []
             for entry in sorted(self.entries.values(), key=lambda e: e['name']):
                 public = {k: v for k, v in entry.items() if k not in ('kid', 'view_url', 'messages')}
-                public['steer_messages'] = [dict(id=m['id'], state=m['state']) for m in entry['messages']]
+                public['steer_messages'] = [{k: m[k] for k in ('id', 'state', 'via', 'reason') if k in m}
+                                            for m in entry['messages']]
                 public['age'] = max(0, now - entry['last_beat'])
                 if public['age'] >= entry['ttl']:
                     public['status'] = 'grey'

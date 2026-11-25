@@ -84,6 +84,9 @@ class Fixture:
         os.symlink(os.path.join(d, "outside", "secret.txt"), os.path.join(self.wt, "lnk_out"))
         os.symlink("f.txt", os.path.join(self.wt, "lnk_ok"))
         os.symlink(os.path.join(d, "outside"), os.path.join(self.wt, "content", "dirlink_out"))
+        subprocess.run(["git", "-C", self.wt, "add", "f.txt", "src/pkg/m.py"], check=True)
+        subprocess.run(["git", "-C", self.wt, "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                        "commit", "-qm", "synthetic public fixture"], check=True)
         self.write = G.Policy(H.gate_policy("write", self.wt, nonce="N-W"))
         self.code = G.Policy(H.gate_policy("code", self.wt, test_runner="pytest", nonce="N-C"))
         self.code_bashn = G.Policy(H.gate_policy("code", self.wt, test_runner="bash-n"))
@@ -240,6 +243,9 @@ def test_git_inspection_path_operands():
     broad = G.Policy(dict(cwd=f.wt, allow=["Bash(git:*)"]))
     for policy in (f.write, f.code, broad):
         for verb in ("diff", "log", "show", "status"):
+            v = G.decide("terminal", T(f"git {verb} --"), policy)
+            assert not v.allowed, verb
+            assert "requires a nonempty file list after the double-dash separator" in v.reason, v.reason
             for path in ("lnk_out", "lnk_secret", "../outside/secret.txt", "sec/.db-env", ".env",
                          ".pii-store/data", "':(icase)f.txt'", "@f.txt", "/dev/null", "/dev/zero"):
                 cmd = f"git {verb} -- {path}"
@@ -262,10 +268,10 @@ def test_git_inspection_preserves_unfiltered_grants():
             assert v.allowed, (cmd, v.reason)
     # The hard floor must not narrow other imported grants either, or widen the real policies.
     broad = G.Policy(dict(cwd=f.wt, allow=["Bash(git:*)"]))
-    for cmd in ("git show", "git show HEAD", "git diff --stat HEAD~3"):
+    for cmd in ("git show", "git show HEAD", "git diff --stat HEAD"):
         v = G.decide("terminal", T(cmd), broad)
         assert v.allowed, (cmd, v.reason)
-        assert not G.decide("terminal", T(cmd), f.code).allowed, cmd
+        assert G.decide("terminal", T(cmd), f.code).allowed == (cmd != "git show"), cmd
     ok("eph-gate: unfiltered inspection retains imported grants without widening the allow-list")
 
 
@@ -282,11 +288,14 @@ def test_git_inspection_cannot_expand_to_tracked_secrets():
         broad = G.Policy(dict(cwd=f.wt, allow=["Bash(git:*)"]))
         for policy in (f.write, f.code, broad):
             for verb in ("diff", "log", "show", "status"):
-                for path in ("sec", "src", "sec/*", "'sec/*'", "'sec/.*'", "'sec/?'", "'sec/[a]'",
+                for path in ("sec", "sec/*", "'sec/*'", "'sec/.*'", "'sec/?'", "'sec/[a]'",
                              "'sec/.db-env'", "':(glob)sec/**'", "missing.py", "''"):
                     cmd = f"git {verb} -- {path}"
                     v = G.decide("terminal", T(cmd), policy)
-                    assert not v.allowed, (cmd, v.reason)
+                    # Plain log is metadata only: naming a directory or an unmatched historical path
+                    # cannot print its contents. Patch-producing forms still enforce the tracked floor.
+                    metadata = bool(policy.git_history_forms) and verb == "log" and path in ("sec", "missing.py")
+                    assert v.allowed == metadata, (cmd, v.reason)
                 assert not G.decide("terminal", T("git " + verb + " --"), policy).allowed
             for cmd in ("git show HEAD --",
                         "git show HEAD -- sec", "git show HEAD -- 'sec/*'"):
@@ -299,6 +308,184 @@ def test_git_inspection_cannot_expand_to_tracked_secrets():
     ok("eph-gate: explicit pathspecs cannot select tracked secrets via directories or wildcards")
 
 
+def test_git_history_forms_all_rows_and_secret_floor():
+    from adapters import codex_gate as CG
+    f = Fixture()
+    try:
+        def git(*args):
+            return subprocess.check_output(["git", "-C", f.wt] + list(args), stderr=subprocess.DEVNULL).decode().strip()
+
+        base = git("rev-parse", "HEAD")
+        os.makedirs(os.path.join(f.wt, "private"))
+        open(os.path.join(f.wt, "private/fixture-restricted.txt"), "w").write("synthetic fixture\n")
+        git("add", "sec/.db-env", "private/fixture-restricted.txt")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "synthetic fixture")
+        git("rm", "sec/.db-env", "private/fixture-restricted.txt")
+        git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "remove fixture")
+        # The secret is absent from HEAD and the index. History still contains it.
+        exclude = "-- . ':(exclude)*-env' ':(exclude)*restricted*'"
+        positives = [
+            "git diff --stat %s HEAD" % base,                    # review 43's first blocked form
+            "git diff %s HEAD -- f.txt src" % base,             # review 43's second blocked form
+            "git log --since='7 days ago' --stat " + exclude,   # review 43's third blocked form
+            "git diff --name-only HEAD~2..HEAD",
+            "git diff --numstat HEAD~2...HEAD -- src",
+            "git diff HEAD~2..HEAD " + exclude,
+            "git diff HEAD~2 HEAD " + exclude,
+            "git diff HEAD -- src",
+            "git log HEAD~2..HEAD --oneline -- src",
+            shlex.join(["git", "log", "--format=%h %s", "--since=7 days ago", "--", "src"]),
+            "git show HEAD:f.txt",
+            "git show HEAD~2 -- src",
+            "git show HEAD " + exclude,
+        ]
+        negatives = [
+            "git diff %s HEAD" % base, "git show HEAD", "git diff HEAD -- sec", "git diff HEAD -- private",
+            "git show HEAD~1:sec/.db-env", "git show HEAD:../f.txt", "git show HEAD:/etc/passwd",
+            "git show HEAD:./f.txt", "git show HEAD:src", "git show HEAD:missing.txt",
+            "git diff HEAD -- .", "git diff HEAD -- . ':(exclude)unrelated'",
+            "git diff HEAD -- ../outside", "git log -- ../outside", "git show HEAD -- /etc",
+            "git diff HEAD -- ':(exclude)/etc'", "git diff HEAD -- ':(exclude)../outside'",
+            "git diff HEAD -- ':(icase)f.txt'", "git diff HEAD -- ':(exclude,icase)*-env'",
+            "git diff HEAD -- lnk_out", "git diff HEAD -- lnk_secret",
+            "git diff HEAD --output=out", "git diff --out=out HEAD", "git log --output=out",
+            "git show HEAD --textconv", "git diff --ext-diff HEAD", "git log --textconv",
+            "git -c diff.external=evil diff HEAD", "git -C /tmp log",
+            "git diff f.txt src/pkg/m.py", "git diff HEAD --no-index f.txt src/pkg/m.py",
+        ]
+        for cap in ("write", "code", "general", "mr-review"):
+            with _env(EXEC_GATE="none"):
+                data = H.gate_policy(cap, f.wt)
+            data["deny"].append("Read(//**/*restricted*)")
+            policy = G.Policy(data)
+            for command in positives:
+                v = G.decide("terminal", T(command), policy)
+                assert v.allowed, (cap, command, v.reason)
+                _, _, cv = CG._decide_exec("exec_command", policy, {"cmd": CG._cd_prefix(f.wt) + command})
+                assert cv.allowed, (cap, command, cv.reason)
+            for command in negatives:
+                v = G.decide("terminal", T(command), policy)
+                assert not v.allowed, (cap, command, v.reason)
+            assert not G.decide("terminal", T("git show HEAD:private-restricted.txt"), policy).allowed
+            for command in ("git show HEAD:f.txt", "git diff HEAD -- ."):
+                v = G.decide("terminal", T(command, workdir=os.path.join(f.wt, "src")), policy)
+                assert v.allowed, (cap, command, v.reason)
+        for command in ("git checkout HEAD", "git reset HEAD", "git push", "git commit -m x",
+                        "git log && git commit -m x", "git log; cat f.txt"):
+            assert not G.decide("terminal", T(command), f.mr).allowed, command
+        with _env(EPH_GATE_GIT_HISTORY_FORMS='[]'):
+            disabled = G.Policy(H.gate_policy("mr-review", f.wt))
+        assert not G.decide("terminal", T("git log --oneline"), disabled).allowed
+        for bad in ('["git push"]', '{}', 'null', 'not json'):
+            with _env(EPH_GATE_GIT_HISTORY_FORMS=bad):
+                try:
+                    H.gate_policy("mr-review", f.wt)
+                except H.HermesRefused:
+                    pass
+                else:
+                    raise AssertionError(bad)
+    finally:
+        f.close()
+    ok("git history: all rows and Codex, ranges/directories/exclusions, historical secrets and near misses")
+
+
+def test_git_history_never_runs_signature_verifiers():
+    from adapters import codex as X, codex_gate as CG
+    f = Fixture()
+    try:
+        # No real key or signing tool: Git still invokes its verifier for this synthetic signed object.
+        raw_env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_CONFIG_")}
+
+        def git(*args, **kwargs):
+            return subprocess.check_output(["git", "-C", f.wt] + list(args), env=raw_env,
+                                           stderr=subprocess.DEVNULL, **kwargs).decode().strip()
+
+        marker = os.path.join(f.d, "verifier-ran")
+        prog = _exe(os.path.join(f.d, "verifier"), "#!/bin/sh\n: > " + shlex.quote(marker) + "\nexit 1\n")
+        tree = git("rev-parse", "HEAD^{tree}")
+        obj = ("tree %s\nauthor Test <test@example.com> 1700000000 +0000\n"
+               "committer Test <test@example.com> 1700000000 +0000\n"
+               "gpgsig -----BEGIN PGP SIGNATURE-----\n \n AAAA\n -----END PGP SIGNATURE-----\n\nsigned\n") % tree
+        commit = git("hash-object", "-t", "commit", "-w", "--stdin", input=obj.encode())
+        git("update-ref", "HEAD", commit)
+        git("config", "log.showSignature", "true")
+        git("config", "gpg.program", prog)
+        git("log", "-1")
+        assert os.path.exists(marker), "precondition: unprotected log must run the sentinel"
+        os.unlink(marker)
+        git("config", "gpg.openpgp.program", prog)  # overrides gpg.program on newer Git versions
+
+        for cap in ("write", "code", "general", "mr-review"):
+            with _env(EXEC_GATE="none"):
+                policy = G.Policy(H.gate_policy(cap, f.wt))
+            safe = ["git log '--format=%H %s'", "git log --oneline", "git show HEAD -- f.txt",
+                    "git diff HEAD -- f.txt"]
+            unsafe = ["git log --show-signature", "git show --show-sig HEAD -- f.txt"]
+            for placeholder in ("%G?", "%GS", "%GK", "%+G?", "%-GS", "% GK"):
+                for option in ("--format=", "--format ", "--pretty=", "--pretty ", "--form=", "--pre="):
+                    unsafe.append("git log " + option + shlex.quote(placeholder))
+            for command in safe + unsafe:
+                v = G.decide("terminal", T(command), policy)
+                _, _, cv = CG._decide_exec("exec_command", policy, {"cmd": CG._cd_prefix(f.wt) + command})
+                assert v.allowed == cv.allowed == (command in safe), (cap, command, v.reason, cv.reason)
+                # Legacy/broad Bash grants must not bypass the signature floor either.
+                if command in unsafe:
+                    assert not G.decide("terminal", T(command), f.broad).allowed, command
+            assert not os.path.exists(marker), "gate's own history walk ran the verifier"
+
+        # Execute allowed commands using the actual Hermes init file and Codex tool-shell config.
+        # A hostile inherited command-scope setting must not override the pinned environment.
+        hostile = dict(raw_env, GIT_CONFIG_PARAMETERS="'log.showSignature=true' 'gpg.program=%s'" % prog,
+                       GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="log.showSignature", GIT_CONFIG_VALUE_0="true")
+        with tempfile.TemporaryDirectory() as d, _Registry(d):
+            a, _, alerts = _setup(d)
+            w = Worker("vikunja:task:9317", "signature-history", f.wt)
+            assert a._one_turn(w, _r("write"), "SYS", "P", resume=False), alerts
+            init = os.path.join(w.hermes_home, H.TERMINAL_ENV_FILE)
+            cfg = X.codex_config("model", "", "read-only", "instructions")
+            codex_env = dict(hostile)
+            section = ""
+            for line in cfg.splitlines():
+                if line.startswith("["):
+                    section = line
+                elif section == "[shell_environment_policy.set]" and " = " in line:
+                    key, value = line.split(" = ", 1)
+                    codex_env[key] = json.loads(value)
+            # A configured pretty format can request verification without an explicit %G in argv.
+            git("config", "format.pretty", "%G? %s")
+            for command in safe + ["git log"]:
+                for harness, shell_command, env in (
+                        ("hermes", ". " + shlex.quote(init) + "; " + command, hostile),
+                        ("codex", command, codex_env)):
+                    r = subprocess.run(["/bin/sh", "-c", shell_command], cwd=f.wt, env=env,
+                                       capture_output=True, text=True)
+                    assert r.returncode == 0, (harness, command, r.stderr)
+                    assert not os.path.exists(marker), (harness, command, "verifier ran")
+    finally:
+        f.close()
+    ok("git history: signed fixture, no verifier in gate/Hermes/Codex; signature flags/formats refused")
+
+
+def test_git_history_disables_configured_helpers():
+    f = Fixture()
+    try:
+        subprocess.run(["git", "-C", f.wt, "config", "diff.fixture.textconv", "must-not-run"], check=True)
+        for cap in ("write", "code", "general", "mr-review"):
+            with _env(EXEC_GATE="none"):
+                policy = G.Policy(H.gate_policy(cap, f.wt))
+            for verb in ("diff", "log", "show"):
+                cmd = "git %s HEAD -- f.txt" % verb
+                assert not G.decide("terminal", T(cmd), policy).allowed
+                safe = "git %s --no-ext-diff --no-textconv HEAD -- f.txt" % verb
+                v = G.decide("terminal", T(safe), policy)
+                assert v.allowed, (cap, safe, v.reason)
+                out = subprocess.run(safe, cwd=f.wt, shell=True, capture_output=True)
+                assert out.returncode == 0 and b"must-not-run" not in out.stderr
+    finally:
+        f.close()
+    ok("git history: configured helpers require explicit disabling on every row")
+
+
 def test_git_unfiltered_diff_tracked_secret_floor():
     for secret in (".env", "sec/.db-env", ".pii-store/data", "private.txt"):
         f = Fixture()
@@ -306,7 +493,7 @@ def test_git_unfiltered_diff_tracked_secret_floor():
             git = lambda *args: subprocess.run(["git", "-C", f.wt] + list(args), check=True,
                                                capture_output=True, text=True)
             commit = lambda: git("-c", "user.name=Test", "-c", "user.email=test@example.com",
-                                 "commit", "-qm", "synthetic fixture")
+                                 "commit", "--allow-empty", "-qm", "synthetic fixture")
             git("add", "f.txt")
             commit()
             path = os.path.join(f.wt, secret)
@@ -1906,9 +2093,9 @@ def test_probe_refuses_editable_placeholder():
 
 def test_adapter_mr_review_gated_read_only():
     """A tool-less (`-t todo`) mr-review reviewer could not read the checkout and blocked
-    every MR. mr-review now runs `-t file` (no terminal) under eph-gate with cc's pure-read grant: the full gated
+    every MR. mr-review runs file plus gated history terminal under eph-gate with cc's pure-read grant: the full gated
     path (sweep, probe with the path guard first, sentinel, env pops) and a policy that allows reads inside the
-    checkout only and denies write_file / patch / terminal (rules AND the READ-ONLY hard deny)."""
+    checkout only and denies writers and arbitrary terminal commands."""
     with tempfile.TemporaryDirectory() as d, _Registry(d):
         a, wt, alerts = _setup(d)
         open(os.path.join(wt, "f.txt"), "w").write("x\n")
@@ -1921,11 +2108,11 @@ def test_adapter_mr_review_gated_read_only():
                                _r("mr-review", FAKE_RECORD=rec, FAKE_PROBE_RECORD=prec, FAKE_STATUS="pass"),
                                "SYS", "P", resume=False)
         (r,) = _recs(rec)
-        assert r["argv"][r["argv"].index("-t") + 1] == "file", r["argv"]
+        assert r["argv"][r["argv"].index("-t") + 1] == "file,terminal", r["argv"]
         cfg = r["config"]
         assert cfg["plugins"] == {"enabled": ["eph-gate"], "load_timeout_seconds": 0}, cfg["plugins"]
         assert cfg["tools"]["tool_search"]["enabled"] == "off" and cfg["lsp"]["enabled"] is False, cfg
-        assert "terminal" in cfg["agent"]["disabled_toolsets"] and "file" not in cfg["agent"]["disabled_toolsets"]
+        assert not {"file", "terminal"}.intersection(cfg["agent"]["disabled_toolsets"])
         assert cfg["terminal"]["cwd"] == os.path.realpath(wt), cfg
         assert cfg["terminal"]["shell_init_files"] == [os.path.join(w.hermes_home, H.TERMINAL_ENV_FILE)], cfg
         assert r["terminal_cwd"] == os.path.realpath(wt) and r["cwd"] == os.path.realpath(wt), r
@@ -1958,8 +2145,9 @@ def test_adapter_mr_review_gated_read_only():
                            ("search_files", {"pattern": "T"})):
             v = G.decide(tool, args, P)
             assert not v.allowed and "DENIED" in v.reason, (tool, args, v)
-        for tool in G.READ_ONLY_DENIED_TOOLS:                 # the hard deny names the read-only capability
+        for tool in ("write_file", "patch"):
             assert "READ-ONLY" in G.decide(tool, {"path": "f.txt", "command": "x"}, P).reason
+        assert not G.decide("terminal", {"command": "x"}, P).allowed
         # refusal paths fail closed with no launch: gate not loaded / stale nonce / probe crash / bad interpreter path
         n = len(_recs(rec))
         for mode in ("unloaded", "wrongnonce", "crash", "badpath"):
@@ -1974,7 +2162,7 @@ def test_adapter_mr_review_gated_read_only():
         assert a._one_turn(Worker("gitlab:mr:1", "r", wt), _r("mr-review", FAKE_RECORD=rec, FAKE_NO_GATE="1"),
                            "SYS", "P", resume=False) is None
         assert any("not provably live" in m for m in alerts), alerts
-        # belts: a widened CC mr-review grant, or a terminal toolset, is refused before any launch
+        # Belts: a widened CC grant or any toolset beyond files/history is refused before launch.
         n = len(_recs(rec))
         orig_grant = CC.capability_tool_grant
         for widened in (["--permission-mode", "acceptEdits", "--allowedTools", "Read Grep Glob"],
@@ -1989,7 +2177,7 @@ def test_adapter_mr_review_gated_read_only():
             finally:
                 CC.capability_tool_grant = orig_grant
         orig_ts = H.HERMES_GRANTS["mr-review"]
-        H.HERMES_GRANTS["mr-review"] = ("file", "terminal")
+        H.HERMES_GRANTS["mr-review"] = ("file", "terminal", "web")
         try:
             a._one_turn(Worker("gitlab:mr:1", "r", wt), _r("mr-review", FAKE_RECORD=rec), "SYS", "P", resume=False)
             raise AssertionError("mr-review with a terminal toolset must refuse")
@@ -1998,7 +2186,7 @@ def test_adapter_mr_review_gated_read_only():
         finally:
             H.HERMES_GRANTS["mr-review"] = orig_ts
         assert len(_recs(rec)) == n, "a refused mr-review turn must never launch"
-    ok("eph-gate: mr-review - `-t file` (no terminal) under eph-gate, policy = cc's pure-read grant + secret "
+    ok("eph-gate: mr-review - files and parsed history under eph-gate, policy = cc's pure-read grant + secret "
        "floor, read_root = the checkout; probe (path guard first) + sentinel + env pops run; reads inside allowed, "
        "outside/secret/write_file/patch/terminal denied; probe failures / no gate / a widened grant fail closed")
 

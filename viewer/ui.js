@@ -223,8 +223,15 @@ export function viewFetch(url, init = {}) {
   });
 }
 
-export function steerState(state) {
+export function steerState(state, reason) {
+  if (state === 'not_delivered') return 'Not delivered: ' + (reason || 'wake channel failed');
+  if (state === 'sent' || state === 'waking') return 'Sent, awaiting consumption';
   return state === 'delivered' ? 'Delivered' : 'Queued';
+}
+
+export function steerHint(agent) {
+  return agent.status === 'idle' ? agent.wake ? 'Wakes this agent through its configured channel.'
+    : 'Not delivered: agent idle, no wake channel' : 'Arrives at its next tool call.';
 }
 
 // A one-line "what it is doing" note split into the work and who it waits on, so the wait can stand out.
@@ -266,7 +273,7 @@ function meter(info) {
   return wrap;
 }
 
-// One composer for the detail page and the quick view. send(text) resolves to a message id (tracked until
+// One composer for the detail page and the quick view. send(text) resolves to a receipt (tracked until
 // delivered), true (sent, nothing to track) or throws. Quick replies send their text in one tap.
 function composer(opts) {
   const form = el('form', 'ad-comp'), qr = el('div', 'ad-qr'), row = el('div', 'ad-row');
@@ -287,22 +294,31 @@ function composer(opts) {
     hint.textContent = why || opts.hint || '';
   }
   function grow() { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight + 2, 140) + 'px'; }
+  function receipt(id, rec) {
+    const sink = opts.sink && opts.sink();
+    if (sink) sink({type: 'broker', subtype: 'web_message', id, state: rec.state, via: rec.via || 'tool',
+      reason: rec.reason, text: rec.text, timestamp: new Date().toISOString()});
+    if (rec.li) {
+      rec.li.lastChild.textContent = steerState(rec.state, rec.reason);
+      rec.li.lastChild.className = rec.state === 'delivered' ? 'ok' : '';
+    }
+  }
   async function submit(text) {
     if (!canSend || busy || !text.trim()) return false;
     busy = true; why = ''; paint();
     try {
-      const id = await opts.send(text);
+      const result = await opts.send(text);
+      const id = typeof result === 'string' ? result : result && result.id;
       if (typeof id === 'string') {
-        const rec = {text, state: 'queued', li: null};
+        const rec = {text, state: 'queued', li: null, ...(typeof result === 'object' ? result : {})};
         mine.set(id, rec);
         const sink = opts.sink && opts.sink();
-        if (sink) sink({type: 'broker', subtype: 'web_message', id, state: 'queued', via: 'tool', text,
-          timestamp: new Date().toISOString()});
-        else {
-          rec.li = el('li'); rec.li.append(el('span', null, text), el('b', null, steerState('queued')));
+        if (!sink) {
+          rec.li = el('li'); rec.li.append(el('span', null, text), el('b'));
           sent.hidden = false; sent.append(rec.li);
           while (sent.children.length > 3) sent.firstChild.remove();
         }
+        receipt(id, rec);
       }
       return true;
     } catch (err) { why = 'Could not send: ' + err.message; return false; }
@@ -320,8 +336,9 @@ function composer(opts) {
   });
   return {form, input, submit,
     // ok: may send now; reason: shown when it may not; list: quick replies; states: the agent's steer_messages.
-    update(ok, reason, list, states) {
+    update(ok, reason, list, states, deliveryHint) {
       canSend = !!ok; why = ok ? why : reason || '';
+      if (deliveryHint) opts.hint = deliveryHint;
       const labels = (list || []).map((r) => r.label + '\n' + r.text).join('\n\n');
       if (labels !== replies) {
         replies = labels;
@@ -334,12 +351,10 @@ function composer(opts) {
       qr.hidden = !qr.children.length;
       for (const m of states || []) {
         const rec = mine.get(m.id);
-        if (!rec || rec.state === 'delivered' || m.state !== 'delivered') continue;
-        rec.state = 'delivered';
-        const sink = opts.sink && opts.sink();
-        if (sink) sink({type: 'broker', subtype: 'web_message', id: m.id, state: 'delivered', via: 'tool',
-          timestamp: new Date().toISOString()});
-        if (rec.li) { rec.li.lastChild.textContent = steerState('delivered'); rec.li.lastChild.className = 'ok'; }
+        const state = m.state === 'pending' ? 'queued' : m.state;
+        if (!rec || rec.state === 'delivered' || rec.state === state) continue;
+        Object.assign(rec, m, {state});
+        receipt(m.id, rec);
       }
       paint();
     },
@@ -354,7 +369,7 @@ function steerSend(base, name, signal) {
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || 'HTTP ' + response.status);
-    return String(data.id);
+    return {...data, state: data.state === 'pending' ? 'queued' : data.state};
   };
 }
 
@@ -437,7 +452,7 @@ export function mount(el0, ctx = {}) {
     if (info.tokens != null) parts.push(meter(info));
     parts.push(el('span', null, 'Last activity ' + ago(agent.age)));
     head.meta.replaceChildren(...parts);
-    if (comp) comp.update(ctx.canAct, READ_ONLY, replies, agent.steer_messages);
+    if (comp) comp.update(ctx.canAct, READ_ONLY, replies, agent.steer_messages, steerHint(agent));
   }
 
   async function showAgent(agent) {
@@ -447,7 +462,7 @@ export function mount(el0, ctx = {}) {
     detail.replaceChildren(headerFor(agent));
     if (agent.can_steer_pull) {
       comp = composer({name: agent.name, send: steerSend(base, agent.name, ctx.signal),
-        hint: 'Arrives at its next tool call.', sink: () => view && view.note});
+        hint: steerHint(agent), sink: () => view && view.note});
     }
     updateHead(agent);
     if (agent.can_tail) {
@@ -728,7 +743,8 @@ export function quickView(el0, agentName, ctx = {}) {
   function paintComposer() {
     if (!comp || !agent) return;
     const ok = !!ctx.canAct && (mode === 'tail' ? agent.can_steer_pull : agent.can_steer);
-    comp.update(ok, ctx.canAct ? agentName + ' does not accept messages from here.' : READ_ONLY, replies, agent.steer_messages);
+    comp.update(ok, ctx.canAct ? agentName + ' does not accept messages from here.' : READ_ONLY,
+      replies, agent.steer_messages, mode === 'tail' ? steerHint(agent) : '');
     if (mode === 'view') comp.extra(running ? [steerB, stopB] : []);
   }
 
@@ -836,7 +852,7 @@ export function quickView(el0, agentName, ctx = {}) {
       else { liveEl.hidden = true; live.textContent = agentName + ' does not share its transcript, so only its presence shows here.'; }
       if (agent.can_steer_pull && mode === 'tail') {
         comp = composer({name: agentName, send: steerSend(base, agentName, controller.signal),
-          hint: 'Arrives at ' + agentName + "'s next tool call."});
+          hint: steerHint(agent)});
       } else if (mode === 'view') {
         comp = composer({name: agentName, max: 8000, hint: 'Sends a new message.', send: (message) => post('say', {message})});
       }

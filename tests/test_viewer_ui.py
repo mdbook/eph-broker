@@ -103,6 +103,25 @@ class UI(ViewerTest):
         assert b'if (agent.can_steer_pull)' in script and b'b.disabled = !canSend || busy' in script
         assert b"const ok = !!ctx.canAct && (mode === 'tail' ? agent.can_steer_pull : agent.can_steer)" in script
 
+    def test_idle_no_wake_response_has_visible_not_delivered_state(self):
+        directory = Directory(KEY, self.tmp_path, clock=lambda: 100)
+        credentials = enrolled(directory)
+        directory.request('/v1/register', *signed(credentials, '/v1/register',
+                          dict(name='demo', kind='claude-code', caps=['steer-pull'], ttl=30)))
+        directory.request('/v1/beat', *signed(credentials, '/v1/beat', {'status': 'idle'}, ts='101'))
+        body = json.dumps({'text': 'Wrap up'}).encode()
+        headers = ('X-Forwarded-User: operator\r\nX-Viewer-Can-Act: 1\r\n'
+                   'Content-Type: application/json\r\nContent-Length: %d\r\n') % len(body)
+        status, response = request(directory, '/api/agents/demo/steer', headers, method='POST', body=body)
+        assert status == 200
+        result = json.loads(response)
+        assert result['state'] == 'not_delivered' and result['reason'] == 'agent idle, no wake channel'
+        script = request(directory, '/ui.js', 'X-Forwarded-User: operator\r\n')[1]
+        assert b'Not delivered: agent idle, no wake channel' in script
+        assert b'Sent, awaiting consumption' in script and b'receipt(m.id, rec)' in script
+        renderer = request(directory, '/transcript.js', 'X-Forwarded-User: operator\r\n')[1]
+        assert b"o.state === 'not_delivered'" in renderer and b'Not delivered: ' in renderer
+
     def test_legacy_steer_cap_has_no_pull_composer_or_queue_access(self):
         directory = Directory(KEY, self.tmp_path, clock=lambda: 100)
         credentials = enrolled(directory)
@@ -453,9 +472,14 @@ console.log('ok');
         if not node:
             self.skipTest('node unavailable')
         script = """
-import {parseRoute, makeRoute, viewFetch, rowSummary, tailRows, plainText, splitNow, describe, toolLine,
+import {parseRoute, makeRoute, viewFetch, rowSummary, tailRows, plainText, splitNow, describe, toolLine, steerState, steerHint,
   transcriptLines} from %s;
 const assert = (c, m) => { if (!c) { console.error('FAIL', m); process.exit(1); } };
+assert(steerState('not_delivered', 'agent idle, no wake channel') === 'Not delivered: agent idle, no wake channel', 'failure');
+assert(steerState('sent') === 'Sent, awaiting consumption' && steerState('delivered') === 'Delivered', 'wake states');
+assert(steerHint({status: 'idle', wake: null}) === 'Not delivered: agent idle, no wake channel', 'idle without wake');
+assert(steerHint({status: 'idle', wake: {kind: 'zulip-dm'}}).includes('Wakes'), 'idle wake hint');
+assert(steerHint({status: 'busy', wake: {kind: 'zulip-dm'}}).includes('next tool call'), 'busy hint');
 const r = makeRoute('books', 'a/b c', '42');
 assert(JSON.stringify(parseRoute(r)) === JSON.stringify({name: 'books', session: 'a/b c', id: '42'}), r);
 assert(JSON.stringify(parseRoute('books')) === JSON.stringify({name: 'books', session: null, id: null}), 'bare');

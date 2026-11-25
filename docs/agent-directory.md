@@ -133,10 +133,11 @@ Keep that script read-only to the agent. The sandbox must allow the hook to read
 only this agent's steer directory. Use one beat process per state file, and never share a
 state file or steer directory between agents or runs.
 
-In the Agents tab, pick the registered agent and use **Message at next tool call**. The
-composer accepts up to 4000 characters. It shows **Waiting for next tool call**, then
-**Delivered** after the hook's log record reaches the directory on a beat. Idle agents keep
-messages queued until a tool call; there is no Stop-hook injection or automatic new turn.
+In the Agents tab, pick the registered agent and use the message box or a quick reply.
+The composer accepts up to 4000 characters. Busy agents show **Queued**, then **Delivered**
+after the hook's log record reaches the directory on a beat. Idle agents use their configured
+wake channel instead, as described below; without one the UI says
+**Not delivered: agent idle, no wake channel**. There is no Stop-hook injection.
 The hook labels each message as operator feedback sent via the Agents tab, with the sender
 and UTC queue time, separately from the tool's output. Existing permissions and constraints
 still apply. Message delimiters are neutralised in the body, and sender metadata is kept
@@ -158,17 +159,17 @@ use the next-tool-call composer only for agents running this hook and beat clien
 Protocol and recovery:
 
 * Action-gated `POST /api/agents/NAME/steer` accepts JSON `{text: "..."}` and returns
-  `{ok: true, id: "..."}`; agents without `steer-pull` receive 403. The authenticated host supplies the sender identity, not the
+  `{ok: true, id: "...", state: "...", via?: "wake", reason?: "..."}`; agents without `steer-pull` receive 403. The authenticated host supplies the sender identity, not the
   request body. There are at most 32 outstanding messages and 32 recent status records
   per registration; a full queue returns 409. Queue entries are bound to the enrolled kid,
   so a replacement agent with the same name does not receive the old agent's messages.
-* Signed beat responses include `steer: [{id, ns, text, doer}]` until acknowledged. The
+* For the tool-call path, signed beat responses include `steer: [{id, ns, text, doer}]` until acknowledged. The
   client first saves the pending messages in its 0600 state file, then writes
   `<steer dir>/inbox/<ns>-<id>.msg` as JSON `{id, doer, text}`, byte-compatible with
   `steer.enqueue`: dotfile, fsync, atomic rename, 0700 directories and 0600 files.
   All steer-path components refuse symlinks. The next beat includes `steer_queued: [id]`.
 * The client tails `log.jsonl` and reports `steer_delivered: [id]` on the beat. List
-  snapshots expose only `steer_messages: [{id, state}]`, not message text or sender names.
+  snapshots expose `steer_messages: [{id, state, via?, reason?}]`, not message text or sender names.
   The hook prints and flushes context first, then writes a delivered record with
   `output_confirmed: true`, then removes its `.delivered` claim. A normal delivery is
   once, including retrying a lost beat response. Delivery across crashes is at-least-once:
@@ -182,6 +183,61 @@ Protocol and recovery:
   Explicit deregistration clears that registration's server queue; finish outstanding
   deliveries first. Treat both state directories as private message storage and remove
   obsolete local steer directories when retiring an agent.
+
+### Idle-agent delivery
+
+An idle session makes no tool calls. To wake one, the directory administrator can configure
+a channel for its registered name, independently of the agent's registration or harness.
+The directory stores that channel as the entry's `wake` field. Default is none. Non-Zulip
+installations need no bus settings and retain tool-call delivery for busy agents.
+
+For a Zulip-connected agent, set these in the directory process's environment:
+
+```sh
+AGENTDIR_WAKE_CHANNELS='{"demo":{"kind":"zulip-dm","handle":"demo-bot@chat.example.com"}}'
+AGENTDIR_WAKE_ZBUS=/usr/local/bin/zbus
+AGENTDIR_WAKE_ZBUS_ENV=/path/to/directory-sender-identity
+```
+
+Restart the directory after changing the map. A map value of `null` or `"none"` explicitly
+disables that entry's channel. Unknown channel kinds or invalid handles disable the whole
+map and log an error. Registration cannot choose another recipient: the map belongs to the
+administrator, so enrollment alone cannot turn the directory into an arbitrary DM relay.
+The credentials setting is only a path; the directory never reads its contents. The bus CLI
+and sender identity are optional operator-installed dependencies, not included in the viewer.
+The target must already listen for DMs from that sender while idle.
+
+Keep presence accurate: run `status busy` when a main turn starts and `status idle` when it
+ends, using the agent's existing busy/idle hooks. Only an explicit directory `idle` status
+selects wake delivery. Busy or unknown (`live`) status keeps the existing PostToolUse path.
+The delivery path is fixed when the operator sends the message; already-pulled hook messages
+are not also DMed, avoiding duplicate delivery during a busy-to-idle transition.
+
+An idle send goes directly to the channel, without waiting for a heartbeat. The DM uses the
+same capped, delimiter-neutralised forwarding frame, with sender, queue time, dashboard ID
+and **UNTRUSTED COMMENT** markers. Task constraints still apply. The transport has a five-second
+deadline and runs outside the directory lock. With a listening target this removes the
+next-tool-call wait, so a wake normally arrives within about ten seconds.
+
+A successful DM shows **Sent, awaiting consumption**, not Delivered. For agents with `tail`,
+the directory marks **Delivered** when a signed user-role transcript record contains the
+forwarded message's metadata and ID. Tool results and assistant echoes do not acknowledge
+it. For listeners without a canonical user-role transcript record, acknowledge only after
+the main agent consumes that ID, using the same enrolled client:
+
+```sh
+python3 -m viewer.clients.agentdir --state agentdir-state/demo.json ack-wake MESSAGE_ID
+```
+
+This sends a signed `steer_delivered` beat, is idempotent, and does not require a tool call.
+Do not acknowledge merely because the transport accepted the DM or the agent became busy.
+The UI refreshes delivery on its next presence poll. A failed transport shows
+**Not delivered: wake channel failed** and never silently falls back to an idle tool inbox.
+A later consumption receipt overrides a transport failure, since a timeout can mean an
+ambiguous send. There are no automatic DM retries. After a directory
+crash during sending, the persisted `waking` state also awaits a consumption receipt rather
+than resending. Inspect the target before retrying such messages to avoid duplicates.
+Not-delivered records count as completed history, so they do not fill the outstanding queue.
 
 ## Claude Code and Codex transcript tail
 
@@ -244,6 +300,9 @@ are not forwarded. Claude JSONL keeps its existing record shape. Oversized proje
 become size-limit notices. Redaction is best effort, not a substitute for access control.
 Codex rollout command completions with a tracked function-call ID reuse that call's tool card
 instead of adding a duplicate command card.
+Canonical Codex user text parts remain excluded from the display projection. Forwarded wake
+headers carry only their message IDs in `wake_receipts` across client and server projection,
+so consumption can mark a wake Delivered without forwarding the discarded text.
 Use loopback or a trusted TLS reverse proxy for remote agents: HMAC authenticates, not encrypts.
 
 The authenticated UI route `GET /api/agents/NAME/transcript` streams SSE. `Last-Event-ID`
@@ -326,8 +385,11 @@ server's 0600 `revoked.json`, `used-tokens.json` (used token ids and their expir
 keys), and `steering.json` (per-kid messages and recent delivery states, created on first send).
 Keep the enrollment key stable across restarts. Presence and replay timestamps
 are in memory. After restart agents must register again; the CLI saves its registration and
-automatically re-registers on the next beat when the server reports a missing entry. A used
-token stays refused across restarts until it expires; deregistered kids remain revoked.
+automatically re-registers on the next beat when the server reports a missing entry.
+The CLI also saves its latest explicit busy/idle status and includes it in re-registration,
+including recovery triggered by transcript events or TTL expiry. An idle file needs no new turn
+or status hook to restore idle presence after a directory restart. A used token stays refused
+across restarts until it expires; deregistered kids remain revoked.
 Request replay protection resets on restart, so a captured signed request could be replayed
 once within the 60 second skew window right after a restart; it can only repeat a beat,
 register or deregister that the agent already sent.
@@ -344,7 +406,9 @@ Signing headers: `X-Agentdir-Kid`, `X-Agentdir-Ts` (Unix seconds, fractional sec
 `X-Agentdir-Sig` (hex HMAC-SHA256 of `method|path|ts|sha256(body)` using the agent key).
 Skew must be within 60 seconds; timestamps must strictly increase. The CLI uses microsecond
 precision so consecutive commands work within one second. JSON bodies are limited to 16 KiB.
-Register includes `{name,kind,caps,ttl,view_url?}`; TTL is 3..86400 seconds. Allowed kinds are
+Register includes `{name,kind,caps,ttl,view_url?,status?}`; optional status is `busy` or `idle`
+and restores presence atomically with registration. Without it, a new entry starts as `live`.
+TTL is 3..86400 seconds. Allowed kinds are
 `hermes`, `claude-code`, `codex`, `generic`; caps are `view`, `steer`, `steer-pull`, `tail`. A name owned by
 another live/grey kid cannot be replaced. Beat optionally includes `{status:"busy"|"idle"}`.
 

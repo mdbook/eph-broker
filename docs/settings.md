@@ -289,6 +289,8 @@ own separate repo settings.
 | `CODE_REPO_RUNNERS` | unset | Same format; overrides the seeds per path. |
 | `CODE_TEST_RUNNER` | `pytest` | Runner for a repo that's in neither map. |
 | `EPH_GATE_TEST_ENV_ALLOW` | unset | Comma list of extra reviewed, exact environment names allowed before a code worker's granted test runner on hermes/Codex, on top of the benign defaults ([hermes.md](hermes.md#test-runner-environment-assignments-hermes-and-codex)). No wildcard patterns. Values remain confined. |
+| `EPH_GATE_GIT_HISTORY_FORMS` | `["git diff", "git log", "git show"]` | JSON list selecting parsed read-only Git history families on every Hermes/Codex row. `[]` disables the extension. Unknown families refuse the turn. Path, secret and helper floors cannot be disabled ([hermes.md](hermes.md#read-only-git-history-hermes-and-codex)). |
+| `GIT_EXTERNAL_DIFF` | unset | Runtime Git helper selector, not a broker setting. Eph-gate requires explicit `--no-ext-diff --no-textconv` for history inspection when this is present. |
 | `CODE_TEST_DEPS_CONFIG` | unset | Operator-owned JSON map of absolute repo paths to Python package requirements. Mapped repos use the `venv` runner; the broker provisions `<repo>/.venv` before starting them. Setup failures are verification gaps, not pre-start refusals. |
 | `CODE_MR_TARGET_REF` | `main` | Fallback MR target; the repo's own default branch is used when known. |
 | `CODE_BRANCH_PREFIX` | `eph/code-change` | Branch name prefix. |
@@ -529,6 +531,9 @@ The optional [agent directory](agent-directory.md#listeners-and-authentication) 
 | `AGENTDIR_AGENT_BIND` | `127.0.0.1:8790` | Agent API TCP listener, separate from the UI socket. |
 | `AGENTDIR_TAIL_LINES` | `2000` | Per-agent in-memory transcript ring, 1..10000 lines. Each line is at most 24 KiB. Invalid values refuse startup. Restart to apply. The tail client's separate `--lines` replay ring also defaults to 2000. |
 | `AGENTDIR_QUICK_REPLIES` | three defaults | One-tap replies under the message box: a JSON list of up to 8 items, each a string or `{"label": "...", "text": "..."}` (label up to 40 characters, text up to 4000). `[]` turns them off. Invalid values log an error and use the defaults (Ask for status, Wrap up, Pause after this step). Restart to apply. |
+| `AGENTDIR_WAKE_CHANNELS` | `{}` | Administrator-owned JSON map from directory name to its `wake` field: `null` or `"none"` disables waking; `{"kind":"zulip-dm","handle":"demo-bot@chat.example.com"}` sends idle-agent messages by DM instead of the tool-call inbox. Agents cannot supply or override recipients at registration. Invalid maps log an error and disable waking. Requires `steer-pull` registration. See [idle-agent delivery](agent-directory.md#idle-agent-delivery). Restart to apply. |
+| `AGENTDIR_WAKE_ZBUS` | unset | Path to the `zbus` executable used by the optional `zulip-dm` wake transport. No shell; message text is passed on stdin. Unset or failed transport produces a visible not-delivered state. Each send has a five-second timeout. |
+| `AGENTDIR_WAKE_ZBUS_ENV` | unset | Optional credentials-file path passed to the transport as `ZBUS_ENV`, never read by the directory. Unset inherits the directory process's `ZBUS_ENV` or the CLI default. Use a sender identity admitted by the target's bus listener. |
 | `AGENTDIR_AGENT_MAX_CONNECTIONS` | `64` | Positive maximum concurrent agent API connections, including idle and keep-alive connections. Excess connections close immediately without an HTTP response. Invalid values log an error and use 64. Each connection has a 10-second socket idle timeout from setup, covering request lines, headers and bodies. UI listeners are unchanged. Restart to apply. |
 
 ## Other built-in rows

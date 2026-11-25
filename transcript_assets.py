@@ -229,12 +229,12 @@ function webMsg(o){
     const time = timeEl(o);
     meta.appendChild(time);
     ev.appendChild(meta);
-    const body = el('div', 'md', o.state === 'queued' ? o.text || '' : '');
+    const body = el('div', 'md', o.state !== 'reply' ? o.text || '' : '');
     ev.appendChild(body);   // textContent: the operator's own words, never markup
     m = {ev, chip, time, body, reply: null, state: null};
     webMsgs.set(o.id, m);
   }
-  if(o.state === 'queued' && o.text && !m.body.textContent) m.body.textContent = o.text;
+  if(o.state !== 'reply' && o.text && !m.body.textContent) m.body.textContent = o.text;
   if(o.state === 'reply'){
     m.state = 'reply';
     m.chip.className = 'pill ok';
@@ -252,16 +252,24 @@ function webMsg(o){
   }else if(o.state === 'delivered' && m.state !== 'reply'){
     m.state = 'delivered';
     m.chip.className = 'pill ok';
-    m.chip.textContent = o.via === 'tool' ? 'Read mid-turn' : 'Read at the start of its next turn';
+    m.chip.textContent = o.via === 'wake' ? 'Delivered' : o.via === 'tool' ? 'Read mid-turn' : 'Read at the start of its next turn';
     m.time.replaceWith(m.time = timeEl(o));
     m.ev.classList.remove('pending');
     webPending.delete(m.ev);
     const t = new Date(o.timestamp).getTime();
     if(Number.isFinite(t)) placeAt(m.ev, t); else log.appendChild(m.ev);
-  }else if(o.state === 'queued' && m.state !== 'delivered' && m.state !== 'reply'){
+  }else if(o.state === 'not_delivered' && m.state !== 'delivered' && m.state !== 'reply'){
+    m.state = 'not_delivered';
+    m.chip.className = 'pill bad';
+    m.chip.textContent = 'Not delivered: ' + (o.reason || 'wake channel failed');
+    m.ev.classList.remove('pending');
+    webPending.delete(m.ev);
+    log.appendChild(m.ev);
+  }else if(['queued', 'sent', 'waking'].includes(o.state) && m.state !== 'delivered' && m.state !== 'reply'){
     m.state = 'queued';
     m.chip.className = 'pill pend';
-    m.chip.textContent = o.via === 'tool' ? 'Queued: it reads this after its next tool call'
+    m.chip.textContent = o.via === 'wake' ? 'Sent, awaiting consumption'
+                      : o.via === 'tool' ? 'Queued: it reads this after its next tool call'
                                           : 'Queued: it reads this when its current turn ends';
     m.ev.classList.add('pending');
     webPending.add(m.ev);

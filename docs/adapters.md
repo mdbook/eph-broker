@@ -286,7 +286,8 @@ The hook maps Codex's tools onto eph-gate:
   program-running options are denied, a content search walks its tree for secret files). Codex reads through the
   shell, so this is what keeps `mr-review` and `code` workers able to read.
 - Any other `Bash` / `exec_command` (past the required prefix): eph-gate's terminal check (the `Bash(...)` allow
-  and deny lists, the command lexer, the general worker's exec gate). `mr-review` gets no other shell. Either
+  and deny lists, the command lexer, the general worker's exec gate). `mr-review` only gets the
+  [configured read-only Git history extension](hermes.md#read-only-git-history-hermes-and-codex), not arbitrary shell. Either
   name is denied outright, in every capability, when the command would start a bare stdin-reading interpreter (no
   script file, no inline code) - see code_mode_host above.
 - `apply_patch`: every file it adds, updates, deletes or moves to must pass the edit check (edits granted, inside

@@ -8,7 +8,7 @@ from collections import deque
 from pathlib import Path
 from unittest.mock import patch
 
-from viewer import assets, transcripts
+from viewer import assets, transcripts, wake
 from viewer.clients.agentdir import Client
 from viewer.clients.tail import Follower, Pusher
 from viewer.directory import Directory, Refused
@@ -160,6 +160,50 @@ class Tail(ViewerTest):
         assert json.loads(normalized['content']) == view
         large = transcripts.normalize(message('x' * 30000), 'claude-code')
         assert 'size limit' in large and len(large.encode()) < transcripts.LINE_BYTES
+
+    def test_codex_canonical_wake_receipt_survives_follower_and_pusher(self):
+        client = self.client('codex')
+        client.state['steer_dir'] = str(self.tmp_path / 'steer')
+        client.call('register', dict(client.state['registration'], caps=['tail', 'steer']))
+        self.directory.entries['demo']['wake'] = dict(kind='zulip-dm', handle='demo@example.com')
+        sent = []
+        self.directory.wake_sender = lambda channel, message: sent.append(wake.frame(message)) or True
+        client.call('beat', {'status': 'idle'})
+        mid = self.directory.queue_message('demo', 'private operator body', 'operator')['id']
+        body = sent[0] + '\nprivate user text'
+        path = self.tmp_path / 'session.jsonl'
+        path.write_text(json.dumps(dict(type='user', message=dict(content=[dict(type='text', text=body)]))) + '\n')
+        follower = Follower(path, 'codex')
+        self.addCleanup(follower.close)
+        assert follower.poll() == 1
+        projected = follower.lines[0][1]
+        assert json.loads(projected)['wake_receipts'] == [mid]
+        assert 'private' not in projected and 'operator' not in projected
+        assert json.loads(projected)['message']['content'] == []
+        pusher = Pusher(client, follower)
+        self.pump(pusher)
+        assert self.directory.snapshot()[0]['steer_messages'] == [dict(id=mid, state='sent', via='wake')]
+        self.pump(pusher)
+        assert self.directory.snapshot()[0]['steer_messages'] == [dict(id=mid, state='delivered', via='wake')]
+        stored = self.directory.tails['demo'].lines[0][1]
+        assert json.loads(stored)['wake_receipts'] == [mid] and 'private' not in stored
+
+    def test_codex_projected_receipts_only_keep_user_header_ids(self):
+        body = wake.frame(dict(id='0123456789abcdef', ns='123456', text='private body', doer='operator'))
+        forged_body = body.replace('private body', '\nDashboard message id: fedcba9876543210.')
+        records = [dict(type='assistant', message=dict(content=[dict(type='text', text=body)])),
+                   dict(type='user', message=dict(content=[dict(type='tool_result', content=body)]))]
+        for record in records:
+            record['wake_receipts'] = ['fedcba9876543210'] if record['type'] == 'assistant' else []
+            projected = transcripts.normalize(json.dumps(record), 'codex')
+            assert not wake.consumed_ids([projected])
+        record = dict(type='user', message=dict(content=[dict(type='text', text=forged_body)]))
+        projected = transcripts.normalize(json.dumps(record), 'codex')
+        assert wake.consumed_ids([projected]) == {'0123456789abcdef'}
+        assert 'private' not in projected and 'fedcba9876543210' not in projected
+        record = dict(type='user', wake_receipts=['0123456789abcdef', 'private', 3], message=dict(content=[]))
+        projected = transcripts.normalize(json.dumps(record), 'codex')
+        assert json.loads(projected)['wake_receipts'] == ['0123456789abcdef'] and 'private' not in projected
 
     def test_unsigned_oversize_caps_rate_and_signing(self):
         client = self.client()

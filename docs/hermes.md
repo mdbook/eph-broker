@@ -26,6 +26,54 @@ pin the checkout to a commit you've tested and upgrade it on purpose. `HERMES_BI
 `~/.local/share/eph-hermes/venv/bin/hermes`) points the broker at the binary, and `HERMES_HOME_ROOT` (default
 `~/.cache/eph-hermes-homes`) is where each worker gets a private config home.
 
+## Read-only Git history (hermes and Codex)
+
+Every row, including `mr-review`, can inspect history through a parsed read-only extension:
+
+Example command strings:
+
+```json
+[
+  "git diff --stat HEAD~2 HEAD",
+  "git diff HEAD~2..HEAD -- src docs",
+  "git log --since=1.week --stat -- . ':(exclude)*-env' ':(exclude)*restricted*'",
+  "git show HEAD:src/main.py"
+]
+```
+
+`EPH_GATE_GIT_HISTORY_FORMS` is a JSON config list, defaulting to
+`["git diff", "git log", "git show"]`. Use `[]` to disable the extension, or select a subset.
+Unknown entries or malformed JSON refuse the turn. It selects read families, not arbitrary Bash rules.
+Existing capability grants and explicit command denies still apply. `mr-review` keeps its write and
+arbitrary-terminal denies; only parsed history commands bypass its blanket Bash deny. General still needs
+its exec judge's approval. Claude Code's native grants are unchanged.
+
+Diff accepts one revision/range or two revisions, with `--stat`, `--name-only` or `--numstat`.
+Log accepts a revision/range, `--since` (separate value or `=`), `--stat`, `--oneline` and `--format`
+(separate value or `=`). Show accepts one revision or `revision:path`, with an existing historical blob
+and an unambiguous repository-relative path (no `./` spelling). Revisions must resolve to commits.
+After `--`, literal files and directories (including `.`) and quoted `:(exclude)` pathspecs are supported.
+Other pathspec magic and positive wildcards remain denied, as do paths outside the worktree.
+
+Content output is checked against Git's NUL-delimited filename metadata, including deleted historical
+files and policy-specific Read denies. A directory cannot hide a secret. Use explicit safe files or
+exclusions covering every secret-floor file. Diff/show checks conservatively include endpoint history,
+so a secret deleted before the selected revision can still require exclusion. Names/stat-only forms do
+not print file contents and need no whole-tree content floor. Metadata errors fail closed.
+
+Global Git options (`-c`, `-C`), output-file options, external-diff and textconv opt-ins stay denied.
+If Git config names a diff/textconv helper, or `GIT_EXTERNAL_DIFF` is set, include both
+`--no-ext-diff --no-textconv`. This avoids executing default helpers without relying on tool-input
+rewrites, which Codex cannot apply. Config checks inspect names only, never helper values.
+
+Signature verification is disabled in every gate Git subprocess and both harnesses' tool shells:
+`log.showSignature=false`, `gpg.program=/bin/false`, and the OpenPGP/X.509/SSH program overrides also
+point to `/bin/false`. Tool shells pin these via Git's command-scope config environment, replacing
+inherited `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG_COUNT`. This also covers configured pretty formats.
+`--show-signature` (including abbreviations) and `--format`/`--pretty` values containing `%G` signature
+placeholders are denied, including the space/plus/minus formatting modifiers. Ordinary formats such as
+`git log '--format=%H %s'` still work. No worker-supplied `-c` config is permitted.
+
 ## Test-runner environment assignments (hermes and Codex)
 
 For code workers, eph-gate allows environment assignments only before the granted test runner.

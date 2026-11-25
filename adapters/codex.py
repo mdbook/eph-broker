@@ -340,17 +340,17 @@ def codex_config(model, effort, sandbox, instructions_path, network=False, writa
     lines += ["", "[shell_environment_policy]", 'exclude = ["CODEX_HOME"]']
     # Pin the shared launcher's PATH in tool shells, not just the codex parent. Login profiles and
     # shell snapshots must not substitute /usr/bin/ssh for the managed SSH launcher (ticket 2104).
-    if shell_path is not None or companion_env or shell_init_dir or npm_cache:
-        lines += ["", "[shell_environment_policy.set]"]
-        if shell_path is not None:
-            lines.append(f"PATH = {toml_str(shell_path)}")
-            lines += [f"{k} = {toml_str(v)}" for k, v in (git_identity or {}).items()]
-        if shell_init_dir:
-            lines += [f"BASH_ENV = {toml_str(os.path.join(shell_init_dir, '.zshenv'))}",
-                      f"ZDOTDIR = {toml_str(shell_init_dir)}"]
-        if npm_cache:
-            lines.append(f"npm_config_cache = {toml_str(npm_cache)}")
-        lines += [f"{k} = {toml_str(v)}" for k, v in (companion_env or {}).items()]
+    lines += ["", "[shell_environment_policy.set]"]
+    if shell_path is not None:
+        lines.append(f"PATH = {toml_str(shell_path)}")
+        lines += [f"{k} = {toml_str(v)}" for k, v in (git_identity or {}).items()]
+    if shell_init_dir:
+        lines += [f"BASH_ENV = {toml_str(os.path.join(shell_init_dir, '.zshenv'))}",
+                  f"ZDOTDIR = {toml_str(shell_init_dir)}"]
+    if npm_cache:
+        lines.append(f"npm_config_cache = {toml_str(npm_cache)}")
+    lines += [f"{k} = {toml_str(v)}" for k, v in (companion_env or {}).items()]
+    lines += [f"{k} = {toml_str(v)}" for k, v in _gate.git_history_env().items()]
     return "\n".join(lines) + "\n"
 
 
@@ -1082,6 +1082,7 @@ class CodexHarness:
         self._write_new(instructions, codex_gate.worker_system_prompt(system_prompt, capability, cwd))
         env = _cc.worker_env(os.environ, route, worker=worker)
         env.update(_cc.repo_companions.environment(worker))
+        env.update(_gate.git_history_env())
         _cc.test_environment.apply_tmpdir(env, worker, capability, test_runner)
         for k in [k for k in env if k.startswith(_POPPED_ENV_PREFIXES)]:
             del env[k]

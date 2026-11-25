@@ -328,15 +328,24 @@ class UI(ViewerTest):
         import dash
         root = Path(__file__).parent.parent
         script = (root / 'viewer' / 'ui.js').read_text()
-        for gone in ('hermes-ui/view.js', 'attachShadow', 'serif', 'italic', 'gradient', 'Steer'):
+        for gone in ('hermes-ui/view.js', 'attachShadow', 'gradient', 'Steer'):
             assert gone not in script, gone
-        # One control height and one view edge, raised to the tap target on phones.
-        assert '--ctl:36px;--gut:20px' in script and '{--ctl:44px;--gut:16px}' in script
-        assert 'height:var(--ctl);min-height:var(--ctl)' in script and 'width:var(--ctl);min-width:var(--ctl)' in script
+        # Ticket 3322 FR1: a transcript, not a chat. No bubbles, no right-aligned turns, no fill behind user turns.
+        for gone in ('.ad-ev', 'align-self:flex-end', 'border-radius:14px'):
+            assert gone not in script, gone
+        # The mockup's layout: a gutter column, a 2px rule in the sender's colour, replies in its reading serif.
+        assert '.ov-row{display:grid;grid-template-columns:var(--gut) minmax(0,1fr)' in script
+        assert 'border-right:2px solid var(--rail,var(--rule2));text-align:right' in script
+        assert '.ov-reply{font:1.06rem/1.62 var(--serif)' in script and '--gut:5.4rem' in script
+        # One control height, raised to the tap target on phones.
+        assert '.adir,.aqv{--ctl:36px;' in script and '.adir,.aqv{--ctl:44px}' in script
+        assert 'height:var(--ctl);min-height:var(--ctl)' in script and 'width:var(--ctl);height:var(--ctl)' in script
         assert '--ctl:36px;' in dash.PAGE and 'height:var(--ctl);padding:0 16px' in dash.PAGE
-        # Steps start collapsed and quieter than replies; Stop lives in the actions menu.
-        assert "d.open = allOpen || openKeys.has(g.key)" in script and '.ad-steps{max-width:760px;font-size:13px;color:var(--t2)}' in script
-        assert "label: 'Stop current turn', bad: true" in script
+        # Steps start folded; Stop, Interrupt and Queue live in the composer while the agent works.
+        assert "let open = allOpen || openKeys.has(g.key)" in script and ".ov-row.ov-f{display:none}" in script
+        assert "el('button', 'ov-cb ov-stop', 'Stop')" in script and "el('button', 'ov-cb ov-force', 'Interrupt')" in script
+        # The mockup's demo strip does not ship.
+        assert 'Mockup' not in script and 'Agent state' not in script
         assert (root / 'docs' / 'mockups' / 'agent-view.html').is_file()
 
     def test_send_split_offers_interrupt_only_while_working(self):
@@ -347,9 +356,10 @@ class UI(ViewerTest):
 import {sendMode, viewActions} from %s;
 const assert = (c, m) => { if (!c) { console.error('FAIL', m); process.exit(1); } };
 let mode = sendMode(false, true, 'atlas');
-assert(!mode.split && mode.hint === '', 'idle: one plain Send');
+assert(!mode.split && mode.hint === '' && mode.label === 'Send', 'idle: one plain Send');
 mode = sendMode(true, true, 'atlas');
-assert(mode.split && mode.hint === 'atlas is working. Send queues your message for its next turn.', 'working: split');
+assert(mode.split && mode.label === 'Queue' &&
+  mode.hint === 'atlas is busy. Queue waits for this turn to end; Stop or Interrupt ends it now.', 'working: Stop, Interrupt, Queue');
 assert(!sendMode(true, false, 'atlas').split, 'no interrupt route: no split');
 const calls = [];
 globalThis.fetch = async (url, init) => {
@@ -433,39 +443,46 @@ console.log('ok');
                     return (Math.max(a, b) + .05) / (Math.min(a, b) + .05);
                   };
                 }""")
-                page.wait_for_selector('.ad-ev.agent')
+                page.wait_for_selector('.ov-ag .ov-reply')
                 for theme, scheme in (('light', 'dark'), ('dark', 'light'), ('auto', 'dark'), ('auto', 'light')):
                     page.emulate_media(color_scheme=scheme)
                     page.evaluate('(theme) => document.documentElement.dataset.theme = theme', theme)
                     for width, ctl in ((1440, 36), (390, 44)):
                         page.set_viewport_size({'width': width, 'height': 900})
                         m = page.evaluate("""() => {
-                          const h = (s) => { const e = document.querySelector(s); return e ? e.getBoundingClientRect().height : null; };
-                          return {box: h('.ad-row textarea'), send: h('.ad-split .ad-main'), more: h('.ad-split .ad-more'),
-                            top: h('.ad-vh-top'), steps: h('details.ad-steps > summary'),
-                            // One row: the text box and both halves of Send share their top edge, not just a height.
-                            edges: new Set(['.ad-row textarea', '.ad-split .ad-main', '.ad-split .ad-more'].map((s) =>
-                              document.querySelector(s).getBoundingClientRect().top)).size,
-                            open: document.querySelectorAll('details.ad-steps[open]').length,
-                            italic: [...document.querySelectorAll('.ad-tl *')].some((e) => getComputedStyle(e).fontStyle === 'italic'),
+                          const shown = (s) => [...document.querySelectorAll(s)].filter((e) => e.getClientRects().length);
+                          const h = (s) => { const e = shown(s)[0]; return e ? e.getBoundingClientRect().height : null; };
+                          // Working: Queue, plus Stop and Interrupt as buttons (desktop) or behind ··· (phone).
+                          const row = ['.ov-msg', '.ov-send', '.ov-stop', '.ov-force', '.ov-cmore'].filter((s) => shown(s).length);
+                          return {box: h('.ov-msg'), send: h('.ov-send'), row: row.join(),
+                            heights: new Set(row.map((s) => h(s))).size,
+                            // One row: the text box and every button share their top edge, not just a height.
+                            edges: new Set(row.map((s) => shown(s)[0].getBoundingClientRect().top)).size,
+                            bar: h('.ov-bar'), label: document.querySelector('.ov-send').textContent,
+                            open: document.querySelectorAll('.ov-stepsrow:not(.ov-f)').length,
                             fits: document.documentElement.scrollWidth <= innerWidth,
-                            hint: document.querySelector('.ad-hint').textContent,
-                            send_contrast: window.buttonContrast(document.querySelector('.ad-split .ad-main'))};
+                            hint: document.querySelector('.ov-cnotes').textContent,
+                            send_contrast: window.buttonContrast(document.querySelector('.ov-send'))};
                         }""")
                         print('view %s %s: %s' % (theme, width, m))
-                        assert m['box'] == m['send'] == m['more'] == ctl and m['edges'] == 1, m
-                        assert m['top'] >= ctl and m['open'] == 0 and not m['italic'] and m['fits'], m
-                        assert m['hint'] == 'atlas is working. Send queues your message for its next turn.', m
+                        row = '.ov-msg,.ov-send,.ov-stop,.ov-force' if width > 720 else '.ov-msg,.ov-send,.ov-cmore'
+                        assert m['box'] == m['send'] == ctl and m['heights'] == 1 and m['edges'] == 1 and m['row'] == row, m
+                        assert m['bar'] >= ctl and m['open'] == 0 and m['fits'] and m['label'] == 'Queue', m
+                        assert m['hint'] == 'atlas is busy. Queue waits for this turn to end; Stop or Interrupt ends it now.', m
                         assert m['send_contrast'] >= 4.5, m
-                # Stop is in the actions menu; Interrupt and send is in the Send menu.
+                # Phone: Stop and Interrupt sit behind the composer's secondary control.
+                page.set_viewport_size({'width': 390, 'height': 900})
+                page.click('.ov-cmore')
+                assert page.inner_text('.ov-acts .ad-menu').startswith('Stop')
+                assert 'Interrupt' in page.inner_text('.ov-acts .ad-menu')
+                page.keyboard.press('Escape')
+                # A turn's steps open in place from the tally and show the tool wells.
                 page.set_viewport_size({'width': 1440, 'height': 900})
-                page.click('.ad-vh-top .btn.sq')
-                assert 'Stop current turn' in page.inner_text('.ad-vh-top .ad-menu')
-                page.keyboard.press('Escape')
-                page.click('.ad-split .ad-more')
-                assert page.inner_text('.ad-split .ad-menu').startswith('Interrupt and send')
-                page.keyboard.press('Escape')
-                # The Fleet quick view, in the dash's detail sheet: the same steps line and the same Send row.
+                page.click('.ov-tally .ov-tgl')
+                assert page.inner_text('.ov-tally .ov-tgl') == 'Hide steps'
+                assert page.locator('.ov-stepsrow:not(.ov-f) .ov-term').count() == 1
+                assert page.locator('.ov-stepsrow:not(.ov-f) .ov-think').count() == 1
+                # The Fleet quick view, in the dash's detail sheet: the same transcript rows and the same composer.
                 for width, ctl in ((1440, 36), (390, 44)):
                     page.set_viewport_size({'width': width, 'height': 900})
                     q = page.evaluate("""async () => {
@@ -477,13 +494,14 @@ console.log('ok');
                       quickView(side, 'atlas', {canAct: true});
                       await new Promise((r) => setTimeout(r, 300));
                       const h = (s) => d.querySelector(s).getBoundingClientRect();
-                      return {box: h('.ad-row textarea').height, send: h('.ad-split .ad-main').height,
-                        edges: new Set(['.ad-row textarea', '.ad-split .ad-main'].map((s) => h(s).top)).size,
-                        steps: d.querySelectorAll('details.ad-steps').length, open: d.querySelectorAll('details.ad-steps[open]').length,
+                      return {box: h('.ov-msg').height, send: h('.ov-send').height,
+                        edges: new Set(['.ov-msg', '.ov-send'].map((s) => h(s).top)).size,
+                        steps: d.querySelectorAll('.ov-tally').length, open: d.querySelectorAll('.ov-stepsrow:not(.ov-f)').length,
+                        rows: d.querySelectorAll('.ov-row.ov-in .ov-gut .ov-who, .ov-row.ov-ag .ov-gut .ov-who').length >= 2,
                         fits: d.scrollWidth <= d.clientWidth};
                     }""")
                     print('quick view %s: %s' % (width, q))
-                    assert q == {'box': ctl, 'send': ctl, 'edges': 1, 'steps': 1, 'open': 0, 'fits': True}, q
+                    assert q == {'box': ctl, 'send': ctl, 'edges': 1, 'steps': 1, 'open': 0, 'rows': True, 'fits': True}, q
             finally:
                 browser.close()
 
@@ -536,6 +554,7 @@ console.log('ok');
           constructor() { setTimeout(() => this.onmessage && this.onmessage({data: %s}), 10); }
           close() {}
         };""" % json.dumps(frame)
+        mockups = Path(__file__).parent.parent / 'docs' / 'mockups'
         with sync_playwright() as playwright:
             try:
                 browser = playwright.chromium.launch(headless=True)
@@ -547,33 +566,63 @@ console.log('ok');
                     page.add_init_script(stream)
                     page.route('**/*', answer)
                     page.goto('http://broker.example.test/#module/agents/atlas')
-                    page.wait_for_selector('.adir-detail .ad-ev.agent')
+                    page.wait_for_selector('.adir-detail .ov-ag .ov-reply')
                     m = page.evaluate("""() => {
                       scrollTo(0, 99999);
                       const r = (s) => document.querySelector(s).getBoundingClientRect();
-                      const log = document.querySelector('.adir-detail > .ad-tl');
+                      const log = document.querySelector('.adir-detail .log');
                       const view = document.querySelector('main > section:not([hidden])');
-                      const small = [...document.querySelectorAll('.adir-detail :is(button,summary,a.adir-back)')]
+                      const small = [...document.querySelectorAll('.adir-detail :is(button,a.ov-back)')]
                         .filter((e) => e.getClientRects().length && e.getBoundingClientRect().height < 44)
                         .map((e) => e.className || e.tagName);
+                      // A transcript, not a chat: every turn, user and agent alike, starts at the same left edge, is
+                      // left-aligned, and has nothing painted behind it.
+                      const turns = [...log.querySelectorAll('.ov-row.ov-in, .ov-row.ov-ag:not(.ov-f)')];
+                      const clear = (e) => { const s = getComputedStyle(e);
+                        return /^rgba\\(0, 0, 0, 0\\)$|^transparent$/.test(s.backgroundColor) && s.backgroundImage === 'none'; };
+                      const body = (t) => t.querySelector(':scope > .ov-bd');
+                      const chat = turns.filter((t) => ['right', 'end'].includes(getComputedStyle(body(t)).textAlign) ||
+                        ['right', 'end'].includes(getComputedStyle(t).textAlign) || !clear(t) || !clear(body(t)) ||
+                        parseFloat(getComputedStyle(body(t)).borderTopLeftRadius) > 0);
                       return {doc: document.documentElement.scrollHeight, win: innerHeight, scrolled: scrollY,
                         wide: document.documentElement.scrollWidth > innerWidth,
-                        head: r('.ad-vh').top, comp: [r('.ad-comp').top, r('.ad-comp').bottom],
-                        log: [log.scrollHeight > log.clientHeight, r('.adir-detail > .ad-tl').bottom],
+                        head: r('.ov-bar').top, bar: r('.ov-bar').height, comp: [r('.ov-compose').top, r('.ov-compose').bottom],
+                        log: [log.scrollHeight > log.clientHeight, r('.adir-detail .log').bottom, r('.adir-detail .log').height],
                         h1: view.querySelectorAll('h1').length, pad: getComputedStyle(document.querySelector('main')).paddingTop,
-                        open: document.querySelectorAll('details.ad-steps[open]').length,
-                        toggle: document.querySelector('details.ad-steps > summary').textContent, small};
+                        open: document.querySelectorAll('.ov-stepsrow:not(.ov-f)').length,
+                        toggle: document.querySelector('.ov-tally').textContent, small,
+                        users: turns.filter((t) => t.classList.contains('ov-in')).length, chat: chat.length,
+                        lefts: new Set(turns.map((t) => Math.round(body(t).getBoundingClientRect().left))).size,
+                        // The sender's rule: down the gutter on desktop, down the turn's left edge on a phone.
+                        rule: innerWidth > 720 ? getComputedStyle(log.querySelector('.ov-in > .ov-gut')).borderRightWidth
+                          : getComputedStyle(log.querySelector('.ov-in')).borderLeftWidth,
+                        days: log.querySelectorAll('.ov-day').length, card: getComputedStyle(document.querySelector('.adir-detail')).borderTopLeftRadius,
+                        reply: getComputedStyle(log.querySelector('.ov-reply')).fontSize,
+                        mock: /Mockup|Agent state/.test(view.textContent)};
                     }""")
                     print('agents tab %sx%s: %s' % (width, height, m))
                     assert m['doc'] == m['win'] and m['scrolled'] == 0 and not m['wide'], m
                     assert m['head'] >= 0 and 0 < m['comp'][0] < m['comp'][1] <= m['win'], m
                     assert m['log'][0] and m['log'][1] <= m['comp'][0] + 1, m
-                    assert m['h1'] == 0 and m['open'] == 0, m
-                    assert m['toggle'] == '2 tool calls · 38s·Show steps', m
+                    assert m['h1'] == 0 and m['open'] == 0 and not m['mock'], m
+                    assert m['toggle'] == '2 tool calls, 38s·Show 3 steps', m
+                    # No bubbles: no turn is right-aligned or filled, and user and agent turns share one left edge.
+                    assert m['users'] and m['chat'] == 0 and m['lefts'] == 1 and m['rule'] == '2px' and m['days'] >= 1, m
                     if width > 720:
-                        assert m['pad'] == '16px', m
+                        assert m['pad'] == '16px' and m['bar'] < 60, m
                     else:
-                        assert not m['small'], m
+                        assert not m['small'] and m['pad'] == '0px' and m['card'] == '0px', m
+                        assert 15 <= float(m['reply'][:-2]) <= 16, m
+                        # Not cramped: the transcript gets at least 60% of the phone's height.
+                        assert m['log'][2] >= .6 * m['win'], m
+                    page.screenshot(path=str(mockups / ('agents-tab-%dx%d.png' % (width, height))))
+                    page.close()
+                # The approved mockup at the same sizes, for a side-by-side review.
+                for width, height in ((1440, 900), (390, 844)):
+                    page = browser.new_page(viewport={'width': width, 'height': height})
+                    page.goto((mockups / 'agent-view.html').as_uri())
+                    page.wait_for_selector('#view-slot .ov')
+                    page.screenshot(path=str(mockups / ('mockup-%dx%d.png' % (width, height))))
                     page.close()
             finally:
                 browser.close()
@@ -584,7 +633,8 @@ console.log('ok');
             self.skipTest('node unavailable')
         script = """
 import {parseRoute, makeRoute, viewFetch, rowSummary, tailRows, plainText, splitNow, describe, toolLine, steerState, steerHint,
-  transcriptLines, rowItems, groupTurns, stepsSummary, workState, sessionList, dur} from %s;
+  transcriptLines, rowItems, groupTurns, stepsSummary, workState, sessionList, dur, attachResults, toolResult, dayLabel,
+  mmss, secs, liveState} from %s;
 const assert = (c, m) => { if (!c) { console.error('FAIL', m); process.exit(1); } };
 assert(steerState('not_delivered', 'agent idle, no wake channel') === 'Not delivered: agent idle, no wake channel', 'failure');
 assert(steerState('sent') === 'Sent, awaiting consumption' && steerState('delivered') === 'Delivered', 'wake states');
@@ -648,9 +698,30 @@ assert(groups.map((g) => g.type).join() === 'msg,steps,msg', JSON.stringify(grou
 assert(groups[0].who === 'you' && groups[2].who === 'atlas' && groups[2].id === 5, 'who');
 assert(groups[1].steps.map((s) => s.verb + ':' + (s.code || '')).join() === 'Thought:,Ran:python3 tests/test_viewer_ui.py,Read:ui.js', 'steps');
 // The time is the turn's: from the ask (100) to the reply (138), not only between the first and last step.
-assert(groups[1].summary === '2 tool calls · 38s', groups[1].summary);
+assert(groups[1].summary === '2 tool calls, 38s', groups[1].summary);
 assert(stepsSummary([{verb: 'Edited'}, {verb: 'Edited'}, {verb: 'search'}]) === '3 tool calls', 'counts');
 assert(stepsSummary([{verb: 'Ran', ts: 5000}]) === '1 tool call' && stepsSummary([{verb: 'Thought'}]) === 'Thinking', 'one, none');
+assert(stepsSummary([{verb: 'Ran', failed: true}, {verb: 'Ran'}], 0, 38000) === '2 tool calls, 38s, 1 failed', 'failed');
+// Tool results join their calls: by tool_call_id, else the next result after the call's row. Exit code, output, time.
+const calls = [{id: 10, role: 'assistant', ts: 200, tool_calls: [{id: 'a', name: 'terminal', args: {command: 'ls -la'}},
+  {id: 'b', name: 'read_file', args: {path: '/r/viewer/ui.js', content: 'secret'}}]},
+  {id: 11, role: 'tool', tool_call_id: 'b', content: 'ninety lines', ts: 200.1},
+  {id: 12, role: 'tool', tool_call_id: 'a', content: '{"output": "total 0", "exit_code": 2}', ts: 203.6}];
+const its = attachResults(calls.flatMap((r) => rowItems(r, 'atlas')), calls.filter((r) => r.role === 'tool'));
+assert(its[0].cmd === 'ls -la' && its[0].exit === 2 && its[0].failed && its[0].out === 'total 0' && its[0].ms === 3600, JSON.stringify(its[0]));
+assert(its[1].out === 'ninety lines' && !its[1].failed && JSON.stringify(its[1].args) === '[["path","/r/viewer/ui.js"]]', 'read');
+const loose = attachResults(rowItems({id: 20, role: 'assistant', ts: 1, tool_calls: [{name: 'x'}]}),
+  [{id: 19, role: 'tool', content: 'old'}, {id: 21, role: 'tool', content: '{"error": "boom"}', ts: 2}]);
+assert(loose[0].out === 'boom' && loose[0].failed && loose[0].ms === 1000, JSON.stringify(loose[0]));
+assert(toolResult({content: 'x\\n'.repeat(30)}).out.split('\\n').length === 21, 'clipped');
+assert(rowItems({id: 1, role: 'user', content: 'hi', source: 'zulip'})[0].source === 'zulip', 'source line');
+const noon = new Date(2026, 10, 25, 12).getTime();
+assert(dayLabel(noon, noon + 3600e3) === 'Today' && dayLabel(noon - 864e5, noon) === 'Yesterday', 'days');
+assert(!/Today|Yesterday/.test(dayLabel(noon - 3 * 864e5, noon)), 'older day');
+assert(mmss(31000) === '0:31' && mmss(72000) === '1:12' && secs(300) === '0.3s' && secs(27400) === '27.4s', 'clocks');
+assert(liveState({what: ''}, 1000, null, 32000) === 'thinking for 0:31', 'thinking');
+assert(liveState({what: 'running terminal'}, 1000, null, 2000) === 'running terminal for 0:01', 'running');
+assert(liveState(null, null, null) === 'idle' && liveState(null, null, noon).startsWith('idle, last step '), 'idle');
 assert(workState({live: {run_id: 'r', status: 'running', tool: 'terminal'}}).what === 'running terminal', 'live run');
 assert(workState({waiting: true, phase: 'model', since_ts: 5}).since === 5000 && workState({rows: []}) === null, 'waiting, idle');
 assert(workState({live: {run_id: 'r', status: 'running', ended: true}}) === null, 'ended run');

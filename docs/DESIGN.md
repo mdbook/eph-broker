@@ -76,7 +76,7 @@ status color for chips and pills, 8% `--block` for the error banner, 16% for sta
 
 - Spacing steps in use: 4, 8, 12, 16, 20, 24, 32, 40, 64px. Prefer these.
 - Page: max width 1440px, padding 32px 40px 64px. Sections are 32px apart (`.sec`).
-- Fill views (a module view with `data-fill`, such as the Agents tab): the page is exactly the viewport and
+- Fill views (a module view with `data-fill`, such as the Agents tab; no page padding on phones): the page is exactly the viewport and
   never scrolls, top and bottom padding are 16px, and there is no page title (the tab names the view). Only
   the view's own panes scroll; the card header and composer always stay on screen.
 - Header: sticky, 64px tall, `--s1` with a bottom `--line` border.
@@ -160,13 +160,23 @@ status color for chips and pills, 8% `--block` for the error banner, 16% for sta
 - **Transcript** (`.tl`, `.ev`, `details.tool`): message cards (14px radius) and collapsible tool cards (12px
   radius) with a 20px tinted tool icon, monospace argument summary and a rotating `›` chevron. Errors get a
   `--block` border and tint.
-- **Agent view** (`viewer/ui.js`, reference `docs/mockups/agent-view.html`): the Agents tab detail and the
-  Fleet quick view. One header (name, status chip, one `⋯` actions menu; then the doing-now line; then kind,
-  model, context meter, session, last activity in 13px `--t2`). Replies are the loudest text; thinking and
-  tool steps fold into one collapsed 13px `--t2` line per turn ("5 tool calls · 38s · Show steps"). The composer is a text box and one Send split
-  button whose arrow, shown only while the agent works, offers Interrupt and send. Header, body and composer
-  share one edge (`--gut`: 20px, 24px in the quick view, 16px on phones). Menus are a 10px-radius `--s1`
-  popover. No serif, italics, gradients or per-view theme switch.
+- **Agent view** (`viewer/ui.js`, `ov-` classes): the Agents tab detail and the Fleet quick view, ported from
+  the approved mockup `docs/mockups/agent-view.html`, which is the reference for every value. A transcript,
+  not a chat: every turn, user and agent alike, is a full-width left-aligned row with a right-aligned 5.4rem
+  gutter (sender in `--brand` for people and `--run` for the agent, source, time), a 2px rule in the sender's
+  colour, then the text. No bubbles, no right alignment, no fill behind a turn. Day separators ("Yesterday",
+  "Today") with a hairline, and Load earlier at the top. Replies are set in the mockup's reading serif
+  (1.06rem, 16px on phones); thinking is a quiet italic aside. Each turn's steps fold behind one tally line:
+  a bar per tool call (height is run time, red is failed), "5 tool calls, 38s, 1 failed" and "Show 5 steps";
+  open, tool calls are dark terminal wells (`--well`, dark in both themes) with the command, output, exit
+  code and run time. One header row: name, status chip, harness and host, session picker, live state
+  ("thinking for 0:31", amber while working), model and tokens, files and search icons, Show steps, `⋯`. The
+  composer: attach, "Message NAME, or / for commands", Send when idle, Stop / Interrupt / Queue while the
+  agent works, and the queued messages with Remove. The view is a size container: under 720px of view width
+  (a phone, the quick view) the gutter folds into one line above the turn, the header is one row (back,
+  name, status dot, `⋯`) over one truncated line, and the header tools move into `⋯`. On a phone the card
+  goes edge to edge and the composer is one row with Stop and Interrupt behind a `···` control. Menus are
+  a 10px-radius `--s1` popover. No gradients or per-view theme switch.
 - **Focus**: every interactive element shows a 2px `--brand` outline, offset 2px (`:focus-visible`).
 - **Theme**: the header button cycles auto, light, dark and remembers the choice in `localStorage`
   (`eph-theme`).

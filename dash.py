@@ -2497,6 +2497,8 @@ FILL_CSS = (
     "main > section:not([hidden]):has([data-fill]),main > section:not([hidden]) > div:has(> [data-fill])"
     "{flex:1;min-height:0;display:flex;flex-direction:column}\n"
     "@media (min-width:721px){main.page:has(> %(f)s){padding-top:16px;padding-bottom:16px}}\n"
+    # Phones: the view's card goes edge to edge, so the transcript gets the height (ticket 3322 fix round 1).
+    "@media (max-width:720px){main.page:has(> %(f)s){padding:0 0 env(safe-area-inset-bottom)}}\n"
 ) % {"f": FILL}
 
 

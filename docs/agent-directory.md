@@ -70,10 +70,12 @@ first, then the agent with a back link). The address bar follows the pick
 (`#module/agents/NAME`, plus the session and a message id), so links to an agent, a session or
 a message work. A `hermes` agent with a view shows its live view, below.
 
-An agent's page opens with one header, the same for every kind: name, status and a single
-actions menu (**Copy link**, plus the session list, **Show all steps** and **Stop current turn**
-for a `hermes` agent), then what it says it is doing now (a "waiting on" or "blocked by" part is
-called out on its own), then kind, model, a context meter, the session and the last activity.
+An agent's page opens with one header row, the same for every kind: name, status, harness and
+host, the session picker, the live state ("thinking for 0:31", or "idle, last step 10:46"), model
+and tokens, files and search icons, **Show steps**, and a `⋯` menu (**Copy link**). Hovering the
+live state shows what the agent says it is doing now. On a phone or in the quick view the header
+is one compact row (back, name, status dot, `⋯`) over one line with harness, session and live
+state; the header tools and the session list move into `⋯`.
 Status, the doing-now line, model and context come from the Fleet view when it lists the agent
 (see `agentSummary` in [modules](modules.md)); otherwise the header shows directory presence only.
 The page follows the dashboard theme and type scale; the design reference is
@@ -86,13 +88,14 @@ jumps back. A message box is docked at the bottom for agents that registered `st
 messages appear in the transcript as queued, then delivered.
 
 On the Fleet page, **Quick view** on a listed agent opens a card (a bottom sheet on a phone). The
-card's own header names the agent; under it sit one status line (status, kind, model, context,
-last activity, and the actions menu), what it is doing and waiting on, its newest turns in the
-same reply and steps style as the Agents tab, and the same message box with one-tap quick
-replies (`AGENTDIR_QUICK_REPLIES` in [settings](settings.md)). For a `hermes` agent with a view
-the box sends messages: **Send** starts a turn, or while the agent works queues the message for
-its next turn, and the arrow beside Send offers **Interrupt and send**, which stops the current
-turn first. **Stop current turn** is in the actions menu. **Full view** opens the agent's page.
+card's own header names the agent; under it sit the view's compact header row (status, kind,
+session, live state, and `⋯`), what it is doing and waiting on, its newest turns in the same
+transcript rows as the Agents tab, and the same message box with one-tap quick replies
+(`AGENTDIR_QUICK_REPLIES` in [settings](settings.md); behind the `···` control on a phone). For a
+`hermes` agent with a view the box sends messages: **Send** starts a turn. While the agent works
+it offers **Stop** (ends the turn), **Interrupt** (ends the turn and sends the message now) and
+**Queue**: a queued message waits in a list above the box, with **Remove**, and is sent when the
+turn ends (it lives in the page, so closing the page drops it). **Full view** opens the agent's page.
 The box is disabled with a hint for viewers without the broker actions permission or agents that
 did not register `steer`. Closing the card closes its stream, so a tab holds at most one.
 
@@ -474,14 +477,18 @@ route (session list and agent name) needs a sidecar that serves `GET /cfg`. Imag
 (`BROKER_MAX_BODY`, 1 MiB by default); raise it if people attach several photos.
 
 The tab draws the view itself, in the broker's own DOM and dashboard styles, from the `cfg`,
-`events` and `earlier` routes: user messages and replies, with each run of thinking and tool calls
-folded into one quiet line ("5 tool calls · 38s · Show steps", timed from the message before the
-steps to the reply after them) that opens to the steps. **Show all steps** in the actions menu
-opens or closes them all. A working line at the end
-shows what is running and for how long. The session list from `cfg` is in the actions menu, and
-the address bar follows the session and a linked message. The composer has one **Send**: it starts
-a turn, or while the agent works queues the message for its next turn, and the arrow beside it
-offers **Interrupt and send** (`stop`, then `say`). **Stop current turn** is in the actions menu.
+`events` and `earlier` routes as a transcript, the way the mockup draws it: every turn is a
+left-aligned row with a gutter (sender, source when the row reports one, time) and a thin rule
+in the sender's colour, with day separators and **Load earlier** at the top. Each run of thinking
+and tool calls folds into one tally line (a bar per tool call, "5 tool calls, 38s, 1 failed",
+timed from the message before the steps to the reply after them, and "Show 5 steps") that opens
+to the steps: thinking, and each tool call as a terminal well with its command, output, exit code
+and run time (joined from the tool result rows). **Show steps** in the header opens or closes them
+all. A live line at the end shows what is running and for how long. The session list from `cfg`
+is the header's session picker, and the address bar follows the session and a linked message.
+The composer sends with `say`; while the agent works it offers **Stop** (`stop`), **Interrupt**
+(`stop`, then `say`) and **Queue** (held in the page, sent when the turn ends). The attach button
+is drawn but disabled: image sends are not wired through the view yet.
 Viewers without the broker actions permission, or agents without the `steer` cap, get the same
 view with the composer disabled and a hint. The browser never loads script or styles from an
 agent or its sidecar, and every piece of agent text is set with `textContent`.

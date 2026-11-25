@@ -148,7 +148,7 @@ aborted. A reload or navigation aborts and unmounts the old view.
 
 A view that should fill the screen instead of scrolling the page marks its root element with `data-fill`.
 While that view is shown, the broker sizes the page to the viewport: the page itself never scrolls, the top
-padding drops to 16px and the mount element becomes a flex column with the remaining height. The view must
+padding drops to 16px (on a phone the page padding goes to 0, so the view can run edge to edge) and the mount element becomes a flex column with the remaining height. The view must
 then scroll its own panes (`min-height:0` plus `overflow:auto`). The bundled Agents module does this when it is
 hosted, so its card header and composer always stay on screen. Views without `data-fill` keep normal page flow.
 

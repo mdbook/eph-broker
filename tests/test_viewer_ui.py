@@ -323,84 +323,100 @@ class UI(ViewerTest):
             status, body = request(directory, '/hermes-ui/app.css', identity)
             assert status == 404 and b'missing app.css' in body
 
-    def test_view_theme_contract_and_shadow_styles(self):
-        script = (Path(__file__).parent.parent / 'viewer' / 'ui.js').read_text()
-        # The host maps live broker variables, rather than freezing the current palette in JS.
-        tokens = {'bg': 'bg', 'surface': 's1', 'hover': 's2', 'active': 's3', 'border': 'line',
-                  'text': 't1', 'muted': 't2', 'faint': 't3', 'accent': 'brand', 'on-accent': 'onbrand',
-                  'success': 'run', 'warning': 'wait', 'danger': 'block', 'shadow': 'shadow'}
-        for name, broker in tokens.items():
-            assert '--agent-view-%s:var(--%s,' % (name, broker) in script
-        assert '.adir-detail{${VIEW_TOKENS}}' in script
-        assert script.index('themeView(host);') > script.index('view = mod.mount(host,')
+    def test_native_view_uses_broker_styles(self):
+        # Ticket 3193: the hermes view is broker DOM in the dash styles, not the sidecar's page in a shadow root.
+        import dash
+        root = Path(__file__).parent.parent
+        script = (root / 'viewer' / 'ui.js').read_text()
+        for gone in ('hermes-ui/view.js', 'attachShadow', 'serif', 'italic', 'gradient', 'Steer'):
+            assert gone not in script, gone
+        # One control height and one view edge, raised to the tap target on phones.
+        assert '--ctl:36px;--gut:20px' in script and '{--ctl:44px;--gut:16px}' in script
+        assert 'height:var(--ctl);min-height:var(--ctl)' in script and 'width:var(--ctl);min-width:var(--ctl)' in script
+        assert '--ctl:36px;' in dash.PAGE and 'height:var(--ctl);padding:0 16px' in dash.PAGE
+        # Steps start collapsed and quieter than replies; Stop lives in the actions menu.
+        assert "d.open = allOpen || openKeys.has(g.key)" in script and '.ad-steps{max-width:760px;font-size:13px;color:var(--t2)}' in script
+        assert "label: 'Stop current turn', bad: true" in script
+        assert (root / 'docs' / 'mockups' / 'agent-view.html').is_file()
+
+    def test_send_split_offers_interrupt_only_while_working(self):
         node = shutil.which('node')
         if not node:
-            self.skipTest('node unavailable (theme token mappings checked)')
+            self.skipTest('node unavailable')
         check = """
-import {themeView} from %s;
-const assert = (c, m) => { if (!c) throw Error(m); };
-let styles = [];
-globalThis.document = {createElement: (tag) => ({tag, setAttribute(k, v) { this[k] = v; }})};
-const host = {shadowRoot: {
-  querySelector: () => styles[0], append: (style) => styles.push(style)
-}};
-themeView(host);
-assert(styles.length === 1 && styles[0].tag === 'style', 'inject into the renderer shadow tree');
-assert(styles[0]['data-agent-view-theme'] === '', 'marked compatibility stylesheet');
-assert(styles[0].textContent.includes('var(--agent-view-surface)'), 'consume the public seam');
-assert(styles[0].textContent.includes(':focus-visible'), 'native focus styling');
-assert(styles[0].textContent.includes('max-width:720px'), 'phone controls');
-themeView(host);
-assert(styles.length === 1, 'idempotent');
-themeView({}); // Non-shadow renderers can read the inherited variables themselves.
+import {sendMode, viewActions} from %s;
+const assert = (c, m) => { if (!c) { console.error('FAIL', m); process.exit(1); } };
+let mode = sendMode(false, true, 'atlas');
+assert(!mode.split && mode.hint === '', 'idle: one plain Send');
+mode = sendMode(true, true, 'atlas');
+assert(mode.split && mode.hint === 'atlas is working. Send queues your message for its next turn.', 'working: split');
+assert(!sendMode(true, false, 'atlas').split, 'no interrupt route: no split');
+const calls = [];
+globalThis.fetch = async (url, init) => {
+  calls.push([url.split('/').pop(), JSON.parse(init.body), init.headers.get('X-Broker-Action')]);
+  return new Response('{"ok":true}', {status: 200, headers: {'Content-Type': 'application/json'}});
+};
+const acts = viewActions('/api/a/atlas/', () => 's1');
+await acts.say('hello');
+assert(JSON.stringify(calls.shift()) === '["say",{"session":"s1","message":"hello"},"1"]', 'Send says');
+await acts.interrupt('now');
+assert(JSON.stringify(calls) === '[["stop",{"session":"s1"},"1"],["say",{"session":"s1","message":"now"},"1"]]',
+  'Interrupt and send stops the turn, then says: ' + JSON.stringify(calls));
+globalThis.fetch = async () => new Response('{"error":"agent offline"}', {status: 502, headers: {'Content-Type': 'application/json'}});
+let failed = '';
+try { await acts.interrupt('x'); } catch (e) { failed = e.message; }
+assert(failed === 'agent offline', 'a failed stop does not send');
 console.log('ok');
 """ % json.dumps((Path(__file__).parent.parent / 'viewer' / 'ui.js').as_uri())
         out = subprocess.run([node, '--input-type=module', '-e', check], capture_output=True, text=True, timeout=60)
         assert out.returncode == 0 and out.stdout.strip() == 'ok', out.stderr + out.stdout
 
-    def test_view_theme_in_browser(self):
-        # Optional developer check, not a dependency. This fixture models the installed renderer's open
-        # shadow-root contract; it does not pretend to be a screenshot of the external sidecar renderer.
+    def test_view_in_browser(self):
+        # Optional developer check, not a dependency: the native hermes view on a stubbed sidecar, measured at
+        # 1440 and 390 in both themes. Text box and Send share --ctl; steps start collapsed; nothing overflows.
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
-            self.skipTest('Playwright unavailable; browser theme check not run')
+            self.skipTest('Playwright unavailable; browser view check not run')
         import re
         import dash
         css = re.search(r'<style>(.*?)</style>', dash.PAGE, re.S).group(1)
         script = (Path(__file__).parent.parent / 'viewer' / 'ui.js').read_text()
-        # Capture the actual module stylesheet so the host token mapping is exercised too.
-        script += '\nexport const testCSS = CSS;'
+        stub = """() => {
+          const json = (v) => new Response(JSON.stringify(v), {headers: {'Content-Type': 'application/json'}});
+          window.fetch = async (url) => {
+            url = String(url);
+            if (url.endsWith('/api/agents')) return json({quick_replies: [], agents: [{name: 'atlas', kind: 'hermes',
+              status: 'busy', age: 12, can_view: true, can_steer: true}]});
+            if (url.includes('/cfg')) return json({session: 'main', main: 'main', sessions: ['main', 'fix-composer']});
+            return json({rows: []});
+          };
+          window.EventSource = class {
+            constructor() { setTimeout(() => this.onmessage && this.onmessage({data: JSON.stringify({
+              live: {run_id: 'r1', status: 'running', tool: 'terminal'},
+              rows: [{id: 1, role: 'user', content: 'Why does the composer lose focus?', ts: 1700000000},
+                {id: 2, role: 'assistant', reasoning: 'The form resets the height.', ts: 1700000001,
+                 tool_calls: [{name: 'read_file', args: {path: 'viewer/ui.js'}}]},
+                {id: 3, role: 'assistant', content: 'Found it. Keeping focus is a two-line change.', ts: 1700000038}]})}), 10); }
+            close() {}
+          };
+        }"""
         with sync_playwright() as playwright:
             try:
                 browser = playwright.chromium.launch(headless=True)
             except Exception as exc:
                 self.skipTest('Chromium unavailable: ' + str(exc))
             try:
-                page = browser.new_page(viewport={'width': 1400, 'height': 900})
+                page = browser.new_page(viewport={'width': 1440, 'height': 900})
                 page.route('**/*', lambda route: route.fulfill(
                     body=script if route.request.url.endswith('/ui.js') else '<!doctype html><style>' + css + '</style>',
                     content_type='text/javascript' if route.request.url.endswith('/ui.js') else 'text/html'))
-                page.goto('http://theme.example.test/')
+                page.goto('http://view.example.test/#atlas')
+                page.evaluate(stub)
                 page.evaluate("""async () => {
-                  const {themeView, testCSS} = await import('/ui.js');
-                  const style = document.createElement('style'); style.textContent = testCSS;
-                  document.head.append(style);
-                  const host = document.createElement('div'); host.className = 'adir-view';
-                  const detail = document.createElement('div'); detail.className = 'adir-detail';
-                  detail.append(host); document.body.append(detail);
-                  const root = host.attachShadow({mode: 'open'});
-                  const legacy = document.createElement('style');
-                  legacy.textContent = ':host{--bg:#123;--line:pink}.ob{--panel:#123;--ink:#eee;background:var(--panel);color:var(--ink);font:16px serif}';
-                  const panel = document.createElement('main'); panel.className = 'ob';
-                  for (const variant of ['', 'pri', 'primary', 'submit', 'ghost', 'on',
-                    'bad', 'error', 'run', 'busy', 'ok', 'wait', 'warn', 'pend']) {
-                    const button = document.createElement('button');
-                    button.textContent = variant || 'Default'; button.dataset.variant = variant;
-                    if (variant === 'submit') button.type = 'submit'; else button.className = variant;
-                    panel.append(button);
-                  }
-                  root.append(legacy, panel); themeView(host);
+                  const {mount} = await import('/ui.js');
+                  const box = document.createElement('main'); document.body.append(box);
+                  mount(box, {canAct: true});
                   window.buttonContrast = (button) => {
                     const style = getComputedStyle(button);
                     const luminance = (color) => {
@@ -410,60 +426,155 @@ console.log('ok');
                         : ((v + .055) / 1.055) ** 2.4).reduce((sum, v, i) =>
                           sum + v * [.2126, .7152, .0722][i], 0);
                     };
-                    // An opaque computed pair is not sufficient if an ancestor dims the control.
-                    for (let node = button; node; node = node.parentElement || node.getRootNode().host) {
+                    for (let node = button; node; node = node.parentElement) {
                       if (getComputedStyle(node).opacity !== '1') throw Error('Dimmed button');
                     }
                     const a = luminance(style.color), b = luminance(style.backgroundColor);
                     return (Math.max(a, b) + .05) / (Math.min(a, b) + .05);
                   };
                 }""")
-                for theme, scheme, surface, ink in (
-                    ('light', 'dark', 'rgb(255, 255, 255)', 'rgb(20, 25, 32)'),
-                    ('dark', 'light', 'rgb(22, 26, 32)', 'rgb(232, 236, 241)'),
-                    ('auto', 'dark', 'rgb(22, 26, 32)', 'rgb(232, 236, 241)'),
-                    ('auto', 'light', 'rgb(255, 255, 255)', 'rgb(20, 25, 32)'),
-                ):
+                page.wait_for_selector('.ad-ev.agent')
+                for theme, scheme in (('light', 'dark'), ('dark', 'light'), ('auto', 'dark'), ('auto', 'light')):
                     page.emulate_media(color_scheme=scheme)
                     page.evaluate('(theme) => document.documentElement.dataset.theme = theme', theme)
-                    for width in (1400, 390):
+                    for width, ctl in ((1440, 36), (390, 44)):
                         page.set_viewport_size({'width': width, 'height': 900})
-                        actual = page.evaluate("""() => {
-                          const host = document.querySelector('.adir-view'), root = host.shadowRoot;
-                          const panel = getComputedStyle(root.querySelector('main'));
-                          const button = getComputedStyle(root.querySelector('button'));
-                          return [panel.backgroundColor, panel.color, panel.fontSize,
-                            button.borderRadius, button.minHeight, host.scrollWidth <= host.clientWidth];
+                        m = page.evaluate("""() => {
+                          const h = (s) => { const e = document.querySelector(s); return e ? e.getBoundingClientRect().height : null; };
+                          return {box: h('.ad-row textarea'), send: h('.ad-split .ad-main'), more: h('.ad-split .ad-more'),
+                            top: h('.ad-vh-top'), steps: h('details.ad-steps > summary'),
+                            // One row: the text box and both halves of Send share their top edge, not just a height.
+                            edges: new Set(['.ad-row textarea', '.ad-split .ad-main', '.ad-split .ad-more'].map((s) =>
+                              document.querySelector(s).getBoundingClientRect().top)).size,
+                            open: document.querySelectorAll('details.ad-steps[open]').length,
+                            italic: [...document.querySelectorAll('.ad-tl *')].some((e) => getComputedStyle(e).fontStyle === 'italic'),
+                            fits: document.documentElement.scrollWidth <= innerWidth,
+                            hint: document.querySelector('.ad-hint').textContent,
+                            send_contrast: window.buttonContrast(document.querySelector('.ad-split .ad-main'))};
                         }""")
-                        assert actual == [surface, ink, '14px', '8px', '48px' if width == 390 else '36px', True]
-                        buttons = page.locator('.adir-view button')
-                        for index in range(buttons.count()):
-                            button = buttons.nth(index)
-                            variant = button.get_attribute('data-variant')
-                            for state in ('default', 'hover', 'focus-visible', 'active', 'disabled', 'disabled-hover'):
-                                page.mouse.move(width - 1, 899)
-                                button.evaluate('(button) => { button.disabled = false; button.blur(); }')
-                                if state in ('disabled', 'disabled-hover'):
-                                    button.evaluate('(button) => button.disabled = true')
-                                if state in ('hover', 'active', 'disabled-hover'):
-                                    button.hover()
-                                    assert button.evaluate('(button) => button.matches("button:hover")')
-                                if state == 'focus-visible':
-                                    # Real keyboard modality, not just programmatic focus or a CSS class.
-                                    page.keyboard.press('Tab')
-                                    button.focus()
-                                    assert button.evaluate('(button) => button.matches(":focus-visible")')
-                                if state == 'active':
-                                    page.mouse.down()
-                                try:
-                                    if state == 'active':
-                                        assert button.evaluate('(button) => button.matches("button:active")')
-                                    contrast = button.evaluate('(button) => window.buttonContrast(button)')
-                                    assert contrast >= 4.5, (theme, width, variant, state, contrast)
-                                finally:
-                                    if state == 'active':
-                                        page.mouse.up()
-                            button.evaluate('(button) => button.disabled = false')
+                        print('view %s %s: %s' % (theme, width, m))
+                        assert m['box'] == m['send'] == m['more'] == ctl and m['edges'] == 1, m
+                        assert m['top'] >= ctl and m['open'] == 0 and not m['italic'] and m['fits'], m
+                        assert m['hint'] == 'atlas is working. Send queues your message for its next turn.', m
+                        assert m['send_contrast'] >= 4.5, m
+                # Stop is in the actions menu; Interrupt and send is in the Send menu.
+                page.set_viewport_size({'width': 1440, 'height': 900})
+                page.click('.ad-vh-top .btn.sq')
+                assert 'Stop current turn' in page.inner_text('.ad-vh-top .ad-menu')
+                page.keyboard.press('Escape')
+                page.click('.ad-split .ad-more')
+                assert page.inner_text('.ad-split .ad-menu').startswith('Interrupt and send')
+                page.keyboard.press('Escape')
+                # The Fleet quick view, in the dash's detail sheet: the same steps line and the same Send row.
+                for width, ctl in ((1440, 36), (390, 44)):
+                    page.set_viewport_size({'width': width, 'height': 900})
+                    q = page.evaluate("""async () => {
+                      const old = document.querySelector('dialog'); if (old) old.remove();
+                      const {quickView} = await import('/ui.js');
+                      const d = document.createElement('dialog'), side = document.createElement('div');
+                      d.className = 'detail-sheet quick'; side.className = 'side'; d.append(side);
+                      document.body.append(d); d.showModal();
+                      quickView(side, 'atlas', {canAct: true});
+                      await new Promise((r) => setTimeout(r, 300));
+                      const h = (s) => d.querySelector(s).getBoundingClientRect();
+                      return {box: h('.ad-row textarea').height, send: h('.ad-split .ad-main').height,
+                        edges: new Set(['.ad-row textarea', '.ad-split .ad-main'].map((s) => h(s).top)).size,
+                        steps: d.querySelectorAll('details.ad-steps').length, open: d.querySelectorAll('details.ad-steps[open]').length,
+                        fits: d.scrollWidth <= d.clientWidth};
+                    }""")
+                    print('quick view %s: %s' % (width, q))
+                    assert q == {'box': ctl, 'send': ctl, 'edges': 1, 'steps': 1, 'open': 0, 'fits': True}, q
+            finally:
+                browser.close()
+
+    def test_agents_tab_fits_the_viewport(self):
+        # Ticket 3322: in the real dash page the Agents tab is exactly the viewport. The page never scrolls, only the
+        # transcript does; the card header and composer stay on screen; no page title; 44px tap targets on a phone.
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            self.skipTest('Playwright unavailable; layout check not run')
+        import dash
+
+        class Coalescer:
+            lock = threading.Lock(); live = {}; pending = {}; deduped = 0
+
+        class Broker:
+            coalescer = Coalescer(); echo_guard = type('E', (), {'dropped': 0})(); rejected = 0
+        with patch.object(dash, 'fleet_snapshot', return_value={'agents': []}):
+            state = json.dumps(dash.snapshot(Broker()), default=str)
+        page_html = dash.module_page([{'name': 'agents', 'label': 'Agents'}])
+        script = (Path(__file__).parent.parent / 'viewer' / 'ui.js').read_text()
+        agents = {'quick_replies': [{'label': 'Ask for status', 'text': 'Status?'}], 'agents': [
+            {'name': 'atlas', 'kind': 'hermes', 'status': 'busy', 'age': 12, 'can_view': True, 'can_steer': True},
+            {'name': 'kestrel', 'kind': 'claude-code', 'status': 'idle', 'age': 300}]}
+        answers = {'/': (page_html, 'text/html'), '/state': (state, 'application/json'),
+                   '/actions': ('{"allowed": true}', 'application/json'), '/actions/settings': ('{}', 'application/json'),
+                   '/viewer-status': ('{"agents": {"state": "up", "version": "1", "restarts": 0, "since": 1}}',
+                                      'application/json'),
+                   '/viewer/agents/ui.js': (script, 'text/javascript'),
+                   '/viewer/agents/fleet-index': ('["atlas", "kestrel"]', 'application/json'),
+                   '/viewer/agents/api/agents': (json.dumps(agents), 'application/json'),
+                   '/viewer/agents/api/a/atlas/cfg': ('{"session": "main", "main": "main"}', 'application/json'),
+                   '/viewer/agents/api/a/atlas/earlier': ('{"rows": []}', 'application/json')}
+
+        def answer(route):
+            from urllib.parse import urlsplit
+            body, kind = answers.get(urlsplit(route.request.url).path, ('{}', 'application/json'))
+            route.fulfill(body=body, content_type=kind)
+        # Enough turns that the transcript must scroll inside its card at every size.
+        rows = []
+        for i in range(30):
+            rows += [{'id': 3 * i + 1, 'role': 'user', 'content': 'Question %d about the composer?' % i, 'ts': 1700000000 + i * 60},
+                     {'id': 3 * i + 2, 'role': 'assistant', 'reasoning': 'Check grow().', 'ts': 1700000001 + i * 60,
+                      'tool_calls': [{'name': 'terminal', 'args': {'command': 'rg -n grow viewer/ui.js'}},
+                                     {'name': 'read_file', 'args': {'path': 'viewer/ui.js'}}]},
+                     {'id': 3 * i + 3, 'role': 'assistant', 'content': 'Answer %d: keep focus after a send. ' % i * 3,
+                      'ts': 1700000038 + i * 60}]
+        frame = json.dumps({'live': {'run_id': 'r1', 'status': 'running', 'tool': 'terminal'}, 'rows': rows})
+        stream = """window.EventSource = class {
+          constructor() { setTimeout(() => this.onmessage && this.onmessage({data: %s}), 10); }
+          close() {}
+        };""" % json.dumps(frame)
+        with sync_playwright() as playwright:
+            try:
+                browser = playwright.chromium.launch(headless=True)
+            except Exception as exc:
+                self.skipTest('Chromium unavailable: ' + str(exc))
+            try:
+                for width, height in ((1440, 900), (1366, 650), (390, 844)):
+                    page = browser.new_page(viewport={'width': width, 'height': height})
+                    page.add_init_script(stream)
+                    page.route('**/*', answer)
+                    page.goto('http://broker.example.test/#module/agents/atlas')
+                    page.wait_for_selector('.adir-detail .ad-ev.agent')
+                    m = page.evaluate("""() => {
+                      scrollTo(0, 99999);
+                      const r = (s) => document.querySelector(s).getBoundingClientRect();
+                      const log = document.querySelector('.adir-detail > .ad-tl');
+                      const view = document.querySelector('main > section:not([hidden])');
+                      const small = [...document.querySelectorAll('.adir-detail :is(button,summary,a.adir-back)')]
+                        .filter((e) => e.getClientRects().length && e.getBoundingClientRect().height < 44)
+                        .map((e) => e.className || e.tagName);
+                      return {doc: document.documentElement.scrollHeight, win: innerHeight, scrolled: scrollY,
+                        wide: document.documentElement.scrollWidth > innerWidth,
+                        head: r('.ad-vh').top, comp: [r('.ad-comp').top, r('.ad-comp').bottom],
+                        log: [log.scrollHeight > log.clientHeight, r('.adir-detail > .ad-tl').bottom],
+                        h1: view.querySelectorAll('h1').length, pad: getComputedStyle(document.querySelector('main')).paddingTop,
+                        open: document.querySelectorAll('details.ad-steps[open]').length,
+                        toggle: document.querySelector('details.ad-steps > summary').textContent, small};
+                    }""")
+                    print('agents tab %sx%s: %s' % (width, height, m))
+                    assert m['doc'] == m['win'] and m['scrolled'] == 0 and not m['wide'], m
+                    assert m['head'] >= 0 and 0 < m['comp'][0] < m['comp'][1] <= m['win'], m
+                    assert m['log'][0] and m['log'][1] <= m['comp'][0] + 1, m
+                    assert m['h1'] == 0 and m['open'] == 0, m
+                    assert m['toggle'] == '2 tool calls · 38s·Show steps', m
+                    if width > 720:
+                        assert m['pad'] == '16px', m
+                    else:
+                        assert not m['small'], m
+                    page.close()
             finally:
                 browser.close()
 
@@ -473,7 +584,7 @@ console.log('ok');
             self.skipTest('node unavailable')
         script = """
 import {parseRoute, makeRoute, viewFetch, rowSummary, tailRows, plainText, splitNow, describe, toolLine, steerState, steerHint,
-  transcriptLines} from %s;
+  transcriptLines, rowItems, groupTurns, stepsSummary, workState, sessionList, dur} from %s;
 const assert = (c, m) => { if (!c) { console.error('FAIL', m); process.exit(1); } };
 assert(steerState('not_delivered', 'agent idle, no wake channel') === 'Not delivered: agent idle, no wake channel', 'failure');
 assert(steerState('sent') === 'Sent, awaiting consumption' && steerState('delivered') === 'Delivered', 'wake states');
@@ -526,6 +637,25 @@ assert(transcriptLines(rec('user', 'hi'))[0].kind === 'user', 'user text');
 assert(!transcriptLines(rec('user', '<command-name>/clear</command-name>')).length, 'harness tags');
 assert(!transcriptLines(rec('user', [{type: 'tool_result', content: 'x'}])).length, 'tool results');
 assert(!transcriptLines(rec('user', 'x', {isMeta: true})).length && !transcriptLines({type: 'system'}).length, 'meta');
+assert(dur(38000) === '38s' && dur(72000) === '1m 12s' && dur(125000) === '2m 05s' && dur(3720000) === '1h 02m', 'durations');
+// Reasoning and tool calls fold into one quiet steps line; replies and user messages stay messages.
+const turn = [{id: 1, role: 'user', content: 'why?', ts: 100}, {id: 2, role: 'assistant', reasoning: 'hm', ts: 100,
+  tool_calls: [{function: {name: 'terminal', arguments: '{"command":"python3 tests/test_viewer_ui.py"}'}}]},
+  {id: 3, role: 'assistant', tool_calls: [{name: 'read_file', args: {path: '/repo/viewer/ui.js'}}], ts: 120},
+  {id: 4, role: 'tool', content: 'ok', ts: 121}, {id: 5, role: 'assistant', content: 'Found it.', ts: 138}];
+const groups = groupTurns(turn.flatMap((r) => rowItems(r, 'atlas')));
+assert(groups.map((g) => g.type).join() === 'msg,steps,msg', JSON.stringify(groups));
+assert(groups[0].who === 'you' && groups[2].who === 'atlas' && groups[2].id === 5, 'who');
+assert(groups[1].steps.map((s) => s.verb + ':' + (s.code || '')).join() === 'Thought:,Ran:python3 tests/test_viewer_ui.py,Read:ui.js', 'steps');
+// The time is the turn's: from the ask (100) to the reply (138), not only between the first and last step.
+assert(groups[1].summary === '2 tool calls · 38s', groups[1].summary);
+assert(stepsSummary([{verb: 'Edited'}, {verb: 'Edited'}, {verb: 'search'}]) === '3 tool calls', 'counts');
+assert(stepsSummary([{verb: 'Ran', ts: 5000}]) === '1 tool call' && stepsSummary([{verb: 'Thought'}]) === 'Thinking', 'one, none');
+assert(workState({live: {run_id: 'r', status: 'running', tool: 'terminal'}}).what === 'running terminal', 'live run');
+assert(workState({waiting: true, phase: 'model', since_ts: 5}).since === 5000 && workState({rows: []}) === null, 'waiting, idle');
+assert(workState({live: {run_id: 'r', status: 'running', ended: true}}) === null, 'ended run');
+assert(JSON.stringify(sessionList({sessions: ['main', {id: 'b', title: 'Fix', ts: 9}, {}, 7]})) ===
+  '[{"id":"main","label":"main","ts":null},{"id":"b","label":"Fix","ts":9}]', 'sessions');
 console.log('ok');
 """ % json.dumps((Path(__file__).parent.parent / 'viewer' / 'ui.js').as_uri())
         out = subprocess.run([node, '--input-type=module', '-e', script], capture_output=True, text=True, timeout=60)

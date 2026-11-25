@@ -880,6 +880,9 @@ PAGE = r"""<!DOCTYPE html>
     --accent:var(--brand); --green:var(--run); --amber:var(--wait); --red:var(--block);
     --user:color-mix(in srgb,var(--brand) 7%,var(--s1)); --code:var(--s2);
     --r:12px; --btn:120px;
+    /* One control height for buttons, selects and text boxes, so a row of them lines up by construction.
+       Module views (the Agents tab) raise it to the 44px tap target on phones. */
+    --ctl:36px;
   }
   *{box-sizing:border-box}
   [hidden]{display:none !important}
@@ -918,7 +921,7 @@ PAGE = r"""<!DOCTYPE html>
   .chip.pause::before{content:"";width:8px;height:10px;border-left:3px solid currentColor;border-right:3px solid currentColor;box-sizing:border-box}
 
   /* ---- buttons: row actions share ONE width so a column of them lines up */
-  .btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-width:var(--btn);height:36px;padding:0 16px;
+  .btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-width:var(--btn);height:var(--ctl);padding:0 16px;
        border-radius:8px;border:1px solid var(--line);background:var(--s1);color:var(--t1);font-weight:600;font-size:14px;
        text-decoration:none;cursor:pointer;white-space:nowrap}
   .btn:hover{border-color:color-mix(in srgb,var(--t1) 28%,var(--line))}
@@ -929,7 +932,7 @@ PAGE = r"""<!DOCTYPE html>
   .btn.ghost{background:transparent;border-color:transparent}
   .btn.ghost:hover{background:var(--s2);border-color:var(--line)}
   .btn.ghost:active{background:var(--s3)}
-  .btn.sq{min-width:36px;width:36px;padding:0}
+  .btn.sq{min-width:var(--ctl);width:var(--ctl);padding:0}
   .btn.on{border-color:var(--brand);color:var(--brand)}
   .btn.bad{color:var(--red)} .btn.bad:hover{border-color:var(--red)}
   .btn:disabled{opacity:.5;cursor:default}
@@ -938,9 +941,9 @@ PAGE = r"""<!DOCTYPE html>
              transition:transform .25s cubic-bezier(.3,1.4,.5,1)}
   .sw[aria-checked=true]{background:var(--wait)} .sw[aria-checked=true]::after{transform:translateX(18px)}
   .msg{display:flex;gap:8px;align-items:flex-end;padding:12px 16px;border-top:1px solid var(--line)}
-  .msg textarea{flex:1;min-height:36px;max-height:160px;resize:vertical;border:1px solid var(--line);border-radius:8px;background:var(--s1);
+  .msg textarea{flex:1;min-height:var(--ctl);max-height:160px;resize:vertical;border:1px solid var(--line);border-radius:8px;background:var(--s1);
                 color:var(--t1);padding:8px 12px;font:inherit;font-size:14px}
-  .pick-sel{height:36px;border:1px solid var(--line);border-radius:8px;background:var(--s1);color:var(--t1);font:inherit;
+  .pick-sel{height:var(--ctl);border:1px solid var(--line);border-radius:8px;background:var(--s1);color:var(--t1);font:inherit;
             font-size:14px;padding:0 8px;max-width:100%}
   .pick-sel.num{width:84px}
   .pick-sel.set{border-color:var(--brand)}
@@ -2482,6 +2485,21 @@ PAGE = (PAGE.replace('/* TRANSCRIPT_TEXT_HELPERS */', transcript_basic())
         .replace('/* TRANSCRIPT_CSS */', transcript_css()))
 
 
+# A module view whose root carries data-fill (the Agents tab) gets exactly the viewport: the page itself never
+# scrolls, only the view's own panes do, so its card header and composer stay on screen (ticket 3322). The page top
+# padding drops to 16px; the tab names the view, so there is no page title. Other views keep normal document flow.
+FILL = "section:not([hidden]) [data-fill]"
+FILL_CSS = (
+    "body:has(> main > %(f)s){display:flex;flex-direction:column;height:100dvh;overflow:hidden}\n"
+    "body:has(> main > %(f)s) > :is(.top,#err){flex:none}\n"
+    "body:has(> main > %(f)s) > footer{display:none}\n"
+    "main:has(> %(f)s){flex:1;min-height:0;width:100%%;display:flex;flex-direction:column}\n"
+    "main > section:not([hidden]):has([data-fill]),main > section:not([hidden]) > div:has(> [data-fill])"
+    "{flex:1;min-height:0;display:flex;flex-direction:column}\n"
+    "@media (min-width:721px){main.page:has(> %(f)s){padding-top:16px;padding-bottom:16px}}\n"
+) % {"f": FILL}
+
+
 def module_page(modules):
     if not modules:
         return PAGE
@@ -2496,7 +2514,7 @@ def module_page(modules):
                         "@media (max-width:720px){.tbl td [data-quick-module]{display:inline-flex}"
                         # Phone: the quick view rises from the bottom edge, where the thumb already is.
                         ".detail-sheet.quick{width:100%;max-width:100%;margin:auto 0 0;border-radius:16px 16px 0 0;"
-                        "border-bottom:0;max-height:calc(100dvh - 48px)}}\n</style>")
+                        "border-bottom:0;max-height:calc(100dvh - 48px)}}\n" + FILL_CSS + "</style>")
     page = page.replace("function toggleAgent(e){\n",
                         "function toggleAgent(e){\n  if(e.target.closest('[data-quick-module]')) return;\n")
     page = page.replace("+ '<td><div class=\"an\"><b>' + esc(a.name ?? '?') + '</b>'",

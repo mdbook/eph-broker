@@ -70,24 +70,31 @@ first, then the agent with a back link). The address bar follows the pick
 (`#module/agents/NAME`, plus the session and a message id), so links to an agent, a session or
 a message work. A `hermes` agent with a view shows its live view, below.
 
-An agent's page opens with a compact header: its status, what it says it is doing now (a
-"waiting on" or "blocked by" part is called out on its own line), then kind, model, a context
-meter and the last activity. Status, the doing-now line, model and context come from the Fleet
-view when it lists the agent (see `agentSummary` in [modules](modules.md)); otherwise the header
-shows directory presence only. Below it, a tailing agent's transcript fills the page with a
+An agent's page opens with one header, the same for every kind: name, status and a single
+actions menu (**Copy link**, plus the session list, **Show all steps** and **Stop current turn**
+for a `hermes` agent), then what it says it is doing now (a "waiting on" or "blocked by" part is
+called out on its own), then kind, model, a context meter, the session and the last activity.
+Status, the doing-now line, model and context come from the Fleet view when it lists the agent
+(see `agentSummary` in [modules](modules.md)); otherwise the header shows directory presence only.
+The page follows the dashboard theme and type scale; the design reference is
+[docs/mockups/agent-view.html](mockups/agent-view.html). In the dashboard the tab fills the
+window exactly: the page never scrolls and has no title (the tab names it), only the transcript
+and a long agent list scroll, and the header and message box always stay on screen. Below it, a tailing agent's transcript fills the page with a
 **Conversation** / **Everything** switch: Conversation hides harness records and routine system
 rows and says how many it hid. The log follows the newest line until you scroll up; **Latest**
 jumps back. A message box is docked at the bottom for agents that registered `steer`; sent
 messages appear in the transcript as queued, then delivered.
 
-On the Fleet page, **Quick view** on a listed agent opens a card (a bottom sheet on a phone): its
-status, what it is doing and waiting on, last activity, model and context, the last few
-transcript lines streaming live, and the same message box with one-tap quick replies
-(`AGENTDIR_QUICK_REPLIES` in [settings](settings.md)). For a `hermes` agent with a view the box
-also starts turns: **Send** starts one, and while a turn sent from a view is running, **Stop** ends
-it and **Steer** passes it the typed text. **Full view** opens the agent's page. The box is
-disabled with a hint for viewers without the broker actions permission or agents that did not
-register `steer`. Closing the card closes its stream, so a tab holds at most one.
+On the Fleet page, **Quick view** on a listed agent opens a card (a bottom sheet on a phone). The
+card's own header names the agent; under it sit one status line (status, kind, model, context,
+last activity, and the actions menu), what it is doing and waiting on, its newest turns in the
+same reply and steps style as the Agents tab, and the same message box with one-tap quick
+replies (`AGENTDIR_QUICK_REPLIES` in [settings](settings.md)). For a `hermes` agent with a view
+the box sends messages: **Send** starts a turn, or while the agent works queues the message for
+its next turn, and the arrow beside Send offers **Interrupt and send**, which stops the current
+turn first. **Stop current turn** is in the actions menu. **Full view** opens the agent's page.
+The box is disabled with a hint for viewers without the broker actions permission or agents that
+did not register `steer`. Closing the card closes its stream, so a tab holds at most one.
 
 ## Mid-turn steering (PostToolUse)
 
@@ -153,7 +160,7 @@ instruction priority. Queue time comes from the inbox filename's nanosecond pref
 stays the same on retries; missing or invalid times are shown as `unknown`.
 
 The hook ignores subagent calls carrying `agent_id` and always exits successfully.
-Hermes sidecar Send/Steer controls are a separate mechanism;
+Hermes sidecar Send and Interrupt controls are a separate mechanism;
 use the next-tool-call composer only for agents running this hook and beat client.
 
 Protocol and recovery:
@@ -458,7 +465,7 @@ in the body, so clients should check `error` as well as the HTTP status.
 |---|---|
 | `AGENTDIR_HERMES_AUTH_HEADER` | Forward-auth header sent with the viewer's user name, default `Remote-User`. Configure the sidecar to trust the same name (`OKO_TAIL_AUTH_HEADER`). |
 | `AGENTDIR_HERMES_PROXY_SECRET_FILE` | 0600 file holding the shared proxy secret, read on every request so rotation needs no restart. Never logged or returned. The sidecar reads the same secret (`OKO_TAIL_PROXY_SECRET_FILE`). Unset sends no secret. |
-| `AGENTDIR_HERMES_UI_DIR` | Directory holding the view's renderer: `view.js`, `app.css` and `logo.svg` from the view sidecar's `web/` directory, at the release your sidecars run (one that ships `view.js` and `GET /cfg`). Only those three names are served, at `hermes-ui/`. Unset shows presence only, with a note. |
+| `AGENTDIR_HERMES_UI_DIR` | Optional and no longer used by the Agents tab, which draws the view itself. If set, the viewer still serves `view.js`, `app.css` and `logo.svg` from that directory at `hermes-ui/` and nothing else. Safe to leave unset. |
 | `AGENTDIR_HERMES_PROXY_SECRET_HEADER` | Header carrying it, default `X-View-Proxy-Secret`; set the sidecar's `OKO_TAIL_PROXY_SECRET_HEADER` to match. |
 
 On the sidecar: add the `view_url` host name to `OKO_TAIL_HOSTNAMES` and the viewer's source
@@ -466,68 +473,31 @@ address to `OKO_TAIL_TRUSTED_PROXIES`, and set the auth header and secret as abo
 route (session list and agent name) needs a sidecar that serves `GET /cfg`. Image sends go through the broker's POST limit
 (`BROKER_MAX_BODY`, 1 MiB by default); raise it if people attach several photos.
 
-The live view is the sidecar project's own renderer, mounted in a shadow root in the tab, so it
-has every feature of the sidecar's page: transcript, steps, search, context and usage, memory and
-skills, approvals, the send queue, steer, stop and slash commands. Viewers without the broker
-actions permission, or agents without the `steer` cap, get the same view with the composer
-disabled and a hint. The renderer comes from `AGENTDIR_HERMES_UI_DIR`, which the operator
-installs; the browser never loads script or styles from an agent.
+The tab draws the view itself, in the broker's own DOM and dashboard styles, from the `cfg`,
+`events` and `earlier` routes: user messages and replies, with each run of thinking and tool calls
+folded into one quiet line ("5 tool calls · 38s · Show steps", timed from the message before the
+steps to the reply after them) that opens to the steps. **Show all steps** in the actions menu
+opens or closes them all. A working line at the end
+shows what is running and for how long. The session list from `cfg` is in the actions menu, and
+the address bar follows the session and a linked message. The composer has one **Send**: it starts
+a turn, or while the agent works queues the message for its next turn, and the arrow beside it
+offers **Interrupt and send** (`stop`, then `say`). **Stop current turn** is in the actions menu.
+Viewers without the broker actions permission, or agents without the `steer` cap, get the same
+view with the composer disabled and a hint. The browser never loads script or styles from an
+agent or its sidecar, and every piece of agent text is set with `textContent`.
 
-### Renderer theme contract
+The sidecar page's other panels (search, memory and skills browsers, approvals, slash commands)
+are not part of this view; their read routes stay available through the proxy.
 
-The directory list and live pane use the broker's type scale, surfaces, borders, focus rings and
-status tints. The host element passed to a renderer exposes the following CSS custom properties.
-Any renderer can read them inside its shadow root; none depend on an agent kind or a sidecar's
-data API. Values reference the broker tokens, so light, dark and system theme changes update an
-open pane without reconnecting its stream or resetting its composer. Outside the broker, the
-variables fall back to the broker's light palette.
-
-| Renderer variable (`--agent-view-` prefix) | Broker token or value |
-|---|---|
-| `bg`, `surface`, `hover`, `active` | `--bg`, `--s1`, `--s2`, `--s3` |
-| `border` | `--line` |
-| `text`, `muted`, `faint` | `--t1`, `--t2`, `--t3` |
-| `accent`, `on-accent` | `--brand`, `--onbrand` |
-| `success`, `warning`, `danger` | `--run`, `--wait`, `--block` |
-| `shadow` | `--shadow` |
-| `font`, `mono` | System UI and monospace stacks from [the design standards](DESIGN.md#type) |
-| `font-size`, `line-height` | `14px`, `1.5` |
-| `radius`, `control-radius` | `12px`, `8px` |
-| `space`, `control-height` | `16px`, `36px` (phone controls use at least `48px`) |
-
-For example, a renderer can use `background:var(--agent-view-surface)` and
-`color:var(--agent-view-text)` on its root, and `var(--agent-view-accent)` for focus and primary
-actions. Keep layout and behavior in the renderer; use the variables for appearance only.
-
-Today's installed sidecar renderer does not need an upgrade. After its synchronous `mount`,
-the broker appends a marked `style[data-agent-view-theme]` to the host's open shadow root.
-This scoped compatibility sheet maps the older `--panel`, `--panel2`, `--ink`, `--text`,
-`--muted`, `--faint`, `--accent`, `--green`, `--amber`, `--red`, `--code` and `--user` aliases
-on the root (`.ob`), and normalizes standard controls, links, chips and focus styling. It leaves
-the renderer's stylesheet and responsive layout in place. Nothing is injected into the broker
-document or an agent's page. A non-shadow renderer still inherits the public variable set.
-
-For a clean upstream seam, the sidecar should consume `--agent-view-*` directly (with its own
-standalone defaults). That renderer change belongs in its repository, not this one. The
-compatibility sheet remains necessary until the installed renderer adopts that contract;
-changes to its DOM or private CSS names need a visual compatibility check. The optional
-Playwright test in `tests/test_viewer_ui.py` checks live light/dark/auto inheritance and 390px
-controls against a synthetic shadow-root fixture, not the external renderer itself.
-Button variants retain their background/text pairing during hover, keyboard focus and press.
-Disabled buttons keep full text contrast and use a dashed border and unavailable cursor instead
-of reduced opacity. The browser check measures at least 4.5:1 contrast for these states in both themes.
-
-Control-state comparison using that synthetic fixture and the unchanged base compatibility sheet
-versus the fixed sheet. These are not captures
-of an installed external renderer. Each image shows `.pri` hovered, `.primary` keyboard-focused,
-and a disabled submit button.
-
-| Theme / viewport | Before | After |
-|---|---|---|
-| Light / desktop | [Before](images/agents-buttons-before-light-desktop.png) | [After](images/agents-buttons-after-light-desktop.png) |
-| Light / phone | [Before](images/agents-buttons-before-light-phone.png) | [After](images/agents-buttons-after-light-phone.png) |
-| Dark / desktop | [Before](images/agents-buttons-before-dark-desktop.png) | [After](images/agents-buttons-after-dark-desktop.png) |
-| Dark / phone | [Before](images/agents-buttons-before-dark-phone.png) | [After](images/agents-buttons-after-dark-phone.png) |
+The optional Playwright test in `tests/test_viewer_ui.py` mounts the view and the Fleet quick view
+on a stubbed sidecar at 1440 and 390 pixels in light, dark and system themes. It checks that the
+text box and both halves of Send share one height and top edge (36px on desktop, 44px on
+phones), that steps start collapsed, that nothing is italic or overflows sideways, and that
+Send clears 4.5:1 contrast. A second check loads the real dashboard page with the module at
+1440x900, 1366x650 and 390x844 and checks that the page height equals the window height, that
+only the transcript scrolls, that the card header and composer stay on screen, that there is no
+page title and that every phone tap target is at least 44px. Screenshots from that run are in
+`docs/mockups/agents-tab-*.png`.
 
 Trust boundaries worth knowing before you enable it:
 

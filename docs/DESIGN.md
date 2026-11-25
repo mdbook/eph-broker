@@ -76,6 +76,9 @@ status color for chips and pills, 8% `--block` for the error banner, 16% for sta
 
 - Spacing steps in use: 4, 8, 12, 16, 20, 24, 32, 40, 64px. Prefer these.
 - Page: max width 1440px, padding 32px 40px 64px. Sections are 32px apart (`.sec`).
+- Fill views (a module view with `data-fill`, such as the Agents tab): the page is exactly the viewport and
+  never scrolls, top and bottom padding are 16px, and there is no page title (the tab names the view). Only
+  the view's own panes scroll; the card header and composer always stay on screen.
 - Header: sticky, 64px tall, `--s1` with a bottom `--line` border.
 - Card content padding: 20px (rows, table edge cells) or 24px (side panels, queue head).
 - Rows and table cells: 14 to 16px vertical padding, divided by a 1px `--line` top border.
@@ -97,7 +100,10 @@ status color for chips and pills, 8% `--block` for the error banner, 16% for sta
 
 ## Components
 
-- **Button** (`.btn`): 36px tall, 16px side padding, 8px radius, `--line` border, `--s1` fill, 14px/600.
+- **Control height** (`--ctl`, 36px on `:root`): buttons, square icon buttons, selects and message boxes take
+  their height from it, so a row of controls lines up by construction. The Agents tab and quick view raise it
+  to 44px on phones inside their own scope.
+- **Button** (`.btn`): `--ctl` tall, 16px side padding, 8px radius, `--line` border, `--s1` fill, 14px/600.
   Row actions share one minimum width (`--btn: 120px`) so a column of them lines up.
   - `.pri`: `--brand` fill, `--onbrand` text. The main action of a panel (for example "Watch live").
   - `.ghost`: no border or fill until hover. Used for icon buttons in the header.
@@ -154,6 +160,13 @@ status color for chips and pills, 8% `--block` for the error banner, 16% for sta
 - **Transcript** (`.tl`, `.ev`, `details.tool`): message cards (14px radius) and collapsible tool cards (12px
   radius) with a 20px tinted tool icon, monospace argument summary and a rotating `›` chevron. Errors get a
   `--block` border and tint.
+- **Agent view** (`viewer/ui.js`, reference `docs/mockups/agent-view.html`): the Agents tab detail and the
+  Fleet quick view. One header (name, status chip, one `⋯` actions menu; then the doing-now line; then kind,
+  model, context meter, session, last activity in 13px `--t2`). Replies are the loudest text; thinking and
+  tool steps fold into one collapsed 13px `--t2` line per turn ("5 tool calls · 38s · Show steps"). The composer is a text box and one Send split
+  button whose arrow, shown only while the agent works, offers Interrupt and send. Header, body and composer
+  share one edge (`--gut`: 20px, 24px in the quick view, 16px on phones). Menus are a 10px-radius `--s1`
+  popover. No serif, italics, gradients or per-view theme switch.
 - **Focus**: every interactive element shows a 2px `--brand` outline, offset 2px (`:focus-visible`).
 - **Theme**: the header button cycles auto, light, dark and remembers the choice in `localStorage`
   (`eph-theme`).

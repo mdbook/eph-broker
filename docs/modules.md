@@ -146,6 +146,12 @@ aborted. A reload or navigation aborts and unmounts the old view.
   `context_tokens`/`context_limit` are numbers or null. Plain text only.
 - `signal`: AbortSignal for this mount.
 
+A view that should fill the screen instead of scrolling the page marks its root element with `data-fill`.
+While that view is shown, the broker sizes the page to the viewport: the page itself never scrolls, the top
+padding drops to 16px and the mount element becomes a flex column with the remaining height. The view must
+then scroll its own panes (`min-height:0` plus `overflow:auto`). The bundled Agents module does this when it is
+hosted, so its card header and composer always stay on screen. Views without `data-fill` keep normal page flow.
+
 Use the broker's CSS variables (`--t1`, `--t2`, `--t3`, etc.) and semantic HTML.
 Do not create iframes. Treat names, status and API text as untrusted; use
 `textContent`, not unsanitized innerHTML. POST with JSON and `X-Broker-Action: 1`;

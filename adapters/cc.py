@@ -2184,6 +2184,7 @@ class Worker:
         self.turn_wall_clock = None  # The CURRENT turn's effective wall-clock (per-capability), used for the liveness check
         self.hard_killed = False     # Set True iff the turn JUST ENDED was the wall-clock hard-kill path;
                                       # consumed (and reset) only by the warm-re-prompt cap in _turn_with_envelope
+        self.had_hard_kill = False   # Run-sticky: an envelope-only recovery cannot make partial work complete
         self.inbox_input_tokens = 0  # Run-wide, not reset by session rotation or a warm forward
         self.inbox_cost_usd = 0.0
         self.inbox_limit_reason = None
@@ -2908,6 +2909,36 @@ class CCAdapter(Adapter):
         except Exception as e:
             log.warning("push-refused ticket comment failed task_id=%s run_id=%s: %s",
                         tickets.vikunja_id(key), run_id, e)
+
+    def _save_failed_commits(self, key, run_id, ticket_ref=None):
+        """Preserve only already-committed work before reaping an unsuccessful run. Never raises."""
+        if not hasattr(self.worktree_mgr, "save_commits"):
+            return None
+        try:
+            saved = self.worktree_mgr.save_commits(key)
+            ref = ticket_ref or tickets.ref_from_key(key)
+            if saved and ref is not None:
+                try:
+                    self._tracker_comment(ref, (
+                        '<p><b>Worker stopped before successful publication</b>: existing commits were saved on '
+                        f'<a href="{html.escape(saved["branch_url"], quote=True)}">'
+                        f'<code>{html.escape(saved["branch"])}</code></a> at '
+                        f'<a href="{html.escape(saved["commit_url"], quote=True)}">'
+                        f'<code>{html.escape(saved["sha"])}</code></a>. '
+                        'No uncommitted changes were pushed; this recovery does not open or update an MR. '
+                        'A subsequent run can build on this branch.</p>'), run_id)
+                except Exception as e:
+                    log.warning("save_commits ticket comment failed key=%s run_id=%s: %s", key, run_id, e)
+            return saved
+        except Exception as e:
+            log.warning("save_commits key=%s run_id=%s failed: %s", key, run_id, e)
+            try:
+                self._alert_ops(f"worker commit recovery FAILED ({key}): {e}", subject=f"worker:{key}")
+            except Exception as e2:
+                log.warning("save_commits alert failed key=%s: %s", key, e2)
+            if isinstance(e, PushTargetRefused):
+                self._nag_push_refused(key, run_id, e)
+            return None
 
     # ---- turn-cap WIP save: commit and push an eph/*-wip branch (NO MR) before teardown ----
     def _save_wip(self, key, run_id):
@@ -3634,6 +3665,8 @@ class CCAdapter(Adapter):
         repo_lock_held = False                           # only a route with repo_lock_scope=run
         publish = None                                   # route.publish dict for a write route, else None
         publish_ran = False                              # True once the clean-completion publish block runs
+        publish_completed = False                       # A failed push must also get commit recovery
+        last_env = None                                 # A parse miss/forced close is not clean completion
         capped_published = False                         # turn-capped but a clean commit was MR-published
         inbox_posture = None                             # this account's runtime posture text, if an inbox route
         inbox_account = None                             # The account the inbox gate resolved (zulip: from the bot map)
@@ -4380,6 +4413,7 @@ class CCAdapter(Adapter):
             first_prompt = json.dumps(brief)             # value-free: the collapsed (+ enriched) brief seeds turn 1
             # coalescer already advertised state=open_running for the seed turn at _would_spawn().
             env = self._turn(worker, route, system_prompt, first_prompt, resume=False, run_id=run_id)
+            last_env = env
             self._post_envelope(brief, run_id, env, worker)   # post the seed turn's summary
             if env is not None and getattr(route, "capability", "") == "inbox":
                 # One bounded pass per run. Buffered wakes retire to a fresh run, not another backlog pass
@@ -4426,6 +4460,7 @@ class CCAdapter(Adapter):
                         route2.adapter = adapter_override
                     sp2 = self.prompt_loader.load(route2.prompt_class, route2.domain)
                     env2 = self._turn(worker, route2, sp2, json.dumps(brief2), resume=True, run_id=run_id)
+                    last_env = env2
                     # Retain feedback once per forward, NOT per harness attempt (fallbacks/re-prompts may
                     # retry it). The current delta is merged at dispatch; cache it only AFTER that turn.
                     if isinstance(worker.seed_brief, dict) and brief2.get("comments"):
@@ -4440,10 +4475,12 @@ class CCAdapter(Adapter):
                     self._advertise_idle(key)            # turn-boundary -> open_idle
             # The worker has committed its content edits into the (hook-suppressed,
             # cred-free) worktree; the BROKER does the ONLY push. Runs on clean completion inside the try
-            # (NOT in finally) so a crashed/hard-killed turn never publishes a partial edit. A no-op
+            # (NOT in finally) so a blocked/crashed/hard-killed turn never publishes a partial edit. A no-op
             # (worker made no commit) returns cleanly. A rebase conflict/exhausted-retry raises, and is logged and
             # alerted below, worktree still torn down in finally.
-            if publish is not None:
+            if (publish is not None and ((last_env or {}).get("status") == "done" or worker.turn_capped)
+                    and not worker.api_overloaded
+                    and not worker.hard_killed and not worker.had_hard_kill):
                 publish_ran = True                       # The finally's crash-path patch save keys off this
                 try:
                     if (publish.get("code_repo_path") and worker.turn_capped and TURN_CAP_PUBLISH_CLEAN_COMMIT
@@ -4556,6 +4593,8 @@ class CCAdapter(Adapter):
                     else:
                         with self._repo_operation(key, repo_lock, repo_lock_held):
                             self.worktree_mgr.publish(key, publish_ref=publish["publish_ref"])
+                    publish_completed = not (publish.get("code_repo_path") and worker.turn_capped
+                                             and not capped_published)
                 except Exception as e:
                     log.exception("publish key=%s run_id=%s failed: %s", key, run_id, e)
                     self._alert_ops(f"publish {key} run_id={run_id} failed: {e}", subject=f"worker:{key}")
@@ -4575,15 +4614,20 @@ class CCAdapter(Adapter):
             # A turn-capped code/general worker's edits would die with the worktree below; save
             # them to an eph/*-wip branch FIRST (inside the run, before run_registry.close). Never raises.
             if (worktree and worker is not None and worker.turn_capped and not capped_published
+                    and not worker.hard_killed and not worker.had_hard_kill and not worker.api_overloaded
                     and (publish or {}).get("code_repo_path")):
-                with self._repo_operation(key, repo_lock, repo_lock_held):
-                    self._save_wip(key, run_id)
+                with self._repo_operation(key, repo_lock, repo_lock_held, cancellable=False):
+                    publish_completed = bool(self._save_wip(key, run_id))
             # A code worker whose run RAISED before the publish block (e.g. _turn blew up) would lose its
             # uncommitted edits with the worktree below; save them as a LOCAL patch (no push, so this never
             # publishes a partial edit). Clean completion already handled this in the publish block. Never raises.
             elif (worktree and worker is not None and not publish_ran
                   and (publish or {}).get("code_repo_path")):
                 self._save_patch(key, run_id)
+            if (worktree and publish is not None and not publish_completed
+                    and _env_flag("WORKER_SAVE_COMMITS_ON_FAILURE", "1")):
+                with self._repo_operation(key, repo_lock, repo_lock_held, cancellable=False):
+                    self._save_failed_commits(key, run_id, tickets.vikunja_ref(brief.get("task_id")))
             if worker is not None and worker.write_grant_path:   # Revoke the live-write grant with the worker
                 write_grant.remove_grant_file(worker.write_grant_path)
             if worker is not None and worker.inbox_chat_mcp_path:   # drop the merged combined MCP config
@@ -5313,6 +5357,7 @@ class CCAdapter(Adapter):
             # single sem slot is lost until process restart, not a stuck subject. No code change.
             out, err = proc.communicate()
             worker.hard_killed = True                    # _turn_with_envelope caps the warm re-prompt
+            worker.had_hard_kill = True
             log.warning("HARD-KILL key=%s wall-clock %ss exceeded", worker.key, wall_clock_s)
             if capability != "inbox":  # inbox reports ONE terminal blocked envelope instead
                 self._alert_ops(f"worker {worker.key} hard-killed: wall-clock {wall_clock_s}s",

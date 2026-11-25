@@ -947,6 +947,7 @@ class HermesHarness:
                 _kill_group(proc)
                 out, err = proc.communicate()
                 worker.hard_killed = True                   # _turn_with_envelope caps the warm re-prompt
+                worker.had_hard_kill = True
                 log.warning("HARD-KILL key=%s wall-clock %ss exceeded (hermes)", worker.key, wall_clock_s)
                 adapter._alert_ops(f"worker {worker.key} hard-killed: wall-clock {wall_clock_s}s (hermes)",
                                    subject=f"worker:{worker.key}")

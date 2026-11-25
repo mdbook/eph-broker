@@ -286,6 +286,7 @@ own separate repo settings.
 | `CODE_REPO_RUNNER_SEEDS` | unset | Test runner per repo, `<path>=<runner>,...` (`repo-test` runs the repo's own `./run-tests.sh`). The key must be the repo's real absolute path: a key on a path that does not exist as a directory never applies (the broker warns at startup and the repo falls through to the route default `CODE_TEST_RUNNER`). |
 | `CONTINUE_MR_PREFIXES` | `eph/` | Colon list of branch prefixes a `continue-mr:` line may name. Each must end in `/`. Empty: nothing can be continued. |
 | `TURN_CAP_PUBLISH_CLEAN_COMMIT` | `1` | A worker that hits its turn cap with a clean commit ahead of the base gets that commit published as an MR. `0`: WIP branch only. |
+| `WORKER_SAVE_COMMITS_ON_FAILURE` | `1` | Before removing an unsuccessful write worker's worktree, push existing commits ahead of its cut to a separate ticket WIP branch and comment with branch/SHA links. Never stages or commits edits. `0`: disable this recovery. Applies to all harnesses, including hard-kills, crashes, parse misses and failed publishes. |
 | `CODE_REPO_RUNNERS` | unset | Same format; overrides the seeds per path. |
 | `CODE_TEST_RUNNER` | `pytest` | Runner for a repo that's in neither map. |
 | `EPH_GATE_TEST_ENV_ALLOW` | unset | Comma list of extra reviewed, exact environment names allowed before a code worker's granted test runner on hermes/Codex, on top of the benign defaults ([hermes.md](hermes.md#test-runner-environment-assignments-hermes-and-codex)). No wildcard patterns. Values remain confined. |

@@ -12705,6 +12705,7 @@ def _run_code_worker(d, turn):
         def publish_mr(self, key, **kw): calls.append("publish_mr"); return None
         def save_patch(self, key): calls.append("save_patch"); return os.path.join(d, "_patches", "p.patch")
         def save_wip(self, key): calls.append("save_wip"); return None
+        def save_commits(self, key): calls.append("save_commits"); return None
         def remove(self, key): calls.append("remove")
     route = Route(domain="code", repo=d, prompt_class="change-proposer", agent="code-worker",
                   read_only=False, capability="code", test_runner="pytest", model="m",
@@ -12749,6 +12750,7 @@ def test_crashed_turn_saves_patch_before_worktree_removal():
     assert "save_patch" in calls and "remove" in calls, calls
     assert calls.index("save_patch") < calls.index("remove"), calls
     assert "publish_mr" not in calls and "open_mr" not in calls and "save_wip" not in calls, calls
+    assert calls.index("save_commits") < calls.index("remove"), calls
     ok("a crashed code turn saves uncommitted edits as a patch before worktree removal (no publish)")
 
 
@@ -12757,12 +12759,24 @@ def test_clean_no_commit_saves_patch_once():
     save it a second time."""
     def fine(worker, *a, **k):
         worker.done = True
-        return {"status": "blocked", "summary": "commit refused", "wake": []}
+        return {"status": "done", "summary": "no changes needed", "wake": []}
     with tempfile.TemporaryDirectory() as d:
         calls = _run_code_worker(d, fine)
     assert "publish_mr" in calls and calls.count("save_patch") == 1, calls
     assert calls.index("save_patch") < calls.index("remove"), calls
     ok("clean no-commit completion saves the patch exactly once (publish block, not the finally)")
+
+
+def test_blocked_no_commit_saves_patch_without_publication():
+    def blocked(worker, *a, **k):
+        worker.done = True
+        return {"status": "blocked", "summary": "commit refused", "wake": []}
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        calls = _run_code_worker(d, blocked)
+    assert calls.count("save_patch") == 1, calls
+    assert calls.index("save_patch") < calls.index("save_commits") < calls.index("remove"), calls
+    assert "publish_mr" not in calls and "open_mr" not in calls and "save_wip" not in calls, calls
+    ok("blocked no-commit completion saves a local patch without normal publication")
 
 
 def test_code_capability_refuses_nonclaude_backend_by_default():
@@ -15357,6 +15371,262 @@ def _g18_origin_and_worktree(d, key):
     wm = WorktreeManager(local, os.path.join(d, "wt"))
     path = wm.make(key, publish_ref=branch, suppress_hooks=True)
     return bare, wm, path
+
+
+def test_save_commits_preserves_only_existing_commits():
+    import worktree as W
+    key = "vikunja:task:9373"
+    # Git's identity environment overrides -c user.*, so own the identity asserted below.
+    with _Env(**{k: None for k in os.environ if k.startswith(("GIT_AUTHOR_", "GIT_COMMITTER_"))}), \
+            tempfile.TemporaryDirectory(dir=ROOT) as d:
+        bare, wm, path = _g18_origin_and_worktree(d, key)
+        git = lambda *args: subprocess.run(["git", "-C", path, *args], check=True,
+                                           capture_output=True, text=True).stdout.strip()
+        try:
+            pathlib.Path(path, "f.txt").write_text("uncommitted only\n")
+            git("add", "f.txt")
+            assert wm.save_commits(key) is None
+            assert git("rev-parse", "HEAD") == wm.cut_sha(key)
+            pathlib.Path(path, "f.txt").write_text("committed\n")
+            identity = ["-c", "user.name=eph-code", "-c", "user.email=eph-code@noreply.invalid"]
+            git("add", "f.txt")
+            git(*identity, "-c", "commit.gpgSign=false", "commit", "--no-verify", "-m", "worker commit")
+            head = git("rev-parse", "HEAD")
+            # A pre-existing MR branch must remain at its old head, even when local work advances it.
+            mr_branch = "eph/code-change/existing-mr"
+            git("push", "origin", f"{wm.cut_sha(key)}:refs/heads/{mr_branch}")
+            pathlib.Path(path, "f.txt").write_text("uncommitted\n")
+            pathlib.Path(path, "staged.txt").write_text("not committed\n")
+            git("add", "staged.txt")
+            pathlib.Path(path, "scratch.txt").write_text("scratch\n")
+            before = git("status", "--porcelain")
+            with patch.object(W, "_gitlab_push_url", return_value=bare):
+                saved = wm.save_commits(key)
+                assert saved == wm.save_commits(key), "recovery is idempotent"
+            assert saved["sha"] == head and saved["branch"].endswith("-wip"), saved
+            assert git("status", "--porcelain") == before, "neither index nor worktree may change"
+            assert git("rev-parse", "HEAD") == head, "no broker commit or identity rewrite"
+            def remote(*args):
+                return subprocess.run(["git", "--git-dir", bare, *args], check=True,
+                                      capture_output=True, text=True).stdout.strip()
+            assert remote("rev-parse", saved["branch"]) == head
+            assert remote("rev-parse", mr_branch) == wm.cut_sha(key)
+            assert remote("show", f'{saved["branch"]}:f.txt') == "committed"
+            assert remote("log", "-1", "--format=%an|%cn", saved["branch"]) == "eph-code|eph-code"
+            assert remote("ls-tree", "--name-only", saved["branch"]) == "CLAUDE.md\nf.txt"
+            # A conflicting recovery ref must also fail closed, never advance an existing MR/WIP head.
+            remote("update-ref", f'refs/heads/{saved["branch"]}', wm.cut_sha(key))
+            with patch.object(W, "_gitlab_push_url", return_value=bare):
+                try:
+                    wm.save_commits(key)
+                    raise AssertionError("must refuse an occupied recovery ref")
+                except RuntimeError as e:
+                    assert "refusing to overwrite" in str(e), e
+        finally:
+            wm.remove(key)
+    ok("failed-worker recovery pushes existing commits only, preserves identity/index and never overwrites a branch")
+
+
+def test_hard_killed_worker_pushes_and_comments_before_reaping():
+    """A real timed-out CLI commits, then leaves staged/dirty work. Its recovery envelope cannot open an MR."""
+    import routing as RT
+    import worktree as W
+    key = "vikunja:task:9374"
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        bare, wm, path = _g18_origin_and_worktree(d, key)
+        marker = os.path.join(d, "started")
+        fake = os.path.join(d, "fake_killed_worker.py")
+        pathlib.Path(fake).write_text('''#!/usr/bin/env python3
+import json, os, pathlib, subprocess, time
+marker = pathlib.Path(os.environ["KILL_TEST_MARKER"])
+if not marker.exists():
+    marker.write_text("started")
+    pathlib.Path("f.txt").write_text("committed\\n")
+    subprocess.run(["git", "add", "f.txt"], check=True)
+    subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false",
+                    "commit", "--no-verify", "-qm", "worker commit"], check=True)
+    pathlib.Path("f.txt").write_text("unfinished\\n")
+    pathlib.Path("staged.txt").write_text("unfinished\\n")
+    subprocess.run(["git", "add", "staged.txt"], check=True)
+    time.sleep(60)
+print(json.dumps({"result": json.dumps({"status": "done", "summary": "recovery envelope", "wake": []})}))
+''')
+        os.chmod(fake, 0o700)
+        repo = wm.base_repo
+        route = Route(domain="code", repo=repo, prompt_class="change-proposer", agent="code-worker",
+                      read_only=False, capability="code", test_runner="pytest", model="m",
+                      env={"KILL_TEST_MARKER": marker},
+                      publish={"code_repo_path": repo, "mr_target_ref": "main", "worktree_base": d})
+        class _Router:
+            def route(self, k, b): return route
+        class _PL:
+            def load(self, *a): return "SYS"
+        calls, comments, recovered = [], [], []
+        save, remove = wm.save_commits, wm.remove
+        def recover(k):
+            saved = save(k)
+            recovered.append(saved)
+            calls.append("push")
+            return saved
+        def comment(tid, body, rid):
+            comments.append((tid, body))
+            if "existing commits were saved" in body:
+                calls.append("comment")
+        def reap(k):
+            calls.append("remove")
+            remove(k)
+        a = CCAdapter(router=_Router(), worktree_mgr=wm, prompt_loader=_PL(),
+                      envelope_parser=EnvelopeParser(), claude_bin=fake, wall_clock_s=1,
+                      wall_clock_by_capability={"code": 1}, cmd_poll_s=0.01,
+                      ticket_fetcher=lambda tid: f"**title:** t\nrepo:{repo}\n",
+                      comment_poster=comment, label_poster=lambda tid: None,
+                      alert_ops=lambda *a, **kw: None)
+        with patch.object(RT, "parse_repo_token", return_value=repo), \
+                patch.object(RT, "resolve_target_repo", return_value=repo), \
+                patch.object(RT, "code_repo_allowed", return_value=True), \
+                patch.object(cc, "resolve_default_branch", return_value="main"), \
+                patch.object(cc, "open_mr", side_effect=AssertionError("incomplete work must not open an MR")), \
+                patch.object(wm, "make", return_value=path), patch.object(wm, "save_commits", side_effect=recover), \
+                patch.object(wm, "remove", side_effect=reap), \
+                patch.object(W, "_gitlab_push_url", return_value=bare), \
+                patch.dict(os.environ, {"WORKER_SAVE_COMMITS_ON_FAILURE": "1"}):
+            try:
+                a.spawn(key, {"task_id": 9374})
+                for _ in range(100):
+                    if any("recovery envelope" in body for _, body in comments):
+                        break
+                    time.sleep(0.05)
+                else:
+                    raise AssertionError("timed-out worker never reached the envelope-only recovery")
+            finally:
+                a.teardown(key)
+                a._join(key, timeout=5)
+        assert calls == ["push", "comment", "remove"], calls
+        assert not os.path.exists(path)
+        saved = recovered[0]
+        assert saved and saved["sha"] and saved["branch"].endswith("-wip"), recovered
+        assert any(tid == 9374 and saved["sha"] in body and 'href="' in body
+                   and "/-/tree/" in body and "/-/commit/" in body for tid, body in comments), comments
+        contents = subprocess.run(["git", "--git-dir", bare, "show", f'{saved["branch"]}:f.txt'],
+                                  check=True, capture_output=True, text=True).stdout
+        assert contents == "committed\n", contents
+        names = subprocess.run(["git", "--git-dir", bare, "ls-tree", "--name-only", saved["branch"]],
+                               check=True, capture_output=True, text=True).stdout
+        assert "staged.txt" not in names
+    ok("wall-clock kill -> committed-only push -> linked ticket comment -> worktree reap, even after a done re-prompt")
+
+
+def test_blocked_worker_pushes_commits_without_opening_or_updating_mr():
+    """A valid blocked envelope saves only commits to recovery, for both new work and an MR fix round."""
+    import routing as RT
+    import worktree as W
+    key = "vikunja:task:9375"
+    for continue_mr in (False, True):
+        with tempfile.TemporaryDirectory(dir=ROOT) as d:
+            bare, wm, path = _g18_origin_and_worktree(d, key)
+            git = lambda *args: subprocess.run(["git", "-C", path, *args], check=True,
+                                               capture_output=True, text=True).stdout.strip()
+            mr_branch = "eph/code-change/existing-mr"
+            cut = wm.cut_sha(key)
+            git("push", "origin", f"{cut}:refs/heads/{mr_branch}")
+            repo = wm.base_repo
+            route = Route(domain="code", repo=repo, prompt_class="change-proposer", agent="code-worker",
+                          read_only=False, capability="code", test_runner="pytest", model="m",
+                          publish={"code_repo_path": repo, "mr_target_ref": "main", "worktree_base": d})
+            class _Router:
+                def route(self, k, b): return route
+            class _PL:
+                def load(self, *a): return "SYS"
+            calls, comments, recovered, heads = [], [], [], []
+            save, remove = wm.save_commits, wm.remove
+            def turn(worker, route, *args, **kw):
+                pathlib.Path(path, "f.txt").write_text("partial committed work\n")
+                git("add", "f.txt")
+                git("-c", "user.name=eph-code", "-c", "user.email=eph-code@noreply.invalid",
+                    "-c", "commit.gpgSign=false", "commit", "--no-verify", "-qm", "partial worker commit")
+                heads.append(git("rev-parse", "HEAD"))
+                pathlib.Path(path, "f.txt").write_text("unfinished\n")
+                pathlib.Path(path, "staged.txt").write_text("unfinished\n")
+                git("add", "staged.txt")
+                worker.done = True
+                return EnvelopeParser().try_parse(
+                    {"status": "blocked", "summary": "needs more work", "wake": []}, "blocked-run", route)
+            def recover(k):
+                saved = save(k)
+                recovered.append(saved)
+                calls.append("push")
+                return saved
+            def comment(tid, body, rid):
+                comments.append((tid, body))
+                if "existing commits were saved" in body:
+                    calls.append("comment")
+            def reap(k):
+                calls.append("remove")
+                remove(k)
+            ticket = f"**title:** t\nrepo:{repo}\n"
+            if continue_mr:
+                ticket += f"continue-mr: {mr_branch}\n"
+            a = CCAdapter(router=_Router(), worktree_mgr=wm, prompt_loader=_PL(),
+                          envelope_parser=EnvelopeParser(), ticket_fetcher=lambda tid: ticket,
+                          comment_poster=comment, label_poster=lambda tid: None,
+                          alert_ops=lambda *args, **kw: None)
+            a._turn = turn
+            with patch.object(RT, "parse_repo_token", return_value=repo), \
+                    patch.object(RT, "resolve_target_repo", return_value=repo), \
+                    patch.object(RT, "code_repo_allowed", return_value=True), \
+                    patch.object(cc, "resolve_default_branch", return_value="main"), \
+                    patch.object(cc, "open_mr") as open_mr, \
+                    patch.object(wm, "publish_mr") as publish_mr, \
+                    patch.object(wm, "publish_iteration") as publish_iteration, \
+                    patch.object(wm, "publish") as publish, patch.object(wm, "save_wip") as save_wip, \
+                    patch.object(wm, "make", return_value=path), \
+                    patch.object(wm, "save_commits", side_effect=recover), \
+                    patch.object(wm, "remove", side_effect=reap), \
+                    patch.object(W, "_gitlab_push_url", return_value=bare), \
+                    patch.dict(os.environ, {"WORKER_SAVE_COMMITS_ON_FAILURE": "1"}):
+                a._run_worker(key, {"task_id": 9375}, "blocked-run")
+                for normal in (open_mr, publish_mr, publish_iteration, publish, save_wip):
+                    normal.assert_not_called()
+            assert calls == ["push", "comment", "remove"], calls
+            assert not os.path.exists(path)
+            saved = recovered[0]
+            assert saved and saved["sha"] == heads[0] and saved["branch"].endswith("-wip"), recovered
+            assert saved["branch"] != mr_branch
+            assert any(tid == 9375 and saved["branch_url"] in body and saved["commit_url"] in body
+                       and saved["sha"] in body for tid, body in comments), comments
+            remote = lambda *args: subprocess.run(["git", "--git-dir", bare, *args], check=True,
+                                                  capture_output=True, text=True).stdout.strip()
+            assert remote("rev-parse", saved["branch"]) == heads[0]
+            assert remote("rev-parse", mr_branch) == cut, "the existing MR head must not change"
+            assert remote("show", f'{saved["branch"]}:f.txt') == "partial committed work"
+            assert "staged.txt" not in remote("ls-tree", "--name-only", saved["branch"])
+    ok("blocked worker -> committed-only recovery push -> linked comment -> removal, no new or updated MR")
+
+
+def test_failed_commit_recovery_config_and_errors():
+    def crash(worker, *a, **kw):
+        raise RuntimeError("turn failed")
+    with tempfile.TemporaryDirectory(dir=ROOT) as d, \
+            patch.dict(os.environ, {"WORKER_SAVE_COMMITS_ON_FAILURE": "0"}):
+        calls = _run_code_worker(d, crash)
+    assert "save_commits" not in calls and "remove" in calls, calls
+    alerts = []
+    class _WM:
+        def save_commits(self, key): raise RuntimeError("push unavailable")
+    a = CCAdapter(router=None, worktree_mgr=_WM(), prompt_loader=None, envelope_parser=None,
+                  comment_poster=lambda *a: None, alert_ops=lambda msg, **kw: alerts.append(msg))
+    assert a._save_failed_commits("vikunja:task:9373", "failed-run") is None
+    assert len(alerts) == 1 and "FAILED" in alerts[0], alerts
+    saved = {"branch": "eph/example-wip", "sha": "a" * 40,
+             "branch_url": "https://gitlab.example.com/group/app/-/tree/eph%2Fexample-wip",
+             "commit_url": "https://gitlab.example.com/group/app/-/commit/" + "a" * 40}
+    a.worktree_mgr.save_commits = lambda key: saved
+    comments = []
+    a._tracker_comment = lambda ref, body, rid: comments.append((ref, body))
+    assert a._save_failed_commits("github:owner/repo#9373", "issue-run") == saved
+    assert a._save_failed_commits("mr:group/app:9373", "mr-run", "vikunja:task:9373") == saved
+    assert [ref for ref, _ in comments] == ["github:owner/repo#9373", "vikunja:task:9373"], comments
+    ok("failure recovery can be disabled; a transport failure alerts without wedging cleanup")
 
 
 def test_g18_save_wip_commits_and_pushes_wip_branch():
@@ -24778,7 +25048,9 @@ print(json.dumps({"result": json.dumps({"status": "done", "summary": "<p>fixed</
             with _Env(REPO_INFER_ENABLED=None, CONTINUE_MR_PREFIXES=None):
                 a.spawn(key, {"task_id": 9202})
                 for _ in range(100):
-                    if alerts or any("fixed" in h for _, h in comments):
+                    # A preflight warning (for example, missing mcp-ro.sh) is not turn completion.
+                    # Closing on it kills the done fake before its envelope can permit publication.
+                    if not a.worker_alive(key) or any("fixed" in h for _, h in comments):
                         break
                     time.sleep(0.05)
                 a.teardown(key); a._join(key, timeout=5)

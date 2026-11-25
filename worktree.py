@@ -726,6 +726,43 @@ class WorktreeManager:
             log.warning("capped_commit_ready key=%s: %s -> False", key, e)
             return False
 
+    def save_commits(self, key, remote="origin"):
+        """Preserve an unsuccessful worker's existing commits, never its index or working tree.
+
+        Always use a separate ticket WIP branch: an existing MR head must not be updated with incomplete
+        work, even on a continue-MR/iteration run. The create-only lease also protects against races.
+        No commit, rebase or identity rewrite occurs. Return branch/SHA/links, or None without new commits.
+        """
+        import urllib.parse
+        repo, path, cut_sha = self._checked(key)
+        env = _wt_env(path)
+        env.update(self._git_identities.get(key, {}))
+        head = _git(path, "rev-parse", "HEAD", env=env)
+        if not cut_sha or not int(_git(path, "rev-list", "--count", f"{cut_sha}..{head}", env=env)):
+            return None
+        branch = f"eph/{_safe(key)}-{head}-wip"
+        ref = f"refs/heads/{branch}"
+        push_url = _gitlab_push_url(path, remote)
+        cred = _wt_cred_args(repo)
+        existing = subprocess.run(_wt_argv(path, *cred, "ls-remote", "--heads", push_url, ref),
+                                  check=True, capture_output=True, text=True, env=env, timeout=60).stdout.strip()
+        if existing and existing.split() != [head, ref]:
+            raise RuntimeError(f"save_commits key={key}: refusing to overwrite existing WIP branch")
+        if not existing:
+            r = subprocess.run(_wt_argv(path, *cred, "push", *_ci_skip_opts(),
+                                        f"--force-with-lease={ref}:", push_url, f"{head}:{ref}"),
+                               capture_output=True, text=True, env=env, timeout=60)
+            if r.returncode != 0:
+                raise RuntimeError(f"save_commits key={key}: branch push failed: {r.stderr.strip()}")
+        # Build browser links from the validated push destination, without any URL username.
+        u = urllib.parse.urlsplit(push_url)
+        project_path = u.path[:-4] if u.path.endswith(".git") else u.path.rstrip("/")
+        web = urllib.parse.urlunsplit((u.scheme, u.hostname or "", project_path, "", ""))
+        log.info("save_commits key=%s: preserved %s on %s", key, head, branch)
+        return {"branch": branch, "sha": head,
+                "branch_url": f"{web}/-/tree/{urllib.parse.quote(branch, safe='')}",
+                "commit_url": f"{web}/-/commit/{head}"}
+
     def save_wip(self, key, remote="origin"):
         """A turn-capped code worker's work-in-progress must survive teardown. Commit any
         uncommitted edits as a WIP commit, then push HEAD (incl. any unpushed worker commits) to a fresh

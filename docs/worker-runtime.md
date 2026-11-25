@@ -50,6 +50,27 @@ across its turns and removed when the worker exits. Keep overridden worktree roo
 This bounds the worker root, not every nested socket path. Pytest `tmp_path` adds username and test-name
 directories that can still exceed the AF_UNIX limit; socket tests must keep their full paths short.
 
+## Interrupted worker commits
+
+`WORKER_SAVE_COMMITS_ON_FAILURE=1` (default) preserves a write worker's local commits before its
+worktree is removed after a wall-clock kill, crash, missing result envelope or failed publication.
+This includes code, general, infra and wiki write routes on every harness. A hard-kill remains an
+interruption even if the envelope-only re-prompt succeeds. Incomplete work does not open an MR or
+update an existing MR branch.
+
+The broker pushes the existing HEAD, only when it contains commits not on the worktree's original cut,
+to `eph/<ticket-key>-<full-sha>-wip`. It always uses the separate WIP suffix, including fix rounds, so
+an MR head cannot be overwritten. The push is create-only, with the usual credentials and push-host
+checks; existing author/committer metadata is unchanged. The source ticket gets links to the branch
+and commit SHA before teardown. A later run can use that branch as its starting point. No automatic
+resume or MR is created.
+
+Recovery never stages, commits or pushes uncommitted edits. Existing local patch saves and the separate
+turn-cap WIP policy are unchanged. A recovery push/comment failure is logged (push failures also alert),
+and cleanup continues. Set `WORKER_SAVE_COMMITS_ON_FAILURE=0` to disable this recovery; commits on a failed
+run can then be lost when its worktree is reaped. Recovery runs while the broker is alive; it cannot run
+if the broker itself is killed.
+
 ## Companion sources
 
 An operator can configure per-repo [companions](configuration.md#companion-source-repositories).

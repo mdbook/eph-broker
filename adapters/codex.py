@@ -1124,6 +1124,7 @@ class CodexHarness:
             out, err, killed = _stream_process(proc, prompt_text, wall_clock_s, live)
             if killed:
                 worker.hard_killed = True
+                worker.had_hard_kill = True
                 log.warning("HARD-KILL key=%s wall-clock %ss exceeded (codex)", worker.key, wall_clock_s)
                 adapter._alert_ops(f"worker {worker.key} hard-killed: wall-clock {wall_clock_s}s (codex)",
                                    subject=f"worker:{worker.key}")

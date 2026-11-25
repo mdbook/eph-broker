@@ -13,7 +13,11 @@
     - Composer: one Send. While the agent works, Send queues for the next turn; "Interrupt and send" is the
       secondary option behind the Send menu. Stop moves to the actions menu.
     - The theme follows the dash header button (try it).
+
+  Visual QA (phase 1b): controls take their height from --ctl (36px, 44px on phones) and view edges from --gut,
+  so a text box and the buttons beside it cannot drift apart. Spacing sticks to the DESIGN.md scale.
 -->
+
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -26,20 +30,24 @@
     --bg:#f4f5f7; --s1:#ffffff; --s2:#f0f2f5; --s3:#e6e9ee; --line:#dce0e6;
     --t1:#141920; --t2:#475160; --t3:#626c7b; --brand:#2b57c9; --onbrand:#ffffff;
     --run:#17734a; --wait:#8a5600; --block:#bb3328; --shadow:0 1px 2px rgba(20,25,32,.05);
-    --r:12px; --btn:120px;
+    --r:12px; --btn:120px; --pop:0 8px 24px rgba(20,25,32,.12);
+    /* Shared control metrics. Every button, input and textarea that can sit in a row takes its height from
+       --ctl, so a row lines up by construction. Phones raise it to the 44px tap target (see the 720px block).
+       --gut is the one left/right edge for header, body and composer inside a view. */
+    --ctl:36px; --gut:20px;
   }
   :root[data-theme=dark]{
     color-scheme:dark;
     --bg:#0f1216; --s1:#161a20; --s2:#1d222a; --s3:#262c35; --line:#2b323c;
     --t1:#e8ecf1; --t2:#aab3bf; --t3:#8a94a2; --brand:#8eabff; --onbrand:#0c1120;
-    --run:#4cc38a; --wait:#e3a63d; --block:#f27c71; --shadow:none;
+    --run:#4cc38a; --wait:#e3a63d; --block:#f27c71; --shadow:none; --pop:0 8px 24px rgba(0,0,0,.45);
   }
   @media (prefers-color-scheme:dark){
     :root:not([data-theme=light]){
       color-scheme:dark;
       --bg:#0f1216; --s1:#161a20; --s2:#1d222a; --s3:#262c35; --line:#2b323c;
       --t1:#e8ecf1; --t2:#aab3bf; --t3:#8a94a2; --brand:#8eabff; --onbrand:#0c1120;
-      --run:#4cc38a; --wait:#e3a63d; --block:#f27c71; --shadow:none;
+      --run:#4cc38a; --wait:#e3a63d; --block:#f27c71; --shadow:none; --pop:0 8px 24px rgba(0,0,0,.45);
     }
   }
   *{box-sizing:border-box}
@@ -66,47 +74,55 @@
   .nav a[aria-current=page]{color:var(--t1);font-weight:600;border-bottom-color:var(--brand)}
   .top-r{margin-left:auto;display:flex;align-items:center;gap:12px}
 
-  .btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-width:var(--btn);height:36px;padding:0 16px;
+  .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-width:var(--btn);height:var(--ctl);padding:0 16px;
        border-radius:8px;border:1px solid var(--line);background:var(--s1);color:var(--t1);font-weight:600;font-size:14px;
-       text-decoration:none;cursor:pointer;white-space:nowrap}
+       line-height:20px;text-decoration:none;cursor:pointer;white-space:nowrap;flex:none}
   .btn:hover{border-color:color-mix(in srgb,var(--t1) 28%,var(--line))}
   .btn:active{background:var(--s3);transform:translateY(1px)}
   .btn.pri{background:var(--brand);border-color:var(--brand);color:var(--onbrand)}
-  .btn.pri:hover{background:color-mix(in srgb,var(--brand) 85%,var(--t1))}
+  .btn.pri:hover{background:color-mix(in srgb,var(--brand) 85%,var(--t1));border-color:color-mix(in srgb,var(--brand) 85%,var(--t1))}
+  .btn.pri:active{background:color-mix(in srgb,var(--brand) 75%,var(--t1))}
   .btn.ghost{background:transparent;border-color:transparent}
   .btn.ghost:hover{background:var(--s2);border-color:var(--line)}
-  .btn.sq{min-width:36px;width:36px;padding:0}
+  .btn.sq{min-width:var(--ctl);width:var(--ctl);padding:0}
   .btn.bad{color:var(--block)}
-  .lnk{color:var(--brand);font-weight:600;text-decoration:none;background:none;border:0;padding:0;cursor:pointer;font-size:14px}
+  .btn:disabled,.btn:disabled:hover{opacity:.5;cursor:default;transform:none;border-color:var(--line)}
+  .btn.pri:disabled,.btn.pri:disabled:hover{background:var(--brand);border-color:var(--brand)}
+  .lnk{display:inline-flex;align-items:center;color:var(--brand);font-weight:600;text-decoration:none;background:none;border:0;
+       padding:0;cursor:pointer;font-size:14px;line-height:20px;white-space:nowrap;border-radius:4px}
   .lnk:hover{text-decoration:underline}
   .card{background:var(--s1);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow);min-width:0}
   .page{max-width:1440px;margin:0 auto;padding:32px 40px 64px}
   .ph{display:flex;align-items:baseline;gap:12px;margin:0 0 20px}
   .ph h1{margin:0;font-size:28px;line-height:1.2;font-weight:650;letter-spacing:-.02em}
   .sub{font-size:13px;color:var(--t2)}
-  .seg{display:inline-flex;background:var(--s3);border-radius:9px;padding:3px;gap:2px}
-  .seg button{border:0;background:none;border-radius:7px;padding:5px 12px;font-size:13px;font-weight:600;color:var(--t2);cursor:pointer;white-space:nowrap}
+  /* The track is one control tall, so it lines up with any button beside it. */
+  .seg{display:inline-flex;height:var(--ctl);background:var(--s3);border-radius:9px;padding:3px;gap:2px}
+  .seg button{border:0;background:none;border-radius:7px;padding:0 12px;font-size:13px;line-height:20px;font-weight:600;color:var(--t2);cursor:pointer;white-space:nowrap}
+  .seg button:hover{color:var(--t1)}
   .seg button[aria-pressed=true]{background:var(--s1);color:var(--t1);box-shadow:var(--shadow)}
 
   /* ---- mockup-only control strip (not part of the design) */
-  .mock{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:0 0 16px;padding:10px 16px;border:1px dashed var(--line);
+  .mock{display:flex;align-items:center;gap:8px 12px;flex-wrap:wrap;margin:0 0 16px;padding:8px 16px;border:1px dashed var(--line);
         border-radius:10px;font-size:13px;color:var(--t2)}
+  .mock .lnk{height:var(--ctl)}
   .mock b{font-weight:600;color:var(--t1)}
 
   /* ---- status chip (viewer .ad-st) */
-  .ad-st{display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:600;padding:2px 10px;border-radius:999px;
+  .ad-st{flex:none;display:inline-flex;align-items:center;gap:8px;height:24px;font-size:13px;line-height:20px;font-weight:600;padding:0 12px;border-radius:999px;
     white-space:nowrap;color:var(--t2);background:color-mix(in srgb,currentColor 13%,var(--s1))}
   .ad-st::before{content:'';flex:none;box-sizing:border-box;width:8px;height:8px;border-radius:50%;border:1.5px solid var(--t3)}
   .ad-st.run{color:var(--run)}.ad-st.run::before{border:0;background:currentColor}
   .ad-st.wait{color:var(--wait)}.ad-st.wait::before{border:2px solid currentColor}
   .ad-st.off{color:var(--t3)}.ad-st.off::before{border:0;height:2px;border-radius:1px;background:currentColor}
-  .ad-meter{display:inline-block;width:56px;height:6px;border-radius:3px;background:var(--s3);overflow:hidden;vertical-align:middle;margin-right:6px}
+  .ad-meter{display:inline-block;flex:none;width:56px;height:6px;border-radius:3px;background:var(--s3);overflow:hidden}
   .ad-meter i{display:block;height:100%;background:var(--brand)}.ad-meter.warm i{background:var(--wait)}
 
   /* ---- Agents tab: directory + detail (viewer .adir) */
   .adir{display:grid;grid-template-columns:260px 1fr;gap:16px;align-items:start}
   .adir-list{padding:4px 0}
-  .adir-it{display:flex;align-items:center;gap:12px;padding:14px 20px;border-left:3px solid transparent;color:inherit;text-decoration:none}
+  .adir-it{display:flex;align-items:center;gap:12px;padding:16px 20px 16px 17px;border-left:3px solid transparent;color:inherit;text-decoration:none}
+  .adir-it:focus-visible{outline-offset:-2px}
   .adir-it:hover{background:var(--s2)}
   .adir-it[aria-current=true]{background:color-mix(in srgb,var(--brand) 7%,var(--s1));border-left-color:var(--brand)}
   .adir-it.grey{color:var(--t2)}.adir-grow{flex:1;min-width:0}.adir-nm{font-weight:600}
@@ -115,35 +131,41 @@
   .adir-detail{position:sticky;top:80px;display:flex;flex-direction:column;height:calc(100dvh - 96px - 56px);overflow:hidden}
 
   /* ONE header. Line 1: name, status, actions. Line 2: harness, model, context, session, last activity. */
-  .vh{flex:none;display:grid;gap:6px;padding:14px 12px 14px 20px;border-bottom:1px solid var(--line)}
-  .vh-top{display:flex;align-items:center;gap:12px;min-width:0}
-  .vh-top h2{margin:0;font-size:18px;font-weight:650;letter-spacing:-.01em;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  /* Header, body and composer share --gut, so the name, the first reply and the text box start on one edge. */
+  .vh{flex:none;display:grid;gap:8px;padding:12px var(--gut) 16px;border-bottom:1px solid var(--line)}
+  .vh-top{display:flex;align-items:center;gap:12px;min-width:0;min-height:var(--ctl)}
+  .vh-top h2{margin:0;font-size:18px;line-height:24px;font-weight:650;letter-spacing:-.01em;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .vh-top .sp{flex:1}
-  .vh-now{margin:0;font-size:14px;overflow-wrap:anywhere}.vh-now b{color:var(--t2);font-weight:600;margin-right:6px}
-  .vh-meta{display:flex;align-items:center;flex-wrap:wrap;gap:4px 12px;font-size:13px;color:var(--t2);font-variant-numeric:tabular-nums}
+  .vh-top .lnk{height:var(--ctl)}
+  .vh-now{margin:0;font-size:14px;overflow-wrap:anywhere}.vh-now b{color:var(--t2);font-weight:600;margin-right:8px}
+  .vh-meta{display:flex;align-items:center;flex-wrap:wrap;gap:4px 12px;font-size:13px;line-height:20px;color:var(--t2);font-variant-numeric:tabular-nums}
+  .vh-meta > span{display:inline-flex;align-items:center;gap:8px;white-space:nowrap}
   .vh-meta .sess{color:var(--t1);font-weight:600}
-  .back{display:none;color:var(--brand);font-size:14px;font-weight:600;text-decoration:none;white-space:nowrap}
+  .back{display:none;flex:none;color:var(--brand);font-size:14px;font-weight:600;text-decoration:none;white-space:nowrap;border-radius:4px}
+  .back:hover{text-decoration:underline}
 
   /* Single actions menu: a native popover anchored under the button. */
-  .menu-w{position:relative}
-  .menu{position:absolute;right:0;top:calc(100% + 6px);z-index:10;min-width:220px;padding:6px;margin:0;list-style:none;
-        background:var(--s1);border:1px solid var(--line);border-radius:10px;box-shadow:0 8px 24px rgba(20,25,32,.12)}
-  .menu button{display:flex;width:100%;align-items:center;justify-content:space-between;gap:12px;min-height:36px;padding:0 10px;
-        border:0;background:none;border-radius:6px;font-size:14px;text-align:left;cursor:pointer}
-  .menu button:hover{background:var(--s2)}
+  .menu-w{position:relative;flex:none}
+  .menu{position:absolute;right:0;top:calc(100% + 8px);z-index:10;min-width:220px;padding:4px;margin:0;list-style:none;
+        background:var(--s1);border:1px solid var(--line);border-radius:10px;box-shadow:var(--pop)}
+  .menu button{display:flex;width:100%;align-items:center;justify-content:space-between;gap:12px;min-height:var(--ctl);padding:0 12px;
+        border:0;background:none;border-radius:6px;font-size:14px;line-height:20px;text-align:left;cursor:pointer;white-space:nowrap}
+  .menu button:hover,.menu button:focus-visible{background:var(--s2)}
+  .menu button:focus-visible{outline-offset:-2px}
+  .menu button:disabled{opacity:.5;cursor:default;background:none}
   .menu button.bad{color:var(--block)}
   .menu button span{font-size:13px;color:var(--t2)}
-  .menu hr{border:0;border-top:1px solid var(--line);margin:6px 4px}
-  .menu .lbl{font-size:12px;font-weight:500;color:var(--t2);padding:6px 10px 2px}
+  .menu hr{border:0;border-top:1px solid var(--line);margin:4px}
+  .menu .lbl{font-size:12px;line-height:16px;font-weight:500;color:var(--t2);padding:8px 12px 4px}
 
   /* ---- transcript body: plain surface, broker transcript components */
-  .tl{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:10px;padding:16px 20px 24px;background:var(--s1)}
+  .tl{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:12px;padding:16px var(--gut) 24px;background:var(--s1)}
   .tl > *{flex-shrink:0}
   .day{align-self:center;font-size:12px;color:var(--t2);padding:4px 0}
-  .ev{max-width:760px;border-radius:14px;padding:10px 14px;border:1px solid var(--line);background:var(--s1)}
+  .ev{max-width:760px;border-radius:14px;padding:8px 16px;border:1px solid var(--line);background:var(--s1);min-width:0;overflow-wrap:anywhere}
   .ev.user{background:color-mix(in srgb,var(--brand) 7%,var(--s1));border-color:color-mix(in srgb,var(--brand) 22%,var(--line));align-self:flex-end;max-width:620px}
-  .ev.agent{border-color:transparent;padding-left:0;padding-right:0;max-width:760px}
-  .ev-meta{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--t2);margin-bottom:2px}
+  .ev.agent{border:0;padding-left:0;padding-right:0;max-width:760px}
+  .ev-meta{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--t2);margin-bottom:4px}
   .who{font-weight:600;color:var(--t1)}
   .ev.user .who{color:var(--brand)}
   .ts{font-size:12px;color:var(--t3);font-variant-numeric:tabular-nums}
@@ -152,13 +174,14 @@
 
   /* Steps: one quiet line per turn, collapsed by default. Quieter than any reply: 13px, --t2, no card fill. */
   details.steps{max-width:760px;font-size:13px;color:var(--t2)}
-  details.steps > summary{list-style:none;display:inline-flex;align-items:center;gap:8px;padding:4px 8px;margin-left:-8px;
-        border-radius:8px;cursor:pointer;font-variant-numeric:tabular-nums}
+  /* The -8px margin puts the summary text on the --gut edge; the hover fill hangs into the gutter. */
+  details.steps > summary{list-style:none;display:inline-flex;align-items:center;gap:8px;min-height:32px;padding:0 8px;margin-left:-8px;
+        max-width:calc(100% + 8px);border-radius:8px;cursor:pointer;font-variant-numeric:tabular-nums;line-height:20px}
   details.steps > summary::-webkit-details-marker{display:none}
   details.steps > summary:hover{background:var(--s2);color:var(--t1)}
   details.steps > summary::after{content:"›";color:var(--t3);transition:transform .15s}
   details.steps[open] > summary::after{transform:rotate(90deg)}
-  .steps-body{display:grid;gap:6px;margin:6px 0 4px 4px;padding-left:14px;border-left:2px solid var(--line)}
+  .steps-body{display:grid;gap:8px;margin:4px 0 4px 4px;padding-left:12px;border-left:2px solid var(--line)}
   .step{display:flex;align-items:baseline;gap:8px;min-width:0}
   .step .k{flex:none;font-weight:600;color:var(--t2);min-width:64px}
   .step .v{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -167,36 +190,46 @@
   .step .ts{margin-left:auto;flex:none}
 
   /* Working line: the only live element in the body. A pulsing dot, the current step, elapsed time. */
-  .working{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--t2);font-variant-numeric:tabular-nums}
-  .working::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--run);animation:pulse 1.4s ease-in-out infinite}
+  .working{display:flex;align-items:center;gap:8px;font-size:13px;line-height:20px;color:var(--t2);font-variant-numeric:tabular-nums;min-width:0}
+  .working::before{content:"";flex:none;width:8px;height:8px;border-radius:50%;background:var(--run);animation:pulse 1.4s ease-in-out infinite}
   @keyframes pulse{50%{opacity:.3}}
 
   /* ---- composer: one Send, Interrupt behind the Send menu */
-  .comp{flex:none;display:grid;gap:6px;padding:12px 16px calc(12px + env(safe-area-inset-bottom));border-top:1px solid var(--line);background:var(--s1)}
-  .comp-row{display:flex;align-items:flex-end;gap:8px}
-  .comp textarea{flex:1;min-width:0;resize:none;font:inherit;font-size:14px;line-height:20px;min-height:36px;max-height:140px;
-        padding:7px 12px;border:1px solid var(--line);border-radius:8px;background:var(--s1);color:var(--t1)}
+  /* Text box and Send share one height (--ctl) and one row. The box grows upward as you type; the buttons stay
+     on its bottom edge (flex-end), so at one line their tops, centers and bottoms all match. */
+  .comp{flex:none;display:grid;gap:8px;padding:12px var(--gut) calc(12px + env(safe-area-inset-bottom));border-top:1px solid var(--line);background:var(--s1)}
+  .comp-row{display:flex;align-items:flex-end;gap:8px;min-width:0}
+  .comp textarea{display:block;flex:1;min-width:0;resize:none;margin:0;font:inherit;font-size:14px;line-height:20px;
+        height:var(--ctl);min-height:var(--ctl);max-height:140px;overflow-y:auto;padding:calc((var(--ctl) - 22px) / 2) 12px;
+        border:1px solid var(--line);border-radius:8px;background:var(--s1);color:var(--t1)}
+  .comp textarea::placeholder{color:var(--t3);opacity:1}
+  .comp textarea:hover{border-color:color-mix(in srgb,var(--t1) 28%,var(--line))}
+  .comp textarea:focus{border-color:var(--brand)}
+  .comp textarea:focus-visible{outline-offset:0}
   .split{display:inline-flex;flex:none}
   .split .btn{min-width:0}
   .split .btn.main{border-radius:8px 0 0 8px}
-  .split .btn.more{border-radius:0 8px 8px 0;border-left:1px solid color-mix(in srgb,var(--onbrand) 35%,var(--brand));width:32px;padding:0}
-  .split .menu{bottom:calc(100% + 6px);top:auto;min-width:260px}
-  .comp-hint{margin:0;font-size:12px;color:var(--t2)}
+  .split.solo .btn.main{border-radius:8px}
+  .split .btn.more{border-radius:0 8px 8px 0;border-left-color:color-mix(in srgb,var(--onbrand) 35%,var(--brand));width:var(--ctl);min-width:var(--ctl);padding:0}
+  .split .menu{bottom:calc(100% + 8px);top:auto;min-width:260px}
+  .comp-hint{margin:0;font-size:12px;line-height:16px;color:var(--t2)}
 
   /* ---- Fleet quick view: the dash detail sheet with the same header and composer */
-  .detail-sheet{padding:0;color:var(--t1);width:min(640px,calc(100% - 32px));max-height:calc(100dvh - 32px);
+  .detail-sheet{--gut:24px;padding:0;color:var(--t1);width:min(640px,calc(100% - 32px));max-height:calc(100dvh - 32px);
                 background:var(--s1);border:1px solid var(--line);border-radius:12px;overflow:hidden;display:none}
   .detail-sheet[open]{display:flex;flex-direction:column}
   .detail-sheet::backdrop{background:color-mix(in srgb,var(--t1) 35%,transparent)}
-  .detail-sheet .vh{padding:16px 16px 14px 24px}
-  .qv{flex:1;min-height:0;overflow:auto;display:grid;align-content:start;gap:14px;padding:16px 24px}
-  .qv-now{display:grid;gap:6px;padding:12px 16px;border-radius:12px;background:var(--s2)}
-  .qv-now .lbl{font-size:12px;font-weight:600;color:var(--t2)}
+  .detail-sheet .vh{padding-top:16px}
+  .qv{flex:1;min-height:0;overflow:auto;display:grid;align-content:start;gap:16px;padding:16px var(--gut)}
+  .qv-now{display:grid;gap:8px;padding:12px 16px;border-radius:10px;background:var(--s2)}
+  .qv-now .lbl{font-size:12px;line-height:16px;font-weight:600;color:var(--t2)}
   .qv-now p{margin:0}
   .qv-wait{display:flex;align-items:center;gap:8px;font-weight:600;color:var(--wait)}
-  .qv-wait::before{content:'';width:10px;height:10px;box-sizing:border-box;border-radius:50%;border:2px solid currentColor}
-  .qv .lbl2{font-size:12px;font-weight:600;color:var(--t2);margin:4px 0 -6px}
+  .qv-wait::before{content:'';flex:none;width:10px;height:10px;box-sizing:border-box;border-radius:50%;border:2px solid currentColor}
+  .qv-latest{display:grid;gap:8px}
+  .qv .lbl2{font-size:12px;line-height:16px;font-weight:600;color:var(--t2)}
   .qv .tl{padding:0;overflow:visible;background:none}
+  .menu [data-full-item]{display:none}
 
   @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 
@@ -206,20 +239,26 @@
     .adir-detail{position:static;height:calc(100dvh - 64px - 32px - 48px)}
     .back{display:inline-flex;min-height:44px;align-items:center}
   }
+  /* Phones: every control grows to the 44px tap target through --ctl, and every edge moves to 16px through --gut.
+     The text box is 16px so iOS does not zoom on focus. */
   @media (max-width:720px){
+    :root,.detail-sheet{--ctl:44px;--gut:16px}
     .top-in{padding:0 16px;gap:12px}.nav,.inst{display:none}
     .page{padding:16px 16px 24px}.ph{display:none}
     .mock{margin-bottom:12px}
-    .vh{padding:6px 8px 10px 12px;gap:4px}.vh-top{gap:8px}.vh-top h2{font-size:16px}
-    .vh-meta{font-size:12px;gap:2px 10px}.vh-meta .opt{display:none}
+    .vh{padding:8px var(--gut) 12px;gap:4px}.vh-top{gap:8px}.vh-top h2{font-size:16px}
+    .vh-meta{font-size:12px;gap:0 12px}.vh-meta .opt{display:none}
     .vh-now{font-size:13px}
-    .tl{padding:12px}
+    .tl{padding:12px var(--gut)}
     .ev.user{max-width:88%}
     .comp textarea{font-size:16px}
-    .btn,.menu button{min-height:44px}
-    .comp .btn.main{height:44px}.split .btn.more{height:44px;width:40px}
+    details.steps > summary{min-height:var(--ctl)}
+    .back{min-height:var(--ctl);align-items:center;margin-left:-8px;padding:0 8px}
     .detail-sheet{width:100%;max-width:100%;margin:auto 0 0;border-radius:16px 16px 0 0;border-bottom:0;max-height:calc(100dvh - 48px)}
-    .detail-sheet .vh{padding:12px 12px 12px 16px}.qv{padding:12px 16px}
+    .detail-sheet .vh{padding-top:12px}.qv{padding:12px var(--gut)}
+    /* The quick view header has no room for a text link next to two icon buttons at 390px. */
+    .vh-top [data-full]{display:none}
+    .detail-sheet .menu [data-full-item]{display:flex}
   }
 </style>
 </head>
@@ -285,6 +324,7 @@
       <div class="menu-w">
         <button class="btn ghost sq" type="button" aria-label="Actions" title="Actions" aria-haspopup="menu" aria-expanded="false" data-menu>⋯</button>
         <div class="menu" role="menu" hidden>
+          <button type="button" role="menuitem" data-full-item>Open full view</button>
           <div class="lbl">Session</div>
           <button type="button" role="menuitem">main <span>current</span></button>
           <button type="button" role="menuitem">fix-composer <span>2h ago</span></button>
@@ -360,7 +400,7 @@
   <div class="qv">
     <div class="qv-now"><span class="lbl">Doing now</span><p>Running the viewer tests for the composer change.</p>
       <div class="qv-wait">Waiting on review from kestrel</div></div>
-    <div class="lbl2">Latest</div>
+    <div class="qv-latest"><div class="lbl2">Latest</div></div>
   </div>
 </template>
 
@@ -384,7 +424,7 @@ function build(slot, quick) {
     const qv = clone('t-quick'), body = clone('t-body'), tl = body.querySelector('.tl');
     // The quick view shows the last few lines only.
     [...tl.children].slice(0, 4).forEach((n) => n.remove());
-    const box = qv.querySelector('.qv'); box.append(tl);
+    qv.querySelector('.qv-latest').append(tl);
     s.append(qv);
     s.querySelector('[data-close]').hidden = false;
     s.querySelector('[data-full]').hidden = false;
@@ -418,6 +458,13 @@ document.addEventListener('click', (e) => {
   if (e.target.closest('[data-stop]')) setState('idle');
   if (e.target.closest('[data-close]')) document.getElementById('quick').close();
 });
+// The text box starts one control tall (CSS --ctl) and grows with its content up to its max-height.
+document.addEventListener('input', (e) => {
+  const ta = e.target.closest('.comp textarea');
+  if (!ta) return;
+  ta.style.height = '';
+  if (ta.scrollHeight > ta.clientHeight) ta.style.height = (ta.scrollHeight + ta.offsetHeight - ta.clientHeight) + 'px';
+});
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') document.querySelectorAll('.menu').forEach((m) => { m.hidden = true; });
 });
@@ -432,7 +479,7 @@ function setState(v) {
   document.querySelectorAll('[data-hint]').forEach((h) => { h.hidden = !busy; });
   // Idle: Send is the only option. Working: the split arrow offers Interrupt and send.
   document.querySelectorAll('[data-busy-only]').forEach((b) => { b.hidden = !busy; });
-  document.querySelectorAll('.split .main').forEach((b) => { b.style.borderRadius = busy ? '' : '8px'; });
+  document.querySelectorAll('.split').forEach((s) => { s.classList.toggle('solo', !busy); });
   document.getElementById('list-meta').textContent = (busy ? 'Working' : 'Idle') + ' · Hermes · 12s ago';
 }
 document.getElementById('m-state').onclick = (e) => { const b = e.target.closest('button'); if (b) setState(b.dataset.v); };

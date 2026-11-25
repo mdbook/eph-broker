@@ -854,6 +854,16 @@ class Coalescer:
             log.info("WORKER CANCEL key=%s dropped_buffer=%d", key, dropped)
             return dropped
 
+    def begin_force_close(self, key):
+        """Claim a wedged running worker for lock-free teardown. Keep its buffer for re-arming and
+        retain the subject until force_pop; closing also prevents self-settle or a second teardown."""
+        with self.lock:
+            w = self.live.get(key)
+            if w and w["state"] == "open_running":
+                w["state"] = "closing"
+                return True
+            return False
+
     def forward_message(self, key, text, doer):
         """Operator message into a LIVE worker: a synthetic human comment appended to the delivery buffer,
         delivered at the next turn boundary like any forwarded ticket comment (same UNTRUSTED framing in

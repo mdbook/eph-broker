@@ -2392,7 +2392,7 @@ class CCAdapter(Adapter):
         self.setting_sources = setting_sources
         self.claude_bin = claude_bin
         self.cmd_poll_s = cmd_poll_s          # warm-worker command-loop poll granularity
-        self.teardown_join_s = teardown_join_s  # bounded join of the worker thread in teardown()
+        self.teardown_join_s = teardown_join_s  # warn after this long, but retain ownership until cleanup ends
         # Normalize the injected sink to a (msg, subject=None) contract. The abort/reject
         # alerts now pass a per-KEY `subject=` so each ticket lands in its OWN notify rate-limit bucket:
         # notify._subject_key otherwise DIGIT-COLLAPSES the ticket id and every ticket-abort shares one
@@ -2967,6 +2967,15 @@ class CCAdapter(Adapter):
                 log.warning("save_commits alert failed key=%s: %s", key, e2)
             if isinstance(e, PushTargetRefused):
                 self._nag_push_refused(key, run_id, e)
+            else:
+                ref = ticket_ref or tickets.ref_from_key(key)
+                if ref is not None:
+                    try:
+                        self._tracker_comment(ref, (
+                            f"<p><b>Worker commit recovery failed</b>: {html.escape(str(e))}</p>"), run_id)
+                    except Exception as note_error:
+                        log.warning("save_commits failure comment key=%s run_id=%s failed: %s",
+                                    key, run_id, note_error)
             return None
 
     # ---- turn-cap WIP save: commit and push an eph/*-wip branch (NO MR) before teardown ----
@@ -4554,6 +4563,7 @@ class CCAdapter(Adapter):
                         with self._repo_operation(key, repo_lock, repo_lock_held):
                             branch = self.worktree_mgr.publish_iteration(key, mr_iteration["source_branch"],
                                                                         mr_target_ref=publish["mr_target_ref"])
+                            publish_completed = bool(branch)
                         if not branch:
                             self._save_patch(key, run_id)
                         else:
@@ -4580,6 +4590,7 @@ class CCAdapter(Adapter):
                             branch = self.worktree_mgr.publish_mr(
                                 key, branch_prefix=publish.get("branch_prefix", "eph/code-change"),
                                 mr_target_ref=publish["mr_target_ref"], continue_branch=publish["continue_branch"])
+                            publish_completed = bool(branch)
                         if not branch:   # no commit -> keep any uncommitted edits as a patch file
                             self._save_patch(key, run_id)
                         else:
@@ -4597,6 +4608,7 @@ class CCAdapter(Adapter):
                             branch = self.worktree_mgr.publish_mr(
                                 key, branch_prefix=publish.get("branch_prefix", "eph/code-change"),
                                 mr_target_ref=publish["mr_target_ref"])
+                            publish_completed = bool(branch)
                         if not branch:   # No commit -> keep any uncommitted edits as a patch file
                             self._save_patch(key, run_id)
                         if branch:  # None = worker made no commit; nothing to open
@@ -4650,6 +4662,7 @@ class CCAdapter(Adapter):
                     else:
                         with self._repo_operation(key, repo_lock, repo_lock_held):
                             self.worktree_mgr.publish(key, publish_ref=publish["publish_ref"])
+                            publish_completed = True
                     publish_completed = not (publish.get("code_repo_path") and worker.turn_capped
                                              and not capped_published)
                 except Exception as e:
@@ -5602,16 +5615,18 @@ class CCAdapter(Adapter):
         # worktree removal (_run_worker, above) has COMPLETED before teardown returns. teardown is called by
         # the LivenessDriver's _do_close IMMEDIATELY before finish_close pops live[key] (which unblocks a
         # same-subject respawn's worktree make()). Joining first makes "old worktree removed" happen-BEFORE
-        # "respawn make()" BY CONSTRUCTION, not by ~1s tick latency and defensively-coded make(). Bounded: the
-        # proc was already SIGKILLed so the thread should wind down promptly; if the join times out we LOG and
-        # PROCEED (never block forever). LOCK-FREE with respect to the coalescer lock: teardown only ever
+        # "respawn make()" BY CONSTRUCTION, not by ~1s tick latency and defensively-coded make(). Recovery
+        # can outlast the warning threshold (network calls, repo lock, ticket POST). Never release the subject
+        # while that old thread can still remove its worktree by key (ticket 3317).
+        # LOCK-FREE with respect to the coalescer lock: teardown only ever
         # runs in the lock-free _do_close/_force_close window, and this join holds neither the coalescer lock
         # nor (during the wait) self._lock; both were released above, so the worker's own finally can pop.
         if t is not None and t is not threading.current_thread():
             t.join(self.teardown_join_s)
             if t.is_alive():
                 log.warning("teardown key=%s: worker thread still alive after %.0fs join "
-                            "(proc already killed) -> proceeding", key, self.teardown_join_s)
+                            "(proc already killed) -> waiting for cleanup", key, self.teardown_join_s)
+                t.join()
 
     # test/teardown helper: join the spawn thread
     def _join(self, key, timeout=None):

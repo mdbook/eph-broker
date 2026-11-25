@@ -18,7 +18,8 @@ Invariants honoured here:
     slot on force-close (adapter.teardown), NEVER for the per-subject forward-vs-drain decision.
 
 Transition summary (per live key, evaluated each sweep):
-  open_running -> force-close if the turn is silent past progress_timeout, or the worker thread died.
+  open_running -> closing if the turn is silent past progress_timeout, or the worker thread died;
+                  teardown asynchronously, then force-pop (retain ownership until cleanup finishes).
   open_idle    -> buffered forwards? deliver ONE collapsed --resume turn (take_forwards flips running).
                -> else window-quiet? begin_close (state=closing UNDER LOCK), then teardown LOCK-FREE,
                        then finish_close (closed + pop UNDER LOCK).
@@ -174,6 +175,16 @@ class LivenessDriver:
 
     # ---- force close (also re-arms a non-empty buffer) ----
     def _force_close(self, key, now, reason):
+        # Claim ownership before dispatch: cleanup may outlast the adapter's join warning, but must
+        # block only this subject's respawn, never the global watchdog (ticket 3317).
+        if not self.coalescer.begin_force_close(key):
+            return
+        t = threading.Thread(target=self._do_force_close, args=(key, now, reason),
+                             name=f"r3-force-close-{key}", daemon=True)
+        self._dispatch.append(t)
+        t.start()
+
+    def _do_force_close(self, key, now, reason):
         try:
             self.adapter.teardown(key)                  # pid used ONLY here: kill + reclaim the cap slot
         except Exception as e:

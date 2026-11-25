@@ -329,7 +329,7 @@ def _wt_argv(path, *args):
     return ["git", "-c", f"safe.directory={path}", *_NO_REPO_CODE, "-C", path, *args]
 
 
-def _git(repo, *args, check=True, env=None):
+def _git(repo, *args, check=True, env=None, timeout=None):
     """Run `git -C repo <args>`, return stripped stdout. Value-free plumbing (no secrets in argv).
 
     `-c safe.directory=<repo>`, SCOPED to the exact path this call operates on, never a wildcard.
@@ -346,7 +346,7 @@ def _git(repo, *args, check=True, env=None):
     Also carries _NO_REPO_CODE: the broker never runs repo hooks / an fsmonitor command. Callers in a
     worker worktree pass env=_wt_env(path)."""
     r = subprocess.run(["git", "-c", f"safe.directory={repo}", *_NO_REPO_CODE, "-C", repo, *args],
-                       check=check, capture_output=True, text=True, env=env)
+                       check=check, capture_output=True, text=True, env=env, timeout=timeout)
     return r.stdout.strip()
 
 
@@ -760,6 +760,8 @@ class WorktreeManager:
         Always use a separate ticket WIP branch: an existing MR head must not be updated with incomplete
         work, even on a continue-MR/iteration run. The create-only lease also protects against races.
         No commit, rebase or identity rewrite occurs. Return branch/SHA/links, or None without new commits.
+        On publication failure, save a self-contained bundle outside the worktree and name it, the branch
+        and HEAD in the error so teardown cannot silently lose the only copy of the commits.
         """
         import urllib.parse
         repo, path, cut_sha = self._checked(key)
@@ -770,18 +772,31 @@ class WorktreeManager:
             return None
         branch = f"eph/{_safe(key)}-{head}-wip"
         ref = f"refs/heads/{branch}"
-        push_url = _gitlab_push_url(path, remote)
-        cred = _wt_cred_args(repo)
-        existing = subprocess.run(_wt_argv(path, *cred, "ls-remote", "--heads", push_url, ref),
-                                  check=True, capture_output=True, text=True, env=env, timeout=60).stdout.strip()
-        if existing and existing.split() != [head, ref]:
-            raise RuntimeError(f"save_commits key={key}: refusing to overwrite existing WIP branch")
-        if not existing:
-            r = subprocess.run(_wt_argv(path, *cred, "push", *_ci_skip_opts(),
-                                        f"--force-with-lease={ref}:", push_url, f"{head}:{ref}"),
-                               capture_output=True, text=True, env=env, timeout=60)
-            if r.returncode != 0:
-                raise RuntimeError(f"save_commits key={key}: branch push failed: {r.stderr.strip()}")
+        try:
+            push_url = _gitlab_push_url(path, remote)
+            cred = _wt_cred_args(repo)
+            existing = subprocess.run(_wt_argv(path, *cred, "ls-remote", "--heads", push_url, ref),
+                                      check=True, capture_output=True, text=True, env=env, timeout=60).stdout.strip()
+            if existing and existing.split() != [head, ref]:
+                raise RuntimeError("refusing to overwrite existing WIP branch")
+            if not existing:
+                r = subprocess.run(_wt_argv(path, *cred, "push", *_ci_skip_opts(),
+                                            f"--force-with-lease={ref}:", push_url, f"{head}:{ref}"),
+                                   capture_output=True, text=True, env=env, timeout=60)
+                if r.returncode != 0:
+                    raise RuntimeError(f"branch push failed: {r.stderr.strip()}")
+        except Exception as e:
+            try:
+                out_dir = os.path.join(os.path.dirname(path), "_patches")
+                os.makedirs(out_dir, exist_ok=True)
+                bundle = os.path.join(out_dir, f"{_safe(key)}-{head}.bundle")
+                _git(path, "bundle", "create", bundle, "HEAD", env=env, timeout=60)
+                backup = f"commits saved to bundle {bundle}"
+            except Exception as bundle_error:
+                backup = f"bundle save FAILED: {bundle_error}"
+            error_class = PushTargetRefused if isinstance(e, PushTargetRefused) else RuntimeError
+            raise error_class(f"save_commits key={key} branch={branch} sha={head}: {e}; "
+                              f"{(getattr(e, 'stderr', '') or '').strip()}; {backup}") from e
         # Build browser links from the validated push destination, without any URL username.
         u = urllib.parse.urlsplit(push_url)
         project_path = u.path[:-4] if u.path.endswith(".git") else u.path.rstrip("/")

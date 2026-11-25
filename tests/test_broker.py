@@ -3435,6 +3435,8 @@ def test_force_close_rearms_nonempty_buffer():
     # simulate a wedged turn: in a turn, age past the progress timeout
     fa._in_turn[key] = True; fa._age[key] = 999; fa._alive[key] = True
     drv.sweep()
+    for t in list(drv._dispatch):
+        t.join(timeout=5)
     assert key in fa.teardowns, "force-close kills via the adapter (pid used ONLY to kill/reclaim)"
     assert key not in c.live, "force-popped from live"
     assert key in c.pending, "non-empty buffer re-armed as a fresh pending spawn (no silent loss)"
@@ -3447,6 +3449,8 @@ def test_force_close_rearms_nonempty_buffer():
     k2 = _spawn_via_tick(c2, 6)
     fa2._in_turn[k2] = False; fa2._age[k2] = None; fa2._alive[k2] = False   # thread gone, still open_running
     drv2.sweep()
+    for t in list(drv2._dispatch):
+        t.join(timeout=5)
     assert k2 not in c2.live and k2 in fa2.teardowns
     ok("force-close on silence/dead-thread; non-empty buffer -> log+alert-ops+re-arm pending")
 
@@ -4094,6 +4098,7 @@ def test_fold_join_before_pop():
 
         a = CCAdapter(router=_R(), worktree_mgr=_OrderWT(), prompt_loader=_PL(),
                       envelope_parser=EnvelopeParser(), claude_bin=fake, cmd_poll_s=0.05,
+                      teardown_join_s=0.01,              # removal deliberately outlasts the warning threshold
                       # Vikunja subject fail-closes on a None fetch, so pass a non-None fetcher.
                       ticket_fetcher=lambda tid: f"**id:** {tid}\n**done:** false\n")
         C.RECEIVE_WINDOWS["vikunja:task"] = 0.05
@@ -4239,6 +4244,8 @@ def test_no_force_close_between_state_set_and_thread_registration():
     # steady state is unchanged: once spawned, a genuinely dead thread is still force-closed
     fa._in_turn[key] = False; fa._age[key] = None; fa._alive[key] = False
     drv.sweep()
+    for t in list(drv._dispatch):
+        t.join(timeout=5)
     assert key not in c.live and key in fa.teardowns
     ok("sweep in the state-set/thread-registration window does not false FORCE-CLOSE a starting worker")
 
@@ -15318,6 +15325,8 @@ def test_g18_code_wall_clock_per_capability():
         key = _spawn_via_tick(c, 11)
         fa._in_turn[key] = True; fa._age[key] = 1000; fa._alive[key] = True
         drv.sweep()
+        for t in list(drv._dispatch):
+            t.join(timeout=5)
         assert (key in fa.teardowns) is expect_close, (extra, fa.teardowns, dalerts)
     ok("G18: wall_clock_by_capability (code=1200) drives the per-turn hard-kill AND extends the liveness "
        "progress backstop by the excess; other capabilities keep the global 600s")
@@ -15400,6 +15409,8 @@ def test_local_wall_clock_mult():
         key = _spawn_via_tick(c, 9495)
         fa._in_turn[key] = True; fa._age[key] = 303; fa._alive[key] = True
         drv.sweep()
+        for t in list(drv._dispatch):
+            t.join(timeout=5)
         assert (key in fa.teardowns) is expect_close, (extra, fa.teardowns, dalerts)
     ok("LOCAL_WALL_CLOCK_MULT widens a local-backend turn's wall-clock (default 4x; env-overridable); "
        "a cloud backend is unchanged; the turn_deadline_extra (and so its floor) follows the scaled value")
@@ -15506,6 +15517,226 @@ def test_save_commits_preserves_only_existing_commits():
         finally:
             wm.remove(key)
     ok("failed-worker recovery pushes existing commits only, preserves identity/index and never overwrites a branch")
+
+
+def test_failed_commit_recovery_names_head_and_keeps_bundle():
+    import worktree as W
+    key = "vikunja:task:9376"
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        bare, wm, path = _g18_origin_and_worktree(d, key)
+        git = lambda *args: subprocess.run(["git", "-C", path, *args], check=True,
+                                           capture_output=True, text=True).stdout.strip()
+        pathlib.Path(path, "f.txt").write_text("committed work\n")
+        git("add", "f.txt")
+        git("-c", "user.name=test", "-c", "user.email=test@example.com", "-c", "commit.gpgSign=false",
+            "commit", "--no-verify", "-qm", "worker commit")
+        head = git("rev-parse", "HEAD")
+        branch = f"eph/{W._safe(key)}-{head}-wip"
+        bundle = os.path.join(os.path.dirname(path), "_patches", f"{W._safe(key)}-{head}.bundle")
+        pathlib.Path(path, "staged.txt").write_text("not committed\n")
+        git("add", "staged.txt")
+        pathlib.Path(path, "f.txt").write_text("unfinished\n")
+        before = git("status", "--porcelain")
+        real_run = subprocess.run
+        try:
+            for failure in ("refused", "ls-remote", "ls-timeout", "push", "push-timeout", "bundle", "bundle-timeout"):
+                alerts, comments = [], []
+                def run(argv, **kw):
+                    if "ls-remote" in argv:
+                        if failure == "ls-remote":
+                            raise subprocess.CalledProcessError(128, argv, stderr="lookup failed")
+                        if failure == "ls-timeout":
+                            raise subprocess.TimeoutExpired(argv, 60)
+                        return subprocess.CompletedProcess(argv, 0, "", "")
+                    if "push" in argv:
+                        if failure == "push-timeout":
+                            raise subprocess.TimeoutExpired(argv, 60)
+                        return subprocess.CompletedProcess(argv, 1, "", "push rejected")
+                    if "bundle" in argv:
+                        assert kw.get("timeout") == 60, "bundle recovery must have a finite deadline"
+                        if failure == "bundle":
+                            raise OSError("backup disk unavailable")
+                        if failure == "bundle-timeout":
+                            raise subprocess.TimeoutExpired(argv, kw["timeout"])
+                    return real_run(argv, **kw)
+                a = CCAdapter(router=None, worktree_mgr=wm, prompt_loader=None, envelope_parser=None,
+                              comment_poster=lambda tid, body, rid: comments.append(body),
+                              alert_ops=lambda msg, **kw: alerts.append(msg))
+                refusal = W.PushTargetRefused("destination refused") if failure == "refused" else None
+                with patch.object(W, "_gitlab_push_url", return_value=bare, side_effect=refusal), \
+                        patch.object(W.subprocess, "run", side_effect=run):
+                    assert a._save_failed_commits(key, "bundle-run") is None
+                assert len(alerts) == len(comments) == 1, (failure, alerts, comments)
+                for body in alerts + comments:
+                    assert branch in body and head in body, (failure, body)
+                    if failure in ("bundle", "bundle-timeout"):
+                        assert "bundle save FAILED" in body, body
+                        assert ("backup disk unavailable" if failure == "bundle" else "timed out") in body, body
+                    else:
+                        assert bundle in body and os.path.isfile(bundle), body
+                    if failure == "ls-remote":
+                        assert "lookup failed" in body, body
+                    if failure == "push":
+                        assert "push rejected" in body, body
+                assert git("status", "--porcelain") == before
+                assert git("rev-parse", "HEAD") == head
+        finally:
+            wm.remove(key)
+        # A standalone clone proves all objects survive independently of worktree refs and base-repo GC.
+        restored = os.path.join(d, "restored")
+        subprocess.run(["git", "clone", "-q", bundle, restored], check=True, capture_output=True)
+        restored_git = lambda *args: subprocess.run(["git", "-C", restored, *args], check=True,
+                                                    capture_output=True, text=True).stdout.strip()
+        assert restored_git("rev-parse", "HEAD") == head
+        assert restored_git("show", "HEAD:f.txt") == "committed work"
+        assert "staged.txt" not in restored_git("ls-tree", "--name-only", "HEAD")
+    ok("recovery failures name branch/SHA on alert and ticket, keep a restorable bundle, and report backup failures")
+
+
+def test_teardown_waits_for_commit_recovery_past_warning():
+    key = "vikunja:task:9377"
+    started, release = threading.Event(), threading.Event()
+    order = []
+    a = CCAdapter(router=None, worktree_mgr=None, prompt_loader=None, envelope_parser=None,
+                  teardown_join_s=0.01)
+    def recovering_worker():
+        started.set()
+        assert release.wait(5), "test must release the recovery thread"
+        order.append("recovered and removed")
+    worker_thread = threading.Thread(target=recovering_worker)
+    a._workers[key] = Worker(key, "recovery-run", ".")
+    a._threads[key] = worker_thread
+    def close_and_respawn():
+        a.teardown(key)
+        order.append("respawn allowed")
+    closing = threading.Thread(target=close_and_respawn)
+    worker_thread.start()
+    assert started.wait(5)
+    closing.start()
+    try:
+        closing.join(0.1)
+        assert closing.is_alive(), "slow recovery must retain the subject even after the join warning"
+        assert not order, order
+    finally:
+        release.set()
+        worker_thread.join(5)
+        closing.join(5)
+    assert order == ["recovered and removed", "respawn allowed"], order
+    ok("teardown retains subject ownership until recovery/removal completes, even past the join warning")
+
+
+def test_force_close_slow_recovery_does_not_block_liveness_loop():
+    """Exercise the watchdog caller of CC teardown, not just teardown's ownership-preserving join."""
+    key, other = "vikunja:task:9379", "vikunja:task:9380"
+    release, warned, enforced = threading.Event(), threading.Event(), threading.Event()
+    settled = []
+    a = CCAdapter(router=None, worktree_mgr=None, prompt_loader=None, envelope_parser=None,
+                  teardown_join_s=0.01)
+    c = Coalescer(adapter=a)
+    def recovering_worker():
+        release.wait(10)
+        # A real worker's finally settles itself after recovery/removal. The dispatched force-close
+        # must still own the subject at that point, so this cannot pop it ahead of teardown's join.
+        settled.append(c.settle_self(key))
+    worker_thread = threading.Thread(target=recovering_worker)
+    w = Worker(key, "slow-recovery", ".")
+    w.thread = worker_thread
+    w.in_turn, w.turn_started = True, time.time() - 999
+    a._workers[key], a._threads[key] = w, worker_thread
+    def alert(msg):
+        if f"FORCE-CLOSE key={other}:" in msg:
+            enforced.set()
+    drv = LivenessDriver(c, a, alert_ops=alert, progress_timeout=10, period=0.01)
+    evt = {"source": "vikunja", "task_id": 9379, "event_name": "task.updated"}
+    with patch.object(a, "spawn") as spawn, patch.object(a, "dispatch_context", None), \
+            patch.object(a, "teardown", wraps=a.teardown) as teardown, \
+            patch.object(cc.log, "warning", side_effect=lambda *args: warned.set()):
+        c._would_spawn(key, [evt], time.time())
+        c.on_event(evt)                                  # buffered work must survive force-close
+        worker_thread.start()
+        drv.start()
+        try:
+            assert warned.wait(5), "first cleanup must reach the unbounded join after the warning"
+            assert c.live[key]["state"] == "closing"
+            assert not c.begin_force_close(key), "only one cleanup may own this subject"
+            assert not c.begin_force_close("missing")
+            # A new subject becomes dead on a LATER sweep, while the first is still blocked in cleanup.
+            a._workers[other] = Worker(other, "dead-worker", ".")
+            c._would_spawn(other, [{**evt, "task_id": 9380}], time.time())
+            assert enforced.wait(5), "one blocked recovery must not stop the global liveness loop"
+            assert other not in c.live and other not in c.completed
+            assert c.live[key]["state"] == "closing" and worker_thread.is_alive()
+            c.on_event(evt)                              # racing same-subject work waits in pending
+            with c.lock:
+                c.pending[key]["spawn_at"] = 0           # make pending due without a wall-clock sleep
+            c.tick()
+            assert spawn.call_count == 2, "no same-subject respawn before old cleanup finishes"
+            assert [call.args[0] for call in teardown.call_args_list].count(key) == 1
+        finally:
+            release.set()
+            worker_thread.join(5)
+            drv.stop()
+            for t in list(drv._dispatch):
+                t.join(timeout=5)
+        assert settled == [None], "self-settle must not release a force-closing subject"
+        assert key not in c.live and key not in c.completed
+        assert key in c.pending and len(c.pending[key]["events"]) == 2, "both updates survive"
+        c.tick()
+        assert spawn.call_count == 3, "same-subject respawn is allowed only after cleanup"
+    ok("force-close cleanup retains its subject past the join warning without blocking other liveness sweeps")
+
+
+def test_post_push_failure_does_not_recover_published_commits_again():
+    import routing as RT
+    from types import SimpleNamespace
+    key = "vikunja:task:9378"
+    branch = "eph/code-change/existing-mr"
+    for mode in ("new", "continue", "iteration"):
+        with tempfile.TemporaryDirectory(dir=ROOT) as d:
+            calls, alerts, comments = [], [], []
+            class WM:
+                def make(self, key, **kw): return d
+                def publish_mr(self, key, **kw): calls.append("push"); return branch
+                def publish_iteration(self, key, source, **kw): calls.append("push"); return source
+                def head_sha(self, key): return None      # post-push re-review metadata failure
+                def save_commits(self, key): calls.append("recovery")
+                def save_wip(self, key): calls.append("wip")
+                def remove(self, key): calls.append("remove")
+            route = RT.replace(RT._CODE_ROW, model="m", repo=d, test_runner="pytest",
+                               publish={"code_repo_path": d, "mr_target_ref": "main", "worktree_base": d})
+            ticket = f"**title:** t\nrepo:{d}\n"
+            if mode == "continue":
+                ticket += f"continue-mr: {branch}\n"
+            a = CCAdapter(router=SimpleNamespace(route=lambda *args: route), worktree_mgr=WM(),
+                          prompt_loader=SimpleNamespace(load=lambda *args: "SYS"),
+                          envelope_parser=EnvelopeParser(), ticket_fetcher=lambda tid: ticket,
+                          comment_poster=lambda tid, body, rid: comments.append(body),
+                          alert_ops=lambda msg, **kw: alerts.append(msg), label_poster=lambda tid: None)
+            def turn(worker, *args, **kw):
+                worker.done = True
+                return {"status": "done", "summary": "committed", "wake": []}
+            a._turn = turn
+            brief = {"task_id": 9378}
+            if mode == "iteration":
+                brief.update(event_names=["mr.note"], last_doer="owner",
+                             mr={"source_branch": branch, "target_ref": "main", "project": "owner/app",
+                                 "mr_iid": 9378, "head_sha": "a" * 40})
+            with patch.object(RT, "parse_repo_token", return_value=d), \
+                    patch.object(RT, "resolve_target_repo", return_value=d), \
+                    patch.object(RT, "resolve_issue_repo", return_value=d), \
+                    patch.object(RT, "code_repo_allowed", return_value=True), \
+                    patch.object(RT, "mr_note_author_allowed", return_value=True), \
+                    patch.object(RT, "mr_iteration_max", return_value=3), \
+                    patch.object(cc, "resolve_default_branch", return_value="main"), \
+                    patch.object(cc.test_environment, "prepare", return_value=(None, None)), \
+                    patch.object(cc, "open_mr", side_effect=RuntimeError("MR API unavailable")), \
+                    patch.object(a, "_post_ticket_note", side_effect=RuntimeError("ticket unavailable")), \
+                    patch.dict(os.environ, {"WORKER_SAVE_COMMITS_ON_FAILURE": "1"}):
+                a._run_worker(key, brief, "post-push-run")
+            assert calls == ["push", "remove"], (mode, calls, alerts)
+            assert len(alerts) == 1 and "publish" in alerts[0] and "failed" in alerts[0], (mode, alerts)
+            assert not any("Worker stopped before successful publication" in body for body in comments), comments
+    ok("post-push failures in fresh MR, continue-MR and MR iteration do not create duplicate WIP recovery")
 
 
 def test_hard_killed_worker_pushes_and_comments_before_reaping():
@@ -16088,6 +16319,8 @@ def test_leftover_comment_not_rearmed_at_close():
     assert len(c.live[key]["fwd_buffer"]) == 1
     fa._in_turn[key] = True; fa._age[key] = 999; fa._alive[key] = True
     drv.sweep()                                          # force-close with a comment-only leftover buffer
+    for t in list(drv._dispatch):
+        t.join(timeout=5)
     assert key not in c.live and key not in c.pending, "leftover comment NOT re-armed as a fresh spawn"
     assert not any("ORPHANED" in m for m in alerts), alerts
     # mixed leftover (normal close / settle-self funnel): only the non-comment event re-arms
@@ -27303,6 +27536,8 @@ def test_inbox_real_force_close_rearms_gmail_subject():
     fa._in_turn[key], fa._age[key], fa._alive[key] = False, None, False
     drv = LivenessDriver(c, fa, alert_ops=alerts.append)
     drv.sweep()
+    for t in list(drv._dispatch):
+        t.join(timeout=5)
     assert key not in c.live and key not in c.completed
     assert any("FORCE-CLOSE" in msg for msg in alerts)
     c.on_event(evt)

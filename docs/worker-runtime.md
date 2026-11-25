@@ -67,7 +67,14 @@ resume or MR is created.
 
 Recovery never stages, commits or pushes uncommitted edits. Existing local patch saves and the separate
 turn-cap WIP policy are unchanged. A recovery push/comment failure is logged (push failures also alert),
-and cleanup continues. Set `WORKER_SAVE_COMMITS_ON_FAILURE=0` to disable this recovery; commits on a failed
+and cleanup continues. If recovery publication fails, the broker writes a self-contained git bundle to
+`<worktrees_root>/_patches/<ticket-key>-<full-sha>.bundle`. The failure alert and ticket note name the
+branch, SHA and bundle path (or report a bundle-write failure). Teardown retains the subject until the
+worker's recovery and cleanup finish, even past the 30-second join warning, so a same-subject respawn
+cannot lose its new worktree to the old thread. A successful push counts as publication immediately;
+later MR, notification or re-review failures do not create another WIP branch.
+
+Set `WORKER_SAVE_COMMITS_ON_FAILURE=0` to disable this recovery; commits on a failed
 run can then be lost when its worktree is reaped. Recovery runs while the broker is alive; it cannot run
 if the broker itself is killed.
 

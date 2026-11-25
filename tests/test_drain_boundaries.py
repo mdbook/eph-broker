@@ -149,6 +149,8 @@ class BoundaryTests(DrainTests):
         b.set_drain(True)
         with patch.object(b.adapter, 'teardown'), patch.object(b.liveness, 'alert_ops'):
             b.liveness._force_close(key, 0, 'synthetic force close')
+            for t in list(b.liveness._dispatch):
+                t.join(timeout=5)
         assert len(b.coalescer.pending[key]['events']) == 1
         b = self.restart(b)
         assert len(b.coalescer.pending[key]['events']) == 1

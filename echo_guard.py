@@ -86,8 +86,11 @@ class EchoGuard:
     def filter(self, evt):
         """Return evt to ingest, or None to drop (counted). Human edits pass; echoes drop."""
         if self.is_echo(evt):
+            from coalescer import normalize
             self.dropped += 1
-            log.info("echo-guard DROP doer=%s run_id=%s (worker echo, not re-armed; total_dropped=%d)",
-                     evt.get("doer"), evt.get("run_id"), self.dropped)
+            reason = ("active run echo" if evt.get("run_id") and self.run_registry.is_active(evt["run_id"])
+                      else "bot/system event without an eligible idle-subject handoff")
+            log.info("echo-guard DROP key=%s event=%s reason=%s (not re-armed; total_dropped=%d)",
+                     normalize(evt), evt.get("event_name"), reason, self.dropped)
             return None
         return evt

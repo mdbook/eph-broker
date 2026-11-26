@@ -26,7 +26,7 @@ Transition summary (per live key, evaluated each sweep):
                -> else stay open_idle.
   closing/closed -> teardown in flight / popped: nothing (on_event routes racing events to pending).
 """
-import os, threading, time, logging
+import inspect, os, threading, time, logging
 
 log = logging.getLogger("eph-broker.liveness")
 
@@ -68,15 +68,24 @@ class LivenessDriver:
     force-closes wedged workers. Call sweep() from a periodic loop (start()) or directly (tests)."""
 
     def __init__(self, coalescer, adapter, *, alert_ops=None, ticket_comment=None,
-                 progress_timeout=900.0, period=1.0):
+                 progress_timeout=900.0, period=1.0, first_turn_timeout=300.0):
         self.coalescer = coalescer
         self.adapter = adapter
         self.alert_ops = alert_ops or (lambda msg: log.warning("ALERT-OPS: %s", msg))
+        # Like CCAdapter, keep one-argument sinks compatible without retrying a sink's own TypeError.
+        try:
+            inspect.signature(self.alert_ops).bind("message", subject="key")
+            self._alert_takes_subject = True
+        except TypeError:
+            self._alert_takes_subject = False
+        except ValueError:
+            self._alert_takes_subject = True
         self.ticket_comment = ticket_comment or (lambda route, text: log.info("TICKET-COMMENT: %s", text))
         # progress_timeout is the BROKER backstop for a silent/wedged turn. It should sit ABOVE the adapter's
         # own per-turn wall-clock hard-kill (default 600s): the adapter kills a runaway subprocess; this
         # catches a worker that advertised running but made no progress / whose thread died.
         self.progress_timeout = progress_timeout
+        self.first_turn_timeout = first_turn_timeout
         self.period = period
         self._stop = threading.Event()
         self._thread = None
@@ -112,6 +121,22 @@ class LivenessDriver:
             state = w["state"]
 
             if state == "open_running":
+                # Setup/admission can wedge before turn_age exists. Alert until delivered, independently of the
+                # hard-kill backstop; do not kill a legitimate concurrency/repository-lock waiter.
+                started = getattr(self.adapter, "first_turn_started", None)
+                admitted = w.get("admitted_at", now)
+                if (started and now - admitted >= self.first_turn_timeout and not started(key)):
+                    with self.coalescer.lock:
+                        if (self.coalescer.live.get(key) is w and w["state"] == "open_running" and
+                                not w.get("first_turn_alerted") and not w.get("first_turn_alert_inflight") and
+                                now >= w.get("first_turn_alert_retry_at", 0)):
+                            w["first_turn_alert_inflight"] = True
+                            msg = (f"NO-FIRST-TURN key={key}: no harness launch after "
+                                   f"{now - admitted:.0f}s; setup/admission may be stalled")
+                            log.info("liveness: %s", msg)
+                            t = threading.Thread(target=self._alert_first_turn, args=(key, w, msg), daemon=True)
+                            self._dispatch.append(t)
+                            t.start()
                 # Force-close backstop. pid is used ONLY to kill/reclaim (in _force_close); the DECISION
                 # is "no advertised turn progress", not "pid gone".
                 age = self.adapter.turn_age(key)
@@ -135,6 +160,28 @@ class LivenessDriver:
                         self._dispatch_close(key, now)     # SLOW teardown runs LOCK-FREE, then pop
                 # else: stay open_idle
             # state in (closing, closed): teardown in flight / popped -> nothing (racing events go to pending)
+
+    def _alert_first_turn(self, key, w, msg):
+        # Never acknowledge a suppression, transport failure or log-only sink as delivery.
+        outcome = False
+        try:
+            outcome = (self.alert_ops(msg, subject=f"no-first-turn:{key}") if self._alert_takes_subject
+                       else self.alert_ops(msg))
+        except Exception as e:
+            log.warning("liveness: no-first-turn alert key=%s raised: %s", key, e)
+        with self.coalescer.lock:
+            # An old send must not acknowledge a replacement spawn of this subject.
+            if self.coalescer.live.get(key) is not w:
+                return
+            w["first_turn_alert_inflight"] = False
+            if outcome is True:
+                w["first_turn_alerted"] = True
+            else:
+                delay = w.get("first_turn_alert_retry_delay", 30.0)
+                w["first_turn_alert_retry_at"] = time.time() + delay
+                w["first_turn_alert_retry_delay"] = min(delay * 2, 300.0)
+                log.info("liveness: no-first-turn alert key=%s not delivered (%r); retry in %.0fs",
+                         key, outcome, delay)
 
     # ---- normal close (state=closing under lock, teardown lock-free, then closed + pop under lock) ----
     def _dispatch_close(self, key, now):

@@ -433,6 +433,7 @@ class Coalescer:
                 p = self.pending.setdefault(key, {"events": [], "armed_at": now, "spawn_at": now})
                 p["events"].append(evt)
                 self._save_pending()
+                log.info("route: key=%s deferred; prior launch requires recovery", key)
                 return key
             w = self.live.get(key)
             liveness = w["state"] if w else "none"
@@ -476,6 +477,7 @@ class Coalescer:
                     decision = "SPAWN(armed)"
                 else:
                     self.deduped += 1
+                    log.info("dedup: key=%s not re-armed; completed run without human re-engagement", key)
                     decision = "DEDUP-DROP"
             elif w and w["state"] in ("open_idle", "open_running"):   # handshake alive: forward into warm worker
                 w["events"].append(evt); w["forwards"] += 1

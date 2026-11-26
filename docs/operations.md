@@ -29,6 +29,17 @@ journalctl -u eph-broker -f
 
 Most lines start with an upper-case tag, so they're easy to grep for.
 
+An admitted worker that has not launched its first harness turn after five minutes emits
+`NO-FIRST-TURN key=...` and alerts ops once per spawn. This includes setup and admission waits.
+Only confirmed delivery marks the alert sent. Failed or rate-limited sends retry after 30 seconds,
+doubling the delay up to five minutes, with at most one send in flight per spawn. Each worker subject
+has its own notification throttle bucket. Retries stop if the first harness turn launches or the worker closes.
+It does not kill the waiter or flag a healthy long first turn; the wall-clock and liveness
+backstops remain separate. Inspect repository-lock and concurrency waits when this alert fires.
+Echo and completed-run dedup drops name the subject and their refusal reason at INFO level.
+After a `continue-mr:` push, the broker queues a review pinned to the new head, waiting for
+an older live reviewer to close rather than forwarding into it.
+
 | Tag | Meaning |
 |---|---|
 | `INGEST` | an event was accepted or rejected at the door |

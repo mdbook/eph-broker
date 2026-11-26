@@ -925,7 +925,8 @@ class Broker:
                         self._mr_tasks[f"mr:{evt['project']}!{evt['mr_iid']}"] = evt["task_id"]
                     if evt.get("issue") is not None:
                         self._mr_issues[f"mr:{evt['project']}!{evt['mr_iid']}"] = evt["issue"]
-        if evt.get("source") == "mr" and evt.get("event_name") == "mr.opened" and evt.get("iteration"):
+        if (evt.get("source") == "mr" and evt.get("event_name") == "mr.opened"
+                and (evt.get("iteration") or evt.get("review_refresh"))):
             return self._queue_mr_review(evt)
         return self.ingest(evt)
 
@@ -991,8 +992,10 @@ class Broker:
                 if prior:
                     prior_evt, _, escalation = self._cd_retry_entry(prior)
                     if escalation is not None:
+                        log.info("re-review: key=%s not queued; prior escalation still owed", key)
                         return False        # never erase an owed escalation to arrange another review
-                    if prior_evt.get("iteration") and not evt.get("iteration"):
+                    if ((prior_evt.get("iteration") or prior_evt.get("review_refresh"))
+                            and not (evt.get("iteration") or evt.get("review_refresh"))):
                         # A late BLOCK on the older head must not overwrite a queued iteration's new head.
                         evt = {**evt, **prior_evt, "prior_findings": evt.get("prior_findings")}
                 self._cd_retry_pending[key] = {"evt": evt, "queued_at": time.time()}
@@ -1006,7 +1009,7 @@ class Broker:
                 log.info("re-review of %s queued (reviewer still live) -> delivered at close", key)
                 return True
             ok = self._cd_retry_deliver(key, evt)
-        log.info("cd: informed re-review of %s dispatched now (%s)", key, "ok" if ok else "FAILED")
+        log.info("re-review: key=%s dispatched now (%s)", key, "ok" if ok else "FAILED")
         return ok
 
     @staticmethod

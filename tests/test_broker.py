@@ -3243,6 +3243,143 @@ def test_state_written_only_under_lock():
     ok("R3 invariant: `state` is the sole sync token (4-phase, lock-guarded); coalescer never consults pid")
 
 
+def test_spawn_without_first_turn_alerts_once_before_wall_clock():
+    a = CCAdapter(router=None, worktree_mgr=None, prompt_loader=None, envelope_parser=None)
+    key = "vikunja:task:9405"
+    worker = Worker(key, "no-first-turn", ".")
+    c = Coalescer(adapter=a, completed_path="")
+    c.live[key] = {"state": "open_running", "admitted_at": 100, "fwd_buffer": []}
+    alerts = []
+    def alert(msg):
+        alerts.append(msg)
+        return True
+    drv = LivenessDriver(c, a, alert_ops=alert, progress_timeout=10000)
+    with patch.object(a, "worker_alive", return_value=True), patch.object(a, "turn_age", return_value=None):
+        drv.sweep(now=399)
+        assert not alerts
+        # Covers setup before Worker registration, as well as a registered but never launched worker.
+        drv.sweep(now=400)
+        a._workers[key] = worker
+        drv.sweep(now=401)
+        for t in drv._dispatch:
+            t.join(5)
+        assert len(alerts) == 1 and key in alerts[0] and "NO-FIRST-TURN" in alerts[0], alerts
+        assert c.live[key]["state"] == "open_running", "alert only; a queued worker must not be killed"
+        c.live[key].pop("first_turn_alerted")
+        cc.record_launch(worker, "m", harness="codex")
+        assert worker.turns == 0 and a.first_turn_started(key)
+        drv.sweep(now=500)
+        assert len(alerts) == 1, "a long healthy first turn must not trigger the startup alarm"
+    ok("unlaunched spawns alert once after five minutes, without killing queued or long-running workers")
+
+
+def test_first_turn_alert_retries_non_delivery_with_bounded_backoff():
+    key = "vikunja:task:9407"
+    a = _FakeAdapter()
+    a.first_turn_started = lambda key: False
+    a._alive[key] = True
+    c = Coalescer(adapter=a, completed_path="")
+    w = {"state": "open_running", "admitted_at": 100, "fwd_buffer": []}
+    c.live[key] = w
+    outcomes = iter([False, notify.SUPPRESSED, None, TypeError("sink failed"), False, False, True])
+    calls = []
+    def alert(msg, subject=None):
+        calls.append(subject)
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+    drv = LivenessDriver(c, a, alert_ops=alert, progress_timeout=10000)
+    now = 400
+    for attempt, delay in enumerate([30, 60, 120, 240, 300, 300]):
+        with patch("liveness.time.time", return_value=now):
+            drv.sweep(now=now)
+            drv._dispatch[-1].join(5)
+        assert len(calls) == attempt + 1, "a sink TypeError must not cause a second invocation"
+        assert not w.get("first_turn_alerted") and not w["first_turn_alert_inflight"]
+        assert w["first_turn_alert_retry_at"] == now + delay
+        drv.sweep(now=now + delay - 1)
+        assert len(calls) == attempt + 1, "backoff must prevent a retry every sweep"
+        now += delay
+    drv.sweep(now=now)
+    drv._dispatch[-1].join(5)
+    assert len(calls) == 7 and w["first_turn_alerted"] and not w["first_turn_alert_inflight"]
+    drv.sweep(now=now + 1000)
+    assert len(calls) == 7 and set(calls) == {f"no-first-turn:{key}"}
+    ok("no-first-turn failures/suppression retry with capped backoff until confirmed delivery")
+
+
+def test_first_turn_alert_inflight_is_not_ack_and_cannot_ack_replacement():
+    key = "vikunja:task:9408"
+    a = _FakeAdapter()
+    a.first_turn_started = lambda key: False
+    a._alive[key] = True
+    c = Coalescer(adapter=a, completed_path="")
+    w = {"state": "open_running", "admitted_at": 100, "fwd_buffer": []}
+    c.live[key] = w
+    entered, release = threading.Event(), threading.Event()
+    def alert(msg, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return True
+    drv = LivenessDriver(c, a, alert_ops=alert, progress_timeout=10000)
+    try:
+        drv.sweep(now=400)
+        assert entered.wait(5)
+        assert w["first_turn_alert_inflight"] and not w.get("first_turn_alerted")
+        drv.sweep(now=1000)
+        assert len(drv._dispatch) == 1, "only one notification may be in flight"
+        c.live[key] = dict(state="open_running", admitted_at=1000, fwd_buffer=[])
+    finally:
+        release.set()
+        for t in drv._dispatch:
+            t.join(5)
+    assert not c.live[key].get("first_turn_alerted"), "old delivery must not settle a new spawn"
+    ok("in-flight alert is not delivered and cannot acknowledge a replacement spawn")
+
+
+def test_first_turn_alert_distinct_workers_have_distinct_throttle_subjects():
+    a = _FakeAdapter()
+    a.first_turn_started = lambda key: False
+    c = Coalescer(adapter=a, completed_path="")
+    keys = [f"vikunja:task:{tid}" for tid in range(9410, 9416)]
+    for key in keys:
+        a._alive[key] = True
+        c.live[key] = {"state": "open_running", "admitted_at": 100, "fwd_buffer": []}
+    with patch.object(notify, "_subject_ts", {}), patch.object(notify, "_global_ts", []), \
+            patch.object(notify, "_subject_suppressed", {}), patch.object(notify, "_now", return_value=400), \
+            patch.object(notify, "OPS_HANDLE", "ops@example.test"), \
+            patch.object(notify, "NOTIFY_BACKEND", "webhook"), \
+            patch.object(notify, "_send_other", return_value=True) as send, patch.object(notify.events, "emit"):
+        drv = LivenessDriver(c, a, alert_ops=notify.wake_ops, progress_timeout=10000)
+        drv.sweep(now=400)
+        for t in drv._dispatch:
+            t.join(5)
+        assert send.call_count == len(keys), "distinct stalled workers must not share the three-send cap"
+        assert set(notify._subject_ts) == {f"no-first-turn:{key}" for key in keys}
+        assert all(c.live[key].get("first_turn_alerted") for key in keys)
+    ok("six stalled tickets deliver through notify with independent per-worker throttle subjects")
+
+
+def test_no_action_logs_name_subject_and_reason():
+    key = "vikunja:task:9406"
+    evt = {"source": "vikunja", "task_id": 9406, "event_name": "task.updated", "run_id": "echo-test"}
+    registry = RunRegistry()
+    registry.open("echo-test", key)
+    with patch("echo_guard.log.info") as info:
+        assert EchoGuard(registry).filter(evt) is None
+        line = info.call_args[0][0] % info.call_args[0][1:]
+        assert key in line and "active run echo" in line, line
+    c = Coalescer(completed_path="")
+    c.completed[key] = time.time()
+    with patch.object(C.log, "info") as info, patch.object(C, "_append_raw"):
+        c.on_event({k: v for k, v in evt.items() if k != "run_id"})
+        lines = [args[0] % args[1:] for args, _ in info.call_args_list]
+        assert any(key in line and "completed run without human re-engagement" in line for line in lines), lines
+    assert key not in c.pending
+    ok("echo and completion-dedup refusals log the subject and explicit no-action reason")
+
+
 def test_d2_buffered_forward_one_resume():
     fa = _FakeAdapter()
     C.RECEIVE_WINDOWS["vikunja:task"] = 100
@@ -25328,7 +25465,7 @@ def test_worktree_cut_from_branch_and_push_back_to_it():
     ok("worktree cut from the continue-mr branch; fix commits pushed back onto it fast-forward only")
 
 
-def _run_continue_code_worker(ticket, make_raises=None):
+def _run_continue_code_worker(ticket, make_raises=None, opened=None, emit_event=None):
     """Drive _run_worker on a code route with a fake claude (status done) + a recording worktree manager."""
     import adapters.cc as CCM
     import routing as RT
@@ -25352,7 +25489,7 @@ print(json.dumps({"result": json.dumps({"status": "done", "summary": "<p>fixed</
                 return d
             def publish_mr(self, key, **kw): calls.append(("publish_mr", kw)); return kw.get("continue_branch") or "eph/code-change/new"
             def save_patch(self, key): calls.append(("save_patch", {}))
-            def head_sha(self, key): return None
+            def head_sha(self, key): return "b" * 40
             def remove(self, key): calls.append(("remove", {}))
         route = Route(domain="code", repo=d, prompt_class="change-proposer", agent="code-worker",
                       read_only=False, capability="code", test_runner="pytest", model="m",
@@ -25368,6 +25505,7 @@ print(json.dumps({"result": json.dumps({"status": "done", "summary": "<p>fixed</
                       ticket_fetcher=lambda tid: f"**title:** t\n**description:** <p>repo:{d}</p>{ticket}",
                       comment_poster=lambda tid, html_, rid: comments.append((tid, html_)),
                       label_poster=lambda tid: None,
+                      emit_event=emit_event,
                       alert_ops=lambda msg, subject=None: alerts.append(msg))
         original_turn = a._turn
         def capture_turn(worker, route, system_prompt, prompt_text, **kwargs):
@@ -25380,7 +25518,10 @@ print(json.dumps({"result": json.dumps({"status": "done", "summary": "<p>fixed</
         RT.resolve_target_repo = lambda declared, default, allowed: d
         RT.code_repo_allowed = lambda r: True
         CCM.resolve_default_branch = lambda repo, fallback="main": "main"
-        CCM.open_mr = lambda *a_, **k: calls.append(("open_mr", {}))
+        def fake_open_mr(*args, **kwargs):
+            calls.append(("open_mr", {}))
+            return opened
+        CCM.open_mr = fake_open_mr
         try:
             with _Env(REPO_INFER_ENABLED=None, CONTINUE_MR_PREFIXES=None):
                 a.spawn(key, {"task_id": 9202})
@@ -25410,7 +25551,7 @@ def test_adapter_continues_mr_branch_in_place():
     assert make["publish_ref"] == br, make                          # cut FROM the MR branch, not main
     pub = [kw for n, kw in calls if n == "publish_mr"]
     assert pub and pub[0]["continue_branch"] == br and pub[0]["mr_target_ref"] == "main", pub
-    assert "open_mr" not in names, "the existing MR updates in place; no new MR"
+    assert "open_mr" in names, "look up the existing MR idempotently to arrange re-review"
     assert any(br in h and "in place" in h for _, h in comments), comments
     # no continue-mr line: unchanged behaviour (cut from target, fresh branch, MR opened)
     calls, _, _ = _run_continue_code_worker("<p>plain ticket</p>")
@@ -25419,6 +25560,49 @@ def test_adapter_continues_mr_branch_in_place():
     pub = [kw for n, kw in calls if n == "publish_mr"]
     assert pub and not pub[0].get("continue_branch") and "open_mr" in [c[0] for c in calls], calls
     ok("adapter cuts from the continue-mr branch, pushes back onto it and opens no new MR")
+
+
+def test_continue_mr_push_rereviews_existing_mr_new_head():
+    import app
+    opened = {"project": "owner/sample-app", "iid": 9400,
+              "web_url": "https://gitlab.example.com/owner/sample-app/-/merge_requests/9400"}
+    branch = "eph/code-change/task-9400-abcd1234"
+    for live in (False, True):
+        with _mr_note_tempdir() as d, _Env(DISPATCH_PRIORITY="fifo", ROW_CONCURRENCY=""), \
+                patch.object(C, "COMPLETED_PATH", ""), patch.object(C, "EVENTS_LOG", os.path.join(d, "events.jsonl")), \
+                patch.object(C, "INITIAL_WINDOWS", {}), patch.object(C, "INITIAL_DEFAULT", 0):
+            b = app.Broker(state_path="")
+            calls, emitted = [], []
+            b.adapter.spawn = lambda key, brief: calls.append((key, brief))
+            evt = {"source": "mr", "event_name": "mr.opened", "project": opened["project"],
+                   "mr_iid": opened["iid"], "source_branch": branch, "target_ref": "main", "head_sha": "a" * 40}
+            key = b.ingest(evt)
+            b.tick()
+            if not live:
+                b.coalescer.settle_self(key)
+            def emit(event):
+                emitted.append(event)
+                return b._worker_event(event)
+            # This test exercises re-review, not the host's optional mcp-ro.sh installation.
+            mcp_ro = os.path.join(d, "mcp-ro.sh")
+            with open(mcp_ro, "w") as f:
+                f.write("#!/bin/sh\n")
+            os.chmod(mcp_ro, os.stat(mcp_ro).st_mode | stat.S_IEXEC)
+            with patch.object(cc, "scrub_worker_env", side_effect=lambda *a, **k: {
+                    "PATH": os.pathsep.join((d, os.path.dirname(sys.executable), os.defpath)), "HOME": d}):
+                _, _, alerts = _run_continue_code_worker(f"<p>continue-mr: {branch}</p>",
+                                                         opened=opened, emit_event=emit)
+            assert not alerts, alerts
+            assert len(emitted) == 1 and emitted[0]["head_sha"] == "b" * 40
+            if live:
+                assert b.coalescer.live[key]["forwards"] == 0
+                assert b._cd_redispatch(evt, "<p>Old findings</p>", "old-review")
+                assert b._cd_retry_pending[key]["evt"]["head_sha"] == "b" * 40
+                b.coalescer.settle_self(key)
+            b.tick()
+            assert len(calls) == 2 and calls[-1][1]["mr"]["head_sha"] == "b" * 40, calls
+            assert calls[-1][1]["task_id"] == 9202
+    ok("continue-mr publication queues a new-head review after completed or still-live reviews")
 
 
 def test_adapter_refuses_non_broker_branch():

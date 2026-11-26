@@ -4598,6 +4598,23 @@ class CCAdapter(Adapter):
                                 f"<p>Pushed the fix commits onto the existing MR branch <code>"
                                 f"{html.escape(branch)}</code>; its open MR updates in place (no new MR).</p>"),
                                 run_id)
+                            # Reusing an MR does not emit a GitLab open webhook. Arrange the review
+                            # ourselves, pinned to the pushed head, even if its last review completed.
+                            opened = open_mr(publish["code_repo_path"], branch,
+                                             publish["mr_target_ref"], key=key)
+                            if not opened:
+                                raise RuntimeError("continue-mr pushed but MR lookup failed; re-review not queued")
+                            head = self.worktree_mgr.head_sha(key)
+                            if not re.fullmatch(r"[0-9a-fA-F]{40}", head or ""):
+                                raise RuntimeError("continue-mr pushed but its head SHA is unavailable for re-review")
+                            if not self._emit_event({
+                                    "source": "mr", "event_name": "mr.opened", "review_refresh": True,
+                                    "project": opened["project"], "mr_iid": opened["iid"],
+                                    "source_branch": branch, "target_ref": publish["mr_target_ref"],
+                                    "web_url": opened["web_url"], "repo_path": publish["code_repo_path"],
+                                    "task_id": tickets.vikunja_id(key), "head_sha": head,
+                                    **({"issue": brief["issue"]} if brief.get("issue") else {})}):
+                                raise RuntimeError("continue-mr pushed but re-review delivery failed")
                     elif publish.get("code_repo_path"):
                         # A code change-proposer NEVER auto-publishes to main. The broker pushes
                         # the worker's committed HEAD to a FRESH eph FEATURE BRANCH (never mr_target_ref) and
@@ -5543,6 +5560,16 @@ class CCAdapter(Adapter):
         if worker and worker.in_turn and worker.turn_started is not None:
             return time.time() - worker.turn_started
         return None
+
+    def first_turn_started(self, key):
+        """Has any harness launch occurred? Includes setup before a Worker is registered.
+
+        model_at is shared by CC, Hermes and Codex and survives session rotation. Completed-turn
+        counts alone would incorrectly flag a healthy long first turn as a stalled spawn.
+        """
+        with self._lock:
+            worker = self._workers.get(key)
+            return bool(worker and (worker.model_at is not None or worker.turns))
 
     def turn_deadline_extra(self, key):
         """Seconds the CURRENT turn's per-capability wall-clock exceeds the global wall_clock_s (0 when

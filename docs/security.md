@@ -50,6 +50,12 @@ a running worker are wrapped and labelled as data. Authors listed in `untrusted_
 `MODEL_LABEL_TRUSTED_CREATORS` can use a `model:` label to move a ticket to a non-Anthropic backend, or a
 `hermes` label to move it to the hermes harness.
 
+Workers with a live-write grant (`worker.write_grant_path` set) are refused on Codex before harness
+dispatch, with a blocked ticket comment naming ticket 3345.
+Codex's per-exec sandbox cannot access the syslog socket required by the `mcp-rw` intent audit. Move
+granted tickets to a Claude Code row and retry. Audit failures remain fail-closed; ungranted tickets
+keep their selected harness, and `EPH_WRITE_GRANTS_ENABLED` still defaults off.
+
 MR note iteration is separately opt-in through `MR_NOTE_AUTHOR_ALLOWLIST` (empty means off), behind the same
 GitLab webhook token check. Only new, non-system notes on open, same-project broker MRs under
 `CD_WORKER_BRANCH_PREFIX` and `eph/` qualify. The broker's own `broker-run:` notes are ignored even if its

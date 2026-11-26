@@ -23787,7 +23787,7 @@ def test_cc_threads_worker_write_grant_to_env():
     ok("cc: granted launch carries file plus matching on-disk nonce; ungranted launch carries neither")
 
 
-def _flag_run(ticket, flag="1", doer="ops"):
+def _flag_run(ticket, flag="1", doer="ops", row=None):
     import adapters.cc as CCM
     import write_grant as WG
     seen = []
@@ -23804,7 +23804,7 @@ def _flag_run(ticket, flag="1", doer="ops"):
         orig_spawn = CCM.CCAdapter.spawn
         CCM.CCAdapter.spawn = lambda self, key, brief: orig_spawn(self, key, {**brief, "last_doer": doer})
         try:
-            res = _run_infra_worker("eph/infra/x", ticket=ticket)
+            res = _run_infra_worker("eph/infra/x", ticket=ticket, row=row)
         finally:
             CCM.CCAdapter.build_argv, CCM.CCAdapter.spawn, WG._journal_reader = orig, orig_spawn, saved_reader
         left = os.listdir(gd)
@@ -23825,6 +23825,33 @@ def test_infra_spawn_writes_grant_and_revokes_at_teardown():
         assert left == [] and comments and "mcp-rw audit" not in comments[0][1]
     ok("trusted infra spawn writes the grant + mcp-rw.sh + brief write_grant, revoked at teardown, audit "
        "appended; untrusted / write:none / flag off / untrusted assigner -> no grant")
+
+
+def test_infra_codex_write_grant_refuses_with_ticket_note():
+    import routing as RT
+    from adapters import codex as X
+    for row in (RT._INFRA_ROW, RT._INFRA_GENERAL_ROW):
+        row = RT.replace(row, adapter="codex")
+        with patch.object(X, "CodexHarness") as harness:
+            seen, comments, left = _flag_run(_ticket("owner"), row=row)
+            harness.assert_not_called()
+        assert seen == [] and left == [], (seen, left)   # no CC launch; grant revoked on refusal
+        assert len(comments) == 1 and comments[0][0] == 9361, comments
+        note = comments[0][1]
+        assert "Granted write refused" in note and "intent audit" in note and "Claude Code" in note, note
+        assert "ticket 3345" in note, note
+        # Neither a disabled/unset flag nor a ticket opt-out should change the selected harness.
+        for flag, labels in (("0", []), (None, []), ("1", ["write:none"])):
+            def turn(adapter, worker, route, *args, **kwargs):
+                assert route.adapter == "codex" and worker.write_grant_path is None
+                worker.done = True
+                return {"status": "done", "summary": "ungranted codex turn", "wake": []}
+            with patch.object(X, "CodexHarness") as harness:
+                harness.return_value.one_turn.side_effect = turn
+                seen, comments, left = _flag_run(_ticket("owner", labels), flag=flag, row=row)
+                assert harness.return_value.one_turn.call_count == 1
+            assert seen == [] and left == [] and comments[0][1] == "ungranted codex turn", comments
+    ok("infra codex grant refuses with ticket note and revocation; flag off/unset and opt-out keep codex routing")
 
 
 def _run_ticket_worker(ticket, emitted=None, row="_GENERAL_ROW", pin=("GENERAL_REPO_ALLOWLIST", lambda d: {d}),

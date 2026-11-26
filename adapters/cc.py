@@ -5203,6 +5203,17 @@ class CCAdapter(Adapter):
         # even when _inbox_failure has already consumed its terminal limit reason.
         if getattr(worker, "done", False):
             return None
+        # Codex's per-exec sandbox has no usable syslog socket, so mcp-rw cannot record its required
+        # intent audit (ticket 3345). Refuse before even constructing the harness, including warm turns
+        # and label-selected routes. The normal envelope path posts this broker-generated ticket note.
+        if getattr(route, "adapter", "cc") == "codex" and getattr(worker, "write_grant_path", None):
+            worker.done = True
+            log.warning("write grant: key=%s refused on codex; audit socket unavailable (ticket 3345)", worker.key)
+            return {"status": "blocked", "summary": (
+                "<p>Granted write refused on the Codex route: its exec sandbox cannot access the syslog "
+                "socket required for the mcp-rw intent audit. No worker was launched for this turn. "
+                "Move this ticket to a Claude Code row and retry. The write wrapper remains fail-closed. "
+                "See ticket 3345.</p>"), "wake": []}
         try:
             delta = json.loads(prompt_text)
         except (TypeError, ValueError):

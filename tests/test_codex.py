@@ -1126,10 +1126,23 @@ def test_codex_happy_path_and_resume():
        "scrubbed env (no OPENAI_*/CODEX_* leak), gate trusted and live, denials reported, resume + token delta")
 
 
-def test_codex_threads_worker_write_grant_to_policy_and_env():
-    from unittest.mock import patch
-    import write_grant as WG
+def test_codex_refuses_worker_write_grant_before_dispatch():
+    for resume in (False, True):
+        for cap in ("code", "write", "mr-review"):
+            a = CCAdapter(router=None, worktree_mgr=None, prompt_loader=None, envelope_parser=EnvelopeParser())
+            w = Worker("vikunja:task:9312", "grant-test", "/unused")
+            w.write_grant_path = "/broker/grants/9312.json"
+            with patch.object(X, "CodexHarness") as harness:
+                result = a._turn_with_envelope(w, _route(capability=cap), "SYS", "P", resume, w.run_id)
+                harness.assert_not_called()
+            assert result["status"] == "blocked" and result["wake"] == [], result
+            assert "ticket 3345" in result["summary"], result
+            assert "Claude Code" in result["summary"] and "intent audit" in result["summary"], result
+            assert w.done and a.codex is None
+    ok("codex: granted seed/resume turns refuse before harness construction with a ticket 3345 receipt")
 
+
+def test_codex_ungranted_policy_and_env_unchanged():
     class StopTurn(Exception):
         pass
 
@@ -1137,13 +1150,9 @@ def test_codex_threads_worker_write_grant_to_policy_and_env():
         wt = _git_repo(os.path.join(d, "wt"))
         a = _adapter(d)
         w = Worker("vikunja:task:9312", "grant-test", wt)
-        grant = {"ticket": 9312, "bundles": ["grafana-edit"], "nonce": "codex-test-nonce", "expires": 5}
-        grant_path = WG.write_grant_file(grant, os.path.join(d, "grants"))
-        w.write_grant = {"nonce": "not-the-file-nonce"}
         for cap in ("code", "write", "mr-review"):
-            for path in (None, "", grant_path):
+            for path in (None, ""):
                 w.write_grant_path = path
-                expected = cap == "code" and bool(path)
                 with patch.object(X, "gate_policy", wraps=X.gate_policy) as make_policy, \
                         patch.object(a.codex, "_install_gate", side_effect=StopTurn) as install:
                     try:
@@ -1151,17 +1160,13 @@ def test_codex_threads_worker_write_grant_to_policy_and_env():
                         raise AssertionError("must reach the gate installer")
                     except StopTurn:
                         pass
-                    assert make_policy.call_args.kwargs["write_grant"] is expected
+                    assert make_policy.call_args.kwargs["write_grant"] is False
                     env = install.call_args.args[2]
-                    if path:
-                        assert env["EPH_WRITE_GRANT_FILE"] == grant_path
-                        assert env["EPH_WRITE_GRANT_NONCE"] == grant["nonce"]
-                    else:
-                        assert "EPH_WRITE_GRANT_FILE" not in env and "EPH_WRITE_GRANT_NONCE" not in env
+                    assert "EPH_WRITE_GRANT_FILE" not in env and "EPH_WRITE_GRANT_NONCE" not in env
                     policy = install.call_args.args[1]
                     if cap == "code":
-                        assert bool(CC._WRITE_WRAPPER_LIFTABLE.intersection(policy["deny"])) is not expected
-    ok("codex: grant file supplies the env pair; only granted code workers lift the policy floor")
+                        assert CC._WRITE_WRAPPER_LIFTABLE.intersection(policy["deny"])
+    ok("codex: ungranted workers retain the harness, deny floor and grant-free env")
 
 
 def test_codex_sandbox_network_requires_opt_in():

@@ -35,8 +35,10 @@ modules/
   role/ephemeral-oneshot.md          who the worker is (one ticket, then exit)
   scopes/code-change.md              what the job is
   scopes/general.md
+  scopes/fleet-rules.md              explicit shared rules for every worker, including reviewers
   scopes/mr-review.md
   scopes/ui-mockup.md                UI tickets: port the mockup, render and view it (code worker)
+  scopes/ui-controls.md              UI workers: themed controls, open pickers, 390/1440 shots
   scopes/mr-review-ui.md             UI MRs: view the screenshots, BLOCK on mismatch (both review tiers)
   capabilities/code-change.md        what tools it has and how to use them
   capabilities/general.md
@@ -103,9 +105,28 @@ pointing to the existing read-only, git-excluded `.eph/repo-rules/<original-name
 Workers read those copies as repository data for conventions using their harness's granted
 file-reading tools, within the existing scope. The notice does not grant access to the live
 base checkout. Repositories without regular root charters have no copies directory.
+The code and general scope modules explicitly discover `.eph/repo-rules/*.txt`, just like
+infra/general, in both generic and site-rendered prompts. Copies are repository data, not
+new tool grants; workers leave the stripped originals and read-only copies untouched.
 The notice survives fresh-session forwards with the seed brief. Neither the originals nor
-their copies are inserted into the system prompt. Signed prompts and `approved-prompts.json`
-are unchanged; any future change to their approved behavior still needs operator re-signing.
+their copies are inserted into the system prompt. The notice itself changes neither signed
+prompts nor approvals. Changes to approved behavior still require operator re-signing.
+
+### Explicit shared fleet rules
+
+Every manifest includes `scopes/fleet-rules` exactly once, including specialist workers,
+inbox workers that write human-facing text, and both review tiers. This single generic source
+covers writing voice, configurable OSS code, code categories, global ticket links, restricted
+overlays and mechanism-first fixes with runnable checks. It does not claim that a harness has
+loaded a fleet charter or wiki skills. Site details come from configuration or explicitly
+supplied site/repo rules. The core's ticket-link example uses `tickets.example.com`; workers
+use the real global id and URL in their runtime brief.
+
+The existing `scopes/ui-controls` module completes the shared rules for every non-review
+worker. Reviewers instead include `scopes/mr-review-ui`, with the matching read-only blocker
+checks. Neither module grants tools. Coverage tests enumerate all manifests, check generic
+and site renders, and verify committed prompts and approvals so a new row cannot silently
+miss the rules. All affected rendered prompts must be reviewed and re-signed together.
 
 ## Site overrides
 
@@ -189,6 +210,14 @@ Rendering needs a browser: the `code/ui` row's Playwright MCP (label the ticket 
 `CODE_BROWSER_MCP_CONFIG`, see [configuration.md](configuration.md#the-code-workers-browser)) or a
 screenshot script the repo's test runner already runs. Without one the
 worker commits the code, says which screenshots are missing, and the reviewer blocks the MR.
+
+The code and specialist UI workers also share a short `scopes/ui-controls` section: port committed
+mockup markup/CSS, report missing mockups without inventing layouts, theme every form control (including
+open pickers), set `color-scheme` on dark pages, and align adjacent controls by height and vertical center.
+With a browser, commit 390 px and 1440 px screenshots including open pickers beside the mockup shots.
+Both review tiers check for bare `select`/`input` elements without theme styles and block UI MRs on
+unstyled native controls or missing open-state screenshots for changed pickers. Closed-select styling
+alone is not enough: use a styled listbox or `appearance: base-select` with a themed picker.
 
 Viewing needs a harness that shows images to the model. On Claude Code the reviewer's `Read` grant opens
 PNG, JPG and WebP files in the checkout; the secret and env-file deny floor is unchanged. The hermes gate

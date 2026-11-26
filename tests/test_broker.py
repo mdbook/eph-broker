@@ -4793,6 +4793,8 @@ def test_phase2b_wiki_docs_manifest_reuses_role_and_output_adds_scope_and_capabi
     assert mf["domain"] == "wiki" and mf["class"] == "docs", mf
     assert mf["sections"] == [
         "role/ephemeral-oneshot",       # REUSED
+        "scopes/fleet-rules",
+        "scopes/ui-controls",
         "capabilities/file-access",     # REUSED: harness-specific file tools
         "capabilities/fleet-dm",         # shared, runtime-identity-gated DMs
         "scopes/wiki-docs",             # NEW: wiki READ scope
@@ -7194,6 +7196,8 @@ def test_phase2c_manifest_is_single_class_no_vars():
     assert mf["domain"] == "inbox" and mf["class"] == "triage", mf
     assert mf["sections"] == [
         "role/ephemeral-inbox",
+        "scopes/fleet-rules",
+        "scopes/ui-controls",
         "capabilities/inbox-file-access",
         "scopes/inbox-rules",
         "scopes/inbox-triage",
@@ -9374,6 +9378,7 @@ def test_mr_review_manifest_renders_and_matches_committed_prompt():
     assert mf["domain"] == "mr-review" and mf["class"] == "agent", mf
     assert mf["sections"] == [
         "role/ephemeral-oneshot",       # REUSED
+        "scopes/fleet-rules",
         "capabilities/file-access",     # REUSED: harness-specific file tools
         "scopes/mr-review",             # NEW: read-only adversarial scope
         "scopes/mr-review-ui",          # UI MRs: view the screenshots, BLOCK on mismatch
@@ -9592,12 +9597,14 @@ def test_general_manifest_reuses_role_and_renders_matches_committed():
     """The general/agent manifest REUSES role/ephemeral-oneshot and composes the new thin general
     scope/capability/constraints/output modules, renders through the modular pipeline, and byte-matches the
     committed prompts/general/agent.md (the owner-signable artifact; the drift-guard would pass). Confirms
-    the signed prompt is THIN+STABLE: it does NOT embed FLEET.md (that rides setting-sources)."""
+    the signed prompt includes explicit shared rules without embedding a fleet charter."""
     import pathlib
     mf = json.load(open(os.path.join(ROOT, "workers", "general", "agent.json")))
     assert mf["domain"] == "general" and mf["class"] == "agent", mf
     assert mf["sections"] == [
         "role/ephemeral-oneshot",       # REUSED
+        "scopes/fleet-rules",
+        "scopes/ui-controls",
         "capabilities/file-access",     # REUSED: harness-specific file tools
         "capabilities/fleet-dm",         # shared, runtime-identity-gated DMs
         "scopes/general",               # NEW: arbitrary-ticket scope
@@ -26211,6 +26218,159 @@ def test_ui_mockup_sections_in_code_and_review_prompts():
         assert approved.get(key) == digest, (key, digest)
     ok("code worker ports + renders + views the mockup (stops without one); both review tiers view the "
        "screenshots and BLOCK on mismatch or missing images; prompts signed")
+
+
+def test_ui_controls_in_worker_and_reviewer_prompts():
+    """UI rules survive site/public rendering and the changed prompts remain signed (ticket 3341)."""
+    rp = _load_render_module()
+    root = pathlib.Path(ROOT)
+    keys = ["code/change-proposer", "mr-review/agent", "mr-review/quick"]
+    loader = PromptLoader(str(root / "prompts"), str(root / "approved-prompts.json"))
+    for key in keys:
+        reviewer = key.startswith("mr-review/")
+        module = "scopes/mr-review-ui" if reviewer else "scopes/ui-controls"
+        mf = root / "workers" / (key + ".json")
+        sections = json.loads(mf.read_text(encoding="utf-8"))["sections"]
+        assert sections.count(module) == 1, key
+        assert not (root / "modules/site" / (module + ".md")).exists(), key
+        out, rendered = rp.render(mf)
+        assert out.read_text(encoding="utf-8") == rendered, key
+        domain, cls = key.split("/")
+        assert loader.load(cls, domain) == rendered, key
+        # Render without site overrides as well: this is generic behavior, not a site's charter.
+        with tempfile.TemporaryDirectory(dir=ROOT) as d:
+            public = pathlib.Path(d)
+            for sec in sections:
+                target = public / "modules" / (sec + ".md")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text((root / "modules" / (sec + ".md")).read_text(encoding="utf-8"),
+                                  encoding="utf-8")
+            rp.ROOT = public
+            try:
+                _, generic = rp.render(mf)
+            finally:
+                rp.ROOT = root
+        body = (root / "modules" / (module + ".md")).read_text(encoding="utf-8").rstrip("\n")
+        for text in (rendered, generic):
+            assert text.count(body) == 1, key
+            for rule in ("styled listbox", "`appearance: base-select`", "themed picker", "`color-scheme`",
+                         "textareas, checkboxes, radios, sliders and file inputs", "390 px and 1440 px",
+                         "Adjacent controls in a row share height and vertical center" if not reviewer else
+                         "adjacent controls in a row share height and vertical center"):
+                assert rule in text, (key, rule)
+            if reviewer:
+                assert "bare `select`/`input` elements without theme styles" in text, key
+                blockers = text.split("- **BLOCK**", 1)[1].split("- **Explained minor", 1)[0]
+                assert "unstyled native form control" in blockers, key
+                assert "missing open-state screenshots" in blockers, key
+            else:
+                assert "## When the change touches UI" in text, key
+                assert "committed mockup markup/CSS; do not re-interpret it" in text, key
+                assert "report the gap in your summary and any MR; never invent a layout" in text, key
+                assert "including pickers open" in text and "next to the mockup ones" in text, key
+    ok("code/forge workers theme all controls and capture open pickers; both reviewers block missing "
+       "styles/open-state shots; generic and site renders agree and changed prompts load signed")
+
+
+def test_mr_review_manifests_exclude_ui_write_instructions():
+    """Reviewers check UI changes, never receive the worker's build instructions (ticket 3341)."""
+    root = pathlib.Path(ROOT)
+    rp = _load_render_module()
+    manifests = sorted((root / "workers/mr-review").glob("*.json"))
+    assert manifests
+    for mf in manifests:
+        sections = json.loads(mf.read_text(encoding="utf-8"))["sections"]
+        assert "scopes/ui-controls" not in sections, mf
+        assert sections.count("scopes/mr-review-ui") == 1, mf
+        _, rendered = rp.render(mf)
+        assert "## When the change touches UI" not in rendered, mf
+    ok("all MR-review rows include UI review checks without worker UI write instructions")
+
+
+def test_shared_fleet_rules_cover_every_worker_manifest():
+    """Every row gets the shared rules and UI policy, with or without site overrides (ticket 3341)."""
+    rp = _load_render_module()
+    root = pathlib.Path(ROOT)
+    module = "scopes/fleet-rules"
+    body = (root / "modules" / (module + ".md")).read_text(encoding="utf-8").rstrip("\n")
+    assert not (root / "modules/site" / (module + ".md")).exists()
+    assert chr(0x2014) not in body
+    for rule in ("plain prose, no em dashes", "site specifics in config, never core", "10 minutes",
+                 "Never include private data", "`fleet-category:`", "nearest `.fleet-category`",
+                 "Never edit `upstream`", "Edit `vetted` only as the ticket explicitly asks",
+                 "name vetted files in result/MR",
+                 "global ticket id and full link",
+                 "never a project-relative identifier", "https://tickets.example.com/tasks/<id>",
+                 "Restricted overlays", "Do not read further", "Find the mechanism before fixing",
+                 "one runnable check", "When the change touches UI"):
+        assert rule in body, rule
+    assert "`vetted` or `upstream` means do not edit" not in body
+    loader = PromptLoader(str(root / "prompts"), str(root / "approved-prompts.json"))
+    manifests = sorted((root / "workers").rglob("*.json"))
+    assert manifests
+    for mf in manifests:
+        manifest = json.loads(mf.read_text(encoding="utf-8"))
+        key = manifest["domain"] + "/" + manifest["class"]
+        sections = manifest["sections"]
+        assert sections.count(module) == 1, key
+        ui_module = "scopes/mr-review-ui" if manifest["domain"] == "mr-review" else "scopes/ui-controls"
+        assert sections.count(ui_module) == 1, key
+        ui_body = (root / "modules" / (ui_module + ".md")).read_text(encoding="utf-8").rstrip("\n")
+        committed = loader.load(manifest["class"], manifest["domain"])
+        assert committed.count(body) == 1 and committed.count(ui_body) == 1, key
+        with tempfile.TemporaryDirectory(dir=ROOT) as d:
+            public = pathlib.Path(d)
+            # External site documents need not exist in CI. Exercise inline composition with local
+            # fixtures, without reading a live checkout or weakening coverage of any manifest.
+            local = json.loads(mf.read_text(encoding="utf-8"))
+            for i, sec in enumerate(local["sections"]):
+                if isinstance(sec, dict):
+                    source = public / ("reference-%s.md" % i)
+                    source.write_text("Reference fixture\n", encoding="utf-8")
+                    sec["inline"] = str(source)
+                else:
+                    target = public / "modules" / (sec + ".md")
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text((root / "modules" / (sec + ".md")).read_text(encoding="utf-8"),
+                                      encoding="utf-8")
+            local_mf = public / "worker.json"
+            local_mf.write_text(json.dumps(local), encoding="utf-8")
+            _, rendered = rp.render(local_mf)
+            if not rp.inline_sources(mf):
+                assert rendered == committed, key
+            with patch.object(rp, "ROOT", public):
+                _, generic = rp.render(local_mf)
+            for text in (rendered, generic):
+                assert text.count(body) == 1 and text.count(ui_body) == 1, key
+                assert "You loaded the fleet rules" not in text, key
+                assert "your session inherited the fleet charter" not in text, key
+    ok("all worker manifests include shared fleet rules and UI policy once; generic/site renders and approvals checked")
+
+
+def test_code_and_general_discover_repo_rules_without_assuming_inheritance():
+    root = pathlib.Path(ROOT)
+    rp = _load_render_module()
+    for key, scope in (("code/change-proposer", "code-change"), ("general/agent", "general")):
+        mf = root / "workers" / (key + ".json")
+        for base in (root / "modules", root / "modules/site"):
+            if not base.is_dir():  # the public export intentionally drops site overrides
+                continue
+            body = (base / "scopes" / (scope + ".md")).read_text(encoding="utf-8").rstrip("\n")
+            for rule in (".eph/repo-rules/*.txt", "AGENTS.md.txt", "CLAUDE.md.txt", "read-only copies",
+                         "not new tool grants", "do not restore them", "stage their expected deletions",
+                         "Never read rules from a live checkout", "exact old/new lines"):
+                assert rule in body, (base, scope, rule)
+        _, rendered = rp.render(mf)
+        assert ".eph/repo-rules/*.txt" in rendered, key
+    for base in (root / "modules", root / "modules/site"):
+        if not base.is_dir():
+            continue
+        capability = (base / "capabilities/general.md").read_text(encoding="utf-8")
+        assert "Use the shared fleet rules here and any explicitly supplied site/repo rules" in capability
+        assert "Do not assume the harness loaded user-level settings" not in capability
+        assert "You loaded the fleet rules" not in capability
+        assert "Your session loaded the operator's user-level settings" not in capability
+    ok("code/general discover in-worktree rules copies in generic/site modules; general makes no false inheritance claim")
 
 
 def test_test_environment_gap_reaches_worker_and_does_not_prevent_mr():

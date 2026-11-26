@@ -1,7 +1,7 @@
 {
   "_comment": "sha256 of each rendered prompt the operator signed off (prompts.py hash gate). Re-render with tools/render-prompts.py and sign your own after changing any module.",
-  "code/change-proposer": "2b4da8f22cf65a773cf3d9607eba16260e9bc69ef3980ad4154b3e0b8820611c",
-  "mr-review/agent": "ca61682ec17773bbeb3167e153dd01b2c1f27a6b832b368c04233ab3d2564e15",
-  "mr-review/quick": "7951debf2f3f9b39dadbe23a42b2f2bb892c6edd7e7111f012891e77ed841db8",
-  "general/agent": "a099a29b12198064b7e7ace64902147dcb97ec7fe20c40428c6f6f622a7dbe7c"
+  "code/change-proposer": "d8dabe2f06314033b020cf025565472c6df5b8c29933abd0d4df4c04d097b697",
+  "mr-review/agent": "88af1ecd580d97417d8387daa06ed351ba5aa0db1036198aacd2c6949f31112b",
+  "mr-review/quick": "f36950cd8e61e652fbdbd7b417878a97856aa78f7e70bfd99b088868eb7de3c2",
+  "general/agent": "9628c2a3cffdb64718aadaa65b43be7a4949df8f4140d67423398cb92e60d30c"
 }

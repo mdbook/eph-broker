@@ -4,6 +4,7 @@
   "class": "agent",
   "sections": [
     "role/ephemeral-oneshot",
+    "scopes/fleet-rules",
     "capabilities/file-access",
     "scopes/mr-review",
     "scopes/mr-review-ui",

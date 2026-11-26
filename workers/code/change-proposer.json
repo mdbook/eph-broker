@@ -4,9 +4,11 @@
   "class": "change-proposer",
   "sections": [
     "role/ephemeral-oneshot",
+    "scopes/fleet-rules",
     "capabilities/file-access",
     "capabilities/fleet-dm",
     "scopes/code-change",
+    "scopes/ui-controls",
     "scopes/ui-mockup",
     "capabilities/code-change",
     "constraints/code-change",

@@ -2978,6 +2978,43 @@ class CCAdapter(Adapter):
                                     key, run_id, note_error)
             return None
 
+    def _salvage_wall_clock(self, key, run_id, publish):
+        """Save killed code work before reaping; optionally reserve one journaled continuation. No MR."""
+        try:
+            saved = self.worktree_mgr.salvage(key)
+            if not saved:
+                self._alert_ops(f"wall-clock worker {key}: no recoverable work; owner action required",
+                                subject=f"worker:{key}")
+                return False
+            queued = False
+            if _env_flag("WORKER_AUTO_CONTINUE_ON_WALL_CLOCK", "0") and self.coalescer is not None:
+                try:
+                    queued = self.coalescer.queue_code_continuation(key, {
+                        **saved, "repo": publish["code_repo_path"], "target": publish["mr_target_ref"],
+                        "continue_branch": publish.get("continue_branch"), "run_id": run_id})
+                except Exception as e:
+                    # The branch is already durable. A journal failure must not hide its receipt.
+                    log.warning("wall-clock continuation key=%s failed: %s", key, e)
+            files = "".join(f"<li><code>{html.escape(p)}</code></li>" for p in saved["files"])
+            self._post_ticket_note(key, (
+                "<p><b>Wall-clock salvage: unreviewed WIP</b> saved on branch "
+                f"<code>{html.escape(saved['branch'])}</code>. No MR opened or updated; not reviewed.</p>"
+                f"<ul>{files}</ul><p>" + ("One automatic continuation queued: verify then finish, commit early."
+                if queued else "No automatic continuation queued. Owner action required (retry disabled, "
+                                  "budget already used, or durable scheduling unavailable).") + "</p>"), run_id)
+            if not queued:
+                self._alert_ops(f"wall-clock worker {key}: WIP {saved['branch']}; owner action required; "
+                                "no further automatic retry", subject=f"worker:{key}")
+            return True
+        except Exception as e:
+            log.warning("wall-clock salvage key=%s run_id=%s failed: %s", key, run_id, e)
+            try:
+                self._alert_ops(f"wall-clock salvage FAILED ({key}): {e}; owner action required",
+                                subject=f"worker:{key}")
+            except Exception as alert_error:
+                log.warning("wall-clock salvage alert key=%s failed: %s", key, alert_error)
+            return False
+
     # ---- turn-cap WIP save: commit and push an eph/*-wip branch (NO MR) before teardown ----
     def _save_wip(self, key, run_id):
         """Push a turn-capped worker's uncommitted/unpushed work to an eph/*-wip branch (worktree.save_wip),
@@ -3720,6 +3757,7 @@ class CCAdapter(Adapter):
         publish_completed = False                       # A failed push must also get commit recovery
         last_env = None                                 # A parse miss/forced close is not clean completion
         capped_published = False                         # turn-capped but a clean commit was MR-published
+        continuation = None                             # broker-owned salvage seed, never ticket instructions
         inbox_posture = None                             # this account's runtime posture text, if an inbox route
         inbox_account = None                             # The account the inbox gate resolved (zulip: from the bot map)
         chat_zc = brief.get("zulip") if isinstance(brief, dict) else None   # Zulip reply target, if a chat
@@ -4205,6 +4243,10 @@ class CCAdapter(Adapter):
                 attempted = True                          # Past repo authorization; environment gaps go in brief
                 publish = {**pub, "code_repo_path": target_repo,
                            "mr_target_ref": resolve_default_branch(target_repo, pub["mr_target_ref"])}
+                if getattr(route, "capability", "") == "code" and self.coalescer is not None:
+                    continuation = self.coalescer.code_continuation(key)
+                    if continuation and continuation["repo"] != target_repo:
+                        raise ValueError("wall-clock continuation repo changed; owner must reconcile the saved WIP")
                 # A bare `base: <branch>` line cuts the worktree from origin/<branch> (not the default
                 # branch) and makes that branch the MR target. Invalid or missing on the remote -> refuse, never
                 # fall back to the default branch. The default branch is still refreshed (also_fetch) so the
@@ -4230,6 +4272,13 @@ class CCAdapter(Adapter):
                         self._refuse_continue_mr(key, run_id, refusal)
                         return
                     publish["continue_branch"] = continue_branch
+                if continuation:
+                    # The salvage branch is only the cut, NEVER the MR target. Retain the original
+                    # target/continue-MR contract so the final reviewed diff includes the saved WIP.
+                    publish["mr_target_ref"] = continuation["target"]
+                    publish.pop("continue_branch", None)
+                    if continuation.get("continue_branch"):
+                        publish["continue_branch"] = continuation["continue_branch"]
                 repo_lock = self._repo_lock(target_repo)
                 if getattr(route, "repo_lock_scope", "phases") == "run":
                     self._acquire_wait(key, repo_lock, "repo_lock")
@@ -4238,11 +4287,14 @@ class CCAdapter(Adapter):
                     with self._repo_operation(key, repo_lock, repo_lock_held):
                         worktree = self.worktree_mgr.make(
                             key, base_repo=target_repo, worktrees_root=pub["worktree_base"],
-                            publish_ref=continue_branch or publish["mr_target_ref"],   # cut FROM the MR branch / target
+                            publish_ref=(continuation["branch"] if continuation else
+                                         continue_branch or publish["mr_target_ref"]),
                             suppress_hooks=True,
-                            **({"expect_sha": mr_iteration.get("head_sha")} if mr_iteration is not None else {}),
+                            **({"expect_sha": continuation["sha"]} if continuation else
+                               {"expect_sha": mr_iteration.get("head_sha")} if mr_iteration is not None else {}),
                             git_identity=routing.worker_git_identity(route),
-                            **({"also_fetch": (default_branch,)} if base_branch else {}))
+                            **({"also_fetch": (publish["mr_target_ref"], default_branch)}
+                               if continuation else {"also_fetch": (default_branch,)} if base_branch else {}))
                 except subprocess.CalledProcessError as e:
                     why = (e.stderr or '').strip()[:200] or e
                     if continue_branch:
@@ -4475,6 +4527,13 @@ class CCAdapter(Adapter):
                 # + the broker-prefetched thread file, written to a per-worker dir OUTSIDE any repo
                 # (worker.thread_dir), replaces 's live zbus lookback.
                 brief = self._write_thread_file(key, worker, chat_zc, brief, run_id)
+            if continuation:
+                brief = {**brief, "continuation": {
+                    "notice": "Unreviewed WIP from a killed run, verify then finish, commit early. "
+                              "Do not assume the saved work is correct or tested. All normal review gates apply.",
+                    "branch": continuation["branch"], "sha": continuation["sha"],
+                    "previous_run": continuation["run_id"]}}
+                worker.code_continuation = True
             worker.seed_brief = brief                    # re-sent (merged with the delta) if a forward runs fresh
             first_prompt = json.dumps(brief)             # value-free: the collapsed (+ enriched) brief seeds turn 1
             # coalescer already advertised state=open_running for the seed turn at _would_spawn().
@@ -4562,7 +4621,8 @@ class CCAdapter(Adapter):
                     elif publish.get("code_repo_path") and mr_iteration is not None:
                         with self._repo_operation(key, repo_lock, repo_lock_held):
                             branch = self.worktree_mgr.publish_iteration(key, mr_iteration["source_branch"],
-                                                                        mr_target_ref=publish["mr_target_ref"])
+                                mr_target_ref=publish["mr_target_ref"],
+                                **({"include_inherited": True} if continuation else {}))
                             publish_completed = bool(branch)
                         if not branch:
                             self._save_patch(key, run_id)
@@ -4589,7 +4649,8 @@ class CCAdapter(Adapter):
                         with self._repo_operation(key, repo_lock, repo_lock_held):
                             branch = self.worktree_mgr.publish_mr(
                                 key, branch_prefix=publish.get("branch_prefix", "eph/code-change"),
-                                mr_target_ref=publish["mr_target_ref"], continue_branch=publish["continue_branch"])
+                                mr_target_ref=publish["mr_target_ref"], continue_branch=publish["continue_branch"],
+                                **({"include_inherited": True} if continuation else {}))
                             publish_completed = bool(branch)
                         if not branch:   # no commit -> keep any uncommitted edits as a patch file
                             self._save_patch(key, run_id)
@@ -4624,7 +4685,8 @@ class CCAdapter(Adapter):
                         with self._repo_operation(key, repo_lock, repo_lock_held):
                             branch = self.worktree_mgr.publish_mr(
                                 key, branch_prefix=publish.get("branch_prefix", "eph/code-change"),
-                                mr_target_ref=publish["mr_target_ref"])
+                                mr_target_ref=publish["mr_target_ref"],
+                                **({"include_inherited": True} if continuation else {}))
                             publish_completed = bool(branch)
                         if not branch:   # No commit -> keep any uncommitted edits as a patch file
                             self._save_patch(key, run_id)
@@ -4698,6 +4760,15 @@ class CCAdapter(Adapter):
                 self._note_spawn_failure(key, run_id, mr_review, e)
             self._chat_notice(chat_zc, CHAT_LIMIT_REPLY, run_id)   # A dead chat worker tells its sender
         finally:
+            if (worktree and worker is not None and (worker.hard_killed or worker.had_hard_kill)
+                    and getattr(route, "capability", "") == "code" and (publish or {}).get("code_repo_path")
+                    and _env_flag("WORKER_AUTO_SALVAGE_ON_WALL_CLOCK", "0")):
+                # Keep a local patch even if the credentialed salvage push fails. The shared git
+                # lock is held only for snapshot/publication; no MR or reviewer events are emitted.
+                publish_ran = True                       # Do not overwrite this patch after moving HEAD
+                self._save_patch(key, run_id)
+                with self._repo_operation(key, repo_lock, repo_lock_held, cancellable=False):
+                    publish_completed = self._salvage_wall_clock(key, run_id, publish)
             # A turn-capped code/general worker's edits would die with the worktree below; save
             # them to an eph/*-wip branch FIRST (inside the run, before run_registry.close). Never raises.
             if (worktree and worker is not None and worker.turn_capped and not capped_published
@@ -4821,6 +4892,9 @@ class CCAdapter(Adapter):
         try:
             if not resume:
                 self._begin_worker_turn(worker.key)
+                if getattr(worker, "code_continuation", False) and self.coalescer is not None:
+                    self.coalescer.code_continuation(worker.key, consume=True)
+                    worker.code_continuation = False
             return self._turn_with_envelope(worker, route, system_prompt, prompt_text, resume, run_id)
         finally:
             if self._sem is not None:
@@ -4852,6 +4926,11 @@ class CCAdapter(Adapter):
         failure = self._inbox_failure(worker, route, run_id)
         if failure is not None:
             return failure
+        if (getattr(worker, "hard_killed", False) and getattr(route, "capability", "") == "code"
+                and _env_flag("WORKER_AUTO_SALVAGE_ON_WALL_CLOCK", "0")):
+            # Do not spend a warm envelope-only turn mutating a tree we are about to snapshot.
+            worker.done = True
+            return None
         if result is not None:
             return result
         # A turn killed by teardown() is a parse miss, but NEVER re-prompt it: the re-prompt
@@ -5360,7 +5439,7 @@ class CCAdapter(Adapter):
                       "(silent-127 risk, memory broken) - check scrub_worker_env PATH prepend", worker.key)
             self._alert_ops(f"worker {worker.key}: mcp-ro.sh granted but unresolvable on worker PATH "
                             f"(silent-127 / memory-broken tripwire)", subject=f"worker:{worker.key}")
-        wall_clock_s = self.wall_clock_by_capability.get(capability, self.wall_clock_s)   # per-capability
+        wall_clock_s = self.route_wall_clock(route, capability)
         # The RESOLVED backend for this turn (native/cloud unchanged; a kind:"local" vLLM rung is
         # measurably slower, so it gets LOCAL_WALL_CLOCK_MULT x the per-capability allotment). Checked on
         # `_backend` (the name actually dispatching this turn), never the row's unresolved default.
@@ -5524,6 +5603,11 @@ class CCAdapter(Adapter):
             except Exception:
                 pass                                     # malformed output -> leave session_id unchanged
         return self._inbox_failure(worker, route, worker.run_id) or result
+
+    def route_wall_clock(self, route, capability):
+        """Per-route policy wins over the capability/global default, for every harness."""
+        value = getattr(route, "wall_clock_s", None)
+        return value if value is not None else self.wall_clock_by_capability.get(capability, self.wall_clock_s)
 
     # ---- primitive: forward (enqueue a warm --resume turn onto the worker's command loop) ----
     # The LivenessDriver calls this at a turn boundary with the COLLAPSED buffered forwards

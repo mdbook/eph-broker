@@ -29282,6 +29282,248 @@ def test_mail_shares_inbox_runtime_policy():
     ok("mail uses the same live inbox policy settings while preserving its no-mailbox restriction")
 
 
+def test_wall_clock_salvage_snapshot_paths_and_index():
+    import worktree as W
+    key = "vikunja:task:9470"
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        bare, wm, path = _g18_origin_and_worktree(d, key)
+        git = lambda *args: subprocess.run(["git", "-C", path, *args], check=True,
+                                           capture_output=True, text=True).stdout
+        with patch.object(W, "_gitlab_push_url", return_value=bare), \
+                patch.dict(os.environ, {"WORKER_SALVAGE_EXCLUDE_GLOBS": "scratch/**,notes/**"}):
+            assert wm.salvage(key) is None
+            pathlib.Path(path, "scratch").mkdir()
+            pathlib.Path(path, "scratch", "tracked.py").write_text("old\n")
+            git("add", "scratch/tracked.py")
+            git("-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "checkpoint")
+            pathlib.Path(path, "scratch", "tracked.py").write_text("tracked edit\n")
+            pathlib.Path(path, "scratch", "untracked.py").write_text("scratch\n")
+            pathlib.Path(path, "scratch", "staged.py").write_text("scratch\n")
+            git("add", "scratch/staged.py")
+            pathlib.Path(path, ".gitignore").write_text("ignored.py\n")
+            pathlib.Path(path, "ignored.py").write_text("deliberately staged source\n")
+            git("add", "-f", "ignored.py")
+            pathlib.Path(path, "new file.py").write_text("new source\n")
+            pathlib.Path(path, "f.txt").unlink()
+            index_before = git("diff", "--cached", "--name-only")
+            saved = wm.salvage(key)
+            assert saved and set(saved["files"]) == {
+                ".gitignore", "ignored.py", "f.txt", "new file.py", "scratch/tracked.py"}, saved
+            show = lambda spec: git("show", spec)
+            assert show("HEAD:new file.py") == "new source\n"
+            assert show("HEAD:ignored.py") == "deliberately staged source\n"
+            assert show("HEAD:scratch/tracked.py") == "tracked edit\n"
+            assert show("HEAD:CLAUDE.md") == "charter\n"
+            names = git("ls-tree", "-r", "--name-only", "HEAD").splitlines()
+            assert "f.txt" not in names and "scratch/staged.py" not in names and \
+                "scratch/untracked.py" not in names and not any(p.startswith(".eph/") for p in names)
+            # The worker's original index was not consumed or rewritten by the broker snapshot.
+            assert "scratch/staged.py" in index_before and "scratch/staged.py" in git("ls-files", "--cached")
+            assert saved["sha"] == git("rev-parse", "HEAD").strip()
+        wm.remove(key)
+    ok("wall-clock salvage includes source additions, tracked edits/deletions and checkpoints; excludes scratch/charters")
+
+
+def test_wall_clock_salvage_file_to_directory_respects_exclusions():
+    import worktree as W
+    key = "vikunja:task:9474"
+    for in_head in (False, True):
+        for staged in (False, True):
+            for include_source in (False, True):
+                with tempfile.TemporaryDirectory(dir=ROOT) as d:
+                    bare, wm, path = _g18_origin_and_worktree(d, key)
+                    git = lambda *args: subprocess.run(["git", "-C", path, *args], check=True,
+                                                       capture_output=True, text=True).stdout
+                    name = "f.txt" if in_head else "new.txt"
+                    replacement = pathlib.Path(path, name)
+                    if not in_head:
+                        replacement.write_text("staged addition\n")
+                        git("add", "--", name)
+                    replacement.unlink()
+                    replacement.mkdir()
+                    (replacement / "scratch").mkdir()
+                    (replacement / "scratch" / "notes.txt").write_text("excluded scratch\n")
+                    (replacement / "omit.txt").write_text("excluded by filename\n")
+                    if include_source:
+                        (replacement / "source.py").write_text("new source\n")
+                    if staged:
+                        git("add", "-A", "--", name)
+                    index_path = pathlib.Path(git("rev-parse", "--git-path", "index").strip())
+                    index_before = index_path.read_bytes()
+                    with patch.object(W, "_gitlab_push_url", return_value=bare), \
+                            patch.dict(os.environ, {"WORKER_SALVAGE_EXCLUDE_GLOBS": "*/scratch/**,*/omit.txt"}):
+                        saved = wm.salvage(key)
+                    source = {name + "/source.py"} if include_source else set()
+                    expected = {"CLAUDE.md"} | (set() if in_head else {"f.txt"}) | source
+                    changes = ({"f.txt"} if in_head else set()) | source
+                    assert set(git("ls-tree", "-r", "--name-only", "HEAD").splitlines()) == expected
+                    assert bool(saved) == bool(changes), saved
+                    assert git("show", "HEAD:CLAUDE.md") == "charter\n"
+                    if include_source:
+                        assert git("show", "HEAD:" + name + "/source.py") == "new source\n"
+                    assert index_path.read_bytes() == index_before, "salvage must not rewrite the worker index"
+                    if saved:
+                        assert set(saved["files"]) == changes, saved
+                        published = subprocess.run(
+                            ["git", "-C", bare, "ls-tree", "-r", "--name-only", saved["branch"]],
+                            check=True, capture_output=True, text=True).stdout
+                        assert set(published.splitlines()) == expected, "exclusions must hold on published snapshot"
+                    wm.remove(key)
+    ok("file-to-directory salvage preserves deletions/allowed children, excludes new descendants and keeps worker index")
+
+
+def test_wall_clock_continuation_retirement_and_restart():
+    from broker_state import BrokerState
+    for method in ("settle_self", "finish_close", "force_pop"):
+        with tempfile.TemporaryDirectory(dir=ROOT) as d:
+            path = os.path.join(d, "state.sqlite3")
+            state = BrokerState(path)
+            c = Coalescer(state_store=state)
+            key = "vikunja:task:9471"
+            evt = {"source": "vikunja", "task_id": 9471, "event_name": "task.updated", "assignees": ["code"]}
+            c._would_spawn(key, [evt], time.time())
+            c.active_intents[key] = {"events": [evt], "row": "code"}
+            context = {"repo": "/srv/git/example", "branch": "eph/example-wip", "sha": "a" * 40,
+                       "target": "main", "run_id": "killed"}
+            assert c.queue_code_continuation(key, context)
+            assert not c.queue_code_continuation(key, context), "one reservation per ticket"
+            assert key not in c.pending, "never spawn before worktree removal/retirement"
+            getattr(c, method)(key)
+            assert key in c.pending and key not in c.live and key not in c.completed
+            state.put("draining", True)
+            c.pending[key]["spawn_at"] = 0
+            c.tick()
+            assert key in c.pending and key not in c.live, "a continuation cannot bypass drain"
+            state.put("draining", False)
+            state.close()
+            state = BrokerState(path)
+            try:
+                restored = Coalescer(state_store=state)
+                assert key in restored.pending and not restored.recovery
+                assert restored.code_continuation(key)["branch"] == context["branch"]
+                restored.code_continuation(key, consume=True)
+                assert restored.code_continuation(key) is None
+                restored._would_spawn(key, [evt], time.time())
+                restored.active_intents[key] = {"events": [evt]}
+                assert not restored.queue_code_continuation(key, context), "restart must not reset budget"
+                restored.pending.clear()
+                restored.settle_self(key)
+                assert key in restored.completed and key not in restored.pending
+            finally:
+                state.close()
+    assert not Coalescer().queue_code_continuation("vikunja:task:9471", {})
+    ok("single durable continuation transfers at all retirement boundaries and survives restart without looping")
+
+
+def test_wall_clock_salvage_continues_from_saved_sha_then_finishes_or_escalates():
+    import routing as RT
+    import worktree as W
+    from broker_state import BrokerState
+    for kill_again, verify_only in ((False, False), (True, False), (False, True)):
+        with tempfile.TemporaryDirectory(dir=ROOT) as d:
+            key = "vikunja:task:9472"
+            bare, wm, path = _g18_origin_and_worktree(d, key)
+            repo = wm.base_repo
+            target = subprocess.run(["git", "-C", repo, "symbolic-ref", "--short", "HEAD"],
+                                    check=True, capture_output=True, text=True).stdout.strip()
+            route = Route(domain="code", repo=repo, prompt_class="change-proposer", agent="code",
+                          capability="code", read_only=False, model="test", test_runner="pytest",
+                          publish={"code_repo_path": repo, "mr_target_ref": target, "worktree_base": os.path.join(d, "wt")})
+            comments, alerts, prompts, cuts, publications = [], [], [], [], []
+            a = CCAdapter(router=type("Router", (), {"route": lambda s, k, b: route})(), worktree_mgr=wm,
+                          prompt_loader=type("Loader", (), {"load": lambda s, *args: "SYS"})(),
+                          envelope_parser=EnvelopeParser(), ticket_fetcher=lambda tid: f"repo:{repo}\n",
+                          comment_poster=lambda tid, text, rid: comments.append(text), label_poster=lambda tid: None,
+                          alert_ops=lambda text, **kwargs: alerts.append(text))
+            state = BrokerState(os.path.join(d, "state.sqlite3"))
+            c = Coalescer(adapter=a, state_store=state)
+            evt = {"source": "vikunja", "task_id": 9472, "event_name": "task.updated"}
+            real_make, real_publish = wm.make, wm.publish_mr
+            def make(k, **kwargs):
+                cuts.append(kwargs)
+                return path if len(cuts) == 1 else real_make(k, **kwargs)
+            def publish(k, **kwargs):
+                publications.append(kwargs)
+                return real_publish(k, **kwargs)
+            def turn(worker, route, system, prompt, resume, **kwargs):
+                prompts.append(json.loads(prompt))
+                p = pathlib.Path(worker.worktree)
+                if len(prompts) == 1:
+                    (p / "new.py").write_text("first unfinished step\n")
+                    worker.hard_killed = worker.had_hard_kill = True
+                else:
+                    assert (p / "new.py").read_text() == "first unfinished step\n"
+                    if not verify_only:
+                        (p / "new.py").write_text("finished second step\n")
+                    if kill_again:
+                        worker.hard_killed = worker.had_hard_kill = True
+                    else:
+                        if not verify_only:
+                            subprocess.run(["git", "-C", str(p), "add", "new.py"], check=True)
+                            subprocess.run(["git", "-C", str(p), "-c", "user.name=test", "-c",
+                                            "user.email=test@example.com", "commit", "-qm", "finish"], check=True)
+                        worker.done = True
+                return {"status": "done", "summary": "step", "wake": []}
+            with patch.dict(os.environ, {"WORKER_AUTO_SALVAGE_ON_WALL_CLOCK": "1",
+                                         "WORKER_AUTO_CONTINUE_ON_WALL_CLOCK": "1"}), \
+                    patch.object(RT, "parse_repo_token", return_value=repo), \
+                    patch.object(RT, "resolve_target_repo", return_value=repo), \
+                    patch.object(RT, "code_repo_allowed", return_value=True), \
+                    patch.object(cc, "resolve_default_branch", return_value=target), \
+                    patch.object(W, "_gitlab_push_url", return_value=bare), \
+                    patch.object(wm, "make", side_effect=make), patch.object(wm, "publish_mr", side_effect=publish), \
+                    patch.object(cc, "open_mr", return_value=None) as mr, patch.object(a, "_one_turn", side_effect=turn):
+                try:
+                    for run in range(2):
+                        c.pending.pop(key, None)
+                        c.live[key] = {"events": [evt], "fwd_buffer": [], "forwards": 0, "state": "open_running"}
+                        c.active_intents[key] = {"events": [evt], "row": "code"}
+                        a._run_worker(key, {"task_id": 9472}, f"run-{run}")
+                        if run == 0:
+                            assert key in c.pending and key not in c.completed and not publications and not mr.called
+                            saved = c.code_continuation(key)
+                            assert saved and "new.py" in saved["files"]
+                    assert len(prompts) == 2, "kill must not spend a warm JSON re-prompt"
+                    assert cuts[1]["publish_ref"] == saved["branch"] and cuts[1]["expect_sha"] == saved["sha"]
+                    assert "Unreviewed WIP" in prompts[1]["continuation"]["notice"]
+                    assert key not in c.pending and key in c.completed
+                    assert any("new.py" in text and "unreviewed WIP" in text for text in comments)
+                    if kill_again:
+                        assert not publications and not mr.called
+                        assert any("owner action required" in text for text in alerts)
+                    else:
+                        assert len(publications) == 1 and publications[0]["mr_target_ref"] == target
+                        assert publications[0]["include_inherited"]
+                        assert mr.call_args.args[2] == target, "never target the WIP branch"
+                finally:
+                    state.close()
+    ok("killed code snapshots before removal, starts exactly once at saved SHA, then normal MR or owner escalation")
+
+
+def test_wall_clock_salvage_failure_is_safe_and_no_retry():
+    a = CCAdapter(router=None, worktree_mgr=type("WM", (), {"salvage": lambda s, k: (_ for _ in ()).throw(
+        RuntimeError("push unavailable"))})(), prompt_loader=None, envelope_parser=None,
+                  alert_ops=lambda *a, **kw: None)
+    c = Coalescer(adapter=a)
+    with patch.object(c, "queue_code_continuation") as queue_retry:
+        assert not a._salvage_wall_clock("vikunja:task:9473", "killed", {"code_repo_path": "/srv/git/example"})
+        queue_retry.assert_not_called()
+    saved = {"branch": "eph/example-wip", "sha": "a" * 40, "files": ["new.py"]}
+    a.worktree_mgr.salvage = lambda key: saved
+    notes = []
+    a._post_ticket_note = lambda key, body, run_id: notes.append(body)
+    with patch.dict(os.environ, {"WORKER_AUTO_CONTINUE_ON_WALL_CLOCK": "1"}), \
+            patch.object(c, "queue_code_continuation", side_effect=RuntimeError("journal unavailable")):
+        assert a._salvage_wall_clock("vikunja:task:9473", "killed", {
+            "code_repo_path": "/srv/git/example", "mr_target_ref": "main"})
+        assert len(notes) == 1 and saved["branch"] in notes[0] and "new.py" in notes[0]
+    # Even a failed alert must not interrupt worktree teardown.
+    a.worktree_mgr.salvage = lambda key: (_ for _ in ()).throw(RuntimeError("push unavailable"))
+    a._alert_ops = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("alert unavailable"))
+    assert not a._salvage_wall_clock("vikunja:task:9473", "killed", {})
+    ok("salvage/alert failure never queues a retry or interrupts cleanup")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     print(f"running {len(tests)} broker self-tests...")

@@ -32,6 +32,7 @@ which of the built-in capabilities it gets. Start from `config/routes.example.js
 | `agent` | no | Name passed to `FLEET_MODEL_SH` to pick a model. Defaults to the built-in worker of the same capability (`CODE_AGENT`, `GENERAL_AGENT`, or the ansible row's agent for `read`). |
 | `model` | no | Pin a model for this row (for example `opus`), skipping `FLEET_MODEL_SH`. |
 | `repo_lock_scope` | no | `phases` (default): same-repo workers edit/test in parallel, while cut, publish and removal are mutually exclusive. `run`: serialize the whole worker run for that repo. Applies to publishing routes. |
+| `wall_clock_s` | no | Positive, finite seconds for this row; absent or `null` inherits the capability/global constraint. Applies to all harnesses. |
 
 Keys starting with `_` are ignored, so you can leave `_comment` notes.
 

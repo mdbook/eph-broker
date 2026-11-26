@@ -898,6 +898,40 @@ class Coalescer:
         _append_raw(key, evt)
         return True
 
+    def queue_code_continuation(self, key, context):
+        """Reserve the ticket's single automatic wall-clock retry before removing its worktree.
+
+        Requires the journal: losing the retry budget on restart would create a kill/retry loop.
+        The branch context is broker-owned state, never a field accepted from a webhook.
+        Retirement transfers the original routing events to pending atomically with active removal.
+        An ambiguous crash still uses the existing owner reconciliation gate.
+        """
+        if not self.state_store:
+            return False
+        with self.lock, self.state_store.atomic():
+            used = self.state_store.get("code_continuations", {})
+            w = self.live.get(key)
+            if key in used or not w or key not in self.active_intents:
+                return False
+            self.state_store.put("code_continuations", {**used, key: {**context, "consumed": False}})
+            w["code_continuation"] = True
+            self.active_intents[key]["code_continuation"] = True
+            self._checkpoint()
+        return True
+
+    def code_continuation(self, key, consume=False):
+        """Return the reserved continuation until first-turn admission, then retain only its budget."""
+        if not self.state_store:
+            return None
+        with self.lock, self.state_store.atomic():
+            used = self.state_store.get("code_continuations", {})
+            context = used.get(key)
+            if not context or context.get("consumed"):
+                return None
+            if consume:
+                self.state_store.put("code_continuations", {**used, key: {"consumed": True}})
+            return context
+
     def finish_close(self, key):
         """After the lock-free teardown, set closed and pop UNDER LOCK. Returns the popped record (its
         leftover fwd_buffer, if any, lets the caller re-arm). Under lock.
@@ -919,7 +953,7 @@ class Coalescer:
             # the whole account and every new-mail wake is a LEGIT fresh sweep, so a gmail subject must
             # RE-ARM a spawn after its worker completes. Runaway is bounded elsewhere (a live worker takes
             # the FORWARD branch; per-subject single-flight; MAX_SPAWNS_PER_HOUR). So don't mark gmail keys.
-            if not key.startswith(_REARM_PREFIXES):   # also zulip:<bot>:<sender> (every DM is fresh)
+            if not key.startswith(_REARM_PREFIXES) and not popped.get("code_continuation"):
                 self._mark_completed(key)
             else:
                 self._checkpoint()
@@ -995,7 +1029,7 @@ class Coalescer:
             self.active_intents.pop(key, None)
             self._transfer_leftovers(key, popped,
                                      rearm=not mark_completed or key.startswith(_REARM_PREFIXES))
-            if mark_completed and not key.startswith(_REARM_PREFIXES):   # also zulip
+            if mark_completed and not key.startswith(_REARM_PREFIXES) and not popped.get("code_continuation"):
                 self._mark_completed(key)
             else:
                 self._checkpoint()
@@ -1014,7 +1048,11 @@ class Coalescer:
         Legacy callers still perform their existing rearm; durable callers receive a
         receipt so they only alert, never enqueue the same leftovers twice.
         """
-        if self.state_store:
+        if popped.get("code_continuation"):
+            # Do not replay undelivered forward-only comments as spawn signals. Original seed events
+            # preserve tracker/issue identity and the row stamp; normal admission rechecks authorization.
+            popped["rearmed"] = self.rearm_pending(key, popped["events"], row=popped.get("row"))
+        elif self.state_store:
             popped["rearmed"] = (self.rearm_pending(key, popped["fwd_buffer"], row=popped.get("row"))
                                  if rearm else 0)
             if not rearm and popped["fwd_buffer"]:

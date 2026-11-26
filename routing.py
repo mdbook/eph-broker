@@ -7,7 +7,7 @@ ansible`, NOT hard-coded, so a fleet-mode change moves the worker's model too.
 
 Value-free: no secrets. ZBUS_ENV / repo path are references, not credentials.
 """
-import fnmatch, os, re, html, json, subprocess, logging
+import fnmatch, os, re, html, json, subprocess, logging, math
 from dataclasses import dataclass, field, replace
 from typing import Optional
 
@@ -1012,12 +1012,17 @@ class Route:
     # path is in ROUTE_WORKDIR_ALLOWLIST, and cc._run_worker re-checks both at spawn. Empty (every built-in row and
     # every repo row) = the worktree cut, unchanged.
     workdir: str = ""
+    # Operator-owned per-row cap; None inherits constraints.wall_clock_by_capability/global.
+    wall_clock_s: Optional[float] = None
 
     @property
     def row_key(self):
         return self.row_id or self.domain
 
     def __post_init__(self):
+        if self.wall_clock_s is not None and (type(self.wall_clock_s) not in (int, float)
+                or not math.isfinite(self.wall_clock_s) or self.wall_clock_s <= 0):
+            raise ValueError(f"Route {self.row_key!r}: wall_clock_s must be positive and finite or null")
         if type(self.pin) is not bool:
             raise ValueError(f"Route {self.row_key!r}: pin must be a boolean")
         for name in ("cc_disable_thinking_local", "cc_fail_fast", "mail_event_only"):
@@ -1084,7 +1089,7 @@ class Route:
                      self.pin or bool(self.model_pin), self.row_id, self.model_pin,
                      self.from_config, self.site_capability, self.browser_mcp_config, self.repo_lock_scope, self.pin,
                      self.cc_disable_thinking_local, self.cc_fail_fast, self.inbox_input_token_limit,
-                     self.repo_model_pin, self.mail_event_only, self.workdir)
+                     self.repo_model_pin, self.mail_event_only, self.workdir, self.wall_clock_s)
 
 
 # Per-ticket model selection via a `model:<name>` label. The name is either a native
@@ -2413,7 +2418,8 @@ CONFIG_ROUTE_CAPABILITIES = {"read": _ANSIBLE_ROW, "code": _CODE_ROW, "general":
 # prompt domains cc.py/app.py branch on by name (tfa launch, inbox account gate, infra grants): a config row
 # reusing one would inherit that special handling, so they are refused.
 CONFIG_ROUTE_RESERVED_DOMAINS = frozenset({"tfa", "inbox", "infra"})
-_CONFIG_ROUTE_KEYS = {"id", "match", "prompt", "capability", "repo", "workdir", "agent", "model", "repo_lock_scope"}
+_CONFIG_ROUTE_KEYS = {"id", "match", "prompt", "capability", "repo", "workdir", "agent", "model", "repo_lock_scope",
+                      "wall_clock_s"}
 
 # Every capability name cc.capability_tool_grant knows. A site capability may not reuse one.
 BUILTIN_CAPABILITIES = frozenset({"read", "write", "code", "general", "inbox", "inbox-chat", "mr-review",
@@ -2655,14 +2661,18 @@ def load_config_routes(path=None, prompts_dir=None, approved_path=None, site_cap
         fields = dict(domain=domain, repo=repo, prompt_class=prompt_class, agent=row.get("agent", tmpl.agent),
                       capability=cap, row_id=rid, model_pin=row.get("model", ""), backend=tmpl.backend, pin=tmpl.pin,
                       backend_from_mode=True, from_config=True, site_capability=site_cap,
-                      repo_lock_scope=row.get("repo_lock_scope", tmpl.repo_lock_scope))
+                      repo_lock_scope=row.get("repo_lock_scope", tmpl.repo_lock_scope),
+                      wall_clock_s=row.get("wall_clock_s"))
         if cap != "read":
             fields.update(read_only=False, env=dict(tmpl.env), test_runner=tmpl.test_runner,
                           setting_sources=tmpl.setting_sources, mcp_config_path=tmpl.mcp_config_path,
                           publish={**tmpl.publish, "code_repo_path": repo, "branch_prefix": f"eph/{rid}"})
         if workdir is not None:
             fields.update(workdir=workdir, setting_sources="project")   # load the dir's own CLAUDE.md + .claude/
-        route = Route(**fields)
+        try:
+            route = Route(**fields)
+        except ValueError as e:
+            raise RoutesConfigError(f"{where}: {e}") from e
         if label and assignee:
             entries.append(("vikunja:task", (assignee, label), route, _assignee_label_signal_predicates))
         elif assignee:

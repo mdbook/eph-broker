@@ -56,6 +56,29 @@ class Site:
         self.tmp.cleanup()
 
 
+def test_custom_route_wall_clock_cap():
+    for value in (None, 5400):
+        data = row()
+        data["wall_clock_s"] = value
+        site = Site([data])
+        try:
+            route = site.load()[0][2]
+            assert route.wall_clock_s == value and route.with_model().wall_clock_s == value
+        finally:
+            site.close()
+    for value in (True, 0, -1, "5400", float("inf")):
+        site = Site([row(wall_clock_s=value)])
+        try:
+            try:
+                site.load()
+                assert False, "invalid per-route wall clock accepted"
+            except routing.RoutesConfigError as e:
+                assert "wall_clock_s" in str(e)
+        finally:
+            site.close()
+    ok("custom label routes accept positive wall clocks, inherit null, and reject invalid caps")
+
+
 def row(**kw):
     base = {"id": "docs", "match": {"label": "eph:docs"}, "prompt": "docs/agent", "capability": "read",
             "repo": REPO}

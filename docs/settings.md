@@ -56,6 +56,14 @@ Removing an entry restores its startup value. Bootstrap paths, ports and identit
 ## Batching and limits
 
 Turn caps and time limits per capability are in `config/constraints.json`, not here.
+Per-route `wall_clock_s` overrides are also available in `routes.json` and routing overrides.
+See [wall-clock recovery](wall-clock-recovery.md) for cap precedence and recovery settings.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `WORKER_AUTO_SALVAGE_ON_WALL_CLOCK` | off | Snapshot killed `code` workers, including new source files, and push an unreviewed WIP branch before teardown. Never opens an MR. |
+| `WORKER_AUTO_CONTINUE_ON_WALL_CLOCK` | off | With auto-salvage and a durable journal, continue a ticket once from its saved SHA. A second kill alerts the owner instead. |
+| `WORKER_SALVAGE_EXCLUDE_GLOBS` | `scratch/**,.scratch/**,tmp/**,.env,.env.*,.*-env,.pii-store/**` | Comma-separated, case-sensitive repo-relative globs for new salvage paths, including staged additions. Tracked edits/deletions are preserved regardless of these globs. Empty includes all new paths except broker metadata and root charters. |
 
 ### Inbox run guardrails (Claude Code)
 

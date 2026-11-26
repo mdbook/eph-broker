@@ -80,6 +80,32 @@ class _Env:
                 os.environ[k] = v
 
 
+def test_wall_clock_per_row_override_and_inheritance():
+    with _Overrides() as (path, loader):
+        template = routing._CODE_ROW
+        adapter = cc.CCAdapter(router=None, worktree_mgr=None, prompt_loader=None, envelope_parser=None,
+                               wall_clock_s=100, wall_clock_by_capability={"code": 200})
+        save(path, {"rows": {template.row_key: {"wall_clock_s": 5400}}})
+        route = template.with_model()
+        assert route.wall_clock_s == 5400 and adapter.route_wall_clock(route, "code") == 5400
+        save(path, {"rows": {template.row_key: {"wall_clock_s": None}}})
+        inherited = template.with_model()
+        assert inherited.wall_clock_s is None and adapter.route_wall_clock(inherited, "code") == 200
+        assert adapter.route_wall_clock(inherited, "read") == 100
+        assert route.wall_clock_s == 5400, "already-running route retains launch policy"
+        worker = cc.Worker("vikunja:task:9474", "killed", "/unused")
+        worker.turn_wall_clock = route.wall_clock_s
+        adapter._workers[worker.key] = worker
+        assert adapter.turn_deadline_extra(worker.key) == 5300
+        for bad in (True, False, 0, -1, "5400", float("nan"), float("inf")):
+            try:
+                loader._validate({"rows": {template.row_key: {"wall_clock_s": bad}}})
+                assert False, "invalid wall clock must fail closed"
+            except ValueError:
+                pass
+    ok("per-row wall-clock overrides inherit constraints, preserve running caps and reject invalid values")
+
+
 def test_shipped_example_is_valid():
     with _Overrides() as (_, loader):
         example = os.path.join(ROOT, "config", "routing-overrides.example.json")

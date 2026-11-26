@@ -1053,7 +1053,7 @@ class CodexHarness:
         sandbox = codex_sandbox(capability)                                   # refuse BEFORE any launch
         backend = getattr(route, "backend", "") if backend_override is _NO_OVERRIDE else backend_override
         model, effort, model_src = codex_model(backend)
-        wall_clock_s = adapter.wall_clock_by_capability.get(capability, adapter.wall_clock_s)
+        wall_clock_s = adapter.route_wall_clock(route, capability)
         if wall_clock_override is not None:
             wall_clock_s = min(wall_clock_s, wall_clock_override)
         if not (worker.worktree and os.path.isdir(worker.worktree)):

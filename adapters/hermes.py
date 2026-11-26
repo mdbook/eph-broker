@@ -853,7 +853,7 @@ class HermesHarness:
         backend = getattr(route, "backend", "") if backend_override is _NO_OVERRIDE else backend_override
         provider, model, token, overrides = hermes_provider(backend)
         max_turns = adapter.max_turns_by_capability.get(capability, adapter.max_turns)
-        wall_clock_s = adapter.wall_clock_by_capability.get(capability, adapter.wall_clock_s)
+        wall_clock_s = adapter.route_wall_clock(route, capability)
         # Same local-backend widening and bounded-reprompt cap as cc.CCAdapter._one_turn: a kind:"local"
         # vLLM rung is measurably slower than hosted Claude, and the ONE re-prompt after a wall-clock
         # hard-kill must stay short (never a second full, possibly scaled, allotment).

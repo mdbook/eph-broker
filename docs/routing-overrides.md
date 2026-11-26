@@ -44,6 +44,10 @@ The file accepts four optional top-level keys:
   covers its exact row key and all `<group>/...` rows. Zero pauses new workers in that group; pending
   work stays queued and existing workers are not stopped.
 
+Rows also accept `wall_clock_s`: positive, finite seconds, or `null` to inherit capability/global
+constraints. For example, `{"rows":{"code":{"wall_clock_s":5400}}}` caps the code row at 90 minutes.
+This is operator policy, not a ticket-supplied grant. See [wall-clock recovery](wall-clock-recovery.md).
+
 Omitted row fields keep their environment-backed defaults. An empty string explicitly clears `backend`
 or `model_pin` (but is not a valid `adapter` or `repo_lock_scope`); removing the field restores its default. Removing the
 overrides file restores all environment defaults.

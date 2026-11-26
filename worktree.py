@@ -10,7 +10,7 @@ Code publication also refuses committed root-charter deletions before opening an
 
 Value-free: git plumbing only, no secrets.
 """
-import os, re, shutil, subprocess, logging, time, hashlib
+import os, re, shutil, subprocess, logging, time, hashlib, fnmatch, tempfile
 
 log = logging.getLogger("eph-broker.worktree")
 
@@ -644,7 +644,7 @@ class WorktreeManager:
                 raise RuntimeError(f"wiki publish rebase conflict key={key}: {rb.stderr.strip()}")
         raise RuntimeError(f"wiki publish key={key}: push still rejected after {retries} rebase-retries")
 
-    def publish_iteration(self, key, branch, *, mr_target_ref=None):
+    def publish_iteration(self, key, branch, *, mr_target_ref=None, include_inherited=False):
         """Fast-forward an EXISTING broker MR branch. Never create, overwrite, rebase or open an MR."""
         import routing
         refusal = routing.mr_iteration_refusal(branch)
@@ -653,7 +653,7 @@ class WorktreeManager:
         repo, path, cut_sha = self._checked(key)
         env = _wt_env(path)
         head = _git(path, "rev-parse", "HEAD", env=env)
-        if head == cut_sha:
+        if head == cut_sha and not include_inherited:
             return None
         push_url = _gitlab_push_url(path, "origin")
         cred = _wt_cred_args(repo)
@@ -674,7 +674,7 @@ class WorktreeManager:
         return branch
 
     def publish_mr(self, key, *, branch_prefix="eph/code-change", mr_target_ref="main", remote="origin",
-                   continue_branch=None):
+                   continue_branch=None, include_inherited=False):
         """Publish a code change-proposer's committed HEAD as a FEATURE BRANCH for an
         MR, NEVER a push to `mr_target_ref` (main). This is the human-gated code contract: the worker's diff
         lands on a fresh eph branch on the remote; opening the actual MR (GitLab API, token side) is
@@ -685,12 +685,15 @@ class WorktreeManager:
         forced: a branch that moved since the cut is rejected (non-fast-forward) and raises. The branch is
         re-checked against routing.continue_mr_refusal here too (only broker-created branches; never the target).
 
+        include_inherited is broker-only: a successful continuation may verify its inherited WIP without
+        needing another edit/commit. Its original target still receives the full diff for normal review.
+
         SECURITY INVARIANT: the ONLY ref this method ever pushes to is a fresh
         `<branch_prefix>/...` feature branch (or an eligible continue_branch). It must NEVER push to
         mr_target_ref, since that would auto-deploy unreviewed code. The assert below makes that invariant executable."""
         repo, path, cut_sha = self._checked(key)        # fail closed on a repointed .git
         env = _wt_env(path)                              # no global/system config in the worker worktree
-        if _git(path, "rev-parse", "HEAD", env=env) == cut_sha:
+        if _git(path, "rev-parse", "HEAD", env=env) == cut_sha and not include_inherited:
             log.info("publish_mr key=%s: worker made no commit -> no-op", key)
             return None
         head = _git(path, "rev-parse", "HEAD", env=env)
@@ -805,6 +808,56 @@ class WorktreeManager:
         return {"branch": branch, "sha": head,
                 "branch_url": f"{web}/-/tree/{urllib.parse.quote(branch, safe='')}",
                 "commit_url": f"{web}/-/commit/{head}"}
+
+    def salvage(self, key, remote="origin"):
+        """Snapshot killed code work, including new source files, on an unreviewed WIP branch.
+
+        Use a private index so partially staged work and stripped charters cannot leak into the
+        snapshot. Scratch globs apply only to new paths, never to edits/deletions of tracked code.
+        Reuse save_commits' create-only push, URL guard and offline bundle fallback. No MR effects.
+        """
+        repo, path, cut_sha = self._checked(key)
+        env = _wt_env(path)
+        env.update(self._git_identities.get(key, {}))
+
+        def names(*args):
+            out = subprocess.run(_wt_argv(path, *args), check=True, capture_output=True, text=True, env=env)
+            return set(filter(None, out.stdout.split("\0")))
+        tracked = names("ls-tree", "-r", "--name-only", "-z", "HEAD")
+        candidates = tracked | names("ls-files", "-z", "--cached", "--others", "--exclude-standard")
+        globs = [g.strip() for g in os.getenv("WORKER_SALVAGE_EXCLUDE_GLOBS",
+                                            "scratch/**,.scratch/**,tmp/**,.env,.env.*,.*-env,.pii-store/**"
+                                            ).split(",") if g.strip()]
+        paths = sorted(p for p in candidates if not (
+            "/" not in p and (p in ("CLAUDE.md", "AGENTS.md") or p.endswith(_CHARTER_SUFFIX)))
+            and not p.startswith(".eph/")
+            and (p in tracked or (os.path.lexists(os.path.join(path, p))
+                                 and not any(fnmatch.fnmatchcase(p, g) for g in globs))))
+        with tempfile.TemporaryDirectory(prefix="salvage-index-", dir=os.path.dirname(path)) as d:
+            env["GIT_INDEX_FILE"] = os.path.join(d, "index")
+            _git(path, "read-tree", "HEAD", env=env)
+            for start in range(0, len(paths), 100):
+                # -f preserves deliberately staged ignored additions, without sweeping up ignored
+                # untracked files (which ls-files --exclude-standard omitted).
+                _git(path, "--literal-pathspecs", "add", "-f", "-A", "--", *paths[start:start + 100], env=env)
+            # An enumerated file (in HEAD or the worker's index) may now be a directory, causing add
+            # to recurse. Enforce the allowlist on the snapshot, not just its input pathspecs; retain
+            # all HEAD paths so exclusions never discard tracked edits/deletions or stripped charters.
+            unexpected = sorted(names("ls-files", "-z") - tracked - set(paths))
+            for start in range(0, len(unexpected), 100):
+                _git(path, "update-index", "--force-remove", "--", *unexpected[start:start + 100], env=env)
+            staged = subprocess.run(_wt_argv(path, "diff", "--cached", "--quiet", *_NO_EXT_DIFF),
+                                    capture_output=True, env=env)
+            if staged.returncode not in (0, 1):
+                raise RuntimeError("salvage: cannot inspect snapshot index")
+            if staged.returncode == 1:
+                _git(path, *_wt_identity_args(env), "-c", "commit.gpgSign=false", "commit", "-q", "--no-verify",
+                     "-m", f"WIP: unreviewed wall-clock salvage ({key})", env=env)
+        env.pop("GIT_INDEX_FILE", None)
+        saved = self.save_commits(key, remote=remote)
+        if saved:
+            saved["files"] = sorted(names("diff", "--name-only", "-z", *_NO_EXT_DIFF, cut_sha, "HEAD"))
+        return saved
 
     def save_wip(self, key, remote="origin"):
         """A turn-capped code worker's work-in-progress must survive teardown. Commit any

@@ -823,36 +823,47 @@ class WorktreeManager:
         def names(*args):
             out = subprocess.run(_wt_argv(path, *args), check=True, capture_output=True, text=True, env=env)
             return set(filter(None, out.stdout.split("\0")))
-        tracked = names("ls-tree", "-r", "--name-only", "-z", "HEAD")
-        candidates = tracked | names("ls-files", "-z", "--cached", "--others", "--exclude-standard")
-        globs = [g.strip() for g in os.getenv("WORKER_SALVAGE_EXCLUDE_GLOBS",
-                                            "scratch/**,.scratch/**,tmp/**,.env,.env.*,.*-env,.pii-store/**"
-                                            ).split(",") if g.strip()]
-        paths = sorted(p for p in candidates if not (
-            "/" not in p and (p in ("CLAUDE.md", "AGENTS.md") or p.endswith(_CHARTER_SUFFIX)))
-            and not p.startswith(".eph/")
-            and (p in tracked or (os.path.lexists(os.path.join(path, p))
-                                 and not any(fnmatch.fnmatchcase(p, g) for g in globs))))
-        with tempfile.TemporaryDirectory(prefix="salvage-index-", dir=os.path.dirname(path)) as d:
-            env["GIT_INDEX_FILE"] = os.path.join(d, "index")
-            _git(path, "read-tree", "HEAD", env=env)
-            for start in range(0, len(paths), 100):
-                # -f preserves deliberately staged ignored additions, without sweeping up ignored
-                # untracked files (which ls-files --exclude-standard omitted).
-                _git(path, "--literal-pathspecs", "add", "-f", "-A", "--", *paths[start:start + 100], env=env)
-            # An enumerated file (in HEAD or the worker's index) may now be a directory, causing add
-            # to recurse. Enforce the allowlist on the snapshot, not just its input pathspecs; retain
-            # all HEAD paths so exclusions never discard tracked edits/deletions or stripped charters.
-            unexpected = sorted(names("ls-files", "-z") - tracked - set(paths))
-            for start in range(0, len(unexpected), 100):
-                _git(path, "update-index", "--force-remove", "--", *unexpected[start:start + 100], env=env)
-            staged = subprocess.run(_wt_argv(path, "diff", "--cached", "--quiet", *_NO_EXT_DIFF),
-                                    capture_output=True, env=env)
-            if staged.returncode not in (0, 1):
-                raise RuntimeError("salvage: cannot inspect snapshot index")
-            if staged.returncode == 1:
-                _git(path, *_wt_identity_args(env), "-c", "commit.gpgSign=false", "commit", "-q", "--no-verify",
-                     "-m", f"WIP: unreviewed wall-clock salvage ({key})", env=env)
+        try:
+            # Enumeration still reads the worker's index, which may be corrupt after a kill.
+            # Keep it under the same checkpoint recovery guard as snapshot creation.
+            tracked = names("ls-tree", "-r", "--name-only", "-z", "HEAD")
+            candidates = tracked | names("ls-files", "-z", "--cached", "--others", "--exclude-standard")
+            globs = [g.strip() for g in os.getenv("WORKER_SALVAGE_EXCLUDE_GLOBS",
+                                                "scratch/**,*/scratch/**,.scratch/**,*/.scratch/**,tmp/**,*/tmp/**,"
+                                                ".env,*/.env,.env.*,*/.env.*,.*-env,*/.*-env"
+                                                ).split(",") if g.strip()]
+            paths = sorted(p for p in candidates if not (
+                "/" not in p and (p in ("CLAUDE.md", "AGENTS.md") or p.endswith(_CHARTER_SUFFIX)))
+                and not p.startswith(".eph/")
+                and (p in tracked or (os.path.lexists(os.path.join(path, p))
+                                     and not any(fnmatch.fnmatchcase(p, g) for g in globs))))
+            with tempfile.TemporaryDirectory(prefix="salvage-index-", dir=os.path.dirname(path)) as d:
+                env["GIT_INDEX_FILE"] = os.path.join(d, "index")
+                _git(path, "read-tree", "HEAD", env=env)
+                for start in range(0, len(paths), 100):
+                    # -f preserves deliberately staged ignored additions, without sweeping up ignored
+                    # untracked files (which ls-files --exclude-standard omitted).
+                    _git(path, "--literal-pathspecs", "add", "-f", "-A", "--", *paths[start:start + 100], env=env)
+                # An enumerated file (in HEAD or the worker's index) may now be a directory, causing add
+                # to recurse. Enforce the allowlist on the snapshot, not just its input pathspecs; retain
+                # all HEAD paths so exclusions never discard tracked edits/deletions or stripped charters.
+                unexpected = sorted(names("ls-files", "-z") - tracked - set(paths))
+                for start in range(0, len(unexpected), 100):
+                    _git(path, "update-index", "--force-remove", "--", *unexpected[start:start + 100], env=env)
+                staged = subprocess.run(_wt_argv(path, "diff", "--cached", "--quiet", *_NO_EXT_DIFF),
+                                        capture_output=True, env=env)
+                if staged.returncode not in (0, 1):
+                    raise RuntimeError("salvage: cannot inspect snapshot index")
+                if staged.returncode == 1:
+                    _git(path, *_wt_identity_args(env), "-c", "commit.gpgSign=false", "commit", "-q", "--no-verify",
+                         "-m", f"WIP: unreviewed wall-clock salvage ({key})", env=env)
+        except Exception as e:
+            # A snapshot failure must not lose earlier checkpoints. Publication below already bundles
+            # on push failure, so recover here only before that push, never retry a failed push.
+            saved = self.save_commits(key, remote=remote)
+            receipt = (f"existing commits saved on {saved['branch']} at {saved['sha']}" if saved else
+                       "no existing commits to save")
+            raise RuntimeError(f"salvage snapshot failed: {e}; {receipt}") from e
         env.pop("GIT_INDEX_FILE", None)
         saved = self.save_commits(key, remote=remote)
         if saved:

@@ -499,6 +499,20 @@ def test_hermes_timeout_hard_kill_and_escalate():
        "ops alerted, then the SAME envelope escalation")
 
 
+def test_hermes_salvage_defers_kill_alert():
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as d, _Registry(d), \
+            patch.dict(os.environ, {"CODE_NONCLAUDE_OK": "1", "WORKER_AUTO_SALVAGE_ON_WALL_CLOCK": "1"}):
+        alerts = []
+        a = _adapter(d, envelope_parser=EnvelopeParser(), wall_clock_s=0.1,
+                     alert_ops=lambda text, **kwargs: alerts.append(text))
+        w = Worker("vikunja:task:9478", "killed", d)
+        assert a._turn(w, _route(capability="code", FAKE_SLEEP="5"), "SYS", "P",
+                       resume=False, run_id="killed") is None
+        assert w.hard_killed and w.done and w.turns == 1 and not alerts
+    ok("hermes salvage defers the kill alert to the combined recovery receipt without re-prompting")
+
+
 def test_hermes_refuses_ungrantable():
     with tempfile.TemporaryDirectory() as d, _Registry(d):
         rec = os.path.join(d, "rec.jsonl")

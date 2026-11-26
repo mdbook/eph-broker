@@ -1119,6 +1119,7 @@ class CodexHarness:
             proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, text=True, start_new_session=True)
             worker.proc = proc
+            worker.process_started = True
             if getattr(worker, "done", False):          # teardown landed between the check above and Popen
                 _kill_group(proc)
             out, err, killed = _stream_process(proc, prompt_text, wall_clock_s, live)
@@ -1126,8 +1127,9 @@ class CodexHarness:
                 worker.hard_killed = True
                 worker.had_hard_kill = True
                 log.warning("HARD-KILL key=%s wall-clock %ss exceeded (codex)", worker.key, wall_clock_s)
-                adapter._alert_ops(f"worker {worker.key} hard-killed: wall-clock {wall_clock_s}s (codex)",
-                                   subject=f"worker:{worker.key}")
+                if not (capability == "code" and _cc._env_flag("WORKER_AUTO_SALVAGE_ON_WALL_CLOCK", "0")):
+                    adapter._alert_ops(f"worker {worker.key} hard-killed: wall-clock {wall_clock_s}s (codex)",
+                                       subject=f"worker:{worker.key}")
         finally:
             worker.in_turn = False
             worker.turn_started = None

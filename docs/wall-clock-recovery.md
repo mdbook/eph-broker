@@ -7,7 +7,7 @@ Both automation switches default off. For example, in the `settings` object of `
 {
   "WORKER_AUTO_SALVAGE_ON_WALL_CLOCK": true,
   "WORKER_AUTO_CONTINUE_ON_WALL_CLOCK": true,
-  "WORKER_SALVAGE_EXCLUDE_GLOBS": "scratch/**,.scratch/**,tmp/**,.env,.env.*,.*-env,.pii-store/**"
+  "WORKER_SALVAGE_EXCLUDE_GLOBS": "scratch/**,*/scratch/**,.scratch/**,*/.scratch/**,tmp/**,*/tmp/**,.env,*/.env,.env.*,*/.env.*,.*-env,*/.*-env"
 }
 ```
 
@@ -16,12 +16,15 @@ the list is not a general secret scanner. Globs match repo-relative paths, inclu
 They affect new files, including staged additions and children of a file replaced by a directory,
 not tracked edits or deletions. Ignored untracked files are not included. Root charter files and `.eph/`
 broker metadata are always omitted.
+The default list covers every depth. Add deployment-specific paths in site configuration, keeping the
+generic list because an override replaces it. See [settings](settings.md) for a private-store example.
 
 After a CLI wall-clock kill on any harness, the broker skips the envelope-only re-prompt and saves a local
 patch. It snapshots the latest working files with an isolated index, commits an explicitly unreviewed WIP,
 and uses the existing guarded, create-only WIP push. Existing commits, including an already-published HEAD,
 are preserved without rewriting them. The ticket comment names the WIP branch and changed files. Salvage
-never opens or updates an MR, emits a review, or marks work reviewed. Ordinary turn-cap behavior is unchanged.
+combines the kill, local patch and publication outcome into one ticket comment and one owner alert.
+It never opens or updates an MR, emits a review, or marks work reviewed. Ordinary turn-cap behavior is unchanged.
 This does not cover broker/host SIGKILL, manual teardown, API overload, or a process disappearing without a
 CLI wall-clock receipt. A failed push retains a local bundle/patch and alerts the configured owner sink.
 
@@ -31,12 +34,15 @@ handoff; normal drain, concurrency, routing and prompt-signature gates still app
 an interrupted active launch remains held for the existing owner reconciliation process, never blindly replayed.
 The budget is not time-expired or reset by an operator rerun. A second wall-clock kill still salvages, but
 comments and alerts the owner rather than queuing another run. Missing durable state, disabled retry, no
-recoverable work or a recovery error also require owner action. There is no automatic retry of a failed push.
+publishable WIP or a recovery error also require owner action. There is no automatic retry of a failed push.
 
 The next run fetches the saved branch at the exact saved SHA. It keeps the original MR target (and original
 continue-MR destination, if any), not the salvage branch as a target. Its standard preface says:
 “Unreviewed WIP from a killed run, verify then finish, commit early.” It must verify the inherited code;
 the eventual finished result goes through the normal MR and review gates. A changed repo refuses continuation.
+If continuation setup fails, its saved branch context is cleared and the owner is notified once. The retry
+budget stays spent across restarts. A later operator rerun uses normal ticket routing instead of repeatedly
+trying the broken continuation. Drain parking is not a failed start and retains the reservation.
 No ticket description or `base:` line is modified.
 
 ## Wall-clock policy

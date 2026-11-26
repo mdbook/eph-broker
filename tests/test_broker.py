@@ -29324,6 +29324,50 @@ def test_wall_clock_salvage_snapshot_paths_and_index():
     ok("wall-clock salvage includes source additions, tracked edits/deletions and checkpoints; excludes scratch/charters")
 
 
+def test_wall_clock_salvage_defaults_exclude_new_paths_at_every_depth():
+    import worktree as W
+    key = "vikunja:task:9475"
+    for staged in (False, True):
+        with tempfile.TemporaryDirectory(dir=ROOT) as d:
+            bare, wm, path = _g18_origin_and_worktree(d, key)
+            git = lambda *args: subprocess.run(["git", "-C", path, *args], check=True,
+                                               capture_output=True, text=True).stdout
+            for prefix in ("", "config/", "pkg/sub/"):
+                for name in (".env", ".env.local", ".service-env", "scratch/notes.txt",
+                             ".scratch/notes.txt", "tmp/notes.txt"):
+                    name = prefix + name
+                    p = pathlib.Path(path, name)
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_text("excluded sample\n")
+            # Exclusions never drop an edit or deletion that was already in HEAD.
+            git("add", "config/.env", "pkg/sub/.service-env")
+            git("-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "checkpoint")
+            pathlib.Path(path, "config/.env").write_text("tracked edit\n")
+            pathlib.Path(path, "pkg/sub/.service-env").unlink()
+            allowed = {"pkg/source.py", ".pii-store/sample.txt", "pkg/.pii-store/sample.txt"}
+            for name in allowed:
+                p = pathlib.Path(path, name)
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text("generic source\n")
+            if staged:
+                git("add", "-A")
+            index_path = pathlib.Path(git("rev-parse", "--git-path", "index").strip())
+            index_before = index_path.read_bytes()
+            with patch.object(W, "_gitlab_push_url", return_value=bare), patch.dict(os.environ):
+                os.environ.pop("WORKER_SALVAGE_EXCLUDE_GLOBS", None)
+                saved = wm.salvage(key)
+            expected = {"CLAUDE.md", "f.txt", "config/.env"} | allowed
+            assert set(git("ls-tree", "-r", "--name-only", "HEAD").splitlines()) == expected
+            assert git("show", "HEAD:config/.env") == "tracked edit\n"
+            assert set(saved["files"]) == allowed | {"config/.env"}
+            published = subprocess.run(["git", "-C", bare, "ls-tree", "-r", "--name-only", saved["branch"]],
+                                       check=True, capture_output=True, text=True).stdout
+            assert set(published.splitlines()) == expected
+            assert index_path.read_bytes() == index_before
+            wm.remove(key)
+    ok("default salvage excludes root and nested staged/untracked secrets and scratch, not tracked edits or site paths")
+
+
 def test_wall_clock_salvage_file_to_directory_respects_exclusions():
     import worktree as W
     key = "vikunja:task:9474"
@@ -29483,6 +29527,8 @@ def test_wall_clock_salvage_continues_from_saved_sha_then_finishes_or_escalates(
                             assert key in c.pending and key not in c.completed and not publications and not mr.called
                             saved = c.code_continuation(key)
                             assert saved and "new.py" in saved["files"]
+                            assert len(comments) == len(alerts) == 1, (comments, alerts)
+                            assert "Local patch saved" in comments[0] and "No commit made" not in comments[0]
                     assert len(prompts) == 2, "kill must not spend a warm JSON re-prompt"
                     assert cuts[1]["publish_ref"] == saved["branch"] and cuts[1]["expect_sha"] == saved["sha"]
                     assert "Unreviewed WIP" in prompts[1]["continuation"]["notice"]
@@ -29498,6 +29544,100 @@ def test_wall_clock_salvage_continues_from_saved_sha_then_finishes_or_escalates(
                 finally:
                     state.close()
     ok("killed code snapshots before removal, starts exactly once at saved SHA, then normal MR or owner escalation")
+
+
+def test_wall_clock_continuation_failed_start_clears_context_once():
+    import routing as RT
+    import worktree as W
+    from adapters import hermes as H
+    from broker_state import BrokerState
+    real_which = shutil.which
+    for failure in ("branch gone", "repo changed", "cc spawn", "hermes spawn"):
+        with tempfile.TemporaryDirectory(dir=ROOT) as d:
+            key = "vikunja:task:9476"
+            bare, wm, path = _g18_origin_and_worktree(d, key)
+            repo = wm.base_repo
+            target = subprocess.run(["git", "-C", repo, "symbolic-ref", "--short", "HEAD"],
+                                    check=True, capture_output=True, text=True).stdout.strip()
+            sha = wm.head_sha(key)
+            wm.remove(key)
+            route = Route(domain="code", repo=repo, prompt_class="change-proposer", agent="code",
+                          capability="code", read_only=False, model="test", test_runner="pytest",
+                          adapter="hermes" if failure == "hermes spawn" else "cc",
+                          publish={"code_repo_path": repo, "mr_target_ref": target, "worktree_base": os.path.join(d, "wt")})
+            comments, alerts, prompts = [], [], []
+            a = CCAdapter(router=type("Router", (), {"route": lambda s, k, b: route})(), worktree_mgr=wm,
+                          prompt_loader=type("Loader", (), {"load": lambda s, *args: "SYS"})(),
+                          envelope_parser=EnvelopeParser(), ticket_fetcher=lambda tid: f"repo:{repo}\nbase:{target}\n",
+                          claude_bin="/nonexistent/eph-test/claude",
+                          comment_poster=lambda tid, text, rid: comments.append(text),
+                          alert_ops=lambda text, **kwargs: alerts.append(text))
+            if failure == "hermes spawn":
+                a.hermes = H.HermesHarness(hermes_bin=_write_fake_claude(d), home_root=os.path.join(d, "homes"))
+                a.hermes.hermes_bin = "/nonexistent/eph-test/hermes"
+            state_path = os.path.join(d, "state.sqlite3")
+            state = BrokerState(state_path)
+            c = Coalescer(adapter=a, state_store=state)
+            evt = {"source": "vikunja", "task_id": 9476, "event_name": "task.updated"}
+            def arm():
+                c.pending.pop(key, None)
+                c.live[key] = {"events": [evt], "fwd_buffer": [], "forwards": 0, "state": "open_running"}
+                c.active_intents[key] = {"events": [evt], "row": "code"}
+            arm()
+            context = {"repo": repo + "-changed" if failure == "repo changed" else repo,
+                       "branch": target if failure.endswith("spawn") else "eph/missing-wip",
+                       "sha": sha, "target": target, "run_id": "killed"}
+            assert c.queue_code_continuation(key, context)
+            c.settle_self(key)
+            real_turn = a._one_turn
+            failed_workers = []
+            def turn(worker, route, system, prompt, resume, **kwargs):
+                if failure.endswith("spawn") and not failed_workers:
+                    failed_workers.append(worker)
+                    # Exercise the harness's actual Popen failure after reservation consumption.
+                    assert c.code_continuation(key) is None
+                    try:
+                        return real_turn(worker, route, system, prompt, resume, **kwargs)
+                    except cc.WorkerSpawnFailed:
+                        assert not worker.process_started and worker.proc is None
+                        raise
+                prompts.append(json.loads(prompt))
+                worker.done = True
+                return {"status": "done", "summary": "test rerun", "wake": []}
+            # Isolate continuation alerts from the unrelated memory-tool PATH tripwire,
+            # but leave the actual missing CC/Hermes executable and Popen failure intact.
+            with patch.dict(os.environ, {"PATH": os.defpath}), \
+                    patch.object(RT, "parse_repo_token", return_value=repo), \
+                    patch.object(RT, "resolve_target_repo", return_value=repo), \
+                    patch.object(RT, "code_repo_allowed", return_value=True), \
+                    patch.object(cc, "resolve_default_branch", return_value=target), \
+                    patch.object(W, "_gitlab_push_url", return_value=bare), \
+                    patch.object(W, "CUT_SHA_RETRY_S", ()), \
+                    patch.object(H.HermesHarness, "_install_gate", return_value="test-nonce"), \
+                    patch.object(cc.shutil, "which", side_effect=lambda cmd, **kwargs:
+                                 "/test/mcp-ro.sh" if cmd == "mcp-ro.sh" else real_which(cmd, **kwargs)), \
+                    patch.object(a, "_one_turn", side_effect=turn):
+                try:
+                    arm()
+                    a._run_worker(key, {"task_id": 9476}, "failed-start")
+                    assert not prompts and len(comments) == len(alerts) == 1, (prompts, comments, alerts)
+                    assert "Continuation cleared" in comments[0] and context["branch"] in comments[0]
+                    if failure.endswith("spawn"):
+                        assert len(failed_workers) == 1 and "could not start" in comments[0]
+                    assert c.code_continuation(key) is None and key not in c.completed and key not in c.pending
+                    assert state.get("code_continuations")[key] == {"consumed": True}
+                    state.close()
+                    state = BrokerState(state_path)
+                    c = Coalescer(adapter=a, state_store=state)
+                    assert c.code_continuation(key) is None
+                    arm()
+                    assert not c.queue_code_continuation(key, context), "failed start must not reset retry budget"
+                    a._run_worker(key, {"task_id": 9476}, "operator-rerun")
+                    assert len(prompts) == 1 and "continuation" not in prompts[0]
+                    assert len(alerts) == 1, "later rerun must not repeat the continuation escalation"
+                finally:
+                    state.close()
+    ok("missing WIP, changed repo or CC/Hermes exec failure clears continuation durably, alerts once and permits rerun")
 
 
 def test_wall_clock_salvage_failure_is_safe_and_no_retry():
@@ -29522,6 +29662,138 @@ def test_wall_clock_salvage_failure_is_safe_and_no_retry():
     a._alert_ops = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("alert unavailable"))
     assert not a._salvage_wall_clock("vikunja:task:9473", "killed", {})
     ok("salvage/alert failure never queues a retry or interrupts cleanup")
+
+
+def test_wall_clock_salvage_one_receipt_for_each_outcome():
+    saved = {"branch": "eph/example-wip", "sha": "a" * 40, "files": ["new.py"]}
+    for outcome in (saved, None, RuntimeError("push unavailable")):
+        for patch_fails in (False, True):
+            notes, alerts = [], []
+            def salvage(key):
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return outcome
+            def save_patch(key):
+                if patch_fails:
+                    raise RuntimeError("patch unavailable")
+                return "/example/recovery.patch"
+            wm = type("WM", (), {"salvage": staticmethod(salvage), "save_patch": staticmethod(save_patch)})()
+            a = CCAdapter(router=None, worktree_mgr=wm, prompt_loader=None, envelope_parser=None,
+                          alert_ops=lambda text, **kwargs: alerts.append(text))
+            a._post_ticket_note = lambda key, body, run_id: notes.append(body)
+            assert a._salvage_wall_clock("vikunja:task:9477", "killed", {}) == bool(outcome is saved)
+            assert len(notes) == len(alerts) == 1, (notes, alerts)
+            assert "No commit made" not in notes[0]
+            assert ("Local patch save failed" if patch_fails else "Local patch saved") in notes[0]
+            if outcome is saved:
+                assert saved["branch"] in notes[0] and "new.py" in notes[0]
+            else:
+                assert ("push unavailable" if outcome else "no publishable WIP") in notes[0]
+    ok("salvage emits one accurate receipt and alert for success, empty work, push failure and patch failure")
+
+
+def test_wall_clock_salvage_snapshot_failure_preserves_checkpoints_once():
+    import worktree as W
+    key = "vikunja:task:9479"
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        bare, wm, path = _g18_origin_and_worktree(d, key)
+        git = lambda *args: subprocess.run(["git", "-C", path, *args], check=True,
+                                           capture_output=True, text=True).stdout
+        pathlib.Path(path, "f.txt").write_text("checkpoint\n")
+        git("add", "f.txt")
+        git("-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "checkpoint")
+        checkpoint = git("rev-parse", "HEAD").strip()
+        pathlib.Path(path, "new.py").write_text("unfinished\n")
+        real_git = W._git
+        def fail_snapshot(path, *args, **kwargs):
+            if "add" in args and kwargs.get("env", {}).get("GIT_INDEX_FILE"):
+                raise RuntimeError("snapshot unavailable")
+            return real_git(path, *args, **kwargs)
+        notes, alerts = [], []
+        a = CCAdapter(router=None, worktree_mgr=wm, prompt_loader=None, envelope_parser=None,
+                      alert_ops=lambda text, **kwargs: alerts.append(text))
+        a._post_ticket_note = lambda key, body, run_id: notes.append(body)
+        with patch.object(W, "_gitlab_push_url", return_value=bare), patch.object(W, "_git", side_effect=fail_snapshot):
+            assert not a._salvage_wall_clock(key, "killed", {})
+        branch = f"eph/vikunja_task_9479-{checkpoint}-wip"
+        published = subprocess.run(["git", "-C", bare, "rev-parse", branch],
+                                   check=True, capture_output=True, text=True).stdout.strip()
+        assert published == checkpoint
+        assert len(notes) == len(alerts) == 1 and branch in notes[0]
+        assert "existing commits saved" in notes[0] and "Local patch saved" in notes[0]
+        wm.remove(key)
+    ok("snapshot failure still saves earlier checkpoints without duplicate recovery notifications or push retries")
+
+
+def test_wall_clock_salvage_enumeration_failure_preserves_checkpoints_once():
+    import worktree as W
+    key = "vikunja:task:9480"
+    for failure in ("ls-tree", "corrupt index"):
+        for offline in (False, True):
+            with tempfile.TemporaryDirectory(dir=ROOT) as d:
+                bare, wm, path = _g18_origin_and_worktree(d, key)
+                git = lambda *args: subprocess.run(["git", "-C", path, *args], check=True,
+                                                   capture_output=True, text=True).stdout.strip()
+                pathlib.Path(path, "f.txt").write_text("checkpoint\n")
+                git("add", "f.txt")
+                git("-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "checkpoint")
+                checkpoint = git("rev-parse", "HEAD")
+                pathlib.Path(path, "new.py").write_text("unfinished\n")
+                if failure == "corrupt index":
+                    pathlib.Path(git("rev-parse", "--git-path", "index")).write_bytes(b"corrupt index\n")
+                real_run = subprocess.run
+                publications = []
+                def run(argv, **kwargs):
+                    if "push" in argv:
+                        publications.append(argv)
+                        if offline:
+                            raise subprocess.CalledProcessError(1, argv, stderr="offline")
+                    if failure == "ls-tree" and "ls-tree" in argv:
+                        raise subprocess.CalledProcessError(1, argv, stderr="enumeration unavailable")
+                    return real_run(argv, **kwargs)
+                notes, alerts = [], []
+                a = CCAdapter(router=None, worktree_mgr=wm, prompt_loader=None, envelope_parser=None,
+                              alert_ops=lambda text, **kwargs: alerts.append(text))
+                a._post_ticket_note = lambda key, body, run_id: notes.append(body)
+                with patch.object(W, "_gitlab_push_url", return_value=bare), \
+                        patch.object(W.subprocess, "run", side_effect=run):
+                    assert not a._salvage_wall_clock(key, "killed", {})
+                assert len(publications) == 1, "enumeration failure must preserve HEAD without retrying publication"
+                assert len(notes) == len(alerts) == 1
+                if failure == "corrupt index":
+                    assert "Local patch save failed" in notes[0]
+                if offline:
+                    bundles = list(pathlib.Path(path).parent.glob("_patches/*.bundle"))
+                    assert len(bundles) == 1 and "commits saved to bundle" in notes[0]
+                    refs = git("bundle", "list-heads", str(bundles[0]))
+                    assert refs == f"{checkpoint} HEAD"
+                else:
+                    branch = f"eph/vikunja_task_9480-{checkpoint}-wip"
+                    published = subprocess.run(["git", "-C", bare, "rev-parse", branch],
+                                               check=True, capture_output=True, text=True).stdout.strip()
+                    assert published == checkpoint and branch in notes[0]
+                wm.remove(key)
+    ok("initial enumeration/index failure preserves checkpoints by one push or offline bundle even if patch save fails")
+
+
+def test_wall_clock_salvage_defers_cc_kill_alert():
+    real_which = shutil.which
+    # Memory-tool availability has its own tripwire test. Keep that preflight healthy
+    # without requiring fleet tools on PATH, so only kill/recovery alerts are counted.
+    with tempfile.TemporaryDirectory(dir=ROOT) as d, \
+            patch.dict(os.environ, {"WORKER_AUTO_SALVAGE_ON_WALL_CLOCK": "1", "PATH": os.defpath}), \
+            patch.object(cc.shutil, "which", side_effect=lambda cmd, **kwargs:
+                         "/test/mcp-ro.sh" if cmd == "mcp-ro.sh" else real_which(cmd, **kwargs)):
+        alerts = []
+        a = CCAdapter(router=None, worktree_mgr=None, prompt_loader=None, envelope_parser=EnvelopeParser(),
+                      claude_bin=_write_fake_claude(d), wall_clock_s=0.1,
+                      alert_ops=lambda text, **kwargs: alerts.append(text))
+        w = Worker("vikunja:task:9478", "killed", d)
+        route = Route(domain="code", repo=d, prompt_class="change-proposer", agent="code",
+                      capability="code", read_only=False, model="test", env={"FAKE_SLEEP": "5"})
+        assert a._turn(w, route, "SYS", "P", resume=False, run_id="killed") is None
+        assert w.hard_killed and w.done and w.turns == 1 and not alerts
+    ok("CC salvage skips the warm re-prompt and defers the initial kill alert to the combined recovery receipt")
 
 
 if __name__ == "__main__":

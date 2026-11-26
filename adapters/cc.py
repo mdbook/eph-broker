@@ -2241,6 +2241,7 @@ class Worker:
         self.inbox_chat_mcp_path = None   # inbox-chat's combined all-accounts --mcp-config (lazy; cleaned
                                       # up at teardown), None for every other capability
         self.proc = None            # current in-flight subprocess.Popen, if any
+        self.process_started = False  # actual CLI launch, independent of continuation budget consumption
         self.turns = 0              # cumulative turns this session (for rotation)
         self.tokens = 0             # cumulative tokens this session (dash stat only; NOT the rotation metric)
         self.context_tokens = None  # last model request's input size this session, None = the harness has no figure
@@ -2979,15 +2980,20 @@ class CCAdapter(Adapter):
             return None
 
     def _salvage_wall_clock(self, key, run_id, publish):
-        """Save killed code work before reaping; optionally reserve one journaled continuation. No MR."""
+        """Save killed code work and emit one combined recovery receipt and alert. No MR."""
+        patch_note = ""
+        if hasattr(self.worktree_mgr, "save_patch"):
+            try:
+                patch = self.worktree_mgr.save_patch(key)
+                if patch:
+                    patch_note = f"<p>Local patch saved at <code>{html.escape(patch)}</code>.</p>"
+            except Exception as e:
+                log.warning("wall-clock patch key=%s run_id=%s failed: %s", key, run_id, e)
+                patch_note = f"<p>Local patch save failed: {html.escape(str(e))}.</p>"
+        saved, queued, error = None, False, None
         try:
             saved = self.worktree_mgr.salvage(key)
-            if not saved:
-                self._alert_ops(f"wall-clock worker {key}: no recoverable work; owner action required",
-                                subject=f"worker:{key}")
-                return False
-            queued = False
-            if _env_flag("WORKER_AUTO_CONTINUE_ON_WALL_CLOCK", "0") and self.coalescer is not None:
+            if saved and _env_flag("WORKER_AUTO_CONTINUE_ON_WALL_CLOCK", "0") and self.coalescer is not None:
                 try:
                     queued = self.coalescer.queue_code_continuation(key, {
                         **saved, "repo": publish["code_repo_path"], "target": publish["mr_target_ref"],
@@ -2995,25 +3001,32 @@ class CCAdapter(Adapter):
                 except Exception as e:
                     # The branch is already durable. A journal failure must not hide its receipt.
                     log.warning("wall-clock continuation key=%s failed: %s", key, e)
+        except Exception as e:
+            log.warning("wall-clock salvage key=%s run_id=%s failed: %s", key, run_id, e)
+            error = str(e)
+        if saved:
             files = "".join(f"<li><code>{html.escape(p)}</code></li>" for p in saved["files"])
-            self._post_ticket_note(key, (
+            body = (
                 "<p><b>Wall-clock salvage: unreviewed WIP</b> saved on branch "
                 f"<code>{html.escape(saved['branch'])}</code>. No MR opened or updated; not reviewed.</p>"
                 f"<ul>{files}</ul><p>" + ("One automatic continuation queued: verify then finish, commit early."
                 if queued else "No automatic continuation queued. Owner action required (retry disabled, "
-                                  "budget already used, or durable scheduling unavailable).") + "</p>"), run_id)
-            if not queued:
-                self._alert_ops(f"wall-clock worker {key}: WIP {saved['branch']}; owner action required; "
-                                "no further automatic retry", subject=f"worker:{key}")
-            return True
+                                  "budget already used, or durable scheduling unavailable).") + "</p>")
+            outcome = f"WIP {saved['branch']}; " + ("one continuation queued" if queued else
+                                                   "owner action required; no further automatic retry")
+        else:
+            outcome = f"salvage FAILED: {error}" if error else "no publishable WIP"
+            outcome += "; owner action required"
+            body = f"<p><b>Wall-clock worker stopped</b>: {html.escape(outcome)}. No MR opened or updated.</p>"
+        try:
+            self._post_ticket_note(key, body + patch_note, run_id)
         except Exception as e:
-            log.warning("wall-clock salvage key=%s run_id=%s failed: %s", key, run_id, e)
-            try:
-                self._alert_ops(f"wall-clock salvage FAILED ({key}): {e}; owner action required",
-                                subject=f"worker:{key}")
-            except Exception as alert_error:
-                log.warning("wall-clock salvage alert key=%s failed: %s", key, alert_error)
-            return False
+            log.warning("wall-clock receipt key=%s failed: %s", key, e)
+        try:
+            self._alert_ops(f"wall-clock worker {key}: {outcome}", subject=f"worker:{key}")
+        except Exception as e:
+            log.warning("wall-clock salvage alert key=%s failed: %s", key, e)
+        return bool(saved)
 
     # ---- turn-cap WIP save: commit and push an eph/*-wip branch (NO MR) before teardown ----
     def _save_wip(self, key, run_id):
@@ -3755,6 +3768,7 @@ class CCAdapter(Adapter):
         publish = None                                   # route.publish dict for a write route, else None
         publish_ran = False                              # True once the clean-completion publish block runs
         publish_completed = False                       # A failed push must also get commit recovery
+        salvage_ran = False                             # Salvage owns recovery notifications, even on failure
         last_env = None                                 # A parse miss/forced close is not clean completion
         capped_published = False                         # turn-capped but a clean commit was MR-published
         continuation = None                             # broker-owned salvage seed, never ticket instructions
@@ -4297,7 +4311,9 @@ class CCAdapter(Adapter):
                                if continuation else {"also_fetch": (default_branch,)} if base_branch else {}))
                 except subprocess.CalledProcessError as e:
                     why = (e.stderr or '').strip()[:200] or e
-                    if continue_branch:
+                    if continuation:
+                        raise                           # Report the saved WIP failure, not the ticket's base
+                    elif continue_branch:
                         self._refuse_continue_mr(key, run_id, f"could not fetch continue-mr branch "
                                                  f"{continue_branch!r} ({why})")
                     elif base_branch:
@@ -4753,8 +4769,19 @@ class CCAdapter(Adapter):
             log.info("DRAIN parked setup key=%s run_id=%s", key, run_id)
         except Exception as e:                           # a worker failure must never wedge the broker
             log.exception("worker key=%s run_id=%s failed: %s", key, run_id, e)
-            self._alert_ops(f"worker {key} run_id={run_id} failed: {e}", subject=f"worker:{key}")
-            if isinstance(e, (WorkerSpawnFailed, site_env.ModelDenied)):  # no worker ran: tell the author
+            failed_start = continuation and not getattr(worker, "process_started", False)
+            if failed_start:
+                # Keep the spent retry budget, but never seed an operator rerun with broken WIP context.
+                self.coalescer.code_continuation(key, consume=True)
+                attempted = False
+                self._post_ticket_note(key, (
+                    f"<p><b>Wall-clock continuation could not start</b>: {html.escape(str(e))}. "
+                    f"Saved WIP: <code>{html.escape(continuation['branch'])}</code>. "
+                    "Continuation cleared; automatic retry budget remains used. Owner action required.</p>"), run_id)
+            self._alert_ops(f"worker {key} run_id={run_id} failed: {e}" +
+                            ("; continuation cleared; owner action required" if failed_start else ""),
+                            subject=f"worker:{key}")
+            if not failed_start and isinstance(e, (WorkerSpawnFailed, site_env.ModelDenied)):
                 if mr_review is not None:
                     review_skipped = True                # no review ran -> re-armable, like a diff-unavailable skip
                 self._note_spawn_failure(key, run_id, mr_review, e)
@@ -4766,7 +4793,7 @@ class CCAdapter(Adapter):
                 # Keep a local patch even if the credentialed salvage push fails. The shared git
                 # lock is held only for snapshot/publication; no MR or reviewer events are emitted.
                 publish_ran = True                       # Do not overwrite this patch after moving HEAD
-                self._save_patch(key, run_id)
+                salvage_ran = True
                 with self._repo_operation(key, repo_lock, repo_lock_held, cancellable=False):
                     publish_completed = self._salvage_wall_clock(key, run_id, publish)
             # A turn-capped code/general worker's edits would die with the worktree below; save
@@ -4782,7 +4809,7 @@ class CCAdapter(Adapter):
             elif (worktree and worker is not None and not publish_ran
                   and (publish or {}).get("code_repo_path")):
                 self._save_patch(key, run_id)
-            if (worktree and publish is not None and not publish_completed
+            if (worktree and publish is not None and not publish_completed and not salvage_ran
                     and _env_flag("WORKER_SAVE_COMMITS_ON_FAILURE", "1")):
                 with self._repo_operation(key, repo_lock, repo_lock_held, cancellable=False):
                     self._save_failed_commits(key, run_id, tickets.vikunja_ref(brief.get("task_id")))
@@ -5478,6 +5505,7 @@ class CCAdapter(Adapter):
             worker.turn_started = None
             raise WorkerSpawnFailed(f"could not start {os.path.basename(argv[0])}: {e}") from e
         worker.proc = proc
+        worker.process_started = True
         inbox_usage = _InboxUsage() if capability == "inbox" else None
         fail_fast = getattr(route, "cc_fail_fast", True)
         upstream_error = None
@@ -5527,7 +5555,9 @@ class CCAdapter(Adapter):
             worker.hard_killed = True                    # _turn_with_envelope caps the warm re-prompt
             worker.had_hard_kill = True
             log.warning("HARD-KILL key=%s wall-clock %ss exceeded", worker.key, wall_clock_s)
-            if capability != "inbox":  # inbox reports ONE terminal blocked envelope instead
+            if capability != "inbox" and not (capability == "code" and
+                    _env_flag("WORKER_AUTO_SALVAGE_ON_WALL_CLOCK", "0")):
+                # Salvage reports the kill and recovery outcome together after the snapshot.
                 self._alert_ops(f"worker {worker.key} hard-killed: wall-clock {wall_clock_s}s",
                                 subject=f"worker:{worker.key}")
         finally:

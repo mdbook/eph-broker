@@ -939,6 +939,7 @@ class HermesHarness:
             except OSError as e:                           # the worker never ran: _run_worker notes it on the MR/ticket
                 raise _cc.WorkerSpawnFailed(f"could not start {os.path.basename(argv[0])}: {e}") from e
             worker.proc = proc
+            worker.process_started = True
             if getattr(worker, "done", False):         # teardown landed between the check above and Popen
                 _kill_group(proc)
             try:
@@ -949,8 +950,9 @@ class HermesHarness:
                 worker.hard_killed = True                   # _turn_with_envelope caps the warm re-prompt
                 worker.had_hard_kill = True
                 log.warning("HARD-KILL key=%s wall-clock %ss exceeded (hermes)", worker.key, wall_clock_s)
-                adapter._alert_ops(f"worker {worker.key} hard-killed: wall-clock {wall_clock_s}s (hermes)",
-                                   subject=f"worker:{worker.key}")
+                if not (capability == "code" and _cc._env_flag("WORKER_AUTO_SALVAGE_ON_WALL_CLOCK", "0")):
+                    adapter._alert_ops(f"worker {worker.key} hard-killed: wall-clock {wall_clock_s}s (hermes)",
+                                       subject=f"worker:{worker.key}")
         finally:
             worker.in_turn = False
             worker.turn_started = None

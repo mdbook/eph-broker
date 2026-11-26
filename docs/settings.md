@@ -63,7 +63,13 @@ See [wall-clock recovery](wall-clock-recovery.md) for cap precedence and recover
 |---|---|---|
 | `WORKER_AUTO_SALVAGE_ON_WALL_CLOCK` | off | Snapshot killed `code` workers, including new source files, and push an unreviewed WIP branch before teardown. Never opens an MR. |
 | `WORKER_AUTO_CONTINUE_ON_WALL_CLOCK` | off | With auto-salvage and a durable journal, continue a ticket once from its saved SHA. A second kill alerts the owner instead. |
-| `WORKER_SALVAGE_EXCLUDE_GLOBS` | `scratch/**,.scratch/**,tmp/**,.env,.env.*,.*-env,.pii-store/**` | Comma-separated, case-sensitive repo-relative globs for new salvage paths, including staged additions. Tracked edits/deletions are preserved regardless of these globs. Empty includes all new paths except broker metadata and root charters. |
+| `WORKER_SALVAGE_EXCLUDE_GLOBS` | `scratch/**,*/scratch/**,.scratch/**,*/.scratch/**,tmp/**,*/tmp/**,.env,*/.env,.env.*,*/.env.*,.*-env,*/.*-env` | Comma-separated, case-sensitive repo-relative globs for new salvage paths, including staged additions. Defaults exclude scratch directories and secret-looking files at any depth. Tracked edits/deletions are preserved regardless of these globs. Empty includes all new paths except broker metadata and root charters. |
+
+`WORKER_SALVAGE_EXCLUDE_GLOBS` replaces the entire default list. Globs use Python `fnmatch` semantics:
+`*` also matches `/`, so a root pattern plus its `*/` variant covers every depth. These are generic
+precautions, not a secret scanner. Put site-specific exclusions in site configuration. For example,
+append `,.pii-store/**,*/.pii-store/**` to the full default list in `broker.json` settings if your
+deployment uses that private store. It is not a core default. Both salvage switches remain off by default.
 
 ### Inbox run guardrails (Claude Code)
 

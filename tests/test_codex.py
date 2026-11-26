@@ -1470,6 +1470,17 @@ def test_codex_timeout_and_teardown_kill_group():
     ok(f"codex: wall-clock hard-kill of the whole process group ({dt:.1f}s), ops alerted")
 
 
+def test_codex_salvage_defers_kill_alert():
+    with tempfile.TemporaryDirectory() as d, _Codex(d), _Env(WORKER_AUTO_SALVAGE_ON_WALL_CLOCK="1"):
+        alerts = []
+        wt = _git_repo(os.path.join(d, "wt"))
+        a = _adapter(d, wall_clock_s=0.1, alert_ops=lambda text, **kwargs: alerts.append(text))
+        w = Worker("vikunja:task:9478", "killed", wt)
+        assert a._turn(w, _route(FAKE_SLEEP="5"), "SYS", "P", resume=False, run_id="killed") is None
+        assert w.hard_killed and w.done and w.turns == 1 and not alerts
+    ok("codex salvage defers the kill alert to the combined recovery receipt without re-prompting")
+
+
 def test_codex_live_progress_before_exit():
     with tempfile.TemporaryDirectory() as d, _Codex(d), _Env(BROKER_STREAM_ENABLED="1"), \
             patch.object(X.stream, "PROJECTS_DIR", os.path.join(d, "transcripts")), \

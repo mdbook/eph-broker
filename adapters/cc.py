@@ -3907,6 +3907,13 @@ class CCAdapter(Adapter):
                 self._alert_ops(f"UI code worker {key} parked: CODE_BROWSER_MCP_CONFIG is unset "
                                 f"(browser required){self._dash_url(_ref)}", subject=f"reject:{key}")
                 return
+            # Decide from fetched broker-side facts BEFORE model/harness selection (ticket 3413).
+            # Config rows never used the built-in infra grant path; keep that boundary unchanged.
+            if (getattr(route, "domain", "") == "infra" and getattr(route, "capability", "") == "code"
+                    and not getattr(route, "from_config", False) and _task_id is not None and ticket is not None):
+                infra_grant = write_grant.make_grant(
+                    _task_id, ticket.labels, ticket.creator,
+                    brief.get("last_doer") if isinstance(brief, dict) else None)
             selection_source = None
 
             def select_model(repo):
@@ -3970,6 +3977,11 @@ class CCAdapter(Adapter):
                             adapter_override = flipped.adapter
                             log.info("%s label: key=%s run_id=%s -> adapter=%s backend=%r", flipped.adapter, key,
                                      run_id, flipped.adapter, flipped.backend)
+                        # An explicit harness label wins even when it names the already-selected harness.
+                        if (not choice and not route.backend_pinned
+                                and str(ticket.creator).strip().lower() in routing.model_label_trusted_creators()
+                                and any(str(lab).strip().lower() in routing.ADAPTER_LABELS for lab in ticket.labels)):
+                            selection_source = "label"
                     except ValueError as e:
                         _lbl = str(e).split(":", 1)[0]
                         log.warning("spawn REJECT (%s): key=%s run_id=%s: %s",
@@ -3977,6 +3989,21 @@ class CCAdapter(Adapter):
                                     key, run_id, e)
                         self._alert_ops(f"eph worker {key} not spawned: {e}{self._dash_url(_ref)}", subject=f"abort:{key}")
                         return
+                if infra_grant is not None and route.adapter == "codex" and selection_source == "row default":
+                    from routing_overrides import write_grant_codex_fallback
+                    try:
+                        fallback = write_grant_codex_fallback(route)
+                    except (ValueError, TypeError):
+                        # Invalid configuration keeps the original fail-closed Codex refusal and ticket note.
+                        log.error("write grant reroute: key=%s invalid EPH_WRITE_GRANT_CODEX_FALLBACK; keeping Codex refusal",
+                                  key)
+                    else:
+                        if fallback is not route:
+                            route = fallback
+                            model_override, adapter_override = (route.backend, route.model), route.adapter
+                            selection_source = "write grant fallback"
+                            log.info("write grant reroute: key=%s run_id=%s codex -> %s backend=%r model=%r",
+                                     key, run_id, route.adapter, route.backend, route.model)
                 log.info("model selection: key=%s run_id=%s row=%s winner=%s adapter=%s backend=%r model=%r",
                          key, run_id, getattr(route, "row_key", route.domain), selection_source,
                          getattr(route, "adapter", "cc"), getattr(route, "backend", ""), route.model)
@@ -4125,12 +4152,6 @@ class CCAdapter(Adapter):
                             log.warning("infra spawn REJECTED key=%s: %s (fail-closed, no worker cut)", key, e)
                             self._alert_ops(f"infra worker {key} rejected: {e}", subject=f"reject:{key}")
                             return
-                        # ZERO-LLM grant decision off broker-side facts only: the FETCHED ticket's labels +
-                        # created_by and the event doer. Untrusted / opted-out / flag off: None (no mcp-rw.sh).
-                        if _task_id is not None and ticket is not None:
-                            infra_grant = write_grant.make_grant(
-                                _task_id, ticket.labels, ticket.creator,
-                                brief.get("last_doer") if isinstance(brief, dict) else None)
                     elif issue and issue.get("source") in ("github", "gitlab"):
                         try:
                             target_repo = routing.resolve_issue_repo(

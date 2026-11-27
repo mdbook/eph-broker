@@ -80,6 +80,31 @@ class _Env:
                 os.environ[k] = v
 
 
+def test_write_grant_codex_fallback_spec():
+    with _Overrides():
+        route = replace(routing._INFRA_ROW, adapter="codex", backend="test-backend", model="claude-test")
+        with _Env(EPH_WRITE_GRANT_CODEX_FALLBACK=""):
+            assert routing_overrides.write_grant_codex_fallback(route) is route
+        for fields, backend, model in (({"adapter": "cc"}, "", "claude-test"),
+                                       ({"adapter": "cc", "model_pin": "SONNET"}, "", "sonnet"),
+                                       ({"adapter": "cc", "model_pin": "test-backend"},
+                                        "test-backend", routing._NATIVE_FALLBACK_MODEL)):
+            with _Env(EPH_WRITE_GRANT_CODEX_FALLBACK=json.dumps(fields)):
+                result = routing_overrides.write_grant_codex_fallback(route)
+            assert result.adapter == "cc" and result.backend == backend and result.model == model
+            assert result.backend_pinned == bool(fields.get("model_pin"))
+            assert result.row_key == route.row_key and route.adapter == "codex"
+        for bad in ("{", "[]", "null", '{"adapter":"codex"}', '{"adapter":"cc","capability":"general"}',
+                    '{"adapter":"cc","backend":42}', '{"adapter":"cc","backend":"unknown-test-backend"}',
+                    '{"adapter":"cc","model_pin":"unknown-test-model"}'):
+            try:
+                routing_overrides.parse_write_grant_codex_fallback(bad)
+                assert False, bad
+            except ValueError:
+                pass
+    ok("write-grant fallback accepts only a CC model/backend row, preserves identity and rejects invalid specs")
+
+
 def test_wall_clock_per_row_override_and_inheritance():
     with _Overrides() as (path, loader):
         template = routing._CODE_ROW

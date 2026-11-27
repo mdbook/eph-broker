@@ -23997,7 +23997,7 @@ def test_infra_codex_write_grant_refuses_with_ticket_note():
     from adapters import codex as X
     for row in (RT._INFRA_ROW, RT._INFRA_GENERAL_ROW):
         row = RT.replace(row, adapter="codex")
-        with patch.object(X, "CodexHarness") as harness:
+        with _Env(EPH_WRITE_GRANT_CODEX_FALLBACK=None), patch.object(X, "CodexHarness") as harness:
             seen, comments, left = _flag_run(_ticket("owner"), row=row)
             harness.assert_not_called()
         assert seen == [] and left == [], (seen, left)   # no CC launch; grant revoked on refusal
@@ -24011,12 +24011,64 @@ def test_infra_codex_write_grant_refuses_with_ticket_note():
                 assert route.adapter == "codex" and worker.write_grant_path is None
                 worker.done = True
                 return {"status": "done", "summary": "ungranted codex turn", "wake": []}
-            with patch.object(X, "CodexHarness") as harness:
+            with _Env(EPH_WRITE_GRANT_CODEX_FALLBACK='{"adapter":"cc","backend":"claude","model_pin":"sonnet"}'), \
+                    patch.object(X, "CodexHarness") as harness:
                 harness.return_value.one_turn.side_effect = turn
                 seen, comments, left = _flag_run(_ticket("owner", labels), flag=flag, row=row)
                 assert harness.return_value.one_turn.call_count == 1
             assert seen == [] and left == [] and comments[0][1] == "ungranted codex turn", comments
     ok("infra codex grant refuses with ticket note and revocation; flag off/unset and opt-out keep codex routing")
+
+
+def test_infra_codex_write_grant_fallback_runs_cc_and_labels_win():
+    import routing as RT
+    from adapters import cc as CCM, codex as X
+    fallback = '{"adapter":"cc","backend":"claude","model_pin":"sonnet"}'
+    original = CCM.CCAdapter._one_turn
+    for template in (RT._INFRA_ROW, RT._INFRA_GENERAL_ROW):
+        row = RT.replace(template, adapter="codex")
+        for labels, model in (([], "sonnet"), (["model:opus"], "opus")):
+            routes = []
+            def turn(adapter, worker, route, *args, **kwargs):
+                routes.append(route)
+                assert route.adapter == "cc" and route.backend == "claude" and route.model == model, route
+                assert route.capability == row.capability and route.row_key == row.row_key
+                assert route.prompt_class == row.prompt_class and route.repo == row.repo
+                assert route.publish["branch_prefix"] == row.publish["branch_prefix"]
+                assert worker.write_grant_path, "fallback retains the write grant"
+                return original(adapter, worker, route, *args, **kwargs)
+            with _Env(EPH_WRITE_GRANT_CODEX_FALLBACK=fallback), \
+                    patch.object(CCM.CCAdapter, "_one_turn", turn), patch.object(X, "CodexHarness") as harness, \
+                    patch.object(CCM.log, "info") as info:
+                seen, comments, left = _flag_run(_ticket("owner", labels), row=row)
+                harness.assert_not_called()
+            assert len(routes) == 1 and seen and seen[0][0:2] == (True, True), (routes, seen)
+            assert left == [] and "mcp-rw audit" in comments[0][1], comments
+            reroutes = [call for call in info.call_args_list if call.args[0].startswith("write grant reroute:")]
+            assert len(reroutes) == (0 if labels else 1), reroutes
+            if reroutes:
+                assert reroutes[0].args[1] == "vikunja:task:9361"
+        # A model label selecting Codex, or an explicit codex harness label (even a no-op), still refuses.
+        entry = {"adapter": "codex", "codex": {"model": "test-codex"}}
+        for labels in (["model:test-codex"], ["codex"]):
+            with _Env(EPH_WRITE_GRANT_CODEX_FALLBACK=fallback), \
+                    patch.object(CCM, "_backend_entry", lambda name: entry if name == "test-codex" else None), \
+                    patch.object(X, "CodexHarness") as harness:
+                seen, comments, left = _flag_run(_ticket("owner", labels), row=row)
+                harness.assert_not_called()
+            assert seen == [] and left == [] and "Granted write refused" in comments[0][1], comments
+    ok("granted Codex infra rows run on configured CC fallback; native and Codex labels beat it; reroute logs key")
+
+
+def test_infra_codex_invalid_write_grant_fallback_keeps_refusal():
+    import routing as RT
+    from adapters import codex as X
+    with _Env(EPH_WRITE_GRANT_CODEX_FALLBACK='{"adapter":"hermes"}'), \
+            patch.object(X, "CodexHarness") as harness, patch.object(cc.log, "error") as error:
+        seen, comments, left = _flag_run(_ticket("owner"), row=RT.replace(RT._INFRA_ROW, adapter="codex"))
+        harness.assert_not_called()
+    assert error.called and seen == [] and left == [] and "Granted write refused" in comments[0][1], comments
+    ok("invalid write-grant Codex fallback logs an error and retains refusal plus grant revocation")
 
 
 def _run_ticket_worker(ticket, emitted=None, row="_GENERAL_ROW", pin=("GENERAL_REPO_ALLOWLIST", lambda d: {d}),

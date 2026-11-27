@@ -748,6 +748,7 @@ def test_live_settings_bad_file_and_bad_values_keep_last_good():
                               ("MR_REVIEWER_BACKEND", "unresolvable-test-backend"),
                               ("CODE_CHANGE_ADAPTER", "typo"), ("CODEX_REASONING_SUMMARY", "typo"),
                               ("WORKER_SANDBOX", "typo"), ("EPH_GATE_NONSECRET_PATHS", "[]"),
+                              ("EPH_WRITE_GRANT_CODEX_FALLBACK", '{"adapter":"codex"}'),
                               ("INITIAL_WINDOWS", "[]"), ("EVENTS_WEBHOOK_KINDS", "no-such-kind")):
             with patch.object(logging.getLogger("eph-broker.settings"), "error") as error:
                 _reload(b, path, {"CONCURRENCY": 4, "DISPATCH_PRIORITY": "reviews-first", name: invalid})
@@ -755,6 +756,18 @@ def test_live_settings_bad_file_and_bad_values_keep_last_good():
             assert b.semaphore.limit == app.CONCURRENCY == 2, name
             assert not dispatch.reviews_first(), name
     ok("parse errors and invalid runtime values log and keep the whole last-good settings block")
+
+
+def test_live_write_grant_codex_fallback_reload_and_removal():
+    with _live_broker() as (b, path):
+        name = "EPH_WRITE_GRANT_CODEX_FALLBACK"
+        original = os.environ.get(name)
+        value = '{"adapter":"cc","backend":"claude","model_pin":"sonnet"}'
+        _reload(b, path, {name: value})
+        assert os.environ[name] == value
+        _reload(b, path)
+        assert os.environ.get(name) == original
+    ok("write-grant Codex fallback setting reloads and removal restores its startup value")
 
 
 def test_live_api_overload_retries_follow_reload_and_removal():

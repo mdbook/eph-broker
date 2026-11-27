@@ -223,6 +223,13 @@ ENVIRONMENT["BROKER_PUSH_HOSTS"] = lambda v: _push_hosts(v)
 ENVIRONMENT["WORKER_SANDBOX"] = lambda v: _sandbox_mode(v)
 ENVIRONMENT["EPH_GATE_NONSECRET_PATHS"] = lambda v: _nonsecret_paths(v)
 ENVIRONMENT["EPH_GATE_TEST_ENV_ALLOW"] = lambda v: _passthrough(v)
+ENVIRONMENT["EPH_WRITE_GRANT_CODEX_FALLBACK"] = lambda v: _write_grant_codex_fallback(v)
+
+
+def _write_grant_codex_fallback(value):
+    from routing_overrides import parse_write_grant_codex_fallback
+    parse_write_grant_codex_fallback(text(value))
+    return text(value)
 
 
 def _sandbox_mode(value):

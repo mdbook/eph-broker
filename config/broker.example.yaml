@@ -41,6 +41,9 @@ settings:
   # Reviewed non-secret filename exceptions for eph-gate (Hermes/Codex), empty by default.
   # Exact catalog repo keys, repo-relative globs. Dotfiles and escaping symlinks stay denied.
   # EPH_GATE_NONSECRET_PATHS: '{"example/module-box":["modules/*/module.env"]}'
+  # Optional live-write Codex reroute. Unset/empty keeps refusal; grants still default off.
+  # Only harness/backend/model change; ticket labels and pins retain precedence (docs/security.md).
+  # EPH_WRITE_GRANT_CODEX_FALLBACK: '{"adapter":"cc","backend":"claude","model_pin":"sonnet"}'
   # Per-row commit metadata (push credentials are unchanged). Default: eph-<row>@noreply.invalid.
   CODE_GIT_NAME: "eph-code"
   CODE_GIT_EMAIL: "eph-code@example.com"

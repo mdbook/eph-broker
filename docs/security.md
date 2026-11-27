@@ -50,11 +50,25 @@ a running worker are wrapped and labelled as data. Authors listed in `untrusted_
 `MODEL_LABEL_TRUSTED_CREATORS` can use a `model:` label to move a ticket to a non-Anthropic backend, or a
 `hermes` label to move it to the hermes harness.
 
-Workers with a live-write grant (`worker.write_grant_path` set) are refused on Codex before harness
-dispatch, with a blocked ticket comment naming ticket 3345.
-Codex's per-exec sandbox cannot access the syslog socket required by the `mcp-rw` intent audit. Move
-granted tickets to a Claude Code row and retry. Audit failures remain fail-closed; ungranted tickets
-keep their selected harness, and `EPH_WRITE_GRANTS_ENABLED` still defaults off.
+Codex's per-exec sandbox cannot access the syslog socket required by the `mcp-rw` intent audit.
+By default, workers with a live-write grant (`worker.write_grant_path` set) are refused on Codex before
+harness dispatch, with a blocked ticket comment naming ticket 3345.
+
+To route granted tickets from a Codex row to Claude Code automatically, set
+`EPH_WRITE_GRANT_CODEX_FALLBACK` to a JSON row spec, for example
+`{"adapter":"cc","backend":"claude","model_pin":"sonnet"}`. It uses the routing-overrides row field
+names: `adapter` must be `cc`; optional `backend` and `model_pin` accept the same backend/model names.
+Omitting `backend` selects native Claude; omitting `model_pin` keeps the resolved model. No other row
+fields are accepted, so the fallback cannot change the ticket's repo, capability or prompt.
+The broker decides the grant from fetched ticket provenance before model/harness selection and logs
+each reroute with the ticket key. Ticket model/harness labels and operator choices still win over this
+fallback, subject to existing trust checks and row/repo pins. An explicit Codex selection still gets the
+refusal note; pins are never bypassed. The setting can be reloaded through `broker.yaml` `settings`.
+
+Unset or empty keeps today's refusal. An invalid environment value logs an error and keeps that refusal
+too; a rejected settings reload keeps the last-good settings.
+Audit failures remain fail-closed. Ungranted tickets keep their selected harness, and
+`EPH_WRITE_GRANTS_ENABLED` still defaults off. No `mcp-rw` permission or audit requirement is relaxed.
 
 MR note iteration is separately opt-in through `MR_NOTE_AUTHOR_ALLOWLIST` (empty means off), behind the same
 GitLab webhook token check. Only new, non-system notes on open, same-project broker MRs under

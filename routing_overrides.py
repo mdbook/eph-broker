@@ -43,6 +43,39 @@ def model_choices():
     return sorted(routing.NATIVE_MODEL_ALIASES) + names
 
 
+def parse_write_grant_codex_fallback(value):
+    """A JSON row spec for the opt-in Claude Code fallback, or {} when disabled."""
+    if not value.strip():
+        return {}
+    fields = json.loads(value)
+    if (not isinstance(fields, dict) or set(fields) - {"adapter", "backend", "model_pin"}
+            or fields.get("adapter") != "cc" or any(not isinstance(v, str) for v in fields.values())):
+        raise ValueError("expected a cc row with optional backend and model_pin strings")
+    backend = fields.get("backend", "")
+    if backend and backend != "claude" and not backend_ok(backend):
+        raise ValueError("unresolvable fallback backend")
+    if fields.get("model_pin"):
+        fields["model_pin"] = RoutingOverrides._pin_name(fields["model_pin"])
+    return fields
+
+
+def write_grant_codex_fallback(route):
+    """Replace only the resolved route's harness/model, never its capability, repo or routing identity.
+
+    The caller checks the grant and selection precedence. Do not call with_model(): that would reapply
+    routing overrides and turn the fallback back into the original Codex row.
+    """
+    import routing
+    fields = parse_write_grant_codex_fallback(os.getenv("EPH_WRITE_GRANT_CODEX_FALLBACK", ""))
+    if not fields:
+        return route
+    backend, model = fields.get("backend", ""), fields.get("model_pin") or route.model
+    if fields.get("model_pin") and not backend and routing._is_registry_backend(model):
+        backend, model = model, routing._NATIVE_FALLBACK_MODEL
+    return replace(route, adapter="cc", backend=backend, model=model,
+                   model_pin=fields.get("model_pin", ""), backend_pinned=bool(fields.get("model_pin")))
+
+
 # The dashboard may change these and nothing else. adapter and repo_lock_scope change what a row's worker can
 # do or how it locks; trusted_creators widens who may pick a non-Anthropic backend. Those stay file-only.
 EDITABLE_ROW_FIELDS = ("backend", "model_pin", "pin")

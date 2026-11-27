@@ -1107,7 +1107,8 @@ _CODE_TEST_RUNNERS = {
 # What the worker is told to run (the signed prompt says "your runtime brief names it"). Seed brief only.
 _CODE_TEST_HINTS = {
     "pytest": "python -m pytest",
-    "repo-test": "./run-tests.sh  (the repo's own test entrypoint; no args, no chaining)",
+    "repo-test": ("./run-tests.sh [args]  (the repo's own test entrypoint; arguments go to the script, "
+                  "e.g. suite names to run a subset; no chaining)"),
     "npm":    ("npm ci --ignore-scripts  then  npm test  (separate calls; no chaining). Lockfile updates: "
                "npm install --package-lock-only --ignore-scripts  or  "
                "npm audit fix --package-lock-only --ignore-scripts  (exact commands; no --force)"),
@@ -1133,7 +1134,7 @@ def _code_test_bash(test_runner, repo=None):
         # runner (pytest vs direct-run vs a bespoke harness), its interpreter, or its deps. Same trust model as
         # the other keys: the script is repo-owned + human-reviewed, and the worker runs in a cred-free
         # throwaway worktree whose only output is a feature-branch MR. `:*` = any args; a repo whose runner
-        # needs no args still works, and its own script decides what to reject.
+        # accepts suite names can run a subset; one needing no args still works. The script decides what to reject.
         # RELATIVE, deliberately: the worker's cwd IS the worktree (cc.py constraint #5), so `./run-tests.sh`
         # executes the WORKER'S edited script from the worker's own tree, which is the whole point of running
         # tests. An absolute <repo>/run-tests.sh would run the BASE checkout and test nothing the worker changed.

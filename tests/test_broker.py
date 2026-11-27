@@ -5776,6 +5776,19 @@ def test_g2_venv_and_bash_n_grants():
     ok("G2: venv -> repo's own .venv pytest only (fail-closed w/o safe repo); bash-n -> bash -n; none -> nothing")
 
 
+def test_repo_test_hint_allows_script_arguments_without_changing_grant():
+    """The runtime brief advertises script-owned arguments, matching the existing relative prefix grant."""
+    from adapters.cc import code_test_hint
+    assert code_test_hint("repo-test") == (
+        "./run-tests.sh [args]  (the repo's own test entrypoint; arguments go to the script, "
+        "e.g. suite names to run a subset; no chaining)")
+    code_base = " ".join(_WRITE_ALLOWED + _CODE_GIT + _CODE_MEMORY)
+    for repo in (None, "/srv/git/sample-app"):
+        g = capability_tool_grant("code", test_runner="repo-test", test_repo=repo)
+        assert g[g.index("--allowedTools") + 1] == code_base + " Bash(./run-tests.sh:*)", g
+    ok("repo-test brief allows script arguments and subset suites; relative script grant unchanged")
+
+
 def test_package_json_repo_gets_npm_ci_and_npm_test():
     """An unmapped ALLOWLISTED package.json repo resolves to the `npm` runner, whose grant includes
     exact script-free install commands plus `npm test` (never bare npm/npx); Python grants are unchanged;

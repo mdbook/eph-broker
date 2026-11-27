@@ -16262,8 +16262,7 @@ else:
 
 
 def test_capped_commit_ready_requires_clean_commit_ahead():
-    """worktree.capped_commit_ready: False with no commit; False with a commit plus uncommitted or untracked
-    edits; True with a clean commit ahead of the cut (the stripped charter is not counted as dirty)."""
+    """Only committed work counts: untracked scratch is ignored, staged or tracked edits are not."""
     key = "vikunja:task:9182"
     with tempfile.TemporaryDirectory() as d:
         bare, wm, path = _g18_origin_and_worktree(d, key)
@@ -16275,11 +16274,16 @@ def test_capped_commit_ready_requires_clean_commit_ahead():
         assert wm.capped_commit_ready(key) is True, "clean commit ahead (charter strip ignored) -> ready"
         with open(os.path.join(path, "new.py"), "w") as f:
             f.write("x = 1\n")
-        assert wm.capped_commit_ready(key) is False, "untracked file -> not ready"
+        assert wm.capped_commit_ready(key) is True, "never-staged untracked file -> ready"
+        subprocess.run(["git", "-C", path, "add", "new.py"], check=True)
+        assert wm.capped_commit_ready(key) is False, "staged addition -> not ready"
+        subprocess.run(["git", "-C", path, "reset", "--", "new.py"], check=True, capture_output=True)
         os.remove(os.path.join(path, "new.py"))
         with open(os.path.join(path, "f.txt"), "w") as f:
             f.write("v3\n")
         assert wm.capped_commit_ready(key) is False, "uncommitted edit -> not ready"
+        subprocess.run(["git", "-C", path, "add", "f.txt"], check=True)
+        assert wm.capped_commit_ready(key) is False, "staged tracked edit -> not ready"
         assert wm.capped_commit_ready("vikunja:task:nope") is False, "unknown key -> False, never raises"
         wm.remove(key)
     ok("capped_commit_ready is True only for a clean commit ahead of the cut")
@@ -16372,6 +16376,160 @@ def test_turn_cap_publish_flag_off_keeps_wip_only():
         CCM.TURN_CAP_PUBLISH_CLEAN_COMMIT = saved
     assert "publish_mr" not in calls and "open_mr" not in calls and "save_wip" in calls, calls
     ok("TURN_CAP_PUBLISH_CLEAN_COMMIT=0 -> capped worker never gets an MR")
+
+
+def _check_stopped_commit_publication(stop="wall-clock", commit=True, scratch=False, dirty=False,
+                                      enabled=True, salvage=False, publication_error=False):
+    """Exercise the shared teardown path with real git, without waiting for a CLI timeout."""
+    import routing as RT
+    import worktree as W
+    key = "vikunja:task:9481"
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        bare, wm, path = _g18_origin_and_worktree(d, key)
+        git = lambda *args: subprocess.run(["git", "-C", path, *args], check=True,
+                                           capture_output=True, text=True).stdout.strip()
+        repo = wm.base_repo
+        route = Route(domain="code", repo=repo, prompt_class="change-proposer", agent="code-worker",
+                      capability="code", read_only=False, model="test", test_runner="pytest",
+                      publish={"code_repo_path": repo, "mr_target_ref": "main", "worktree_base": d})
+        calls, reviews, heads = [], [], []
+        def alert(msg, **kwargs):
+            if publication_error and msg.startswith("publish "):
+                raise RuntimeError("alert sink unavailable")
+        a = CCAdapter(router=type("Router", (), {"route": lambda s, k, b: route})(), worktree_mgr=wm,
+                      prompt_loader=type("Loader", (), {"load": lambda s, *args: "SYS"})(),
+                      envelope_parser=EnvelopeParser(), ticket_fetcher=lambda tid: f"repo:{repo}\n",
+                      comment_poster=lambda *args: None, label_poster=lambda tid: None,
+                      alert_ops=alert)
+        def turn(worker, *args, **kwargs):
+            pathlib.Path(path, "f.txt").write_text("committed work\n")
+            if commit:
+                git("add", "f.txt")
+                git("-c", "user.name=test", "-c", "user.email=test@example.com", "-c",
+                    "commit.gpgSign=false", "commit", "--no-verify", "-qm", "worker commit")
+            heads.append(git("rev-parse", "HEAD"))
+            if dirty:
+                pathlib.Path(path, "f.txt").write_text("unfinished work\n")
+            if scratch:
+                for name in ("hermes-test-scratch", "hermes-install-test-scratch"):
+                    pathlib.Path(path, name).mkdir()
+                    pathlib.Path(path, name, "output.txt").write_text("never staged\n")
+            worker.done = True
+            if stop == "wall-clock":
+                # Include a later envelope-only re-prompt that reset hard_killed.
+                worker.had_hard_kill = True
+            elif stop == "crash":
+                raise RuntimeError("lost worker result")
+            elif stop == "post-envelope-error":
+                return {"status": "done", "summary": "committed work", "wake": []}
+            return None
+        a._turn = turn
+        post = a._post_envelope
+        def post_envelope(*args, **kwargs):
+            if stop == "post-envelope-error":
+                raise RuntimeError("envelope receipt unavailable")
+            return post(*args, **kwargs)
+        opened = {"web_url": "https://gitlab.example.com/group/app/-/merge_requests/9481",
+                  "iid": 9481, "project": "group/app"}
+        publish, recover, snapshot, remove = wm.publish_mr, wm.save_commits, wm.salvage, wm.remove
+        def publish_mr(k, **kwargs):
+            calls.append("publish_mr")
+            if publication_error:
+                raise RuntimeError("push unavailable")
+            return publish(k, **kwargs)
+        def save_commits(k, **kwargs):
+            calls.append("save_commits")
+            return recover(k, **kwargs)
+        def save_salvage(k):
+            calls.append("salvage")
+            return snapshot(k)
+        def reap(k):
+            calls.append("remove")
+            remove(k)
+        with patch.object(RT, "parse_repo_token", return_value=repo), \
+                patch.object(RT, "resolve_target_repo", return_value=repo), \
+                patch.object(RT, "code_repo_allowed", return_value=True), \
+                patch.object(cc, "resolve_default_branch", return_value="main"), \
+                patch.object(W, "_gitlab_push_url", return_value=bare), \
+                patch.object(wm, "make", return_value=path), \
+                patch.object(wm, "publish_mr", side_effect=publish_mr), \
+                patch.object(wm, "save_commits", side_effect=save_commits), \
+                patch.object(wm, "salvage", side_effect=save_salvage), \
+                patch.object(wm, "remove", side_effect=reap), \
+                patch.object(a, "_post_envelope", side_effect=post_envelope), \
+                patch.object(a, "_emit_event", side_effect=lambda evt: reviews.append(evt) or True), \
+                patch.object(cc, "open_mr", return_value=opened) as mr, \
+                patch.object(cc, "TURN_CAP_PUBLISH_CLEAN_COMMIT", enabled), \
+                patch.dict(os.environ, {"WORKER_SAVE_COMMITS_ON_FAILURE": "1",
+                                         "WORKER_AUTO_SALVAGE_ON_WALL_CLOCK": "1" if salvage else "0",
+                                         "WORKER_AUTO_CONTINUE_ON_WALL_CLOCK": "0"}):
+            a._run_worker(key, {"task_id": 9481}, "stopped-run")
+        should_publish = commit and not dirty and enabled and not publication_error
+        assert mr.called == should_publish, (calls, mr.call_args_list)
+        refs = subprocess.run(["git", "--git-dir", bare, "for-each-ref", "--format=%(refname)",
+                               "refs/heads/eph/"], check=True, capture_output=True, text=True).stdout.splitlines()
+        assert len(refs) == 1, (calls, refs)
+        if should_publish:
+            assert calls == ["publish_mr", "remove"], calls
+            assert mr.call_args.args[:3] == (repo, refs[0][len("refs/heads/"):], "main")
+            assert len(reviews) == 1 and reviews[0]["head_sha"] == heads[0], reviews
+            assert reviews[0]["event_name"] == "mr.opened" and reviews[0]["task_id"] == 9481
+        else:
+            assert ("publish_mr" in calls) == publication_error and not reviews, (calls, reviews)
+            assert refs[0].endswith("-wip"), refs
+        contents = subprocess.run(["git", "--git-dir", bare, "show", f"{refs[0]}:f.txt"],
+                                  check=True, capture_output=True, text=True).stdout
+        assert contents == "committed work\n", contents
+        if commit:
+            head = subprocess.run(["git", "--git-dir", bare, "rev-parse", refs[0]],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+            assert head == heads[0], "never snapshot or push unfinished tracked edits"
+        names = subprocess.run(["git", "--git-dir", bare, "ls-tree", "--name-only", refs[0]],
+                               check=True, capture_output=True, text=True).stdout
+        assert "hermes-test-" not in names and "hermes-install-test-" not in names, names
+
+
+def test_wall_clock_clean_commit_opens_mr_and_review_without_salvage():
+    for salvage in (False, True):
+        _check_stopped_commit_publication(salvage=salvage)
+    ok("wall-clock clean commit uses the normal MR/review gate, never a duplicate salvage or continuation")
+
+
+def test_wall_clock_untracked_test_scratch_does_not_block_mr():
+    _check_stopped_commit_publication(scratch=True, salvage=True)
+    ok("wall-clock clean commit ignores never-staged test scratch and publishes only committed files")
+
+
+def test_wall_clock_no_commit_still_salvages_wip_without_mr():
+    _check_stopped_commit_publication(commit=False, salvage=True)
+    ok("wall-clock with no commit retains opt-in WIP salvage, no MR or review")
+
+
+def test_wall_clock_dirty_commit_only_saves_commits_without_mr():
+    _check_stopped_commit_publication(dirty=True)
+    ok("wall-clock dirty tracked work cannot enter normal publication; only existing commits are recovered")
+
+
+def test_wall_clock_clean_commit_flag_off_keeps_wip_only():
+    _check_stopped_commit_publication(enabled=False)
+    ok("TURN_CAP_PUBLISH_CLEAN_COMMIT=0 restores wall-clock WIP-only recovery")
+
+
+def test_lost_envelope_or_crash_with_clean_commit_uses_normal_mr_gate():
+    for stop in ("parse-miss", "crash"):
+        _check_stopped_commit_publication(stop=stop)
+    ok("lost result envelopes and crashes publish clean commits through the same MR/review gate")
+
+
+def test_post_envelope_failure_clean_commit_obeys_publication_flag():
+    for enabled in (True, False):
+        _check_stopped_commit_publication(stop="post-envelope-error", enabled=enabled)
+    ok("a failure after a done envelope uses clean-commit recovery only when enabled")
+
+
+def test_stopped_commit_publish_and_alert_failure_still_recovers_and_reaps():
+    _check_stopped_commit_publication(publication_error=True)
+    ok("failed clean-commit publication and a broken alert sink still preserve commits before reaping")
 
 
 

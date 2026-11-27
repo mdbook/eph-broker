@@ -1,4 +1,16 @@
-# Killed code workers: salvage and one continuation
+# Killed code workers: clean commits, salvage and one continuation
+
+By default, a stopped code worker with a clean commit ahead of its cut publishes that commit through the
+normal MR and review gates. Wall-clock kills, turn caps, crashes and missing result envelopes use the same
+path on all harnesses. Clean means no uncommitted tracked or staged changes. Never-staged untracked files,
+including `hermes-test-*` and `hermes-install-test-*` scratch directories, do not block publication and are
+not pushed. The broker pushes only committed HEAD; it does not declare the work verified or merge it.
+Set `TURN_CAP_PUBLISH_CLEAN_COMMIT=0` and restart to restore WIP-only recovery on unsuccessful runs.
+The existing flag now covers all stop reasons, not just turn caps.
+
+Successful clean-commit publication skips salvage and automatic continuation, even when enabled below.
+Dirty or commit-less work keeps the existing recovery behavior: local patches and committed-only WIP
+recovery by default, with optional snapshot salvage and continuation as described below.
 
 Shared engine change, Full review tier.
 Both automation switches default off. For example, in the `settings` object of `broker.json`:
@@ -19,12 +31,12 @@ broker metadata are always omitted.
 The default list covers every depth. Add deployment-specific paths in site configuration, keeping the
 generic list because an override replaces it. See [settings](settings.md) for a private-store example.
 
-After a CLI wall-clock kill on any harness, the broker skips the envelope-only re-prompt and saves a local
-patch. It snapshots the latest working files with an isolated index, commits an explicitly unreviewed WIP,
-and uses the existing guarded, create-only WIP push. Existing commits, including an already-published HEAD,
-are preserved without rewriting them. The ticket comment names the WIP branch and changed files. Salvage
+When enabled, after a CLI wall-clock kill that did not publish normally, the broker skips the envelope-only
+re-prompt and saves a local patch. It snapshots the latest working files with an isolated index, commits an
+explicitly unreviewed WIP, and uses the existing guarded, create-only WIP push. Existing commits, including
+an already-published HEAD, are preserved without rewriting them. The ticket comment names the WIP branch and changed files. Salvage
 combines the kill, local patch and publication outcome into one ticket comment and one owner alert.
-It never opens or updates an MR, emits a review, or marks work reviewed. Ordinary turn-cap behavior is unchanged.
+Salvage itself never opens or updates an MR, emits a review, or marks work reviewed.
 This does not cover broker/host SIGKILL, manual teardown, API overload, or a process disappearing without a
 CLI wall-clock receipt. A failed push retains a local bundle/patch and alerts the configured owner sink.
 

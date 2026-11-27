@@ -61,7 +61,7 @@ See [wall-clock recovery](wall-clock-recovery.md) for cap precedence and recover
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `WORKER_AUTO_SALVAGE_ON_WALL_CLOCK` | off | Snapshot killed `code` workers, including new source files, and push an unreviewed WIP branch before teardown. Never opens an MR. |
+| `WORKER_AUTO_SALVAGE_ON_WALL_CLOCK` | off | If normal clean-commit publication did not succeed, snapshot killed `code` workers, including new source files, and push an unreviewed WIP branch before teardown. Salvage itself never opens an MR. |
 | `WORKER_AUTO_CONTINUE_ON_WALL_CLOCK` | off | With auto-salvage and a durable journal, continue a ticket once from its saved SHA. A second kill alerts the owner instead. |
 | `WORKER_SALVAGE_EXCLUDE_GLOBS` | `scratch/**,*/scratch/**,.scratch/**,*/.scratch/**,tmp/**,*/tmp/**,.env,*/.env,.env.*,*/.env.*,.*-env,*/.*-env` | Comma-separated, case-sensitive repo-relative globs for new salvage paths, including staged additions. Defaults exclude scratch directories and secret-looking files at any depth. Tracked edits/deletions are preserved regardless of these globs. Empty includes all new paths except broker metadata and root charters. |
 
@@ -300,8 +300,8 @@ own separate repo settings.
 | `CODE_REPO_ALLOWLIST` | unset | Colon list of repo paths it may work in. Unset: none. |
 | `CODE_REPO_RUNNER_SEEDS` | unset | Test runner per repo, `<path>=<runner>,...` (`repo-test` runs the repo's own `./run-tests.sh`). The key must be the repo's real absolute path: a key on a path that does not exist as a directory never applies (the broker warns at startup and the repo falls through to the route default `CODE_TEST_RUNNER`). |
 | `CONTINUE_MR_PREFIXES` | `eph/` | Colon list of branch prefixes a `continue-mr:` line may name. Each must end in `/`. Empty: nothing can be continued. |
-| `TURN_CAP_PUBLISH_CLEAN_COMMIT` | `1` | A worker that hits its turn cap with a clean commit ahead of the base gets that commit published as an MR. `0`: WIP branch only. |
-| `WORKER_SAVE_COMMITS_ON_FAILURE` | `1` | Before removing an unsuccessful write worker's worktree, push existing commits ahead of its cut to a separate ticket WIP branch and comment with branch/SHA links. Never stages or commits edits. `0`: disable this recovery. Applies to all harnesses, including hard-kills, crashes, parse misses and failed publishes. |
+| `TURN_CAP_PUBLISH_CLEAN_COMMIT` | `1` | Across all harnesses, publish a clean commit ahead of the cut through normal MR/review gates on any stop, including a wall-clock kill, turn cap, crash or lost result envelope. Clean excludes uncommitted tracked/staged changes, but ignores never-staged untracked files (including test scratch). Only committed HEAD is pushed. `0`: restore WIP-only recovery for unsuccessful runs. The historical flag name now covers all stop reasons; requires restart. |
+| `WORKER_SAVE_COMMITS_ON_FAILURE` | `1` | Before removing an unsuccessful write worker's worktree, if normal publication did not succeed, push existing commits ahead of its cut to a separate ticket WIP branch and comment with branch/SHA links. Never stages or commits edits. `0`: disable this fallback recovery. Applies to all harnesses, including hard-kills, crashes, parse misses and failed publishes. |
 | `CODE_REPO_RUNNERS` | unset | Same format; overrides the seeds per path. |
 | `CODE_TEST_RUNNER` | `pytest` | Runner for a repo that's in neither map. |
 | `EPH_GATE_TEST_ENV_ALLOW` | unset | Comma list of extra reviewed, exact environment names allowed before a code worker's granted test runner on hermes/Codex, on top of the benign defaults ([hermes.md](hermes.md#test-runner-environment-assignments-hermes-and-codex)). No wildcard patterns. Values remain confined. |

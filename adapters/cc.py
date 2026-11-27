@@ -243,10 +243,10 @@ def _env_flag(name, default="0"):
 def _mr_routine_ops_dm():
     return _env_flag("MR_ROUTINE_OPS_DM", "0")
 
-# a code worker that commits its change and then hits --max-turns before writing its envelope has
-# still finished the work. With this on (default), a turn-capped worker whose worktree holds a CLEAN commit
-# ahead of the cut is published as a normal MR (same human review gate); a dirty or commit-less cap still
-# goes to the eph/*-wip branch. Set TURN_CAP_PUBLISH_CLEAN_COMMIT=0 to restore WIP-branch-only behaviour.
+# A code worker can stop after committing but before emitting its final envelope. With this on (default),
+# any stopped worker with a CLEAN commit ahead of the cut uses normal MR/review gates. Dirty or commit-less
+# work keeps WIP recovery. This also covers wall-clock kills, crashes and lost result envelopes.
+# Set TURN_CAP_PUBLISH_CLEAN_COMMIT=0 to restore WIP-branch-only recovery behaviour.
 TURN_CAP_PUBLISH_CLEAN_COMMIT = _env_flag("TURN_CAP_PUBLISH_CLEAN_COMMIT", "1")
 
 USAGE_CAP_FALLBACK_ENABLED = _env_flag("USAGE_CAP_FALLBACK_ENABLED", "0")   # master switch, DEFAULT OFF
@@ -2208,12 +2208,12 @@ class Worker:
         self.stream_session = None  # Pinned/resumed session -> transcript file for steer replies and the viewer
         self.last_output = None      # Most recent raw worker output (wrapped UNTRUSTED on escalate)
         self.last_summary = None     # The latest envelope summary (a GitLab-issue MR description quotes it)
-        self.turn_capped = False     # Sticky: some turn hit --max-turns, so a WIP branch at teardown and no MR
+        self.turn_capped = False     # Sticky: some turn hit --max-turns; clean commits may still get an MR
         self.api_overloaded = False  # Sticky: every 429/529 back-off retry failed, so exit un-stamped
         self.turn_wall_clock = None  # The CURRENT turn's effective wall-clock (per-capability), used for the liveness check
         self.hard_killed = False     # Set True iff the turn JUST ENDED was the wall-clock hard-kill path;
                                       # consumed (and reset) only by the warm-re-prompt cap in _turn_with_envelope
-        self.had_hard_kill = False   # Run-sticky: an envelope-only recovery cannot make partial work complete
+        self.had_hard_kill = False   # Run-sticky: an envelope-only recovery cannot make a dirty tree complete
         self.inbox_input_tokens = 0  # Run-wide, not reset by session rotation or a warm forward
         self.inbox_cost_usd = 0.0
         self.inbox_limit_reason = None
@@ -3766,11 +3766,12 @@ class CCAdapter(Adapter):
         repo_lock = None                                 # shared-checkout operations, if a write route
         repo_lock_held = False                           # only a route with repo_lock_scope=run
         publish = None                                   # route.publish dict for a write route, else None
-        publish_ran = False                              # True once the clean-completion publish block runs
+        publish_on_completion = False                    # reached the ordinary publication boundary, without raising
+        publish_ran = False                              # True once normal MR/publication is attempted
         publish_completed = False                       # A failed push must also get commit recovery
         salvage_ran = False                             # Salvage owns recovery notifications, even on failure
         last_env = None                                 # A parse miss/forced close is not clean completion
-        capped_published = False                         # turn-capped but a clean commit was MR-published
+        recovered_commit = False                         # stopped after a clean commit, eligible for normal MR
         continuation = None                             # broker-owned salvage seed, never ticket instructions
         inbox_posture = None                             # this account's runtime posture text, if an inbox route
         inbox_account = None                             # The account the inbox gate resolved (zulip: from the bot map)
@@ -4614,23 +4615,42 @@ class CCAdapter(Adapter):
                     if worker.api_overloaded:            # Give up on this subject, un-stamped
                         break
                     self._advertise_idle(key)            # turn-boundary -> open_idle
-            # The worker has committed its content edits into the (hook-suppressed,
-            # cred-free) worktree; the BROKER does the ONLY push. Runs on clean completion inside the try
-            # (NOT in finally) so a blocked/crashed/hard-killed turn never publishes a partial edit. A no-op
-            # (worker made no commit) returns cleanly. A rebase conflict/exhausted-retry raises, and is logged and
-            # alerted below, worktree still torn down in finally.
-            if (publish is not None and ((last_env or {}).get("status") == "done" or worker.turn_capped)
-                    and not worker.api_overloaded
-                    and not worker.hard_killed and not worker.had_hard_kill):
+            publish_on_completion = True
+        except WorkerParked:
+            log.info("DRAIN parked setup key=%s run_id=%s", key, run_id)
+        except Exception as e:                           # a worker failure must never wedge the broker
+            log.exception("worker key=%s run_id=%s failed: %s", key, run_id, e)
+            failed_start = continuation and not getattr(worker, "process_started", False)
+            if failed_start:
+                # Keep the spent retry budget, but never seed an operator rerun with broken WIP context.
+                self.coalescer.code_continuation(key, consume=True)
+                attempted = False
+                self._post_ticket_note(key, (
+                    f"<p><b>Wall-clock continuation could not start</b>: {html.escape(str(e))}. "
+                    f"Saved WIP: <code>{html.escape(continuation['branch'])}</code>. "
+                    "Continuation cleared; automatic retry budget remains used. Owner action required.</p>"), run_id)
+            self._alert_ops(f"worker {key} run_id={run_id} failed: {e}" +
+                            ("; continuation cleared; owner action required" if failed_start else ""),
+                            subject=f"worker:{key}")
+            if not failed_start and isinstance(e, (WorkerSpawnFailed, site_env.ModelDenied)):
+                if mr_review is not None:
+                    review_skipped = True                # no review ran -> re-armable, like a diff-unavailable skip
+                self._note_spawn_failure(key, run_id, mr_review, e)
+            self._chat_notice(chat_zc, CHAT_LIMIT_REPLY, run_id)   # A dead chat worker tells its sender
+        finally:
+            # Judge the committed deliverable on every stop, not the presence of a final envelope.
+            # Unstaged/uncommitted tracked work still falls back to recovery, never the normal MR path.
+            if (worktree and worker is not None and (publish or {}).get("code_repo_path")
+                    and TURN_CAP_PUBLISH_CLEAN_COMMIT):
+                recovered_commit = getattr(self.worktree_mgr, "capped_commit_ready", lambda k: False)(key)
+            if (publish is not None and worker is not None
+                    and (recovered_commit or (publish_on_completion
+                                             and ((last_env or {}).get("status") == "done" or worker.turn_capped)
+                                             and not worker.api_overloaded
+                                             and not worker.hard_killed and not worker.had_hard_kill))):
                 publish_ran = True                       # The finally's crash-path patch save keys off this
                 try:
-                    if (publish.get("code_repo_path") and worker.turn_capped and TURN_CAP_PUBLISH_CLEAN_COMMIT
-                            and getattr(self.worktree_mgr, "capped_commit_ready", lambda k: False)(key)):
-                        # capped AFTER a clean commit, before the envelope -> the commit is the
-                        # deliverable; publish it as an MR below (no WIP branch in the finally).
-                        capped_published = True
-                        log.info("publish key=%s: turn-capped with a clean commit ahead of base -> MR", key)
-                    if publish.get("code_repo_path") and worker.turn_capped and not capped_published:
+                    if publish.get("code_repo_path") and worker.turn_capped and not recovered_commit:
                         # A turn-capped worker's work is INCOMPLETE, so no MR and no reviewer; the
                         # finally below pushes it to an eph/*-wip branch (branch only) before teardown instead.
                         log.info("publish key=%s: turn-capped -> WIP branch at teardown, no MR", key)
@@ -4759,35 +4779,18 @@ class CCAdapter(Adapter):
                             self.worktree_mgr.publish(key, publish_ref=publish["publish_ref"])
                             publish_completed = True
                     publish_completed = not (publish.get("code_repo_path") and worker.turn_capped
-                                             and not capped_published)
+                                             and not recovered_commit)
                 except Exception as e:
                     log.exception("publish key=%s run_id=%s failed: %s", key, run_id, e)
-                    self._alert_ops(f"publish {key} run_id={run_id} failed: {e}", subject=f"worker:{key}")
+                    try:
+                        self._alert_ops(f"publish {key} run_id={run_id} failed: {e}", subject=f"worker:{key}")
+                    except Exception as alert_error:
+                        # Publication now runs at retirement. A broken alert sink must not skip recovery/reaping.
+                        log.warning("publish alert key=%s run_id=%s failed: %s", key, run_id, alert_error)
                     if isinstance(e, PushTargetRefused):
                         self._nag_push_refused(key, run_id, e)   # fail-closed push -> say so on the ticket
-        except WorkerParked:
-            log.info("DRAIN parked setup key=%s run_id=%s", key, run_id)
-        except Exception as e:                           # a worker failure must never wedge the broker
-            log.exception("worker key=%s run_id=%s failed: %s", key, run_id, e)
-            failed_start = continuation and not getattr(worker, "process_started", False)
-            if failed_start:
-                # Keep the spent retry budget, but never seed an operator rerun with broken WIP context.
-                self.coalescer.code_continuation(key, consume=True)
-                attempted = False
-                self._post_ticket_note(key, (
-                    f"<p><b>Wall-clock continuation could not start</b>: {html.escape(str(e))}. "
-                    f"Saved WIP: <code>{html.escape(continuation['branch'])}</code>. "
-                    "Continuation cleared; automatic retry budget remains used. Owner action required.</p>"), run_id)
-            self._alert_ops(f"worker {key} run_id={run_id} failed: {e}" +
-                            ("; continuation cleared; owner action required" if failed_start else ""),
-                            subject=f"worker:{key}")
-            if not failed_start and isinstance(e, (WorkerSpawnFailed, site_env.ModelDenied)):
-                if mr_review is not None:
-                    review_skipped = True                # no review ran -> re-armable, like a diff-unavailable skip
-                self._note_spawn_failure(key, run_id, mr_review, e)
-            self._chat_notice(chat_zc, CHAT_LIMIT_REPLY, run_id)   # A dead chat worker tells its sender
-        finally:
-            if (worktree and worker is not None and (worker.hard_killed or worker.had_hard_kill)
+            if (worktree and worker is not None and not publish_completed
+                    and (worker.hard_killed or worker.had_hard_kill)
                     and getattr(route, "capability", "") == "code" and (publish or {}).get("code_repo_path")
                     and _env_flag("WORKER_AUTO_SALVAGE_ON_WALL_CLOCK", "0")):
                 # Keep a local patch even if the credentialed salvage push fails. The shared git
@@ -4798,14 +4801,13 @@ class CCAdapter(Adapter):
                     publish_completed = self._salvage_wall_clock(key, run_id, publish)
             # A turn-capped code/general worker's edits would die with the worktree below; save
             # them to an eph/*-wip branch FIRST (inside the run, before run_registry.close). Never raises.
-            if (worktree and worker is not None and worker.turn_capped and not capped_published
+            if (worktree and worker is not None and worker.turn_capped and not recovered_commit
                     and not worker.hard_killed and not worker.had_hard_kill and not worker.api_overloaded
                     and (publish or {}).get("code_repo_path")):
                 with self._repo_operation(key, repo_lock, repo_lock_held, cancellable=False):
                     publish_completed = bool(self._save_wip(key, run_id))
-            # A code worker whose run RAISED before the publish block (e.g. _turn blew up) would lose its
-            # uncommitted edits with the worktree below; save them as a LOCAL patch (no push, so this never
-            # publishes a partial edit). Clean completion already handled this in the publish block. Never raises.
+            # A code worker with no publishable commit may still have uncommitted edits. Save a LOCAL
+            # patch before reaping (no push). Normal publication already handled this above. Never raises.
             elif (worktree and worker is not None and not publish_ran
                   and (publish or {}).get("code_repo_path")):
                 self._save_patch(key, run_id)

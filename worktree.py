@@ -739,17 +739,20 @@ class WorktreeManager:
         return branch
 
     def capped_commit_ready(self, key):
-        """True iff a turn-capped code worker left a CLEAN commit ahead of the cut: HEAD moved past the
-        cut sha AND the tree has no uncommitted/untracked change (the stripped charter files are ignored, as
-        in save_wip). That commit is the worker's finished deliverable (it capped after committing, before
-        its envelope), so the broker may publish it as an MR instead of a WIP branch. Read-only, never raises:
-        any git failure -> False (the caller falls back to save_wip)."""
+        """True iff a stopped code worker left a CLEAN commit ahead of the cut.
+
+        Ignore never-staged untracked scratch and stripped charters, but reject staged additions and
+        all tracked edits. Publication pushes only HEAD, never those untracked files. Read-only, never
+        raises: any git failure -> False (the caller falls back to WIP recovery).
+        """
         try:
             repo, path, cut_sha = self._checked(key)
             env = _wt_env(path)
-            if _git(path, "rev-parse", "HEAD", env=env) == cut_sha:
+            head = _git(path, "rev-parse", "HEAD", env=env)
+            if not cut_sha or not int(_git(path, "rev-list", "--count", f"{cut_sha}..{head}", env=env)):
                 return False
-            st = subprocess.run(_wt_argv(path, "status", "--porcelain", "--", ".", ":(top,exclude)CLAUDE.md",
+            st = subprocess.run(_wt_argv(path, "status", "--porcelain", "--untracked-files=no",
+                                         "--", ".", ":(top,exclude)CLAUDE.md",
                                          ":(top,exclude)AGENTS.md", f":(top,exclude,glob)*{_CHARTER_SUFFIX}"),
                                 capture_output=True, text=True, env=env)
             return st.returncode == 0 and st.stdout.strip() == ""
